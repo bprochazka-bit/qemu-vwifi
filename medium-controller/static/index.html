@@ -1,0 +1,912 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ath9k Medium Controller</title>
+<link rel="stylesheet" href="/static/css/fonts.css">
+<link rel="stylesheet" href="/static/css/style.css">
+<style>
+/* ── Toast notification ── */
+.toast-container {
+  position: fixed; top: 20px; right: 20px; z-index: 2000;
+  display: flex; flex-direction: column; gap: 8px;
+  pointer-events: none;
+}
+.toast {
+  pointer-events: auto;
+  padding: 12px 20px; border-radius: 12px;
+  font-family: var(--font-body); font-size: 13px;
+  box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+  animation: toastIn 0.3s ease-out;
+  max-width: 420px;
+}
+.toast.warn {
+  background: var(--orange-dim); color: var(--orange);
+  border: 1px solid rgba(240,152,62,0.3);
+}
+.toast.info {
+  background: var(--accent-glow); color: var(--accent);
+  border: 1px solid rgba(74,124,255,0.3);
+}
+.toast.ok {
+  background: var(--green-dim); color: var(--green);
+  border: 1px solid rgba(61,214,140,0.3);
+}
+@keyframes toastIn {
+  from { opacity: 0; transform: translateX(40px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+@keyframes toastOut {
+  from { opacity: 1; transform: translateX(0); }
+  to   { opacity: 0; transform: translateX(40px); }
+}
+
+/* ── None-mode placeholder ── */
+.none-placeholder {
+  display: flex; flex-direction: column; align-items: center;
+  justify-content: center; gap: 16px;
+  padding: 80px 32px;
+  border: 1px dashed var(--border); border-radius: 20px;
+  background: var(--surface); text-align: center;
+}
+.none-placeholder .icon { font-size: 48px; opacity: 0.4; }
+.none-placeholder .title {
+  font-family: var(--font-heading); font-size: 18px;
+  font-weight: 600; color: var(--text-dim);
+}
+.none-placeholder .desc {
+  font-size: 13px; color: var(--text-muted); max-width: 400px; line-height: 1.6;
+}
+
+/* ── SNR note ── */
+.snr-note {
+  font-size: 11px; color: var(--text-muted);
+  margin-top: 6px; line-height: 1.5;
+  font-family: var(--font-mono);
+}
+</style>
+</head>
+<body>
+
+<!-- Toast container -->
+<div class="toast-container" id="toastContainer"></div>
+
+<!-- ═══════════════════════════════════════════════════════════════════ -->
+<!--  HEADER                                                            -->
+<!-- ═══════════════════════════════════════════════════════════════════ -->
+<div class="header">
+  <div class="header-inner" id="headerInner">
+    <div class="header-brand">
+      <div class="header-icon">📡</div>
+      <div>
+        <div class="header-title">Wireless Medium</div>
+        <div class="header-subtitle">ath9k virtual link configuration</div>
+      </div>
+    </div>
+
+    <div class="toolbar">
+      <div class="toolbar-left">
+        <span class="toolbar-label">Model</span>
+        <div class="dropdown" id="modelDropdown">
+          <button class="dropdown-trigger" id="modelTrigger" onclick="toggleDropdown()">
+            <span id="modelTriggerLabel">None</span>
+            <svg class="arrow" width="12" height="12" viewBox="0 0 12 12" fill="none">
+              <path d="M2.5 4.5L6 8L9.5 4.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+          </button>
+          <div class="dropdown-menu" id="modelMenu">
+            <button class="dropdown-item active" data-model="none" onclick="selectModel('none')">None (Fan-out)</button>
+            <button class="dropdown-item" data-model="snr_table" onclick="selectModel('snr_table')">SNR Table</button>
+            <button class="dropdown-item" data-model="log_distance" onclick="selectModel('log_distance')">LOG Distance Loss</button>
+            <button class="dropdown-item" data-model="free_space" onclick="selectModel('free_space')">Free Space Loss</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="toolbar-right">
+        <div style="display:flex;align-items:center;gap:8px">
+          <span class="status-dot" id="deployDot"></span>
+          <span class="toolbar-label">Active:</span>
+          <span id="deployedLabel" style="font-family:var(--font-mono);font-size:12px;font-weight:500;color:var(--text-muted)">None</span>
+        </div>
+        <button class="btn-deploy hidden" id="btnDeploy" onclick="deployModel()">Change Model</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════ -->
+<!--  BODY                                                              -->
+<!-- ═══════════════════════════════════════════════════════════════════ -->
+<div class="body-wrap" id="bodyWrap">
+  <div class="main-content" id="mainContent">
+
+    <div id="connBanner" class="conn-banner err" style="display:none"></div>
+
+    <!-- ── None: empty placeholder ── -->
+    <div id="sectionNone">
+      <div class="none-placeholder">
+        <div class="icon">📡</div>
+        <div class="title">Fan-out Mode</div>
+        <div class="desc">
+          No propagation model active. All frames are relayed without
+          modification — pure fan-out hub. Select a model above and click
+          <strong>Change Model</strong> to enable signal simulation.
+        </div>
+      </div>
+    </div>
+
+    <!-- ── SNR Table: pairwise matrix ── -->
+    <div id="sectionSnr" class="hidden">
+      <div class="section-eyebrow">Pairwise Link Budget</div>
+      <div class="section-title">SNR / Loss Matrix</div>
+      <div class="data-table-wrap">
+        <table class="data-table" id="snrTable">
+          <thead><tr id="snrTableHead"></tr></thead>
+          <tbody id="snrTableBody"></tbody>
+        </table>
+      </div>
+      <div class="legend">
+        <span><span class="legend-dot" style="background:var(--green)"></span>Low loss</span>
+        <span><span class="legend-dot" style="background:var(--orange)"></span>Medium loss</span>
+        <span><span class="legend-dot" style="background:var(--red)"></span>High loss</span>
+        <span class="legend-hint">Click cell to edit · Double-click host to open terminal</span>
+      </div>
+    </div>
+
+    <!-- ── Path Loss Map (log_distance | free_space) ── -->
+    <div id="sectionPathLoss" class="hidden">
+      <div style="display:flex;align-items:flex-end;justify-content:space-between;margin-bottom:20px">
+        <div>
+          <div class="section-eyebrow">Spatial Propagation Model</div>
+          <div class="section-title" id="pathLossTitle">Path Loss Map</div>
+        </div>
+        <div class="zoom-controls">
+          <button class="zoom-btn" onclick="zoomOut()" title="Zoom out">−</button>
+          <div class="zoom-label" id="zoomLabel">100%</div>
+          <button class="zoom-btn" onclick="zoomIn()" title="Zoom in">+</button>
+          <div class="zoom-separator"></div>
+          <button class="zoom-btn" onclick="zoomFit()" title="Zoom to fit">
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="2" y="2" width="12" height="12" rx="2"/><path d="M5 8h6M8 5v6"/>
+            </svg>
+          </button>
+        </div>
+      </div>
+
+      <div class="canvas-container" id="canvas">
+        <div class="canvas-grid" id="canvasGrid"></div>
+        <div class="canvas-world" id="canvasWorld">
+          <svg id="linkSvg" style="position:absolute;left:-2000px;top:-2000px;width:6000px;height:6000px;pointer-events:none"></svg>
+        </div>
+      </div>
+      <div style="margin-top:12px;font-size:11px;color:var(--text-muted);margin-bottom:20px" id="canvasHint"></div>
+
+      <div class="data-table-wrap">
+        <table class="data-table" id="plTable">
+          <thead><tr id="plTableHead"></tr></thead>
+          <tbody id="plTableBody"></tbody>
+        </table>
+      </div>
+    </div>
+
+  </div>
+
+  <div class="terminal-gutter hidden" id="terminalGutter">
+    <div class="terminal-gutter-title">Terminals (<span id="termCount">0</span>)</div>
+    <div id="terminalList"></div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════ -->
+<!--  EDIT MODAL                                                        -->
+<!-- ═══════════════════════════════════════════════════════════════════ -->
+<div class="modal-overlay" id="editModal" onclick="closeModal()">
+  <div class="modal-box" onclick="event.stopPropagation()">
+    <div class="modal-eyebrow">Configure Link</div>
+    <div class="modal-title" id="modalTitle"></div>
+    <div class="modal-field">
+      <label>SNR (dB)</label>
+      <input type="number" id="modalSnr" step="0.1">
+      <div class="snr-note">Relative to −95 dBm noise floor.<br>e.g. SNR 30 dB → RSSI ≈ −65 dBm</div>
+    </div>
+    <div class="modal-field">
+      <label>LOSS (probability 0–1)</label>
+      <input type="number" id="modalLoss" step="0.001" min="0" max="1">
+    </div>
+    <div class="modal-actions">
+      <button class="btn-cancel" onclick="closeModal()">Cancel</button>
+      <button class="btn-save" onclick="saveModal()">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════ -->
+<!--  JAVASCRIPT                                                        -->
+<!-- ═══════════════════════════════════════════════════════════════════ -->
+<script>
+"use strict";
+
+/* ═══════════════════════════════════════════════════════════════════════ */
+/*  MODELS                                                                */
+/*                                                                        */
+/*  UI model    Hub model      View            Editable when active?      */
+/*  ─────────   ────────────   ─────────────   ──────────────────────     */
+/*  none        none           placeholder     n/a (pure fan-out)         */
+/*  snr_table   snr_table      SNR matrix      yes — SET_SNR/SET_LOSS     */
+/*  log_distance log_distance  path-loss map   yes — SET_POS on drop      */
+/*  free_space  free_space     path-loss map   yes — SET_POS on drop      */
+/* ═══════════════════════════════════════════════════════════════════════ */
+
+const MODELS = [
+  { id: "none",         label: "None (Fan-out)",    hubName: "none" },
+  { id: "snr_table",    label: "SNR Table",         hubName: "snr_table" },
+  { id: "log_distance", label: "LOG Distance Loss", hubName: "log_distance" },
+  { id: "free_space",   label: "Free Space Loss",   hubName: "free_space" },
+];
+
+/* ── State ── */
+let selectedModel  = "none";   // what the user has chosen in the dropdown
+let deployedModel  = "none";   // what the hub is actually running
+let initialLoadDone = false;
+let hosts = [];
+let matrix = {};               // matrix[a][b] = { snr, loss }
+let openTerminals = [];
+
+// Path-loss canvas
+let nodes = [];
+let zoom = 1, pan = { x: 0, y: 0 };
+let dragging = null, panning = null, hoveredNode = null;
+let canvasNodeEls = {};
+const ZOOM_MIN = 0.3, ZOOM_MAX = 3, ZOOM_STEP = 0.25;
+const PIXELS_PER_METER = 8;
+
+/* ── Helpers ── */
+function getModelInfo(id)  { return MODELS.find(m => m.id === id) || MODELS[0]; }
+function isPathLoss(id)    { return id === "log_distance" || id === "free_space"; }
+function escHtml(s)        { return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
+function dist(a, b)        { return Math.sqrt((a.x-b.x)**2 + (a.y-b.y)**2); }
+
+function signalColor(v, max) { const r=Math.min(v/max,1); return r<0.33?"var(--green)":r<0.66?"var(--orange)":"var(--red)"; }
+function signalBg(v, max)    { const r=Math.min(v/max,1); return r<0.33?"var(--green-dim)":r<0.66?"var(--orange-dim)":"var(--red-dim)"; }
+
+/* Path-loss and RSSI computation — uses actual hub parameters.
+ *
+ *   Hub formulas:
+ *     Log-distance:  PL = ref_loss_db + 10 * n * log10(d / d0)
+ *     Free-space:    PL = 20 * log10(d / d0) + ref_loss_db
+ *     SNR = tx_power - PL - noise_floor
+ *     RSSI = noise_floor + SNR = tx_power - PL
+ *
+ *   Values are synced from the hub via /api/status on every refresh.
+ */
+let hubParams = {
+  ref_distance: 1.0,
+  ref_loss_db: 40.0,
+  path_loss_exp: 3.0,
+  noise_floor: -95.0,
+};
+// Per-node TX power from LIST_PEERS; keyed by node id
+let nodeTxPower = {};  // { "ap1": 15.0, "sta1": 15.0, ... }
+const DEFAULT_TX_POWER = 15.0;
+
+function getTxPower(nodeId) {
+  return nodeTxPower[nodeId] !== undefined ? nodeTxPower[nodeId] : DEFAULT_TX_POWER;
+}
+
+function computePathLoss(distPx) {
+  const d = distPx / PIXELS_PER_METER;
+  if (d < 0.01) return 0;
+  const H = hubParams;
+  if (selectedModel === "log_distance") {
+    return H.ref_loss_db + 10 * H.path_loss_exp * Math.log10(d / H.ref_distance);
+  } else {
+    return 20 * Math.log10(d / H.ref_distance) + H.ref_loss_db;
+  }
+}
+
+function computeRssi(distPx, txNodeId) {
+  const pl = computePathLoss(distPx);
+  const txp = getTxPower(txNodeId);
+  const rssi = txp - pl;
+  return Math.max(-127, Math.min(0, rssi));
+}
+
+function computeSnr(distPx, txNodeId) {
+  const pl = computePathLoss(distPx);
+  const txp = getTxPower(txNodeId);
+  return txp - pl - hubParams.noise_floor;
+}
+
+/* ── API ── */
+async function apiGet(url)        { return (await fetch(url)).json(); }
+async function apiPost(url, data) { return (await fetch(url, { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(data) })).json(); }
+
+/* ── Toasts ── */
+function showToast(msg, type="warn", duration=4000) {
+  const container = document.getElementById("toastContainer");
+  const el = document.createElement("div");
+  el.className = `toast ${type}`;
+  el.textContent = msg;
+  container.appendChild(el);
+  setTimeout(() => {
+    el.style.animation = "toastOut 0.3s ease-in forwards";
+    setTimeout(() => el.remove(), 300);
+  }, duration);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════ */
+/*  STATUS REFRESH                                                        */
+/* ═══════════════════════════════════════════════════════════════════════ */
+
+async function refreshStatus() {
+  try {
+    const data = await apiGet("/api/status");
+    const banner = document.getElementById("connBanner");
+
+    if (!data.connected) {
+      banner.style.display = "flex";
+      banner.className = "conn-banner err";
+      banner.innerHTML = `<span class="status-dot error"></span>
+        <span>Hub disconnected</span>
+        <span class="mono">${escHtml(data.error||"")}</span>`;
+      return;
+    }
+    banner.style.display = "flex";
+    banner.className = "conn-banner ok";
+    banner.innerHTML = `<span class="status-dot active"></span>
+      <span>Connected to</span>
+      <span class="mono">${escHtml(data.ctl_path||"")}</span>`;
+
+    // Sync deployed model from hub
+    if (data.model && data.model.type) {
+      deployedModel = data.model.type;
+      // Sync model parameters
+      if (data.model.params) {
+        const p = data.model.params;
+        if (p.path_loss_exp !== undefined) hubParams.path_loss_exp = p.path_loss_exp;
+        if (p.ref_distance !== undefined)  hubParams.ref_distance  = p.ref_distance;
+        if (p.ref_loss_db !== undefined)   hubParams.ref_loss_db   = p.ref_loss_db;
+        if (p.noise_floor !== undefined)   hubParams.noise_floor   = p.noise_floor;
+      }
+      if (!initialLoadDone) {
+        selectedModel = deployedModel;
+        syncDropdownUI();
+        initialLoadDone = true;
+      }
+      updateDeployedDisplay();
+    }
+
+    // Build host list and sync per-node TX power
+    if (data.peers && data.peers.length > 0) {
+      hosts = data.peers.map(p => p.id);
+      data.peers.forEach(p => {
+        // Sync TX power
+        if (p.txpow !== undefined) nodeTxPower[p.id] = p.txpow;
+        const existing = nodes.find(n => n.id === p.id);
+        if (p.pos && p.pos.length >= 2) {
+          const px = p.pos[0] * PIXELS_PER_METER;
+          const py = p.pos[1] * PIXELS_PER_METER;
+          if (existing) {
+            if (!dragging || dragging.id !== p.id) { existing.x = px; existing.y = py; }
+          } else {
+            nodes.push({ id: p.id, x: px, y: py });
+          }
+        } else if (!existing) {
+          const idx = nodes.length, total = data.peers.length || 6;
+          nodes.push({
+            id: p.id,
+            x: 200 + 280 * Math.cos((idx/total)*Math.PI*2 - Math.PI/2),
+            y: 220 + 180 * Math.sin((idx/total)*Math.PI*2 - Math.PI/2),
+          });
+        }
+      });
+      nodes = nodes.filter(n => hosts.includes(n.id));
+    }
+
+    if (selectedModel === "snr_table") initMatrixFromHosts();
+    renderCurrentView();
+  } catch (e) { console.error("refreshStatus:", e); }
+}
+
+function initMatrixFromHosts() {
+  hosts.forEach(a => {
+    if (!matrix[a]) matrix[a] = {};
+    hosts.forEach(b => { if (a !== b && !matrix[a][b]) matrix[a][b] = { snr: 30, loss: 0.0 }; });
+  });
+}
+
+/* ═══════════════════════════════════════════════════════════════════════ */
+/*  MODEL DROPDOWN + DEPLOY                                               */
+/* ═══════════════════════════════════════════════════════════════════════ */
+
+function toggleDropdown() {
+  const menu = document.getElementById("modelMenu");
+  const trigger = document.getElementById("modelTrigger");
+  menu.classList.toggle("open"); trigger.classList.toggle("open");
+}
+
+function selectModel(id) {
+  selectedModel = id;
+  syncDropdownUI();
+  updateDeployButton();
+  // Remove existing canvas node DOM elements before rebuilding
+  for (const id in canvasNodeEls) { canvasNodeEls[id].remove(); }
+  canvasNodeEls = {};
+  renderCurrentView();
+}
+
+function syncDropdownUI() {
+  document.getElementById("modelTriggerLabel").textContent = getModelInfo(selectedModel).label;
+  document.getElementById("modelMenu").classList.remove("open");
+  document.getElementById("modelTrigger").classList.remove("open");
+  document.querySelectorAll(".dropdown-item").forEach(el =>
+    el.classList.toggle("active", el.dataset.model === selectedModel));
+}
+
+function updateDeployedDisplay() {
+  const info = getModelInfo(deployedModel);
+  const label = document.getElementById("deployedLabel");
+  label.textContent = info.label;
+  label.style.color = deployedModel === "none" ? "var(--text-muted)" : "var(--text)";
+  document.getElementById("deployDot").className =
+    "status-dot" + (deployedModel !== "none" ? " active" : "");
+  updateDeployButton();
+}
+
+function updateDeployButton() {
+  document.getElementById("btnDeploy").classList.toggle("hidden",
+    selectedModel === deployedModel);
+}
+
+async function deployModel() {
+  const hubName = getModelInfo(selectedModel).hubName;
+
+  // When switching away from snr_table, clear overrides so path-loss
+  // models aren't shadowed by stale per-link SNR values
+  if (deployedModel === "snr_table" && isPathLoss(selectedModel)) {
+    await apiPost("/api/clear_overrides", {});
+  }
+
+  const resp = await apiPost("/api/model", { model: hubName });
+  if (resp.ok) {
+    deployedModel = selectedModel;
+    updateDeployedDisplay();
+    if (isPathLoss(selectedModel)) await pushAllPositions();
+    showToast(`Model changed to ${getModelInfo(selectedModel).label}`, "ok", 3000);
+    await refreshStatus();
+  }
+}
+
+/** Check whether the selected model is the deployed model.
+ *  If not, show a warning toast and return false.  */
+function guardActiveModel(modelNeeded) {
+  if (deployedModel === modelNeeded) return true;
+  showToast(
+    `Model "${getModelInfo(modelNeeded).label}" is not active — ` +
+    `changes have no effect. Deploy it first with Change Model.`,
+    "warn", 5000
+  );
+  return false;
+}
+
+/* ── Render dispatcher ── */
+function renderCurrentView() {
+  document.getElementById("sectionNone").classList.toggle("hidden", selectedModel !== "none");
+  document.getElementById("sectionSnr").classList.toggle("hidden", selectedModel !== "snr_table");
+  document.getElementById("sectionPathLoss").classList.toggle("hidden", !isPathLoss(selectedModel));
+
+  if (selectedModel === "snr_table") renderSnrTable();
+  if (isPathLoss(selectedModel)) renderPathLossView();
+}
+
+/* ═══════════════════════════════════════════════════════════════════════ */
+/*  SNR TABLE                                                             */
+/* ═══════════════════════════════════════════════════════════════════════ */
+
+function renderSnrTable() {
+  if (hosts.length === 0) return;
+  const thead = document.getElementById("snrTableHead");
+  const tbody = document.getElementById("snrTableBody");
+
+  let hdr = '<th>Host</th>';
+  hosts.forEach(h => {
+    hdr += `<th class="host-col" ondblclick="toggleTerminal('${h}')">${h}</th>`;
+  });
+  thead.innerHTML = hdr;
+
+  let body = '';
+  hosts.forEach(rowH => {
+    body += '<tr>';
+    body += `<td ondblclick="toggleTerminal('${rowH}')"><span class="node-dot"></span>${escHtml(rowH)}</td>`;
+    hosts.forEach(colH => {
+      if (rowH === colH) {
+        body += '<td class="cell-self"><span style="color:var(--text-muted);font-size:11px">—</span></td>';
+      } else {
+        const val = (matrix[rowH]&&matrix[rowH][colH]) || {snr:0,loss:0};
+        body += `<td class="cell-link" onclick="openEditModal('${rowH}','${colH}')">
+          <div class="cell-pill" style="background:${signalBg(val.loss*100,15)}">
+            <span class="snr-val" style="color:${signalColor(val.loss*100,15)}">${val.snr} dB</span>
+            <span class="loss-val">loss ${val.loss}</span>
+          </div></td>`;
+      }
+    });
+    body += '</tr>';
+  });
+  tbody.innerHTML = body;
+}
+
+/* ── Edit Modal ── */
+let modalA = "", modalB = "";
+let modalOrigSnr = 0, modalOrigLoss = 0;
+
+function openEditModal(a, b) {
+  modalA = a; modalB = b;
+  const val = (matrix[a]&&matrix[a][b]) || {snr:30,loss:0};
+  modalOrigSnr  = val.snr;
+  modalOrigLoss = val.loss;
+  document.getElementById("modalTitle").innerHTML =
+    `${escHtml(a)} <span class="link-arrow">⟷</span> ${escHtml(b)}`;
+  document.getElementById("modalSnr").value  = val.snr;
+  document.getElementById("modalLoss").value = val.loss;
+  document.getElementById("editModal").classList.add("open");
+  document.getElementById("modalSnr").focus();
+}
+
+function closeModal() {
+  document.getElementById("editModal").classList.remove("open");
+}
+
+async function saveModal() {
+  const snr  = parseFloat(document.getElementById("modalSnr").value)  || 0;
+  const loss = parseFloat(document.getElementById("modalLoss").value) || 0;
+
+  closeModal();
+
+  // If snr_table is not the active model, warn and revert
+  if (!guardActiveModel("snr_table")) {
+    // Revert local state to original values
+    if (matrix[modalA]) matrix[modalA][modalB] = { snr: modalOrigSnr, loss: modalOrigLoss };
+    if (matrix[modalB]) matrix[modalB][modalA] = { snr: modalOrigSnr, loss: modalOrigLoss };
+    renderSnrTable();
+    return;
+  }
+
+  // Update local
+  if (!matrix[modalA]) matrix[modalA] = {};
+  if (!matrix[modalB]) matrix[modalB] = {};
+  matrix[modalA][modalB] = { snr, loss };
+  matrix[modalB][modalA] = { snr, loss };
+
+  // Push to hub immediately
+  await apiPost("/api/snr", { a: modalA, b: modalB, snr });
+  if (loss > 0) {
+    await apiPost("/api/loss", { a: modalA, b: modalB, loss });
+  }
+
+  await refreshStatus();
+}
+
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && document.getElementById("editModal").classList.contains("open")) saveModal();
+  if (e.key === "Escape") closeModal();
+});
+
+/* ═══════════════════════════════════════════════════════════════════════ */
+/*  PATH LOSS MAP                                                         */
+/* ═══════════════════════════════════════════════════════════════════════ */
+
+function renderPathLossView() {
+  const label = selectedModel === "log_distance"
+    ? "LOG Distance (n=3.0, f=2.4 GHz)" : "Free-Space (f=2.4 GHz)";
+  document.getElementById("canvasHint").textContent =
+    `Drag nodes to reposition · Scroll to zoom · Double-click to open terminal · ${label}`;
+  document.getElementById("zoomLabel").textContent = Math.round(zoom*100)+"%";
+  updateCanvasTransform();
+  renderLinks();
+  ensureCanvasNodes();
+  updateAllNodePositions();
+  renderPathLossTable();
+}
+
+function updateCanvasTransform() {
+  const grid = document.getElementById("canvasGrid");
+  const sz = 40 * zoom;
+  grid.style.backgroundSize = `${sz}px ${sz}px`;
+  grid.style.backgroundPosition = `${pan.x}px ${pan.y}px`;
+  document.getElementById("canvasWorld").style.transform =
+    `translate(${pan.x}px,${pan.y}px) scale(${zoom})`;
+}
+
+function renderLinks() {
+  let svg = '';
+  for (let i = 0; i < nodes.length; i++) {
+    for (let j = i+1; j < nodes.length; j++) {
+      const a = nodes[i], b = nodes[j];
+      const d = dist(a,b);
+      const pl = computePathLoss(d);
+      // Use average of both directions (TX power may differ per node)
+      const rssiAB = computeRssi(d, a.id);
+      const rssiBA = computeRssi(d, b.id);
+      const isH = hoveredNode === a.id || hoveredNode === b.id;
+      const op = isH ? 0.6 : Math.max(0.05, 0.4 - d/800);
+      const sw = (isH ? 1.5 : 0.8) / zoom;
+      const dash = isH ? "none" : `${4/zoom} ${4/zoom}`;
+      svg += `<line x1="${a.x+2000}" y1="${a.y+2000}" x2="${b.x+2000}" y2="${b.y+2000}"
+        stroke="${isH?"var(--accent)":"var(--text-muted)"}" stroke-width="${sw}"
+        stroke-dasharray="${dash}" opacity="${op}"/>`;
+      if (isH) {
+        const mx = (a.x+b.x)/2+2000, my = (a.y+b.y)/2+2000;
+        const fs = 10/zoom;
+        svg += `<text x="${mx}" y="${my-12}" fill="var(--accent)" font-size="${fs}"
+          text-anchor="middle" font-family="'JetBrains Mono',monospace">PL ${Math.round(pl)} dB</text>`;
+        // Show both directions if TX power differs, otherwise one value
+        if (rssiAB === rssiBA) {
+          svg += `<text x="${mx}" y="${my+2}" fill="var(--text-dim)" font-size="${fs*0.9}"
+            text-anchor="middle" font-family="'JetBrains Mono',monospace">RSSI ${Math.round(rssiAB)} dBm</text>`;
+        } else {
+          svg += `<text x="${mx}" y="${my+2}" fill="var(--text-dim)" font-size="${fs*0.85}"
+            text-anchor="middle" font-family="'JetBrains Mono',monospace">RSSI ${Math.round(rssiAB)}/${Math.round(rssiBA)} dBm</text>`;
+        }
+      }
+    }
+  }
+  document.getElementById("linkSvg").innerHTML = svg;
+}
+
+function ensureCanvasNodes() {
+  const world = document.getElementById("canvasWorld");
+  const ids = new Set(nodes.map(n => n.id));
+  for (const id in canvasNodeEls) { if (!ids.has(id)) { canvasNodeEls[id].remove(); delete canvasNodeEls[id]; } }
+  nodes.forEach(node => {
+    if (canvasNodeEls[node.id]) return;
+    const el = document.createElement("div");
+    el.className = "node-handle"; el.dataset.nodeId = node.id;
+    el.innerHTML = `<div class="node-ring"></div>
+      <div class="node-body"><div class="node-core"></div></div>
+      <div class="node-label">${escHtml(node.id)}</div>`;
+    el.addEventListener("mousedown", (e) => {
+      e.preventDefault(); e.stopPropagation();
+      const rect = document.getElementById("canvas").getBoundingClientRect();
+      const mx = (e.clientX - rect.left - pan.x) / zoom;
+      const my = (e.clientY - rect.top - pan.y) / zoom;
+      dragging = { id: node.id, offsetX: mx - node.x, offsetY: my - node.y,
+                   startX: node.x, startY: node.y };
+      document.getElementById("canvas").classList.add("grabbing");
+    });
+    el.addEventListener("mouseenter", () => { hoveredNode = node.id; updateNodeVisuals(node.id); renderLinks(); });
+    el.addEventListener("mouseleave", () => { hoveredNode = null; updateNodeVisuals(node.id); renderLinks(); });
+    el.addEventListener("dblclick", () => toggleTerminal(node.id));
+    world.appendChild(el);
+    canvasNodeEls[node.id] = el;
+  });
+}
+
+function updateNodePosition(id) {
+  const el = canvasNodeEls[id], node = nodes.find(n => n.id === id);
+  if (!el || !node) return;
+  el.style.left = node.x + "px"; el.style.top = node.y + "px";
+  el.style.transform = `translate(-50%,-50%) scale(${1/zoom})`;
+}
+
+function updateAllNodePositions() { nodes.forEach(n => { updateNodePosition(n.id); updateNodeVisuals(n.id); }); }
+
+function updateNodeVisuals(id) {
+  const el = canvasNodeEls[id]; if (!el) return;
+  const isH = hoveredNode === id, isD = dragging && dragging.id === id;
+  const body = el.querySelector(".node-body"), core = el.querySelector(".node-core");
+  el.style.filter = isH ? "drop-shadow(0 0 16px rgba(74,124,255,0.53))" : "";
+  el.style.zIndex = isD ? 10 : 2;
+  if (body) { body.style.borderColor = (isH||isD) ? "var(--accent)" : ""; body.style.transform = isH ? "scale(1.1)" : ""; }
+  if (core) { core.style.background = (isH||isD) ? "var(--accent)" : ""; core.style.boxShadow = (isH||isD) ? "0 0 12px rgba(74,124,255,0.4)" : ""; }
+}
+
+function renderPathLossTable() {
+  if (!nodes.length) return;
+  let hdr = '<th style="text-align:left">Link Budget</th>';
+  nodes.forEach(n => { hdr += `<th class="host-col" ondblclick="toggleTerminal('${n.id}')">${escHtml(n.id)}</th>`; });
+  document.getElementById("plTableHead").innerHTML = hdr;
+
+  let body = '';
+  nodes.forEach(rn => {
+    body += '<tr>';
+    body += `<td ondblclick="toggleTerminal('${rn.id}')"><span class="node-dot" style="width:6px;height:6px;background:var(--pink)"></span>${escHtml(rn.id)}</td>`;
+    nodes.forEach(cn => {
+      if (rn.id === cn.id) { body += '<td class="cell-self"><span style="color:var(--text-muted);font-size:10px">—</span></td>'; return; }
+      const d = dist(rn, cn);
+      const pl = Math.round(computePathLoss(d));
+      // RSSI as seen by cn when rn transmits (uses rn's TX power)
+      const rssi = Math.round(computeRssi(d, rn.id));
+      const absRssi = Math.abs(rssi);
+      body += `<td style="padding:6px;text-align:center">
+        <div style="display:inline-flex;flex-direction:column;gap:1px;padding:5px 10px;border-radius:8px;
+          background:${signalBg(absRssi,80)};min-width:80px">
+          <span style="font-family:var(--font-mono);font-size:11px;color:var(--text-dim)">PL ${pl} dB</span>
+          <span style="font-family:var(--font-mono);font-size:13px;font-weight:600;
+            color:${signalColor(absRssi,80)}">${rssi} dBm</span>
+        </div></td>`;
+    });
+    body += '</tr>';
+  });
+  document.getElementById("plTableBody").innerHTML = body;
+}
+
+/* ── Canvas mouse handling ── */
+
+document.getElementById("canvas").addEventListener("mousedown", (e) => {
+  if (dragging) return;
+  panning = { startX: e.clientX, startY: e.clientY, startPanX: pan.x, startPanY: pan.y };
+  document.getElementById("canvas").classList.add("grabbing");
+});
+
+document.addEventListener("mousemove", (e) => {
+  const canvas = document.getElementById("canvas");
+  if (!canvas) return;
+  if (dragging) {
+    const rect = canvas.getBoundingClientRect();
+    const mx = (e.clientX - rect.left - pan.x) / zoom;
+    const my = (e.clientY - rect.top - pan.y) / zoom;
+    const node = nodes.find(n => n.id === dragging.id);
+    if (node) { node.x = mx - dragging.offsetX; node.y = my - dragging.offsetY; updateNodePosition(dragging.id); renderLinks(); renderPathLossTable(); }
+  } else if (panning) {
+    pan.x = panning.startPanX + (e.clientX - panning.startX);
+    pan.y = panning.startPanY + (e.clientY - panning.startY);
+    updateCanvasTransform(); renderLinks();
+  }
+});
+
+document.addEventListener("mouseup", async () => {
+  const was = dragging;
+  dragging = null; panning = null;
+  const canvas = document.getElementById("canvas");
+  if (canvas) canvas.classList.remove("grabbing");
+
+  if (was && isPathLoss(selectedModel)) {
+    const node = nodes.find(n => n.id === was.id);
+    if (!node) return;
+
+    // If this model is not deployed, warn and snap back
+    if (!guardActiveModel(selectedModel)) {
+      node.x = was.startX; node.y = was.startY;
+      updateNodePosition(was.id); renderLinks(); renderPathLossTable();
+      return;
+    }
+
+    // Push position to hub
+    await apiPost("/api/pos", {
+      node: node.id,
+      x: node.x / PIXELS_PER_METER,
+      y: node.y / PIXELS_PER_METER,
+      z: 0,
+    });
+  }
+});
+
+document.getElementById("canvas").addEventListener("wheel", (e) => {
+  e.preventDefault();
+  const rect = document.getElementById("canvas").getBoundingClientRect();
+  const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+  const d = e.deltaY > 0 ? -ZOOM_STEP*0.5 : ZOOM_STEP*0.5;
+  const nz = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, zoom+d));
+  const r = nz / zoom;
+  pan.x = mx - r*(mx - pan.x); pan.y = my - r*(my - pan.y);
+  zoom = nz; renderPathLossView();
+}, { passive: false });
+
+function zoomIn()  { zoom = Math.min(ZOOM_MAX, zoom + ZOOM_STEP); renderPathLossView(); }
+function zoomOut() { zoom = Math.max(ZOOM_MIN, zoom - ZOOM_STEP); renderPathLossView(); }
+function zoomFit() {
+  const c = document.getElementById("canvas");
+  if (!c || !nodes.length) return;
+  const rect = c.getBoundingClientRect(), pad = 80;
+  const xs = nodes.map(n=>n.x), ys = nodes.map(n=>n.y);
+  const [minX,maxX,minY,maxY] = [Math.min(...xs),Math.max(...xs),Math.min(...ys),Math.max(...ys)];
+  const fz = Math.min(rect.width/(maxX-minX+pad*2), rect.height/(maxY-minY+pad*2), ZOOM_MAX);
+  zoom = Math.max(ZOOM_MIN, fz);
+  pan.x = rect.width/2 - (minX+maxX)/2*zoom;
+  pan.y = rect.height/2 - (minY+maxY)/2*zoom;
+  renderPathLossView();
+}
+
+async function pushAllPositions() {
+  const positions = nodes.map(n => ({ node: n.id, x: n.x/PIXELS_PER_METER, y: n.y/PIXELS_PER_METER, z: 0 }));
+  await apiPost("/api/positions", { positions });
+}
+
+/* ═══════════════════════════════════════════════════════════════════════ */
+/*  TERMINALS                                                             */
+/* ═══════════════════════════════════════════════════════════════════════ */
+
+const termState = {};
+function getTermState(id) {
+  if (!termState[id]) {
+    const ts = () => new Date().toTimeString().split(" ")[0];
+    termState[id] = { lines: [
+      `[${ts()}] ${id} interface wlan0 up`,
+      `[${ts()}] ath9k: hw version 0x4a2 mac 14.2`,
+      `[${ts()}] ieee80211 phy0: minstrel_ht`,
+      `[${ts()}] wlan0: associated (aid 1)`,
+      `[${ts()}] IPv4: DHCP bound to 192.168.1.${~~(10+Math.random()*240)}`,
+      `[${ts()}] ${id}> _`,
+    ], input: "" };
+  }
+  return termState[id];
+}
+
+function toggleTerminal(id) {
+  openTerminals = openTerminals.includes(id) ? openTerminals.filter(h=>h!==id) : [...openTerminals, id];
+  renderTerminals(); updateLayout();
+}
+function closeTerminal(id) { openTerminals = openTerminals.filter(h=>h!==id); renderTerminals(); updateLayout(); }
+function updateLayout() {
+  const has = openTerminals.length > 0;
+  document.getElementById("headerInner").classList.toggle("wide", has);
+  document.getElementById("bodyWrap").classList.toggle("wide", has);
+  document.getElementById("terminalGutter").classList.toggle("hidden", !has);
+}
+
+function renderTerminals() {
+  document.getElementById("termCount").textContent = openTerminals.length;
+  const list = document.getElementById("terminalList");
+  list.innerHTML = "";
+  openTerminals.forEach(id => {
+    const st = getTermState(id);
+    const win = document.createElement("div");
+    win.className = "terminal-window";
+    win.innerHTML = `
+      <div class="terminal-titlebar">
+        <div style="display:flex;align-items:center;gap:8px">
+          <div class="terminal-dots">
+            <div class="terminal-dot close" onclick="closeTerminal('${id}')"></div>
+            <div class="terminal-dot min"></div>
+            <div class="terminal-dot max"></div>
+          </div>
+          <span class="terminal-hostname">${escHtml(id)}</span>
+        </div>
+        <span class="terminal-shell">bash</span>
+      </div>
+      <div class="terminal-body" id="termBody_${id}">
+        ${st.lines.map(l=>`<div class="line">${escHtml(l)}</div>`).join("")}
+      </div>
+      <div class="terminal-input-row">
+        <span class="terminal-prompt">$</span>
+        <input class="terminal-input" placeholder="type a command..."
+               value="${escHtml(st.input)}"
+               oninput="termState['${id}'].input=this.value"
+               onkeydown="handleTermKey(event,'${id}',this)">
+      </div>`;
+    list.appendChild(win);
+    const body = document.getElementById(`termBody_${id}`);
+    if (body) body.scrollTop = body.scrollHeight;
+  });
+}
+
+function handleTermKey(e, id, el) {
+  if (e.key !== "Enter" || !el.value.trim()) return;
+  const st = getTermState(id), cmd = el.value.trim();
+  const ts = new Date().toTimeString().split(" ")[0];
+  let r = `[${ts}] ${id}> ${cmd}`;
+  if (cmd==="help") r+="\n  Available: status, ping, scan, clear, help";
+  else if (cmd==="status") r+=`\n  wlan0: UP  ch:${[1,6,11][~~(Math.random()*3)]}  txpower:20dBm  signal:-${~~(30+Math.random()*50)}dBm`;
+  else if (cmd==="ping") r+=`\n  PING 192.168.1.1: 64 bytes, time=${~~(1+Math.random()*12)}ms ttl=64`;
+  else if (cmd==="scan") r+=`\n  BSS 00:1a:2b:xx:xx freq:2412 signal:-${~~(40+Math.random()*40)}dBm`;
+  else if (cmd==="clear") { st.lines=[`[${ts}] ${id}> _`]; st.input=""; renderTerminals(); return; }
+  else r+=`\n  unknown command: ${cmd}`;
+  st.lines.push(r, `[${ts}] ${id}> _`); st.input=""; renderTerminals();
+}
+
+/* ── Dropdown outside-click ── */
+document.addEventListener("mousedown", (e) => {
+  const dd = document.getElementById("modelDropdown");
+  if (dd && !dd.contains(e.target)) {
+    document.getElementById("modelMenu").classList.remove("open");
+    document.getElementById("modelTrigger").classList.remove("open");
+  }
+});
+
+/* ── Init ── */
+(async function() { await refreshStatus(); setInterval(refreshStatus, 10000); })();
+</script>
+</body>
+</html>
