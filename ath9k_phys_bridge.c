@@ -466,14 +466,222 @@ static int send_hello(int fd, const char *id)
 }
 
 /* ================================================================
- *  Step 6: physical interface setup
- *  TODO
+ *  Step 6: physical interface setup (AF_PACKET raw socket)
  * ================================================================ */
+
+#define ARPHRD_IEEE80211_RADIOTAP 803
+
+/*
+ * Verify the interface is in monitor mode by reading its type
+ * from sysfs.  Returns 0 if OK, -1 on error.
+ */
+static int check_monitor_mode(const char *iface)
+{
+    char path[256];
+    FILE *fp;
+    int type = -1;
+
+    snprintf(path, sizeof(path), "/sys/class/net/%s/type", iface);
+    fp = fopen(path, "r");
+    if (!fp) {
+        fprintf(stderr, "bridge: cannot read %s: %s\n",
+                path, strerror(errno));
+        fprintf(stderr, "bridge: does interface %s exist?\n", iface);
+        return -1;
+    }
+    if (fscanf(fp, "%d", &type) != 1)
+        type = -1;
+    fclose(fp);
+
+    if (type != ARPHRD_IEEE80211_RADIOTAP) {
+        fprintf(stderr,
+            "Error: %s is not in monitor mode (type=%d, expected %d)\n"
+            "Fix: sudo ip link set %s down && "
+            "sudo iw dev %s set type monitor && "
+            "sudo ip link set %s up\n",
+            iface, type, ARPHRD_IEEE80211_RADIOTAP,
+            iface, iface, iface);
+        return -1;
+    }
+
+    return 0;
+}
+
+/*
+ * Open an AF_PACKET raw socket bound to the given interface.
+ * Returns fd on success, -1 on failure.
+ */
+static int open_raw_socket(const char *iface)
+{
+    int fd;
+    unsigned int ifindex;
+    struct sockaddr_ll sll;
+
+    ifindex = if_nametoindex(iface);
+    if (ifindex == 0) {
+        fprintf(stderr, "bridge: interface %s not found: %s\n",
+                iface, strerror(errno));
+        return -1;
+    }
+
+    fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+    if (fd < 0) {
+        perror("bridge: socket(AF_PACKET)");
+        return -1;
+    }
+
+    memset(&sll, 0, sizeof(sll));
+    sll.sll_family   = AF_PACKET;
+    sll.sll_protocol = htons(ETH_P_ALL);
+    sll.sll_ifindex  = (int)ifindex;
+
+    if (bind(fd, (struct sockaddr *)&sll, sizeof(sll)) < 0) {
+        perror("bridge: bind(AF_PACKET)");
+        close(fd);
+        return -1;
+    }
+
+    return fd;
+}
 
 /* ================================================================
  *  Step 7: radiotap parsing
- *  TODO
+ *
+ *  Parse the variable-length radiotap header prepended by the kernel
+ *  to every monitor-mode capture.  We extract rate, channel, signal,
+ *  flags, and optionally TSFT.
  * ================================================================ */
+
+/* Radiotap present-word bit numbers */
+#define RT_TSFT             0
+#define RT_FLAGS            1
+#define RT_RATE             2
+#define RT_CHANNEL          3
+#define RT_FHSS             4
+#define RT_DBM_ANTSIGNAL    5
+#define RT_DBM_ANTNOISE     6
+#define RT_EXT              31
+
+/* Radiotap FLAGS bits */
+#define RT_FLAGS_FCS        0x10  /* FCS included at end of frame */
+
+struct radiotap_info {
+    uint8_t  rate;          /* 500 kbps units */
+    uint16_t chan_freq;     /* MHz */
+    uint16_t chan_flags;    /* radiotap channel flags (not ath9k flags) */
+    int8_t   signal_dbm;
+    uint64_t tsft;
+    uint8_t  flags;         /* radiotap FLAGS field */
+    int      has_rate;
+    int      has_channel;
+    int      has_signal;
+    int      has_tsft;
+    int      has_flags;
+};
+
+/* Field sizes for radiotap bits 0-6 (size, alignment) */
+static const struct { uint8_t size; uint8_t align; } rt_fields[] = {
+    [RT_TSFT]          = { 8, 8 },  /* u64 */
+    [RT_FLAGS]         = { 1, 1 },  /* u8  */
+    [RT_RATE]          = { 1, 1 },  /* u8  */
+    [RT_CHANNEL]       = { 4, 2 },  /* u16 freq + u16 flags */
+    [RT_FHSS]          = { 2, 2 },  /* u8 hop_set + u8 hop_pattern */
+    [RT_DBM_ANTSIGNAL] = { 1, 1 },  /* s8  */
+    [RT_DBM_ANTNOISE]  = { 1, 1 },  /* s8  */
+};
+#define RT_NUM_KNOWN_FIELDS 7
+
+/*
+ * Align cursor to required boundary (relative to radiotap header start).
+ */
+static inline size_t rt_align(size_t cursor, uint8_t alignment)
+{
+    return (cursor + alignment - 1) & ~((size_t)alignment - 1);
+}
+
+/*
+ * Parse a radiotap header.
+ * buf points to the start of the radiotap header, len is total capture length.
+ * Returns radiotap header length on success, 0 on failure.
+ */
+static size_t parse_radiotap(const uint8_t *buf, size_t len,
+                             struct radiotap_info *info)
+{
+    uint16_t rt_len;
+    uint32_t present;
+    size_t cursor;
+
+    memset(info, 0, sizeof(*info));
+
+    /* Minimum radiotap header: 8 bytes */
+    if (len < 8)
+        return 0;
+
+    /* Version must be 0 */
+    if (buf[0] != 0)
+        return 0;
+
+    /* Total radiotap length (LE) */
+    memcpy(&rt_len, buf + 2, 2);
+    if (rt_len < 8 || rt_len > len)
+        return 0;
+
+    /* First present word */
+    memcpy(&present, buf + 4, 4);
+
+    /* Skip past all present words (bit 31 = extension) */
+    cursor = 8;
+    {
+        uint32_t p = present;
+        while (p & (1u << RT_EXT)) {
+            if (cursor + 4 > rt_len)
+                return 0;
+            memcpy(&p, buf + cursor, 4);
+            cursor += 4;
+        }
+    }
+
+    /* Walk bits 0-6 of the first present word, skipping/reading fields */
+    for (int bit = 0; bit < RT_NUM_KNOWN_FIELDS && cursor < rt_len; bit++) {
+        if (!(present & (1u << bit)))
+            continue;
+
+        /* Align cursor */
+        cursor = rt_align(cursor, rt_fields[bit].align);
+        if (cursor + rt_fields[bit].size > rt_len)
+            break;
+
+        switch (bit) {
+        case RT_TSFT:
+            memcpy(&info->tsft, buf + cursor, 8);
+            info->has_tsft = 1;
+            break;
+        case RT_FLAGS:
+            info->flags = buf[cursor];
+            info->has_flags = 1;
+            break;
+        case RT_RATE:
+            info->rate = buf[cursor];
+            info->has_rate = 1;
+            break;
+        case RT_CHANNEL:
+            memcpy(&info->chan_freq, buf + cursor, 2);
+            memcpy(&info->chan_flags, buf + cursor + 2, 2);
+            info->has_channel = 1;
+            break;
+        case RT_DBM_ANTSIGNAL:
+            info->signal_dbm = (int8_t)buf[cursor];
+            info->has_signal = 1;
+            break;
+        default:
+            break;
+        }
+
+        cursor += rt_fields[bit].size;
+    }
+
+    return rt_len;
+}
 
 /* ================================================================
  *  Step 8: hub-to-physical path (process_hub_message)
@@ -605,15 +813,22 @@ int main(int argc, char *argv[])
     }
     fprintf(stderr, "bridge: connected to hub %s (fd=%d, node=%s)\n",
             hub_path, hub_fd, node_id);
-    /* TODO step 6: check_monitor_mode(), open_raw_socket() */
+    /* Validate monitor mode and open raw capture/inject socket */
+    if (check_monitor_mode(ifname) < 0)
+        goto out;
+    raw_fd = open_raw_socket(ifname);
+    if (raw_fd < 0)
+        goto out;
+    fprintf(stderr, "bridge: %s raw socket opened (fd=%d)\n", ifname, raw_fd);
     /* TODO step 10: main poll loop */
 
-    /* Shutdown */
+    /* Normal shutdown (reached after main loop exits) */
     fprintf(stderr,
         "bridge: shutting down -- hub->phys: %u frames, phys->hub: %u frames, "
         "echoes suppressed: %u\n",
         stats_hub_to_phys, stats_phys_to_hub, stats_echoes);
 
+out:
     if (hub_fd >= 0) close(hub_fd);
     if (raw_fd >= 0) close(raw_fd);
     return 0;
