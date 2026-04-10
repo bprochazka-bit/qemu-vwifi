@@ -74,7 +74,9 @@
  *    28      2     channel_freq     (MHz, e.g. 2412 for ch1)
  *    30      2     channel_flags    (see CHAN_FLAG_* below)
  *    32      2     channel_bond_freq (MHz, secondary channel for HT40, 0=none)
- *    34      6     _reserved        (pad to 40 bytes, must be zero)
+ *    34      2     center_freq1     (VHT/HE center freq of primary segment, 0=N/A)
+ *    36      2     center_freq2     (VHT80+80 center freq of secondary segment, 0=N/A)
+ *    38      2     _reserved        (must be zero)
  *
  *  Backward compatibility:
  *    - v1 clients send 28-byte headers with no channel info.
@@ -96,7 +98,10 @@ struct ath9k_medium_frame_hdr {
     uint16_t    channel_freq;       /* Center frequency in MHz (0 = unknown/all) */
     uint16_t    channel_flags;      /* Channel flags (see below) */
     uint16_t    channel_bond_freq;  /* HT40 secondary channel freq (0 = none) */
-    uint8_t     _reserved[6];       /* Must be zero */
+    /* --- v2+ extended channel fields (using formerly reserved bytes) --- */
+    uint16_t    center_freq1;       /* VHT/HE: center freq of primary segment (MHz), 0=N/A */
+    uint16_t    center_freq2;       /* VHT80+80: center freq of secondary 80MHz segment, 0=N/A */
+    uint8_t     _reserved[2];       /* Must be zero */
 };
 
 /* V1 header size (for backward compatibility detection) */
@@ -116,6 +121,9 @@ struct ath9k_medium_frame_hdr {
 #define ATH9K_CHAN_FLAG_HT20         0x0004  /* HT20 */
 #define ATH9K_CHAN_FLAG_HT40PLUS     0x0008  /* HT40+ (secondary above) */
 #define ATH9K_CHAN_FLAG_HT40MINUS    0x0010  /* HT40- (secondary below) */
+#define ATH9K_CHAN_FLAG_VHT80        0x0020  /* VHT 80 MHz */
+#define ATH9K_CHAN_FLAG_VHT160       0x0040  /* VHT 160 MHz */
+#define ATH9K_CHAN_FLAG_VHT80_80     0x0080  /* VHT 80+80 MHz */
 
 /* ================================================================
  *  Channel bonding virtual channel
