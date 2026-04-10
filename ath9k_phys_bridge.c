@@ -311,13 +311,159 @@ static uint8_t ath_rate_to_rt(uint8_t ath)
 
 /* ================================================================
  *  Step 4: echo suppression
- *  TODO
+ *
+ *  When we inject a frame via monitor mode, the radio captures it
+ *  back. We use an FNV-1a hash ring buffer to detect and suppress
+ *  these echoes.
  * ================================================================ */
+
+#define ECHO_RING_SIZE  256
+#define ECHO_EXPIRE_MS  100
+
+struct echo_entry {
+    uint32_t hash;
+    uint16_t frame_len;
+    uint64_t timestamp_ms;
+};
+
+static struct echo_entry echo_ring[ECHO_RING_SIZE];
+static int echo_ring_head;
+
+static uint32_t fnv1a(const uint8_t *data, size_t len)
+{
+    uint32_t h = 0x811C9DC5;
+    for (size_t i = 0; i < len; i++) {
+        h ^= data[i];
+        h *= 0x01000193;
+    }
+    return h;
+}
+
+static uint64_t now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+}
+
+/*
+ * Record a frame hash before injection (hub->phys path).
+ * Called just before writing to the raw socket so we can
+ * recognise the echo when it comes back.
+ */
+static void echo_record(const uint8_t *frame, size_t len)
+{
+    struct echo_entry *e = &echo_ring[echo_ring_head];
+    e->hash = fnv1a(frame, len);
+    e->frame_len = (uint16_t)len;
+    e->timestamp_ms = now_ms();
+    echo_ring_head = (echo_ring_head + 1) % ECHO_RING_SIZE;
+}
+
+/*
+ * Check if a captured frame is an echo of something we injected.
+ * Returns 1 (echo, should drop) or 0 (genuine capture, forward).
+ */
+static int echo_check(const uint8_t *frame, size_t len)
+{
+    uint32_t h = fnv1a(frame, len);
+    uint64_t now = now_ms();
+
+    for (int i = 0; i < ECHO_RING_SIZE; i++) {
+        struct echo_entry *e = &echo_ring[i];
+        if (e->hash == h &&
+            e->frame_len == (uint16_t)len &&
+            (now - e->timestamp_ms) < ECHO_EXPIRE_MS) {
+            /* Match — zero out entry and report echo */
+            memset(e, 0, sizeof(*e));
+            return 1;
+        }
+    }
+    return 0;
+}
 
 /* ================================================================
  *  Step 5: hub connection + hello
- *  TODO
  * ================================================================ */
+
+#define HELLO_MAGIC 0x41394B52  /* "A9KR" */
+
+/*
+ * Write all bytes to fd, retrying on EINTR.
+ * Returns 0 on success, -1 on error.
+ */
+static int write_all(int fd, const void *buf, size_t len)
+{
+    const uint8_t *p = buf;
+    size_t done = 0;
+    while (done < len) {
+        ssize_t n = write(fd, p + done, len - done);
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+        done += n;
+    }
+    return 0;
+}
+
+/*
+ * Connect to the hub's Unix domain socket.
+ * Returns fd on success, -1 on failure.
+ */
+static int connect_hub(const char *path)
+{
+    int fd;
+    struct sockaddr_un addr;
+
+    fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) {
+        perror("bridge: socket(AF_UNIX)");
+        return -1;
+    }
+
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", path);
+
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        fprintf(stderr, "bridge: connect(%s): %s\n", path, strerror(errno));
+        close(fd);
+        return -1;
+    }
+
+    return fd;
+}
+
+/*
+ * Send the hello/registration message to the hub.
+ * Format: [uint32_t len (net order)][uint32_t HELLO_MAGIC][node_id\0]
+ */
+static int send_hello(int fd, const char *id)
+{
+    size_t id_len = strlen(id) + 1;  /* include null terminator */
+    uint32_t payload_len = 4 + id_len;
+    uint32_t len_be = htonl(payload_len);
+    uint32_t magic = HELLO_MAGIC;
+
+    uint8_t buf[4 + 4 + 64];
+    if (4 + payload_len > sizeof(buf)) {
+        fprintf(stderr, "bridge: node_id too long\n");
+        return -1;
+    }
+
+    memcpy(buf, &len_be, 4);
+    memcpy(buf + 4, &magic, 4);
+    memcpy(buf + 8, id, id_len);
+
+    if (write_all(fd, buf, 4 + payload_len) < 0) {
+        fprintf(stderr, "bridge: send_hello: %s\n", strerror(errno));
+        return -1;
+    }
+
+    return 0;
+}
 
 /* ================================================================
  *  Step 6: physical interface setup
@@ -446,7 +592,19 @@ int main(int argc, char *argv[])
             chan_cfg.channel_bond_freq, chan_cfg.center_freq1,
             chan_cfg.center_freq2, chan_cfg.freq_lo, chan_cfg.freq_hi);
     }
-    /* TODO step 5: connect_hub(), send_hello() */
+    /* Connect to the hub */
+    hub_fd = connect_hub(hub_path);
+    if (hub_fd < 0) {
+        fprintf(stderr, "bridge: is ath9k_medium_hub running at %s?\n",
+                hub_path);
+        return 1;
+    }
+    if (send_hello(hub_fd, node_id) < 0) {
+        close(hub_fd);
+        return 1;
+    }
+    fprintf(stderr, "bridge: connected to hub %s (fd=%d, node=%s)\n",
+            hub_path, hub_fd, node_id);
     /* TODO step 6: check_monitor_mode(), open_raw_socket() */
     /* TODO step 10: main poll loop */
 
