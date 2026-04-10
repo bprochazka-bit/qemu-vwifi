@@ -944,8 +944,54 @@ static void handle_phys_data(void)
 
 /* ================================================================
  *  Step 10: hub stream reassembly + main loop
- *  TODO
+ *
+ *  The hub socket is a stream, so we need our own framing: read into
+ *  a buffer, extract complete length-prefixed messages, and process
+ *  each one.
  * ================================================================ */
+
+static uint8_t hub_rxbuf[4 + ATH9K_MEDIUM_HDR_SIZE + ATH9K_MEDIUM_MAX_FRAME_SIZE];
+static size_t  hub_rxlen;
+
+static void handle_hub_data(void)
+{
+    ssize_t n;
+
+    n = read(hub_fd, hub_rxbuf + hub_rxlen, sizeof(hub_rxbuf) - hub_rxlen);
+    if (n <= 0) {
+        if (n < 0 && (errno == EAGAIN || errno == EINTR))
+            return;
+        fprintf(stderr, "bridge: hub disconnected\n");
+        g_running = 0;
+        return;
+    }
+    hub_rxlen += (size_t)n;
+
+    /* Process complete messages */
+    while (hub_rxlen >= 4) {
+        uint32_t payload_len = ntohl(*(uint32_t *)hub_rxbuf);
+
+        /* Sanity check */
+        if (payload_len > ATH9K_MEDIUM_HDR_SIZE + ATH9K_MEDIUM_MAX_FRAME_SIZE) {
+            fprintf(stderr, "bridge: hub stream corrupt (len=%u), resetting\n",
+                    payload_len);
+            hub_rxlen = 0;
+            break;
+        }
+
+        /* Need more data? */
+        if (hub_rxlen < 4 + payload_len)
+            break;
+
+        process_hub_message(hub_rxbuf + 4, payload_len);
+
+        /* Consume this message */
+        size_t consumed = 4 + payload_len;
+        hub_rxlen -= consumed;
+        if (hub_rxlen > 0)
+            memmove(hub_rxbuf, hub_rxbuf + consumed, hub_rxlen);
+    }
+}
 
 /* ================================================================
  *  Usage / help
@@ -1069,7 +1115,43 @@ int main(int argc, char *argv[])
     if (raw_fd < 0)
         goto out;
     fprintf(stderr, "bridge: %s raw socket opened (fd=%d)\n", ifname, raw_fd);
-    /* TODO step 10: main poll loop */
+    fprintf(stderr, "bridge: running — bridging %s <-> %s\n", ifname, hub_path);
+
+    /* Main poll loop */
+    {
+        struct pollfd pfds[2];
+        pfds[0].fd = raw_fd;   pfds[0].events = POLLIN;
+        pfds[1].fd = hub_fd;   pfds[1].events = POLLIN;
+
+        while (g_running) {
+            pfds[0].revents = 0;
+            pfds[1].revents = 0;
+
+            int nready = poll(pfds, 2, 1000);
+            if (nready < 0) {
+                if (errno == EINTR)
+                    continue;
+                perror("bridge: poll");
+                break;
+            }
+            if (nready == 0)
+                continue;
+
+            /* Hub -> physical */
+            if (pfds[1].revents & POLLIN)
+                handle_hub_data();
+
+            /* Physical -> hub */
+            if (pfds[0].revents & POLLIN)
+                handle_phys_data();
+
+            /* Error / hangup on either fd */
+            if ((pfds[0].revents | pfds[1].revents) & (POLLERR | POLLHUP)) {
+                fprintf(stderr, "bridge: connection lost\n");
+                break;
+            }
+        }
+    }
 
     /* Normal shutdown (reached after main loop exits) */
     fprintf(stderr,
