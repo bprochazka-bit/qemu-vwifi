@@ -84,14 +84,230 @@ static void sig_handler(int sig)
 }
 
 /* ================================================================
- *  Step 2: channel_to_freq(), compute_channel_config()
- *  TODO
+ *  Step 2: channel/frequency helpers
  * ================================================================ */
+
+/*
+ * Convert a WiFi channel number to center frequency in MHz.
+ * Returns 0 on invalid channel.
+ */
+static uint16_t channel_to_freq(int ch)
+{
+    /* 2.4 GHz band */
+    if (ch >= 1 && ch <= 13)
+        return 2407 + ch * 5;
+    if (ch == 14)
+        return 2484;
+
+    /* 5 GHz band */
+    if (ch >= 36 && ch <= 165 && (ch % 4) == 0)
+        return 5000 + ch * 5;
+    /* Odd 5 GHz channels (e.g. 169) */
+    if (ch > 14 && ch <= 200)
+        return 5000 + ch * 5;
+
+    return 0;
+}
+
+/*
+ * VHT 80 MHz channel blocks in 5 GHz.
+ * Each row: {lowest_ch, highest_ch, center_freq_mhz}
+ */
+static const struct {
+    uint16_t lo_freq;   /* lowest 20MHz channel center */
+    uint16_t hi_freq;   /* highest 20MHz channel center */
+    uint16_t center;    /* 80MHz block center freq */
+} vht80_blocks[] = {
+    { 5180, 5240, 5210 },  /* ch 36-48  */
+    { 5260, 5320, 5290 },  /* ch 52-64  */
+    { 5500, 5560, 5530 },  /* ch 100-112 */
+    { 5580, 5640, 5610 },  /* ch 116-128 */
+    { 5660, 5720, 5690 },  /* ch 132-144 */
+    { 5745, 5805, 5775 },  /* ch 149-161 */
+};
+#define NUM_VHT80_BLOCKS (sizeof(vht80_blocks) / sizeof(vht80_blocks[0]))
+
+/*
+ * Find the VHT80 block index that contains freq.
+ * Returns -1 if not found.
+ */
+static int find_vht80_block(uint16_t freq)
+{
+    for (size_t i = 0; i < NUM_VHT80_BLOCKS; i++) {
+        if (freq >= vht80_blocks[i].lo_freq &&
+            freq <= vht80_blocks[i].hi_freq)
+            return (int)i;
+    }
+    return -1;
+}
+
+/*
+ * Compute channel configuration from CLI args.
+ * Fills chan_cfg with freq, flags, bond freq, center freqs, and
+ * the acceptance range [freq_lo, freq_hi].
+ * Returns 0 on success, -1 on error.
+ */
+static int compute_channel_config(void)
+{
+    uint16_t freq;
+    uint16_t band_flag;
+
+    /* Resolve channel to frequency */
+    if (channel_num > 200) {
+        freq = (uint16_t)channel_num;
+    } else {
+        freq = channel_to_freq(channel_num);
+        if (freq == 0) {
+            fprintf(stderr, "bridge: unknown channel number %d\n",
+                    channel_num);
+            return -1;
+        }
+    }
+
+    chan_cfg.channel_freq = freq;
+    band_flag = (freq < 5000) ? ATH9K_CHAN_FLAG_2GHZ : ATH9K_CHAN_FLAG_5GHZ;
+
+    /* Default: single 20 MHz channel */
+    chan_cfg.freq_lo = freq;
+    chan_cfg.freq_hi = freq;
+    chan_cfg.channel_bond_freq = 0;
+    chan_cfg.center_freq1 = 0;
+    chan_cfg.center_freq2 = 0;
+
+    if (strcmp(bw_str, "HT20") == 0) {
+        chan_cfg.channel_flags = band_flag | ATH9K_CHAN_FLAG_HT20;
+
+    } else if (strcmp(bw_str, "HT40+") == 0) {
+        chan_cfg.channel_flags = band_flag | ATH9K_CHAN_FLAG_HT40PLUS;
+        chan_cfg.channel_bond_freq = freq + 20;
+        chan_cfg.freq_hi = freq + 20;
+
+    } else if (strcmp(bw_str, "HT40-") == 0) {
+        chan_cfg.channel_flags = band_flag | ATH9K_CHAN_FLAG_HT40MINUS;
+        chan_cfg.channel_bond_freq = freq - 20;
+        chan_cfg.freq_lo = freq - 20;
+
+    } else if (strcmp(bw_str, "VHT80") == 0) {
+        int blk = find_vht80_block(freq);
+        if (blk < 0) {
+            fprintf(stderr, "bridge: freq %u MHz not in any 80MHz block\n",
+                    freq);
+            return -1;
+        }
+        chan_cfg.channel_flags = band_flag | ATH9K_CHAN_FLAG_VHT80;
+        chan_cfg.center_freq1 = vht80_blocks[blk].center;
+        chan_cfg.freq_lo = vht80_blocks[blk].lo_freq;
+        chan_cfg.freq_hi = vht80_blocks[blk].hi_freq;
+
+    } else if (strcmp(bw_str, "VHT160") == 0) {
+        int blk = find_vht80_block(freq);
+        if (blk < 0 || blk + 1 >= (int)NUM_VHT80_BLOCKS) {
+            fprintf(stderr, "bridge: freq %u MHz not in a valid 160MHz block\n",
+                    freq);
+            return -1;
+        }
+        /* 160 MHz = two adjacent 80 MHz blocks */
+        int blk2 = blk + 1;
+        /* Verify the blocks are truly adjacent (no gap) */
+        if (vht80_blocks[blk2].lo_freq - vht80_blocks[blk].hi_freq > 20) {
+            fprintf(stderr,
+                "bridge: freq %u MHz: adjacent 80MHz blocks are not contiguous\n",
+                freq);
+            return -1;
+        }
+        chan_cfg.channel_flags = band_flag | ATH9K_CHAN_FLAG_VHT160;
+        chan_cfg.center_freq1 =
+            (vht80_blocks[blk].center + vht80_blocks[blk2].center) / 2;
+        chan_cfg.freq_lo = vht80_blocks[blk].lo_freq;
+        chan_cfg.freq_hi = vht80_blocks[blk2].hi_freq;
+
+    } else if (strcmp(bw_str, "VHT80+80") == 0) {
+        int blk1 = find_vht80_block(freq);
+        if (blk1 < 0) {
+            fprintf(stderr, "bridge: freq %u MHz not in any 80MHz block\n",
+                    freq);
+            return -1;
+        }
+        if (center2_mhz == 0) {
+            fprintf(stderr,
+                "bridge: VHT80+80 requires -s <center2_mhz>\n");
+            return -1;
+        }
+        /* Find the second 80 MHz block by its center freq */
+        int blk2 = -1;
+        for (size_t i = 0; i < NUM_VHT80_BLOCKS; i++) {
+            if (vht80_blocks[i].center == (uint16_t)center2_mhz) {
+                blk2 = (int)i;
+                break;
+            }
+        }
+        if (blk2 < 0) {
+            fprintf(stderr,
+                "bridge: -s %d does not match any 80MHz block center\n",
+                center2_mhz);
+            return -1;
+        }
+        chan_cfg.channel_flags = band_flag | ATH9K_CHAN_FLAG_VHT80_80;
+        chan_cfg.center_freq1 = vht80_blocks[blk1].center;
+        chan_cfg.center_freq2 = (uint16_t)center2_mhz;
+        /* Acceptance range covers both blocks */
+        chan_cfg.freq_lo = vht80_blocks[blk1].lo_freq < vht80_blocks[blk2].lo_freq
+                        ? vht80_blocks[blk1].lo_freq : vht80_blocks[blk2].lo_freq;
+        chan_cfg.freq_hi = vht80_blocks[blk1].hi_freq > vht80_blocks[blk2].hi_freq
+                        ? vht80_blocks[blk1].hi_freq : vht80_blocks[blk2].hi_freq;
+
+    } else {
+        fprintf(stderr, "bridge: unknown bandwidth mode: %s\n", bw_str);
+        fprintf(stderr, "bridge: valid: HT20, HT40+, HT40-, VHT80, VHT160, VHT80+80\n");
+        return -1;
+    }
+
+    return 0;
+}
 
 /* ================================================================
  *  Step 3: rate mapping helpers
- *  TODO
  * ================================================================ */
+
+/* Radiotap uses 500 kbps units; medium protocol uses ath9k rate codes */
+static const struct {
+    uint8_t rt_rate;    /* radiotap 500kbps */
+    uint8_t ath_code;   /* ath9k rate code */
+} rate_map[] = {
+    {   2, 0x1B },  /*  1   Mbps CCK  */
+    {   4, 0x1A },  /*  2   Mbps CCK  */
+    {  11, 0x19 },  /*  5.5 Mbps CCK  */
+    {  22, 0x18 },  /* 11   Mbps CCK  */
+    {  12, 0x0B },  /*  6   Mbps OFDM */
+    {  18, 0x0F },  /*  9   Mbps OFDM */
+    {  24, 0x0A },  /* 12   Mbps OFDM */
+    {  36, 0x0E },  /* 18   Mbps OFDM */
+    {  48, 0x09 },  /* 24   Mbps OFDM */
+    {  72, 0x0D },  /* 36   Mbps OFDM */
+    {  96, 0x08 },  /* 48   Mbps OFDM */
+    { 108, 0x0C },  /* 54   Mbps OFDM */
+};
+#define NUM_RATES (sizeof(rate_map) / sizeof(rate_map[0]))
+
+/* Convert radiotap rate (500kbps units) to ath9k rate code */
+static uint8_t rt_rate_to_ath(uint8_t rt)
+{
+    for (size_t i = 0; i < NUM_RATES; i++) {
+        if (rate_map[i].rt_rate == rt)
+            return rate_map[i].ath_code;
+    }
+    return ATH9K_MEDIUM_DEFAULT_RATE;  /* 6 Mbps OFDM */
+}
+
+/* Convert ath9k rate code to radiotap rate (500kbps units) */
+static uint8_t ath_rate_to_rt(uint8_t ath)
+{
+    for (size_t i = 0; i < NUM_RATES; i++) {
+        if (rate_map[i].ath_code == ath)
+            return rate_map[i].rt_rate;
+    }
+    return 12;  /* 6 Mbps OFDM in 500kbps units */
+}
 
 /* ================================================================
  *  Step 4: echo suppression
@@ -218,7 +434,18 @@ int main(int argc, char *argv[])
     fprintf(stderr, "bridge: hub=%s iface=%s channel=%d bw=%s node=%s\n",
             hub_path, ifname, channel_num, bw_str, node_id);
 
-    /* TODO step 2: compute_channel_config() */
+    /* Compute channel/bandwidth configuration */
+    if (compute_channel_config() < 0)
+        return 1;
+
+    if (verbose) {
+        fprintf(stderr,
+            "bridge: freq=%u flags=0x%04x bond=%u cf1=%u cf2=%u "
+            "range=[%u-%u]\n",
+            chan_cfg.channel_freq, chan_cfg.channel_flags,
+            chan_cfg.channel_bond_freq, chan_cfg.center_freq1,
+            chan_cfg.center_freq2, chan_cfg.freq_lo, chan_cfg.freq_hi);
+    }
     /* TODO step 5: connect_hub(), send_hello() */
     /* TODO step 6: check_monitor_mode(), open_raw_socket() */
     /* TODO step 10: main poll loop */
