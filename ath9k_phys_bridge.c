@@ -685,13 +685,262 @@ static size_t parse_radiotap(const uint8_t *buf, size_t len,
 
 /* ================================================================
  *  Step 8: hub-to-physical path (process_hub_message)
- *  TODO
+ *
+ *  Receives a complete wire-protocol message from the hub, validates
+ *  it, applies the channel filter, and injects the 802.11 frame
+ *  over the air via the monitor-mode interface.
  * ================================================================ */
+
+/* Minimal radiotap header for injection: 8 bytes, no fields */
+static const uint8_t inject_radiotap[8] = {
+    0x00,                   /* version */
+    0x00,                   /* pad */
+    0x08, 0x00,             /* length = 8 (LE) */
+    0x00, 0x00, 0x00, 0x00  /* present = 0 */
+};
+
+/*
+ * Process a single hub message (payload after the 4-byte length prefix).
+ * Validates, filters by channel, and injects the frame.
+ */
+static void process_hub_message(const uint8_t *payload, uint32_t payload_len)
+{
+    const struct ath9k_medium_frame_hdr *hdr;
+    const uint8_t *frame;
+    uint16_t frame_len;
+    uint16_t msg_chan_freq;
+    uint8_t inject_buf[8 + ATH9K_MEDIUM_MAX_FRAME_SIZE];
+    ssize_t n;
+
+    /* Need at least a v1 header */
+    if (payload_len < ATH9K_MEDIUM_HDR_SIZE_V1) {
+        if (verbose)
+            fprintf(stderr, "bridge: hub->phys: short message (%u bytes)\n",
+                    payload_len);
+        return;
+    }
+
+    hdr = (const struct ath9k_medium_frame_hdr *)payload;
+
+    /* Validate magic */
+    if (hdr->magic != ATH9K_MEDIUM_MAGIC) {
+        if (verbose)
+            fprintf(stderr, "bridge: hub->phys: bad magic 0x%08x\n",
+                    hdr->magic);
+        return;
+    }
+
+    /* Extract channel frequency (v2 has it at offset 28; v1 = treat as 0) */
+    if (payload_len >= ATH9K_MEDIUM_HDR_SIZE)
+        msg_chan_freq = hdr->channel_freq;
+    else
+        msg_chan_freq = 0;
+
+    /* Channel filter: accept if freq==0 (broadcast) or in our range */
+    if (msg_chan_freq != 0 &&
+        (msg_chan_freq < chan_cfg.freq_lo || msg_chan_freq > chan_cfg.freq_hi)) {
+        if (verbose)
+            fprintf(stderr,
+                "bridge: hub->phys: filtered freq=%u (range %u-%u)\n",
+                msg_chan_freq, chan_cfg.freq_lo, chan_cfg.freq_hi);
+        return;
+    }
+
+    /* Locate the 802.11 frame */
+    frame_len = hdr->frame_len;
+    if (payload_len >= ATH9K_MEDIUM_HDR_SIZE)
+        frame = payload + ATH9K_MEDIUM_HDR_SIZE;
+    else
+        frame = payload + ATH9K_MEDIUM_HDR_SIZE_V1;
+
+    /* Sanity check frame length */
+    if (frame_len == 0 || frame_len > ATH9K_MEDIUM_MAX_FRAME_SIZE) {
+        if (verbose)
+            fprintf(stderr, "bridge: hub->phys: bad frame_len=%u\n",
+                    frame_len);
+        return;
+    }
+
+    /* Record echo hash before injection */
+    echo_record(frame, frame_len);
+
+    /* Build injection buffer: radiotap header + 802.11 frame */
+    memcpy(inject_buf, inject_radiotap, 8);
+    memcpy(inject_buf + 8, frame, frame_len);
+
+    n = write(raw_fd, inject_buf, 8 + frame_len);
+    if (n < 0) {
+        if (errno != EAGAIN && errno != ENOBUFS)
+            fprintf(stderr, "bridge: inject write: %s\n", strerror(errno));
+        return;
+    }
+
+    stats_hub_to_phys++;
+    if (verbose)
+        fprintf(stderr, "bridge: hub->phys: injected %u bytes (ch=%u)\n",
+                frame_len, msg_chan_freq);
+}
 
 /* ================================================================
  *  Step 9: physical-to-hub path (handle_phys_data)
- *  TODO
+ *
+ *  Reads a captured frame from the AF_PACKET socket, parses the
+ *  radiotap header, strips FCS if present, checks for echo, extracts
+ *  the transmitter MAC, builds the medium header, and sends to the hub.
  * ================================================================ */
+
+/*
+ * 802.11 frame type/subtype helpers.
+ * Frame Control is the first 2 bytes (LE).  Bits 3:2 = type.
+ * Type 1 = Control frames — some lack Address 2.
+ */
+#define IEEE80211_FC_TYPE_MASK  0x000C
+#define IEEE80211_FC_TYPE_CTL   0x0004
+
+/* Control subtypes that have Address 2 (offset 10): RTS, PS-Poll, CF-End, BAR, BA */
+static int ctl_frame_has_addr2(uint16_t fc)
+{
+    uint8_t subtype = (fc >> 4) & 0x0F;
+    /* RTS=11, PS-Poll=10, CF-End=14, CF-End+Ack=15, BAR=8, BA=9 */
+    switch (subtype) {
+    case 8: case 9: case 10: case 11: case 14: case 15:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static void handle_phys_data(void)
+{
+    uint8_t buf[8 + ATH9K_MEDIUM_MAX_FRAME_SIZE + 64];
+    ssize_t nread;
+    struct radiotap_info rt_info;
+    size_t rt_len;
+    const uint8_t *frame;
+    size_t frame_len;
+    uint16_t fc;
+    struct ath9k_medium_frame_hdr hdr;
+    uint32_t msg_len;
+    uint32_t len_be;
+    uint8_t sendbuf[4 + sizeof(hdr) + ATH9K_MEDIUM_MAX_FRAME_SIZE];
+
+    nread = read(raw_fd, buf, sizeof(buf));
+    if (nread <= 0) {
+        if (nread < 0 && (errno == EAGAIN || errno == EINTR))
+            return;
+        fprintf(stderr, "bridge: raw socket read error: %s\n",
+                strerror(errno));
+        g_running = 0;
+        return;
+    }
+
+    /* Parse radiotap header */
+    rt_len = parse_radiotap(buf, (size_t)nread, &rt_info);
+    if (rt_len == 0) {
+        if (verbose)
+            fprintf(stderr, "bridge: phys->hub: bad radiotap header\n");
+        return;
+    }
+
+    /* 802.11 frame starts after radiotap */
+    frame = buf + rt_len;
+    frame_len = (size_t)nread - rt_len;
+
+    /* Strip FCS if radiotap FLAGS says it's included */
+    if (rt_info.has_flags && (rt_info.flags & RT_FLAGS_FCS)) {
+        if (frame_len < 4)
+            return;
+        frame_len -= 4;
+    }
+
+    /* Minimum frame: FC (2) + Duration (2) + Addr1 (6) = 10 bytes */
+    if (frame_len < 10)
+        return;
+
+    /* Oversized frame check */
+    if (frame_len > ATH9K_MEDIUM_MAX_FRAME_SIZE)
+        return;
+
+    /* Echo check — drop frames we injected */
+    if (echo_check(frame, frame_len)) {
+        stats_echoes++;
+        if (verbose)
+            fprintf(stderr, "bridge: phys->hub: echo suppressed\n");
+        return;
+    }
+
+    /* Extract frame control to determine frame type */
+    memcpy(&fc, frame, 2);
+
+    /* Control frames: some lack Address 2 — skip those */
+    if ((fc & IEEE80211_FC_TYPE_MASK) == IEEE80211_FC_TYPE_CTL) {
+        if (!ctl_frame_has_addr2(fc))
+            return;
+    }
+
+    /* Need at least 16 bytes to have Address 2 (offset 10, 6 bytes) */
+    if (frame_len < 16)
+        return;
+
+    /* Build medium header */
+    memset(&hdr, 0, sizeof(hdr));
+    hdr.magic   = ATH9K_MEDIUM_MAGIC;
+    hdr.version = ATH9K_MEDIUM_VERSION;
+    hdr.frame_len = (uint16_t)frame_len;
+
+    /* tx_mac = Address 2 (transmitter) at offset 10 */
+    memcpy(hdr.tx_mac, frame + 10, 6);
+
+    /* Rate */
+    hdr.rate_code = rt_info.has_rate
+                  ? rt_rate_to_ath(rt_info.rate)
+                  : ATH9K_MEDIUM_DEFAULT_RATE;
+
+    /* RSSI */
+    hdr.rssi = rt_info.has_signal
+             ? rt_info.signal_dbm
+             : ATH9K_MEDIUM_DEFAULT_RSSI;
+
+    /* TSF */
+    if (rt_info.has_tsft) {
+        hdr.tsf_lo = (uint32_t)(rt_info.tsft & 0xFFFFFFFF);
+        hdr.tsf_hi = (uint32_t)(rt_info.tsft >> 32);
+    }
+
+    /* Channel info: prefer radiotap channel, fall back to our config */
+    hdr.channel_freq = rt_info.has_channel
+                     ? rt_info.chan_freq
+                     : chan_cfg.channel_freq;
+    hdr.channel_flags     = chan_cfg.channel_flags;
+    hdr.channel_bond_freq = chan_cfg.channel_bond_freq;
+    hdr.center_freq1      = chan_cfg.center_freq1;
+    hdr.center_freq2      = chan_cfg.center_freq2;
+
+    /* flags: TTL = 0, rest reserved */
+    hdr.flags = 0;
+
+    /* Send: [uint32_t len (net order)][header][frame] */
+    msg_len = (uint32_t)(sizeof(hdr) + frame_len);
+    len_be = htonl(msg_len);
+
+    memcpy(sendbuf, &len_be, 4);
+    memcpy(sendbuf + 4, &hdr, sizeof(hdr));
+    memcpy(sendbuf + 4 + sizeof(hdr), frame, frame_len);
+
+    if (write_all(hub_fd, sendbuf, 4 + msg_len) < 0) {
+        fprintf(stderr, "bridge: phys->hub: write failed: %s\n",
+                strerror(errno));
+        g_running = 0;
+        return;
+    }
+
+    stats_phys_to_hub++;
+    if (verbose)
+        fprintf(stderr,
+            "bridge: phys->hub: forwarded %zu bytes "
+            "(rate=0x%02x rssi=%d ch=%u)\n",
+            frame_len, hdr.rate_code, hdr.rssi, hdr.channel_freq);
+}
 
 /* ================================================================
  *  Step 10: hub stream reassembly + main loop
