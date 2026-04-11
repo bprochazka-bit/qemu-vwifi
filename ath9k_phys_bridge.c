@@ -928,9 +928,15 @@ static void handle_phys_data(void)
     memcpy(sendbuf + 4 + sizeof(hdr), frame, frame_len);
 
     if (write_all(hub_fd, sendbuf, 4 + msg_len) < 0) {
-        fprintf(stderr, "bridge: phys->hub: write failed: %s\n",
-                strerror(errno));
-        g_running = 0;
+        if (errno == EPIPE || errno == ECONNRESET) {
+            fprintf(stderr, "bridge: phys->hub: hub disconnected\n");
+            g_running = 0;
+            return;
+        }
+        /* Non-fatal write failure (backpressure) -- drop frame */
+        if (verbose)
+            fprintf(stderr, "bridge: phys->hub: write failed (dropped): %s\n",
+                    strerror(errno));
         return;
     }
 
@@ -1106,6 +1112,11 @@ int main(int argc, char *argv[])
         close(hub_fd);
         return 1;
     }
+    /* Increase socket send buffer to absorb bursts from physical captures */
+    {
+        int sndbuf = 1024 * 1024;  /* 1 MB */
+        setsockopt(hub_fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+    }
     fprintf(stderr, "bridge: connected to hub %s (fd=%d, node=%s)\n",
             hub_path, hub_fd, node_id);
     /* Validate monitor mode and open raw capture/inject socket */
@@ -1145,10 +1156,15 @@ int main(int argc, char *argv[])
             if (pfds[0].revents & POLLIN)
                 handle_phys_data();
 
-            /* Error / hangup on either fd */
-            if ((pfds[0].revents | pfds[1].revents) & (POLLERR | POLLHUP)) {
-                fprintf(stderr, "bridge: connection lost\n");
+            /* Hub disconnect is fatal */
+            if (pfds[1].revents & (POLLERR | POLLHUP)) {
+                fprintf(stderr, "bridge: hub connection lost\n");
                 break;
+            }
+            /* Raw socket errors are typically transient (interface flap) */
+            if (pfds[0].revents & POLLERR) {
+                if (verbose)
+                    fprintf(stderr, "bridge: raw socket error (transient)\n");
             }
         }
     }
