@@ -761,7 +761,18 @@ static void process_hub_message(const uint8_t *payload, uint32_t payload_len)
         return;
     }
 
-    /* Record echo hash before injection */
+    /*
+     * Strip the 4-byte FCS placeholder before injection.
+     * Frames on the virtual medium always include a 4-byte FCS (the QEMU
+     * ath9k-virt device and kernel module both append one).  The physical
+     * radio adds its own real FCS during injection, so we must remove the
+     * placeholder to avoid corrupting the frame (extra 4 bytes would cause
+     * CCMP MIC failure for encrypted frames).
+     */
+    if (frame_len > 4)
+        frame_len -= 4;
+
+    /* Record echo hash before injection (hash the frame without FCS) */
     echo_record(frame, frame_len);
 
     /* Build injection buffer: radiotap header + 802.11 frame */
@@ -822,7 +833,7 @@ static void handle_phys_data(void)
     struct ath9k_medium_frame_hdr hdr;
     uint32_t msg_len;
     uint32_t len_be;
-    uint8_t sendbuf[4 + sizeof(hdr) + ATH9K_MEDIUM_MAX_FRAME_SIZE];
+    uint8_t sendbuf[4 + sizeof(hdr) + ATH9K_MEDIUM_MAX_FRAME_SIZE + 4]; /* +4 for FCS */
 
     nread = read(raw_fd, buf, sizeof(buf));
     if (nread <= 0) {
@@ -919,13 +930,24 @@ static void handle_phys_data(void)
     /* flags: TTL = 0, rest reserved */
     hdr.flags = 0;
 
-    /* Send: [uint32_t len (net order)][header][frame] */
-    msg_len = (uint32_t)(sizeof(hdr) + frame_len);
+    /*
+     * Append a 4-byte FCS placeholder.  Frames on the virtual medium
+     * always include FCS (the QEMU ath9k-virt device and kernel module
+     * both have RX_INCLUDES_FCS set, so mac80211 expects FCS at the end).
+     * We already stripped the real FCS from the capture above; now add
+     * 4 zero bytes as a placeholder.
+     */
+    size_t wire_frame_len = frame_len + 4;  /* frame + FCS placeholder */
+    hdr.frame_len = (uint16_t)wire_frame_len;
+
+    /* Send: [uint32_t len (net order)][header][frame][fcs_placeholder] */
+    msg_len = (uint32_t)(sizeof(hdr) + wire_frame_len);
     len_be = htonl(msg_len);
 
     memcpy(sendbuf, &len_be, 4);
     memcpy(sendbuf + 4, &hdr, sizeof(hdr));
     memcpy(sendbuf + 4 + sizeof(hdr), frame, frame_len);
+    memset(sendbuf + 4 + sizeof(hdr) + frame_len, 0, 4);  /* FCS placeholder */
 
     if (write_all(hub_fd, sendbuf, 4 + msg_len) < 0) {
         if (errno == EPIPE || errno == ECONNRESET) {
