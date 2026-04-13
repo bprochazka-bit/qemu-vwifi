@@ -310,54 +310,74 @@ static uint8_t ath_rate_to_rt(uint8_t ath)
 }
 
 /* ================================================================
- *  Step 4: echo suppression via virtual MAC tracking
+ *  Step 4: echo suppression
  *
- *  When we inject a frame via monitor mode, some drivers capture it
- *  back.  Hash-based suppression is fragile (drivers may rewrite
- *  sequence numbers, duration, etc.).  Instead we track MAC addresses
- *  seen in hub→phys traffic — these belong to virtual devices.  Any
- *  frame captured from the air with a transmitter MAC in this set is
- *  an echo (or a virtual device's frame looping back) and is dropped.
+ *  When we inject a frame via monitor mode, the radio captures it
+ *  back. We use an FNV-1a hash ring buffer to detect and suppress
+ *  these echoes.
  * ================================================================ */
 
-#define VMAC_TABLE_SIZE  64
+#define ECHO_RING_SIZE  256
+#define ECHO_EXPIRE_MS  100
 
-static uint8_t vmac_table[VMAC_TABLE_SIZE][6];
-static int     vmac_count;
+struct echo_entry {
+    uint32_t hash;
+    uint16_t frame_len;
+    uint64_t timestamp_ms;
+};
 
-/*
- * Record a MAC address seen in hub→phys traffic (virtual device MAC).
- */
-static void vmac_learn(const uint8_t *mac)
+static struct echo_entry echo_ring[ECHO_RING_SIZE];
+static int echo_ring_head;
+
+static uint32_t fnv1a(const uint8_t *data, size_t len)
 {
-    /* Already known? */
-    for (int i = 0; i < vmac_count; i++) {
-        if (memcmp(vmac_table[i], mac, 6) == 0)
-            return;
+    uint32_t h = 0x811C9DC5;
+    for (size_t i = 0; i < len; i++) {
+        h ^= data[i];
+        h *= 0x01000193;
     }
-    /* Add if space available */
-    if (vmac_count < VMAC_TABLE_SIZE) {
-        memcpy(vmac_table[vmac_count], mac, 6);
-        vmac_count++;
-        if (verbose) {
-            fprintf(stderr,
-                "bridge: learned virtual MAC %02x:%02x:%02x:%02x:%02x:%02x "
-                "(%d total)\n",
-                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
-                vmac_count);
-        }
-    }
+    return h;
+}
+
+static uint64_t now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
 }
 
 /*
- * Check if a MAC address belongs to a virtual device (seen from hub).
- * Returns 1 if it's a virtual MAC (should suppress), 0 otherwise.
+ * Record a frame hash before injection (hub->phys path).
+ * Called just before writing to the raw socket so we can
+ * recognise the echo when it comes back.
  */
-static int vmac_is_virtual(const uint8_t *mac)
+static void echo_record(const uint8_t *frame, size_t len)
 {
-    for (int i = 0; i < vmac_count; i++) {
-        if (memcmp(vmac_table[i], mac, 6) == 0)
+    struct echo_entry *e = &echo_ring[echo_ring_head];
+    e->hash = fnv1a(frame, len);
+    e->frame_len = (uint16_t)len;
+    e->timestamp_ms = now_ms();
+    echo_ring_head = (echo_ring_head + 1) % ECHO_RING_SIZE;
+}
+
+/*
+ * Check if a captured frame is an echo of something we injected.
+ * Returns 1 (echo, should drop) or 0 (genuine capture, forward).
+ */
+static int echo_check(const uint8_t *frame, size_t len)
+{
+    uint32_t h = fnv1a(frame, len);
+    uint64_t now = now_ms();
+
+    for (int i = 0; i < ECHO_RING_SIZE; i++) {
+        struct echo_entry *e = &echo_ring[i];
+        if (e->hash == h &&
+            e->frame_len == (uint16_t)len &&
+            (now - e->timestamp_ms) < ECHO_EXPIRE_MS) {
+            /* Match — zero out entry and report echo */
+            memset(e, 0, sizeof(*e));
             return 1;
+        }
     }
     return 0;
 }
@@ -741,12 +761,8 @@ static void process_hub_message(const uint8_t *payload, uint32_t payload_len)
         return;
     }
 
-    /*
-     * Learn the transmitter MAC from this hub frame.  Any frame captured
-     * from the air with this MAC will be suppressed (it's a virtual device
-     * echo or belongs to the virtual medium, not real traffic).
-     */
-    vmac_learn(hdr->tx_mac);
+    /* Record echo hash before injection */
+    echo_record(frame, frame_len);
 
     /* Build injection buffer: radiotap header + 802.11 frame */
     memcpy(inject_buf, inject_radiotap, 8);
@@ -812,10 +828,6 @@ static void handle_phys_data(void)
     if (nread <= 0) {
         if (nread < 0 && (errno == EAGAIN || errno == EINTR))
             return;
-        if (nread < 0 && (errno == ENETDOWN || errno == ENXIO)) {
-            /* Interface went down — recoverable, just skip */
-            return;
-        }
         fprintf(stderr, "bridge: raw socket read error: %s\n",
                 strerror(errno));
         g_running = 0;
@@ -849,6 +861,14 @@ static void handle_phys_data(void)
     if (frame_len > ATH9K_MEDIUM_MAX_FRAME_SIZE)
         return;
 
+    /* Echo check — drop frames we injected */
+    if (echo_check(frame, frame_len)) {
+        stats_echoes++;
+        if (verbose)
+            fprintf(stderr, "bridge: phys->hub: echo suppressed\n");
+        return;
+    }
+
     /* Extract frame control to determine frame type */
     memcpy(&fc, frame, 2);
 
@@ -861,16 +881,6 @@ static void handle_phys_data(void)
     /* Need at least 16 bytes to have Address 2 (offset 10, 6 bytes) */
     if (frame_len < 16)
         return;
-
-    /*
-     * Suppress frames from virtual devices.  Any transmitter MAC that
-     * we've seen in hub→phys traffic belongs to a virtual device — its
-     * frames being captured from the air are echoes of what we injected.
-     */
-    if (vmac_is_virtual(frame + 10)) {
-        stats_echoes++;
-        return;
-    }
 
     /* Build medium header */
     memset(&hdr, 0, sizeof(hdr));
@@ -908,7 +918,6 @@ static void handle_phys_data(void)
 
     /* flags: TTL = 0, rest reserved */
     hdr.flags = 0;
-    hdr.frame_len = (uint16_t)frame_len;
 
     /* Send: [uint32_t len (net order)][header][frame] */
     msg_len = (uint32_t)(sizeof(hdr) + frame_len);
@@ -924,10 +933,7 @@ static void handle_phys_data(void)
             g_running = 0;
             return;
         }
-        /* Non-fatal write failure (backpressure) -- drop frame */
-        if (verbose)
-            fprintf(stderr, "bridge: phys->hub: write failed (dropped): %s\n",
-                    strerror(errno));
+        /* Backpressure — drop frame, don't exit */
         return;
     }
 
@@ -1103,9 +1109,9 @@ int main(int argc, char *argv[])
         close(hub_fd);
         return 1;
     }
-    /* Increase socket send buffer to absorb bursts from physical captures */
+    /* Increase socket send buffer to handle burst captures */
     {
-        int sndbuf = 1024 * 1024;  /* 1 MB */
+        int sndbuf = 1024 * 1024;
         setsockopt(hub_fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
     }
     fprintf(stderr, "bridge: connected to hub %s (fd=%d, node=%s)\n",
@@ -1152,11 +1158,7 @@ int main(int argc, char *argv[])
                 fprintf(stderr, "bridge: hub connection lost\n");
                 break;
             }
-            /* Raw socket errors are typically transient (interface flap) */
-            if (pfds[0].revents & POLLERR) {
-                if (verbose)
-                    fprintf(stderr, "bridge: raw socket error (transient)\n");
-            }
+            /* Raw socket errors are transient (interface flap) — ignore */
         }
     }
 
