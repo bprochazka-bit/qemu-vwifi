@@ -71,6 +71,7 @@ struct ath9k_host_priv {
     /* TX queue: frames going from mac80211 → chardev → relay → hub */
     struct sk_buff_head     tx_queue;
     wait_queue_head_t       tx_waitq;           /* relay polls for TX */
+    bool                    tx_queues_stopped;  /* true between stop_queues/wake_queues */
 
     /* RX queue: frames coming from hub → relay → chardev → mac80211 */
     struct work_struct      rx_work;
@@ -157,7 +158,23 @@ static struct ieee80211_supported_band ath9k_host_band_2ghz = {
  * We wrap the 802.11 frame in an ath9k_medium_frame_hdr, prepend the
  * 4-byte length prefix, and enqueue it for the relay daemon to read
  * from the chardev.
+ *
+ * Backpressure model:
+ *   - At HIGH watermark we ask mac80211 to stop the TX queues, so the
+ *     stack stops giving us frames before we have to drop them.
+ *   - The relay-side dequeue (chardev_read) wakes the queues again
+ *     once the depth drops below LOW.
+ *   - If, despite backpressure, the queue is full when a frame arrives
+ *     (e.g. the relay has died and the queues haven't been stopped yet,
+ *     or a single producer races past the watermark), we drop the
+ *     frame and report a TX failure to mac80211 (no STAT_ACK flag) so
+ *     its retry/rate-control logic responds correctly. We do NOT fake
+ *     an ACK on the drop path -- that would lie to the upper layers.
  */
+#define ATH9K_TX_QUEUE_MAX  1024
+#define ATH9K_TX_QUEUE_HIGH 768
+#define ATH9K_TX_QUEUE_LOW  256
+
 static void ath9k_host_tx(struct ieee80211_hw *hw,
                           struct ieee80211_tx_control *control,
                           struct sk_buff *skb)
@@ -167,11 +184,14 @@ static void ath9k_host_tx(struct ieee80211_hw *hw,
     struct ieee80211_hdr *hdr = (struct ieee80211_hdr *)skb->data;
     struct sk_buff *msg;
     struct ath9k_medium_frame_hdr fhdr;
-    u32 wire_len;
+    u32 wire_len, qlen;
     __be32 len_be;
     u8 rate_code = 0x0B;  /* default: 6 Mbps OFDM */
 
     if (!priv->started || !priv->relay_connected) {
+        /* Driver not in a state to transmit -- frame was never on the
+         * wire. Free without status; mac80211 treats this as a clean
+         * drop, not an ACK and not a retryable failure. */
         ieee80211_free_txskb(hw, skb);
         priv->tx_drop_count++;
         return;
@@ -209,21 +229,35 @@ static void ath9k_host_tx(struct ieee80211_hw *hw,
     skb_put_data(msg, &fhdr, ATH9K_MEDIUM_HDR_SIZE);
     skb_put_data(msg, skb->data, skb->len);
 
-    /* Enqueue for the relay daemon */
-    if (skb_queue_len(&priv->tx_queue) < 1024) {
-        skb_queue_tail(&priv->tx_queue, msg);
-        wake_up_interruptible(&priv->tx_waitq);
-    } else {
-        /* Queue full — drop */
-        kfree_skb(msg);
-        priv->tx_drop_count++;
+    qlen = skb_queue_len(&priv->tx_queue);
+
+    /* Cross the high watermark: ask mac80211 to back off so we have a
+     * chance to drain before the queue actually fills. */
+    if (qlen >= ATH9K_TX_QUEUE_HIGH && !priv->tx_queues_stopped) {
+        ieee80211_stop_queues(hw);
+        priv->tx_queues_stopped = true;
     }
 
-    /* Report TX status to mac80211 */
-    ieee80211_tx_info_clear_status(tx_info);
-    tx_info->flags |= IEEE80211_TX_STAT_ACK;  /* auto-ACK */
-    ieee80211_tx_status_irqsafe(hw, skb);
-    priv->tx_count++;
+    if (qlen < ATH9K_TX_QUEUE_MAX) {
+        skb_queue_tail(&priv->tx_queue, msg);
+        wake_up_interruptible(&priv->tx_waitq);
+
+        /* Frame is queued for transmission. Report success with the
+         * synthetic ACK; the medium has no real over-the-air ACK. */
+        ieee80211_tx_info_clear_status(tx_info);
+        tx_info->flags |= IEEE80211_TX_STAT_ACK;
+        ieee80211_tx_status_irqsafe(hw, skb);
+        priv->tx_count++;
+    } else {
+        /* Queue is at MAX even though we tried to backpressure earlier.
+         * Honestly report a TX failure: clear STAT_ACK so mac80211's
+         * retry counter and rate control see a real loss. */
+        kfree_skb(msg);
+        priv->tx_drop_count++;
+        ieee80211_tx_info_clear_status(tx_info);
+        /* No IEEE80211_TX_STAT_ACK flag -> mac80211 sees no-ACK -> retries */
+        ieee80211_tx_status_irqsafe(hw, skb);
+    }
 }
 
 static int ath9k_host_start(struct ieee80211_hw *hw)
@@ -240,6 +274,12 @@ static void ath9k_host_stop(struct ieee80211_hw *hw, bool suspend)
     struct ath9k_host_priv *priv = hw->priv;
 
     priv->started = false;
+    /* Leave the TX queues in the woken state so a subsequent start
+     * doesn't inherit a stale stop. */
+    if (priv->tx_queues_stopped) {
+        ieee80211_wake_queues(hw);
+        priv->tx_queues_stopped = false;
+    }
     pr_info(DRV_NAME ": radio stopped (TX: %llu RX: %llu drops: %llu)\n",
             priv->tx_count, priv->rx_count, priv->tx_drop_count);
 }
@@ -456,6 +496,14 @@ static int ath9k_host_chrdev_release(struct inode *inode, struct file *filp)
 
     if (priv) {
         priv->relay_connected = false;
+        /* Wake any stopped TX queues; with no relay, .tx will fast-drop
+         * anyway, but leaving queues stopped would block restart. */
+        if (priv->tx_queues_stopped) {
+            ieee80211_wake_queues(priv->hw);
+            priv->tx_queues_stopped = false;
+        }
+        /* Drain any frames still queued for the (now-departed) relay. */
+        skb_queue_purge(&priv->tx_queue);
         pr_info(DRV_NAME ": relay daemon disconnected\n");
     }
     return 0;
@@ -492,6 +540,14 @@ static ssize_t ath9k_host_chrdev_read(struct file *filp, char __user *buf,
     skb = skb_dequeue(&priv->tx_queue);
     if (!skb) {
         return -EAGAIN;
+    }
+
+    /* If we're draining and have crossed back below the low watermark,
+     * release the TX backpressure so mac80211 can hand us frames again. */
+    if (priv->tx_queues_stopped &&
+        skb_queue_len(&priv->tx_queue) <= ATH9K_TX_QUEUE_LOW) {
+        ieee80211_wake_queues(priv->hw);
+        priv->tx_queues_stopped = false;
     }
 
     len = skb->len;
