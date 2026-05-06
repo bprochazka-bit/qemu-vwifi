@@ -73,8 +73,11 @@
 #include <stdint.h>
 #include <inttypes.h>
 #include <stdarg.h>
+#include <stddef.h>
 #include <time.h>
 #include <stdbool.h>
+
+#include "ath9k_medium.h"
 
 /* -------------------------------------------------------------------
  *  Configuration constants
@@ -83,14 +86,14 @@
 #define MAX_UPSTREAMS       16
 #define MAX_CTL_CLIENTS     8
 #define MAX_LINK_OVERRIDES  256
-#define RECV_BUF_SIZE       (4 + 8192 + 64)
-#define MAX_MSG_SIZE        (8192 + 64)
+
+/* Wire-protocol sizes derived from the canonical header definition. */
+#define MAX_MSG_SIZE        (ATH9K_MEDIUM_MAX_MSG_SIZE)
+#define RECV_BUF_SIZE       (4 + MAX_MSG_SIZE)
 #define CTL_BUF_SIZE        4096
 #define CTL_RESP_SIZE       4096
 
-#define TTL_BYTE_OFFSET     27
 #define DEFAULT_TTL         8
-#define MIN_HDR_SIZE        28
 #define UPSTREAM_RETRY_SEC  3
 
 #define MAX_NODES           256
@@ -100,21 +103,22 @@
 
 /*
  * Medium header field offsets (bytes from start of payload, after the
- * 4-byte length prefix).  These must match ath9k_medium.h layout:
- *   [0]  uint32  magic
- *   [4]  uint16  version
- *   [6]  uint16  frame_len
- *   [8]  uint8[6] tx_mac
- *   [14] uint8   rate_code
- *   [15] int8    rssi
- *   [16] uint32  tsf_lo
- *   [20] uint32  tsf_hi
- *   [24] uint32  flags   (byte 27 = TTL)
+ * 4-byte length prefix) -- derived from the canonical struct layout in
+ * ath9k_medium.h so they can never drift.
+ *
+ * TTL is the high byte of the v1 `flags` u32 (offset 27 = 24 + 3),
+ * which is unused by the driver and repurposed by the hub for loop
+ * prevention in multi-hub topologies.
+ *
+ * The minimum header size we'll accept is the v1 layout (28 bytes);
+ * the v2 channel fields are an optional extension.
  */
-#define HDR_OFF_MAGIC       0
-#define HDR_OFF_TX_MAC      8
-#define HDR_OFF_RATE_CODE   14
-#define HDR_OFF_RSSI        15
+#define HDR_OFF_TX_MAC          offsetof(struct ath9k_medium_frame_hdr, tx_mac)
+#define HDR_OFF_RATE_CODE       offsetof(struct ath9k_medium_frame_hdr, rate_code)
+#define HDR_OFF_RSSI            offsetof(struct ath9k_medium_frame_hdr, rssi)
+#define HDR_OFF_FLAGS           offsetof(struct ath9k_medium_frame_hdr, flags)
+#define TTL_BYTE_OFFSET         (HDR_OFF_FLAGS + 3)
+#define MIN_HDR_SIZE            ATH9K_MEDIUM_HDR_SIZE_MIN
 
 /* -------------------------------------------------------------------
  *  802.11a/g OFDM rate table
