@@ -941,6 +941,18 @@ static void handle_peer_data(int idx)
 /* -------------------------------------------------------------------
  *  TCP upstream connection + auto-reconnect
  * ------------------------------------------------------------------- */
+/*
+ * Bounded-time connect for upstream hubs.
+ *
+ * The previous implementation used a blocking connect(), which stalls
+ * the entire single-threaded hub for the kernel's full TCP connect
+ * timeout (~75 s on Linux) every time an upstream is unreachable.
+ * Switch to a non-blocking connect with a short poll wait so a dead
+ * upstream costs at most CONNECT_TIMEOUT_MS rather than freezing
+ * fanout for everyone.
+ */
+#define UPSTREAM_CONNECT_TIMEOUT_MS  500
+
 static int connect_upstream(int upstream_idx)
 {
     struct addrinfo hints, *res, *rp;
@@ -960,10 +972,39 @@ static int connect_upstream(int upstream_idx)
     for (rp = res; rp != NULL; rp = rp->ai_next) {
         fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
         if (fd < 0) continue;
-        if (connect(fd, rp->ai_addr, rp->ai_addrlen) == 0)
-            break;
-        close(fd);
-        fd = -1;
+
+        set_nonblock(fd);
+        int rc = connect(fd, rp->ai_addr, rp->ai_addrlen);
+        if (rc == 0)
+            break;  /* connected immediately */
+
+        if (errno != EINPROGRESS) {
+            close(fd);
+            fd = -1;
+            continue;
+        }
+
+        /* Wait up to UPSTREAM_CONNECT_TIMEOUT_MS for the connection
+         * to complete (or fail). */
+        struct pollfd p = { .fd = fd, .events = POLLOUT };
+        int pr = poll(&p, 1, UPSTREAM_CONNECT_TIMEOUT_MS);
+        if (pr <= 0) {
+            /* Timeout or poll error: abandon this address. */
+            close(fd);
+            fd = -1;
+            continue;
+        }
+
+        /* Check actual connect result via SO_ERROR. */
+        int soerr = 0;
+        socklen_t solen = sizeof(soerr);
+        if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &solen) < 0
+            || soerr != 0) {
+            close(fd);
+            fd = -1;
+            continue;
+        }
+        break;  /* connected */
     }
     freeaddrinfo(res);
 
