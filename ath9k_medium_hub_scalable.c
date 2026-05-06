@@ -1185,9 +1185,20 @@ static int ctl_process_command(int fd, char *line)
 
     /* ---- LOAD_CONFIG <path> ---- */
     if (strncasecmp(cmd, "LOAD_CONFIG ", 12) == 0) {
+        /* Cap recursion so a config file that LOAD_CONFIGs itself (or
+         * mutually recursive configs) can't blow the stack. The hub is
+         * single-threaded, so a static counter is sufficient. */
+        #define MAX_LOAD_CONFIG_DEPTH 4
+        static int load_depth = 0;
+
         char path[256];
         if (sscanf(cmd + 12, "%255s", path) != 1) {
             ctl_respond(fd, "ERR usage: LOAD_CONFIG <path>\n");
+            return 0;
+        }
+        if (load_depth >= MAX_LOAD_CONFIG_DEPTH) {
+            ctl_respond(fd, "ERR LOAD_CONFIG too deeply nested (max %d)\n",
+                        MAX_LOAD_CONFIG_DEPTH);
             return 0;
         }
         FILE *f = fopen(path, "r");
@@ -1196,6 +1207,7 @@ static int ctl_process_command(int fd, char *line)
                         path, strerror(errno));
             return 0;
         }
+        load_depth++;
         char cfgline[512];
         int count = 0;
         while (fgets(cfgline, sizeof(cfgline), f)) {
@@ -1204,6 +1216,7 @@ static int ctl_process_command(int fd, char *line)
             ctl_process_command(fd, cl);
             count++;
         }
+        load_depth--;
         fclose(f);
         ctl_respond(fd, "OK loaded %d commands from %s\n", count, path);
         return 0;
