@@ -930,28 +930,47 @@ static int ctl_process_command(int fd, char *line)
 
     /* ---- LIST_PEERS ---- */
     if (strncasecmp(cmd, "LIST_PEERS", 10) == 0) {
-        ctl_respond(fd, "OK %d nodes (%d peers online)\n", num_nodes, num_peers);
+        /* Sized for MAX_MACS_PER_NODE (16) entries of 17 chars + 1
+         * separator each, plus the "(none)" placeholder, with comfortable
+         * headroom so output never silently truncates. */
+        char maclist[512];
+        ctl_respond(fd, "OK %d nodes (%d peers online)\n",
+                    num_nodes, num_peers);
         for (int ni = 0; ni < num_nodes; ni++) {
             struct node_phys *nd = &nodes[ni];
             if (!nd->active) continue;
-            char maclist[256] = "";
+
+            maclist[0] = '\0';
+            size_t mused = 0;
             for (int m = 0; m < nd->num_macs; m++) {
-                char ms[20]; mac_to_str(nd->macs[m], ms, sizeof(ms));
-                if (m > 0) strncat(maclist, ",", sizeof(maclist)-strlen(maclist)-1);
-                strncat(maclist, ms, sizeof(maclist)-strlen(maclist)-1);
+                char ms[20];
+                mac_to_str(nd->macs[m], ms, sizeof(ms));
+                int w = snprintf(maclist + mused, sizeof(maclist) - mused,
+                                 "%s%s", (m > 0) ? "," : "", ms);
+                if (w < 0 || (size_t)w >= sizeof(maclist) - mused) break;
+                mused += (size_t)w;
             }
-            if (nd->num_macs == 0) strncpy(maclist, "(none)", sizeof(maclist)-1);
+            if (nd->num_macs == 0)
+                snprintf(maclist, sizeof(maclist), "(none)");
+
             const char *st = (nd->peer_idx >= 0) ? "online" : "offline";
+            uint64_t txd = (nd->peer_idx >= 0)
+                ? peers[nd->peer_idx].tx_dropped : 0;
+
             if (nd->pos_set)
                 ctl_respond(fd, "  %-12s %s macs=[%s] pos=(%.1f,%.1f,%.1f) "
-                    "txpow=%.1f tx=%" PRIu64 " rx=%" PRIu64 " drop=%" PRIu64 "\n",
+                    "txpow=%.1f tx=%" PRIu64 " rx=%" PRIu64
+                    " rx_drop=%" PRIu64 " tx_drop=%" PRIu64 "\n",
                     nd->node_id, st, maclist, nd->pos_x, nd->pos_y, nd->pos_z,
-                    nd->tx_power_dbm, nd->tx_frames, nd->rx_frames, nd->rx_dropped);
+                    nd->tx_power_dbm, nd->tx_frames, nd->rx_frames,
+                    nd->rx_dropped, txd);
             else
                 ctl_respond(fd, "  %-12s %s macs=[%s] pos=none txpow=%.1f "
-                    "tx=%" PRIu64 " rx=%" PRIu64 " drop=%" PRIu64 "\n",
+                    "tx=%" PRIu64 " rx=%" PRIu64
+                    " rx_drop=%" PRIu64 " tx_drop=%" PRIu64 "\n",
                     nd->node_id, st, maclist, nd->tx_power_dbm,
-                    nd->tx_frames, nd->rx_frames, nd->rx_dropped);
+                    nd->tx_frames, nd->rx_frames,
+                    nd->rx_dropped, txd);
         }
         return 0;
     }
