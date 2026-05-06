@@ -429,6 +429,7 @@ struct peer {
     uint32_t    buf_used;
     int         is_bridge;
     char        label[64];
+    uint64_t    tx_dropped;     /* frames dropped due to socket backpressure */
 };
 
 static struct peer peers[MAX_PEERS];
@@ -469,7 +470,8 @@ static struct ctl_client ctl_clients[MAX_CTL_CLIENTS];
 
 /* Global stats */
 static uint64_t total_frames_forwarded = 0;
-static uint64_t total_frames_dropped = 0;
+static uint64_t total_frames_dropped = 0;       /* physics-model drops */
+static uint64_t total_frames_tx_dropped = 0;    /* hub->peer socket-backpressure drops */
 
 /* -------------------------------------------------------------------
  *  Utility
@@ -508,10 +510,17 @@ static int add_peer(int fd, int is_bridge, const char *label)
         close(fd); return -1;
     }
     set_nonblock(fd);
+    /* Enlarge the send buffer so short bursts don't immediately
+     * overflow and trigger backpressure drops. */
+    {
+        int sndbuf = 1024 * 1024;
+        setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+    }
     int idx = num_peers;
     peers[idx].fd = fd;
     peers[idx].buf_used = 0;
     peers[idx].is_bridge = is_bridge;
+    peers[idx].tx_dropped = 0;
     snprintf(peers[idx].label, sizeof(peers[idx].label), "%s", label);
     peer_node[idx] = -1;
     fprintf(stderr, "hub: peer %d connected: %s (fd=%d, %s)\n",
@@ -547,7 +556,8 @@ static void remove_peer(int idx)
 
     fprintf(stderr, "hub: peer %d disconnected: %s (fd=%d)\n",
             idx, peers[idx].label, peers[idx].fd);
-    close(peers[idx].fd);
+    if (peers[idx].fd >= 0)
+        close(peers[idx].fd);
 
     /* Update upstream_state references before the swap */
     for (i = 0; i < num_upstreams; i++) {
@@ -602,6 +612,49 @@ static void process_hello(int pidx, const uint8_t *payload, uint32_t len)
 }
 
 /* -------------------------------------------------------------------
+ *  Non-blocking framed send to a peer.
+ *
+ *  The peer's socket is non-blocking. When the peer's kernel send
+ *  buffer is full at frame boundary we drop the frame rather than
+ *  spin -- a slow or hung peer must not stall the whole hub. This
+ *  matches the lossy-medium semantics of the simulated radio.
+ *
+ *  In the rare case where the buffer fills *mid-frame* (after we've
+ *  already written some bytes), continuing without finishing the
+ *  frame would corrupt the receiver's stream framing. We treat the
+ *  peer as broken and let the caller remove it.
+ *
+ *  Returns:
+ *      1  -- whole message written
+ *      0  -- dropped at frame boundary (peer slow, but still healthy)
+ *     -1  -- peer is broken (partial-write stall or fatal error);
+ *            caller must remove this peer.
+ * ------------------------------------------------------------------- */
+static int peer_send_frame(int idx, const uint8_t *buf, uint32_t len)
+{
+    uint32_t offset = 0;
+    while (offset < len) {
+        ssize_t sent = write(peers[idx].fd, buf + offset, len - offset);
+        if (sent > 0) {
+            offset += (uint32_t)sent;
+            continue;
+        }
+        if (sent < 0 && errno == EINTR)
+            continue;
+        if (sent < 0 && errno == EAGAIN) {
+            if (offset == 0) {
+                peers[idx].tx_dropped++;
+                total_frames_tx_dropped++;
+                return 0;
+            }
+            return -1;
+        }
+        return -1;
+    }
+    return 1;
+}
+
+/* -------------------------------------------------------------------
  *  Frame forwarding with TTL + physics
  * ------------------------------------------------------------------- */
 static void forward_message(int sender_idx, const uint8_t *msg,
@@ -613,8 +666,8 @@ static void forward_message(int sender_idx, const uint8_t *msg,
     uint8_t ttl;
     int forward_to_bridges;
     int i;
-    ssize_t sent;
-    uint32_t offset;
+    int dead[MAX_PEERS];
+    int n_dead = 0;
 
     if (total_len < 4 || total_len > sizeof(tmp))
         return;
@@ -669,6 +722,9 @@ static void forward_message(int sender_idx, const uint8_t *msg,
         if (i == sender_idx)
             continue;
 
+        if (peers[i].fd < 0)
+            continue;
+
         if (peers[i].is_bridge && !forward_to_bridges)
             continue;
 
@@ -702,38 +758,36 @@ static void forward_message(int sender_idx, const uint8_t *msg,
         if (rx_ni >= 0) nodes[rx_ni].rx_frames++;
         total_frames_forwarded++;
 
+        int rc;
         if (!peers[i].is_bridge) {
             uint8_t saved_ttl = tmp[4 + TTL_BYTE_OFFSET];
             tmp[4 + TTL_BYTE_OFFSET] = 0;
 
-            offset = 0;
-            while (offset < total_len) {
-                sent = write(peers[i].fd, tmp + offset,
-                             total_len - offset);
-                if (sent <= 0) {
-                    if (sent < 0 && (errno == EAGAIN || errno == EINTR))
-                        continue;
-                    break;
-                }
-                offset += (uint32_t)sent;
-            }
+            rc = peer_send_frame(i, tmp, total_len);
+
             tmp[4 + TTL_BYTE_OFFSET] = saved_ttl;
 
             /* Restore original RSSI for next peer (may differ per-link) */
             tmp[4 + HDR_OFF_RSSI] = msg[4 + HDR_OFF_RSSI];
         } else {
-            offset = 0;
-            while (offset < total_len) {
-                sent = write(peers[i].fd, tmp + offset,
-                             total_len - offset);
-                if (sent <= 0) {
-                    if (sent < 0 && (errno == EAGAIN || errno == EINTR))
-                        continue;
-                    break;
-                }
-                offset += (uint32_t)sent;
-            }
+            rc = peer_send_frame(i, tmp, total_len);
         }
+
+        if (rc < 0) {
+            /* Peer is broken (partial-write stall or fatal error).
+             * Close fd now and queue for removal after the loop so
+             * we don't disturb iteration. */
+            fprintf(stderr, "hub: peer %d (%s) broken on send -- removing\n",
+                    i, peers[i].label);
+            close(peers[i].fd);
+            peers[i].fd = -1;
+            dead[n_dead++] = i;
+        }
+    }
+
+    /* Remove broken peers in reverse order (remove_peer swaps with last). */
+    while (n_dead > 0) {
+        remove_peer(dead[--n_dead]);
     }
 }
 
@@ -1116,8 +1170,10 @@ static int ctl_process_command(int fd, char *line)
     /* ---- STATS ---- */
     if (strncasecmp(cmd, "STATS", 5) == 0) {
         ctl_respond(fd, "OK fwd=%" PRIu64 " drop=%" PRIu64
+                    " tx_drop=%" PRIu64
                     " peers=%d nodes=%d links=%d\n",
                     total_frames_forwarded, total_frames_dropped,
+                    total_frames_tx_dropped,
                     num_peers, num_nodes, num_link_overrides);
         return 0;
     }
@@ -1729,8 +1785,10 @@ int main(int argc, char **argv)
     }
 
     fprintf(stderr, "hub: shutting down (%d peers, %" PRIu64
-            " forwarded, %" PRIu64 " dropped)\n",
-            num_peers, total_frames_forwarded, total_frames_dropped);
+            " forwarded, %" PRIu64 " phys-dropped, %" PRIu64
+            " tx-dropped)\n",
+            num_peers, total_frames_forwarded,
+            total_frames_dropped, total_frames_tx_dropped);
     free(pfds);
     cleanup();
     return 0;
