@@ -124,11 +124,27 @@
 #define MIN_HDR_SIZE            ATH9K_MEDIUM_HDR_SIZE_MIN
 
 /* -------------------------------------------------------------------
- *  802.11a/g OFDM rate table
+ *  Rate table: legacy + HT + VHT
  *
  *  Rate code → data rate in Mbps, and minimum SNR (dB) required for
- *  <10% frame error rate at 1500-byte frames.  These thresholds are
- *  derived from the same curves wmediumd uses (IEEE 802.11a BER).
+ *  <10% frame error rate at 1500-byte frames.  Legacy thresholds are
+ *  derived from the same curves wmediumd uses (IEEE 802.11a BER); HT
+ *  and VHT thresholds follow standard 802.11n/ac link-budget tables.
+ *
+ *  Rate-code namespace (single byte, internal to this medium):
+ *    0x00..0x1F  legacy: ath9k PLCP codes (OFDM 802.11a/g, CCK 802.11b)
+ *    0x80..0x87  HT20  NSS=1  MCS 0..7
+ *    0x88..0x8F  HT20  NSS=2  MCS 0..7  (i.e. MCS 8..15)
+ *    0x90..0x97  HT40  NSS=1  MCS 0..7
+ *    0x98..0x9F  HT40  NSS=2  MCS 0..7  (i.e. MCS 8..15)
+ *    0xA0..0xA9  VHT80 NSS=1  MCS 0..9
+ *    0xB0..0xB9  VHT80 NSS=2  MCS 0..9
+ *
+ *  The driver currently only emits legacy codes; HT/VHT entries here
+ *  let the physics layer respond correctly once the driver is taught
+ *  to encode MCS rates from tx_info->control.rates[0]. Until then,
+ *  unknown codes fall through to the 6 Mbps default in
+ *  get_frame_error_prob() and behave exactly as before.
  * ------------------------------------------------------------------- */
 struct rate_info {
     uint8_t     code;
@@ -138,23 +154,91 @@ struct rate_info {
 
 /*
  * SNR thresholds for ~10% FER at 1500-byte frames.
- * Sources: wmediumd per_packet_delivery(), 802.11a simulation data.
+ * Sources: wmediumd per_packet_delivery(), 802.11a/n/ac simulation data,
+ * standard MCS link-budget tables.
  */
 static const struct rate_info rate_table[] = {
-    /* OFDM rates (802.11a/g) */
-    { 0x0B,  6.0,   4.0 },     /* 6 Mbps   - BPSK 1/2 */
-    { 0x0F,  9.0,   5.0 },     /* 9 Mbps   - BPSK 3/4 */
-    { 0x0A, 12.0,   7.0 },     /* 12 Mbps  - QPSK 1/2 */
-    { 0x0E, 18.0,  10.0 },     /* 18 Mbps  - QPSK 3/4 */
-    { 0x09, 24.0,  14.0 },     /* 24 Mbps  - 16-QAM 1/2 */
-    { 0x0D, 36.0,  18.0 },     /* 36 Mbps  - 16-QAM 3/4 */
-    { 0x08, 48.0,  22.0 },     /* 48 Mbps  - 64-QAM 2/3 */
-    { 0x0C, 54.0,  25.0 },     /* 54 Mbps  - 64-QAM 3/4 */
-    /* CCK rates (802.11b) */
-    { 0x1B,  1.0,   2.0 },     /* 1 Mbps   - DBPSK */
-    { 0x1A,  2.0,   4.0 },     /* 2 Mbps   - DQPSK */
-    { 0x19,  5.5,   6.0 },     /* 5.5 Mbps - CCK */
-    { 0x18, 11.0,   9.0 },     /* 11 Mbps  - CCK */
+    /* ---- Legacy OFDM rates (802.11a/g) ---- */
+    { 0x0B,   6.0,   4.0 },    /* 6 Mbps   - BPSK 1/2 */
+    { 0x0F,   9.0,   5.0 },    /* 9 Mbps   - BPSK 3/4 */
+    { 0x0A,  12.0,   7.0 },    /* 12 Mbps  - QPSK 1/2 */
+    { 0x0E,  18.0,  10.0 },    /* 18 Mbps  - QPSK 3/4 */
+    { 0x09,  24.0,  14.0 },    /* 24 Mbps  - 16-QAM 1/2 */
+    { 0x0D,  36.0,  18.0 },    /* 36 Mbps  - 16-QAM 3/4 */
+    { 0x08,  48.0,  22.0 },    /* 48 Mbps  - 64-QAM 2/3 */
+    { 0x0C,  54.0,  25.0 },    /* 54 Mbps  - 64-QAM 3/4 */
+    /* ---- Legacy CCK rates (802.11b) ---- */
+    { 0x1B,   1.0,   2.0 },    /* 1 Mbps   - DBPSK */
+    { 0x1A,   2.0,   4.0 },    /* 2 Mbps   - DQPSK */
+    { 0x19,   5.5,   6.0 },    /* 5.5 Mbps - CCK */
+    { 0x18,  11.0,   9.0 },    /* 11 Mbps  - CCK */
+
+    /* ---- 802.11n HT20, single spatial stream (MCS 0..7) ---- */
+    { 0x80,   6.5,   5.0 },    /* HT20 NSS=1 MCS0  - BPSK 1/2 */
+    { 0x81,  13.0,   7.0 },    /* HT20 NSS=1 MCS1  - QPSK 1/2 */
+    { 0x82,  19.5,  10.0 },    /* HT20 NSS=1 MCS2  - QPSK 3/4 */
+    { 0x83,  26.0,  13.0 },    /* HT20 NSS=1 MCS3  - 16QAM 1/2 */
+    { 0x84,  39.0,  17.0 },    /* HT20 NSS=1 MCS4  - 16QAM 3/4 */
+    { 0x85,  52.0,  21.0 },    /* HT20 NSS=1 MCS5  - 64QAM 2/3 */
+    { 0x86,  58.5,  23.0 },    /* HT20 NSS=1 MCS6  - 64QAM 3/4 */
+    { 0x87,  65.0,  25.0 },    /* HT20 NSS=1 MCS7  - 64QAM 5/6 */
+
+    /* ---- 802.11n HT20, two spatial streams (MCS 8..15) ---- */
+    /* SU-MIMO needs ~3 dB more SNR than the equivalent NSS=1 MCS. */
+    { 0x88,  13.0,   8.0 },    /* HT20 NSS=2 MCS8  */
+    { 0x89,  26.0,  10.0 },    /* HT20 NSS=2 MCS9  */
+    { 0x8A,  39.0,  13.0 },    /* HT20 NSS=2 MCS10 */
+    { 0x8B,  52.0,  16.0 },    /* HT20 NSS=2 MCS11 */
+    { 0x8C,  78.0,  20.0 },    /* HT20 NSS=2 MCS12 */
+    { 0x8D, 104.0,  24.0 },    /* HT20 NSS=2 MCS13 */
+    { 0x8E, 117.0,  26.0 },    /* HT20 NSS=2 MCS14 */
+    { 0x8F, 130.0,  28.0 },    /* HT20 NSS=2 MCS15 */
+
+    /* ---- 802.11n HT40, single spatial stream ---- */
+    /* Same modulation as HT20 → same SNR threshold; double the rate. */
+    { 0x90,  13.5,   5.0 },    /* HT40 NSS=1 MCS0  */
+    { 0x91,  27.0,   7.0 },    /* HT40 NSS=1 MCS1  */
+    { 0x92,  40.5,  10.0 },    /* HT40 NSS=1 MCS2  */
+    { 0x93,  54.0,  13.0 },    /* HT40 NSS=1 MCS3  */
+    { 0x94,  81.0,  17.0 },    /* HT40 NSS=1 MCS4  */
+    { 0x95, 108.0,  21.0 },    /* HT40 NSS=1 MCS5  */
+    { 0x96, 121.5,  23.0 },    /* HT40 NSS=1 MCS6  */
+    { 0x97, 135.0,  25.0 },    /* HT40 NSS=1 MCS7  */
+
+    /* ---- 802.11n HT40, two spatial streams ---- */
+    { 0x98,  27.0,   8.0 },
+    { 0x99,  54.0,  10.0 },
+    { 0x9A,  81.0,  13.0 },
+    { 0x9B, 108.0,  16.0 },
+    { 0x9C, 162.0,  20.0 },
+    { 0x9D, 216.0,  24.0 },
+    { 0x9E, 243.0,  26.0 },
+    { 0x9F, 270.0,  28.0 },
+
+    /* ---- 802.11ac VHT 80 MHz, single spatial stream (MCS 0..9) ---- */
+    /* MCS 8/9 add 256-QAM modulation → much higher SNR floors. */
+    { 0xA0,  32.5,   5.0 },    /* VHT80 NSS=1 MCS0  */
+    { 0xA1,  65.0,   7.0 },    /* VHT80 NSS=1 MCS1  */
+    { 0xA2,  97.5,  10.0 },    /* VHT80 NSS=1 MCS2  */
+    { 0xA3, 130.0,  13.0 },    /* VHT80 NSS=1 MCS3  */
+    { 0xA4, 195.0,  17.0 },    /* VHT80 NSS=1 MCS4  */
+    { 0xA5, 260.0,  21.0 },    /* VHT80 NSS=1 MCS5  */
+    { 0xA6, 292.5,  23.0 },    /* VHT80 NSS=1 MCS6  */
+    { 0xA7, 325.0,  25.0 },    /* VHT80 NSS=1 MCS7  */
+    { 0xA8, 390.0,  28.0 },    /* VHT80 NSS=1 MCS8  - 256QAM 3/4 */
+    { 0xA9, 433.3,  30.0 },    /* VHT80 NSS=1 MCS9  - 256QAM 5/6 */
+
+    /* ---- 802.11ac VHT 80 MHz, two spatial streams ---- */
+    { 0xB0,  65.0,   8.0 },
+    { 0xB1, 130.0,  10.0 },
+    { 0xB2, 195.0,  13.0 },
+    { 0xB3, 260.0,  16.0 },
+    { 0xB4, 390.0,  20.0 },
+    { 0xB5, 520.0,  24.0 },
+    { 0xB6, 585.0,  26.0 },
+    { 0xB7, 650.0,  28.0 },
+    { 0xB8, 780.0,  31.0 },
+    { 0xB9, 866.7,  33.0 },
 };
 #define NUM_RATES   (int)(sizeof(rate_table) / sizeof(rate_table[0]))
 
