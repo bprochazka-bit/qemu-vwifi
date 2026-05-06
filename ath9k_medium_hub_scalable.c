@@ -67,6 +67,7 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -1405,10 +1406,19 @@ static int setup_tcp_listen(const char *port_str)
     return fd;
 }
 
-static int setup_unix_listen(const char *path)
+/*
+ * Bind a listening Unix socket at `path` with file mode `mode`.
+ *
+ * The umask is temporarily restricted around bind() so the socket file
+ * is created with the requested permissions atomically -- without this,
+ * an attacker could race a connect() through the bind→chmod window.
+ * A follow-up chmod() handles the case where bind() ignored the umask.
+ */
+static int setup_unix_listen(const char *path, mode_t mode)
 {
     struct sockaddr_un addr;
-    int fd;
+    int fd, rc;
+    mode_t old_umask;
 
     unlink(path);
 
@@ -1422,10 +1432,20 @@ static int setup_unix_listen(const char *path)
     addr.sun_family = AF_UNIX;
     strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
 
-    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+    old_umask = umask((mode_t)(~mode & 0777));
+    rc = bind(fd, (struct sockaddr *)&addr, sizeof(addr));
+    umask(old_umask);
+    if (rc < 0) {
         perror("hub: Unix bind");
         close(fd);
         return -1;
+    }
+
+    if (chmod(path, mode) < 0) {
+        /* Non-fatal: log but keep going. The umask above already
+         * restricted creation perms in the typical case. */
+        fprintf(stderr, "hub: chmod %s 0%o: %s\n",
+                path, (unsigned)mode, strerror(errno));
     }
 
     if (listen(fd, 16) < 0) {
@@ -1572,8 +1592,13 @@ int main(int argc, char **argv)
     signal(SIGTERM, sighandler);
     signal(SIGPIPE, SIG_IGN);
 
-    /* Setup listen sockets */
-    unix_listen_fd = setup_unix_listen(socket_path);
+    /* Setup listen sockets.
+     *
+     * The data socket is world-accessible (0666) so unprivileged QEMU
+     * processes from any user can connect. The control socket is owner-
+     * only (0600) because its commands are unauthenticated and include
+     * SAVE_CONFIG which would otherwise be a privesc primitive. */
+    unix_listen_fd = setup_unix_listen(socket_path, 0666);
     if (unix_listen_fd < 0)
         return 1;
     fprintf(stderr, "hub: Unix socket %s\n", socket_path);
@@ -1588,12 +1613,13 @@ int main(int argc, char **argv)
     }
 
     if (ctl_socket_path) {
-        ctl_listen_fd = setup_unix_listen(ctl_socket_path);
+        ctl_listen_fd = setup_unix_listen(ctl_socket_path, 0600);
         if (ctl_listen_fd < 0) {
             cleanup();
             return 1;
         }
-        fprintf(stderr, "hub: control socket %s\n", ctl_socket_path);
+        fprintf(stderr, "hub: control socket %s (mode 0600)\n",
+                ctl_socket_path);
     }
 
     /* Initialize upstream state */
