@@ -739,11 +739,18 @@ static bool channels_match(uint16_t a_freq, uint16_t a_bond,
 
 /* -------------------------------------------------------------------
  *  Frame forwarding with TTL + physics
+ *
+ *  forward_message is invoked sequentially from the single-threaded
+ *  main loop, so the scratch buffer can be allocated once and reused
+ *  -- this keeps an 8 KB+ array off the stack (matters for restricted
+ *  stack environments) and avoids per-frame allocation overhead.
  * ------------------------------------------------------------------- */
+static uint8_t *fwd_scratch = NULL;     /* 4 + MAX_MSG_SIZE bytes */
+
 static void forward_message(int sender_idx, const uint8_t *msg,
                             uint32_t total_len)
 {
-    uint8_t tmp[4 + MAX_MSG_SIZE];
+    uint8_t *tmp = fwd_scratch;
     uint32_t payload_len;
     int sender_is_bridge;
     uint8_t ttl;
@@ -754,7 +761,7 @@ static void forward_message(int sender_idx, const uint8_t *msg,
     uint16_t msg_chan_freq = 0;
     uint16_t msg_chan_bond = 0;
 
-    if (total_len < 4 || total_len > sizeof(tmp))
+    if (total_len < 4 || total_len > (4 + MAX_MSG_SIZE))
         return;
     payload_len = total_len - 4;
 
@@ -1648,6 +1655,8 @@ static void cleanup(void)
     }
     if (socket_path) unlink(socket_path);
     if (ctl_socket_path) unlink(ctl_socket_path);
+    free(fwd_scratch);
+    fwd_scratch = NULL;
 }
 
 static void sighandler(int sig)
@@ -1760,6 +1769,14 @@ int main(int argc, char **argv)
 
     /* Seed the PRNG */
     rng_state = (uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32);
+
+    /* Allocate the per-frame forwarding scratch buffer once -- keeps
+     * an 8 KB+ array off forward_message's stack frame. */
+    fwd_scratch = malloc(4 + MAX_MSG_SIZE);
+    if (!fwd_scratch) {
+        perror("malloc fwd_scratch");
+        return 1;
+    }
 
     signal(SIGINT, sighandler);
     signal(SIGTERM, sighandler);
