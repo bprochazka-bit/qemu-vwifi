@@ -260,6 +260,7 @@ struct node_phys {
     uint64_t    rx_dropped;
     int         peer_idx;       /* bound peer, or -1 if offline */
     bool        active;
+    bool        auto_named;     /* true = auto "node%d" id (recycled on disconnect) */
 };
 
 static struct node_phys nodes[MAX_NODES];
@@ -271,13 +272,25 @@ static struct node_phys *find_node(const char *nid, bool create)
     for (int i = 0; i < num_nodes; i++)
         if (nodes[i].active && strcmp(nodes[i].node_id, nid) == 0)
             return &nodes[i];
-    if (!create || num_nodes >= MAX_NODES) return NULL;
-    struct node_phys *nd = &nodes[num_nodes++];
+    if (!create) return NULL;
+
+    /* Reuse an inactive slot before extending the array, so a churning
+     * peer doesn't permanently consume node-table capacity. */
+    struct node_phys *nd = NULL;
+    for (int i = 0; i < num_nodes; i++) {
+        if (!nodes[i].active) { nd = &nodes[i]; break; }
+    }
+    if (!nd) {
+        if (num_nodes >= MAX_NODES) return NULL;
+        nd = &nodes[num_nodes++];
+    }
+
     memset(nd, 0, sizeof(*nd));
     snprintf(nd->node_id, NODE_ID_LEN, "%s", nid);
     nd->tx_power_dbm = 15.0;
     nd->peer_idx = -1;
     nd->active = true;
+    nd->auto_named = false;
     return nd;
 }
 
@@ -344,8 +357,19 @@ static struct link_override *find_link(const char *id_a, const char *id_b,
              strcmp(link_overrides[i].node_b, id_a) == 0))
             return &link_overrides[i];
     }
-    if (!create || num_link_overrides >= MAX_LINK_OVERRIDES) return NULL;
-    struct link_override *lk = &link_overrides[num_link_overrides++];
+    if (!create) return NULL;
+
+    /* Reuse an inactive slot before extending the array, so repeated
+     * SET_SNR/CLEAR_SNR cycles don't permanently exhaust capacity. */
+    struct link_override *lk = NULL;
+    for (int i = 0; i < num_link_overrides; i++) {
+        if (!link_overrides[i].active) { lk = &link_overrides[i]; break; }
+    }
+    if (!lk) {
+        if (num_link_overrides >= MAX_LINK_OVERRIDES) return NULL;
+        lk = &link_overrides[num_link_overrides++];
+    }
+
     snprintf(lk->node_a, NODE_ID_LEN, "%s", id_a);
     snprintf(lk->node_b, NODE_ID_LEN, "%s", id_b);
     lk->snr_ab = NAN;  lk->snr_ba = NAN;
@@ -553,6 +577,9 @@ static void auto_bind_peer(int pidx)
     char id[NODE_ID_LEN];
     snprintf(id, NODE_ID_LEN, "node%d", next_auto_id++);
     bind_peer_to_node(pidx, id);
+    int ni = peer_node[pidx];
+    if (ni >= 0)
+        nodes[ni].auto_named = true;
 }
 
 static void remove_peer(int idx)
@@ -564,6 +591,19 @@ static void remove_peer(int idx)
     if (peers[idx].fd >= 0)
         close(peers[idx].fd);
 
+    /* Detach from node. Auto-named nodes are recycled on disconnect so
+     * the table doesn't grow without bound under reconnect churn;
+     * user-named nodes persist with their physical state intact. */
+    int ni = peer_node[idx];
+    if (ni >= 0) {
+        nodes[ni].peer_idx = -1;
+        if (nodes[ni].auto_named) {
+            nodes[ni].active = false;
+            nodes[ni].num_macs = 0;
+        }
+    }
+    peer_node[idx] = -1;
+
     /* Update upstream_state references before the swap */
     for (i = 0; i < num_upstreams; i++) {
         if (upstream_state[i].peer_idx == idx) {
@@ -573,9 +613,14 @@ static void remove_peer(int idx)
         }
     }
 
-    /* Swap with last — also swap phys */
+    /* Swap with last -- also move the node->peer back-reference and
+     * the peer_node[] entry so they stay in sync after the swap. */
     if (idx < num_peers - 1) {
-        peers[idx] = peers[num_peers - 1];
+        int last = num_peers - 1;
+        peers[idx] = peers[last];
+        peer_node[idx] = peer_node[last];
+        if (peer_node[idx] >= 0)
+            nodes[peer_node[idx]].peer_idx = idx;
     }
     num_peers--;
 }
