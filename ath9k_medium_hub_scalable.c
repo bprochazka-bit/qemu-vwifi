@@ -495,14 +495,33 @@ static struct upstream_state upstream_state[MAX_UPSTREAMS];
 static int ctl_listen_fd = -1;
 static char *ctl_socket_path = NULL;
 
+/* Per-client outbound buffer: lets ctl_respond keep writing across
+ * EAGAIN without dropping the response. Sized for the worst-case
+ * LIST_PEERS dump (256 nodes * ~120 chars). Excess is dropped (with
+ * a warning) -- the responses were always best-effort. */
+#define CTL_OUTBUF_SIZE     (64 * 1024)
+
 struct ctl_client {
     int         fd;
     char        buf[CTL_BUF_SIZE];
     uint32_t    buf_used;
+    char        outbuf[CTL_OUTBUF_SIZE];
+    uint32_t    outbuf_used;
     bool        active;
 };
 
 static struct ctl_client ctl_clients[MAX_CTL_CLIENTS];
+
+/* Look up ctl_client index by fd, or -1 if fd isn't a tracked client
+ * (e.g. STDERR_FILENO from the startup config-load path). */
+static int ctl_client_by_fd(int fd)
+{
+    for (int i = 0; i < MAX_CTL_CLIENTS; i++) {
+        if (ctl_clients[i].active && ctl_clients[i].fd == fd)
+            return i;
+    }
+    return -1;
+}
 
 /* Global stats */
 static uint64_t total_frames_forwarded = 0;
@@ -1052,6 +1071,41 @@ static void try_reconnect_upstreams(void)
  * ------------------------------------------------------------------- */
 
 /* Write a response string to a control client fd */
+/*
+ * Try to drain a ctl_client's outbuf. Returns true if the buffer is
+ * now empty (POLLOUT can be unregistered), false if bytes remain.
+ */
+static bool ctl_drain_outbuf(int idx)
+{
+    struct ctl_client *c = &ctl_clients[idx];
+    while (c->outbuf_used > 0) {
+        ssize_t wr = write(c->fd, c->outbuf, c->outbuf_used);
+        if (wr > 0) {
+            uint32_t left = c->outbuf_used - (uint32_t)wr;
+            if (left > 0)
+                memmove(c->outbuf, c->outbuf + wr, left);
+            c->outbuf_used = left;
+            continue;
+        }
+        if (wr < 0 && (errno == EAGAIN || errno == EINTR))
+            return false;
+        /* Other write errors: client is dead. Drop the buffered
+         * output and let the main loop notice the disconnect. */
+        c->outbuf_used = 0;
+        return true;
+    }
+    return true;
+}
+
+/*
+ * Send formatted text to a control client.
+ *
+ * If `fd` matches an active ctl_client, the response is written
+ * directly when possible and buffered into the client's outbuf when
+ * the kernel buffer is full. The main loop arms POLLOUT to drain.
+ * If `fd` doesn't match a tracked client (e.g. STDERR_FILENO during
+ * startup config load), we just do a best-effort blocking-style write.
+ */
 static void ctl_respond(int fd, const char *fmt, ...)
 {
     char buf[CTL_RESP_SIZE];
@@ -1059,11 +1113,47 @@ static void ctl_respond(int fd, const char *fmt, ...)
     va_start(ap, fmt);
     int len = vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
-    if (len > 0) {
-        /* Best-effort write to control client */
+    if (len <= 0)
+        return;
+
+    int idx = ctl_client_by_fd(fd);
+    if (idx < 0) {
+        /* Untracked fd (stderr, ad-hoc): legacy best-effort write. */
         ssize_t wr = write(fd, buf, (size_t)len);
         (void)wr;
+        return;
     }
+
+    struct ctl_client *c = &ctl_clients[idx];
+    size_t off = 0;
+    size_t need = (size_t)len;
+
+    /* If the outbuf is empty, try a direct write first to avoid the
+     * memcpy on the fast path. */
+    if (c->outbuf_used == 0) {
+        ssize_t wr = write(fd, buf, need);
+        if (wr > 0) {
+            off = (size_t)wr;
+            if (off >= need)
+                return;
+        } else if (wr < 0 && errno != EAGAIN && errno != EINTR) {
+            /* Hard write error: drop. The next read will see the
+             * disconnect and clean up. */
+            return;
+        }
+    }
+
+    /* Buffer the remainder. If it would overflow, log and truncate. */
+    size_t leftover = need - off;
+    if (c->outbuf_used + leftover > sizeof(c->outbuf)) {
+        size_t fit = sizeof(c->outbuf) - c->outbuf_used;
+        fprintf(stderr,
+                "hub: ctl client %d outbuf overflow (dropping %zu bytes)\n",
+                idx, leftover - fit);
+        leftover = fit;
+    }
+    memcpy(c->outbuf + c->outbuf_used, buf + off, leftover);
+    c->outbuf_used += (uint32_t)leftover;
 }
 
 /*
@@ -1902,12 +1992,16 @@ int main(int argc, char **argv)
             nfds++;
         }
 
-        /* Control clients */
+        /* Control clients (POLLIN always; POLLOUT when there's
+         * buffered response output that didn't fit in the kernel
+         * send buffer earlier). */
         ctl_base = nfds;
         for (i = 0; i < MAX_CTL_CLIENTS; i++) {
             if (ctl_clients[i].active) {
                 pfds[nfds].fd = ctl_clients[i].fd;
                 pfds[nfds].events = POLLIN;
+                if (ctl_clients[i].outbuf_used > 0)
+                    pfds[nfds].events |= POLLOUT;
                 pfds[nfds].revents = 0;
                 nfds++;
             }
@@ -1965,6 +2059,7 @@ int main(int argc, char **argv)
                     if (!ctl_clients[i].active) {
                         ctl_clients[i].fd = cfd;
                         ctl_clients[i].buf_used = 0;
+                        ctl_clients[i].outbuf_used = 0;
                         ctl_clients[i].active = true;
                         placed = true;
                         fprintf(stderr,
@@ -1995,10 +2090,17 @@ int main(int argc, char **argv)
             int pfd_idx = ctl_base;
             for (i = 0; i < MAX_CTL_CLIENTS; i++) {
                 if (!ctl_clients[i].active) continue;
-                if (pfd_idx < nfds &&
-                    (pfds[pfd_idx].revents &
-                     (POLLIN | POLLHUP | POLLERR)))
-                    handle_ctl_data(i);
+                if (pfd_idx < nfds) {
+                    short rev = pfds[pfd_idx].revents;
+                    /* Drain pending response bytes first so a client
+                     * blocked on POLLOUT doesn't get a fresh response
+                     * appended ahead of the queued one. */
+                    if ((rev & POLLOUT) && ctl_clients[i].active)
+                        ctl_drain_outbuf(i);
+                    if ((rev & (POLLIN | POLLHUP | POLLERR))
+                        && ctl_clients[i].active)
+                        handle_ctl_data(i);
+                }
                 pfd_idx++;
             }
         }
