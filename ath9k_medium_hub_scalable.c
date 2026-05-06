@@ -118,6 +118,8 @@
 #define HDR_OFF_RATE_CODE       offsetof(struct ath9k_medium_frame_hdr, rate_code)
 #define HDR_OFF_RSSI            offsetof(struct ath9k_medium_frame_hdr, rssi)
 #define HDR_OFF_FLAGS           offsetof(struct ath9k_medium_frame_hdr, flags)
+#define HDR_OFF_CHAN_FREQ       offsetof(struct ath9k_medium_frame_hdr, channel_freq)
+#define HDR_OFF_CHAN_BOND_FREQ  offsetof(struct ath9k_medium_frame_hdr, channel_bond_freq)
 #define TTL_BYTE_OFFSET         (HDR_OFF_FLAGS + 3)
 #define MIN_HDR_SIZE            ATH9K_MEDIUM_HDR_SIZE_MIN
 
@@ -459,6 +461,11 @@ struct peer {
     int         is_bridge;
     char        label[64];
     uint64_t    tx_dropped;     /* frames dropped due to socket backpressure */
+    /* Channel state learned from peer's most recent TX (v2 header).
+     * Both 0 means "unknown" -- such peers receive everything until
+     * they transmit and reveal their channel. */
+    uint16_t    channel_freq;
+    uint16_t    channel_bond_freq;
 };
 
 static struct peer peers[MAX_PEERS];
@@ -550,6 +557,8 @@ static int add_peer(int fd, int is_bridge, const char *label)
     peers[idx].buf_used = 0;
     peers[idx].is_bridge = is_bridge;
     peers[idx].tx_dropped = 0;
+    peers[idx].channel_freq = 0;
+    peers[idx].channel_bond_freq = 0;
     snprintf(peers[idx].label, sizeof(peers[idx].label), "%s", label);
     peer_node[idx] = -1;
     fprintf(stderr, "hub: peer %d connected: %s (fd=%d, %s)\n",
@@ -705,6 +714,30 @@ static int peer_send_frame(int idx, const uint8_t *buf, uint32_t len)
 }
 
 /* -------------------------------------------------------------------
+ *  Channel-match policy.
+ *
+ *  Per the v2 wire protocol (ath9k_medium.h):
+ *    - channel_freq == 0 means "unknown / broadcast" and matches anything
+ *    - otherwise the primary frequency must match
+ *    - if either side has a bond_freq != 0, the bond_freq must also match
+ *      (so HT40+ ch6 and HT40- ch6 don't collide with each other)
+ *
+ *  This is symmetric in the sender/receiver pair, which is what we want
+ *  for the simulated medium.
+ * ------------------------------------------------------------------- */
+static bool channels_match(uint16_t a_freq, uint16_t a_bond,
+                           uint16_t b_freq, uint16_t b_bond)
+{
+    if (a_freq == 0 || b_freq == 0)
+        return true;
+    if (a_freq != b_freq)
+        return false;
+    if ((a_bond != 0 || b_bond != 0) && a_bond != b_bond)
+        return false;
+    return true;
+}
+
+/* -------------------------------------------------------------------
  *  Frame forwarding with TTL + physics
  * ------------------------------------------------------------------- */
 static void forward_message(int sender_idx, const uint8_t *msg,
@@ -718,6 +751,8 @@ static void forward_message(int sender_idx, const uint8_t *msg,
     int i;
     int dead[MAX_PEERS];
     int n_dead = 0;
+    uint16_t msg_chan_freq = 0;
+    uint16_t msg_chan_bond = 0;
 
     if (total_len < 4 || total_len > sizeof(tmp))
         return;
@@ -751,6 +786,17 @@ static void forward_message(int sender_idx, const uint8_t *msg,
     /* Extract rate code from the medium header */
     uint8_t rate_code = tmp[4 + HDR_OFF_RATE_CODE];
 
+    /* Extract channel info if the sender uses the v2 header. v1 senders
+     * are treated as channel=0 (broadcast) for backward compatibility. */
+    if (payload_len >= ATH9K_MEDIUM_HDR_SIZE) {
+        memcpy(&msg_chan_freq, tmp + 4 + HDR_OFF_CHAN_FREQ, 2);
+        memcpy(&msg_chan_bond, tmp + 4 + HDR_OFF_CHAN_BOND_FREQ, 2);
+        /* Cache the sender's current channel so symmetric filtering
+         * can match it on subsequent frames sent toward this peer. */
+        peers[sender_idx].channel_freq = msg_chan_freq;
+        peers[sender_idx].channel_bond_freq = msg_chan_bond;
+    }
+
     /* --- TTL handling (unchanged logic) --- */
     ttl = tmp[4 + TTL_BYTE_OFFSET];
 
@@ -776,6 +822,15 @@ static void forward_message(int sender_idx, const uint8_t *msg,
             continue;
 
         if (peers[i].is_bridge && !forward_to_bridges)
+            continue;
+
+        /* Channel-aware filtering. If we know both sender and receiver
+         * channels and they don't match (with HT40 bond awareness),
+         * the receiver wouldn't hear this transmission on a real
+         * radio, so skip it. */
+        if (!channels_match(msg_chan_freq, msg_chan_bond,
+                            peers[i].channel_freq,
+                            peers[i].channel_bond_freq))
             continue;
 
         int rx_ni = peer_node[i];
