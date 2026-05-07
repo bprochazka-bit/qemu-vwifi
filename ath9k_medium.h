@@ -57,6 +57,17 @@
 #define ATH9K_MEDIUM_MAX_MSG_SIZE       \
     (sizeof(struct ath9k_medium_frame_hdr) + ATH9K_MEDIUM_MAX_FRAME_SIZE)
 
+/* Short aliases used by the driver and relay. The kernel side and the
+ * relay daemon predate the _SIZE-suffixed names; provide aliases so
+ * every component compiles against a single canonical header. */
+#define ATH9K_MEDIUM_MAX_FRAME          ATH9K_MEDIUM_MAX_FRAME_SIZE
+#define ATH9K_MEDIUM_MAX_MSG            ATH9K_MEDIUM_MAX_MSG_SIZE
+
+/* Misc-device name exposed by the kernel module, as in
+ *   /dev/ath9k_medium
+ * The relay opens this path; the driver uses it as miscdevice .name. */
+#define ATH9K_MEDIUM_CHRDEV_NAME        "ath9k_medium"
+
 /* ================================================================
  *  Frame header – prepended to every 802.11 frame on the wire
  *
