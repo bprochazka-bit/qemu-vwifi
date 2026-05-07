@@ -1551,14 +1551,24 @@ static int ctl_process_command(int fd, char *line)
         load_depth++;
         char cfgline[512];
         int count = 0;
+        int rc = 0;
         while (fgets(cfgline, sizeof(cfgline), f)) {
             char *cl = trim(cfgline);
             if (cl[0] == '\0' || cl[0] == '#') continue;
-            ctl_process_command(fd, cl);
+            /* If a nested command is QUIT (returns -1), stop reading
+             * the file -- the fd has been closed and any further
+             * ctl_respond would be a write to a dead socket. Propagate
+             * the -1 up so handle_ctl_data also stops processing. */
+            if (ctl_process_command(fd, cl) < 0) {
+                rc = -1;
+                break;
+            }
             count++;
         }
         load_depth--;
         fclose(f);
+        if (rc < 0)
+            return -1;
         ctl_respond(fd, "OK loaded %d commands from %s\n", count, path);
         return 0;
     }
