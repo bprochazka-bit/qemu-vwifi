@@ -2161,11 +2161,32 @@ int main(int argc, char **argv)
             }
         }
 
-        /* Handle data peer I/O (backwards for safe removal) */
+        /*
+         * Handle data peer I/O (backwards iteration for safe removal).
+         *
+         * forward_message can call remove_peer for *other* indices
+         * (peers that fail a fanout write) before the dispatch loop
+         * gets to them. remove_peer swaps with last, so a previously-
+         * polled fd at index N may have been replaced by a different
+         * peer with no events to handle. Two protections:
+         *
+         *   1. i may now be >= num_peers (slot was discarded).
+         *   2. peers[i].fd may not match pfds[pfd_idx].fd (slot was
+         *      swapped to a different peer whose events live elsewhere
+         *      in pfds, or whose events arrive in the next poll
+         *      iteration).
+         *
+         * In either case, skip dispatching -- spurious read() on the
+         * wrong peer would corrupt its rx state or misattribute
+         * counters.
+         */
         for (i = num_peers - 1; i >= 0; i--) {
             int pfd_idx = peer_base + i;
-            if (pfd_idx < nfds &&
-                (pfds[pfd_idx].revents & (POLLIN | POLLHUP | POLLERR)))
+            if (pfd_idx >= nfds)
+                continue;
+            if (pfds[pfd_idx].fd != peers[i].fd)
+                continue;   /* slot swapped after a remove_peer */
+            if (pfds[pfd_idx].revents & (POLLIN | POLLHUP | POLLERR))
                 handle_peer_data(i);
         }
 
