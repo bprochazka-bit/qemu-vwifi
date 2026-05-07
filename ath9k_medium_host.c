@@ -68,6 +68,24 @@ struct ath9k_host_priv {
     enum nl80211_band       channel_band;
     u8                      mac_addr[ETH_ALEN];
 
+    /*
+     * state_lock protects:
+     *   - tx_queue (instead of relying on the sk_buff_head's own
+     *     internal lock, so the relay_connected check + enqueue can
+     *     happen atomically inside a single critical section)
+     *   - relay_connected
+     *   - tx_queues_stopped
+     *
+     * .tx runs in mac80211 softirq context, while chrdev_open / read /
+     * release run in process context. Without this lock the open
+     * EBUSY check is racy (two relays could both attach), and a
+     * release that flips relay_connected=false then purges the queue
+     * can be interleaved with a .tx that already passed the
+     * relay_connected check -- the late-enqueued skb leaks until the
+     * module is unloaded.
+     */
+    spinlock_t              state_lock;
+
     /* TX queue: frames going from mac80211 → chardev → relay → hub */
     struct sk_buff_head     tx_queue;
     wait_queue_head_t       tx_waitq;           /* relay polls for TX */
@@ -76,7 +94,7 @@ struct ath9k_host_priv {
     /* RX queue: frames coming from hub → relay → chardev → mac80211 */
     struct work_struct      rx_work;
 
-    /* Chardev state */
+    /* Chardev state (guarded by state_lock) */
     bool                    relay_connected;
 
     /* Statistics */
@@ -184,14 +202,16 @@ static void ath9k_host_tx(struct ieee80211_hw *hw,
     struct ieee80211_hdr *hdr = (struct ieee80211_hdr *)skb->data;
     struct sk_buff *msg;
     struct ath9k_medium_frame_hdr fhdr;
+    unsigned long flags;
+    bool stop_queues_now = false;
+    bool dropped = false;
     u32 wire_len, qlen;
     __be32 len_be;
     u8 rate_code = 0x0B;  /* default: 6 Mbps OFDM */
 
-    if (!priv->started || !priv->relay_connected) {
-        /* Driver not in a state to transmit -- frame was never on the
-         * wire. Free without status; mac80211 treats this as a clean
-         * drop, not an ACK and not a retryable failure. */
+    /* Quick fast-path check before we do work; the authoritative
+     * relay_connected check happens again under the lock below. */
+    if (!priv->started || !READ_ONCE(priv->relay_connected)) {
         ieee80211_free_txskb(hw, skb);
         priv->tx_drop_count++;
         return;
@@ -229,35 +249,54 @@ static void ath9k_host_tx(struct ieee80211_hw *hw,
     skb_put_data(msg, &fhdr, ATH9K_MEDIUM_HDR_SIZE);
     skb_put_data(msg, skb->data, skb->len);
 
-    qlen = skb_queue_len(&priv->tx_queue);
+    /*
+     * Critical section: re-check relay_connected, evaluate the
+     * watermark, and enqueue under the lock so chrdev_release can't
+     * tear down the queue between our check and our enqueue.
+     */
+    spin_lock_irqsave(&priv->state_lock, flags);
 
-    /* Cross the high watermark: ask mac80211 to back off so we have a
-     * chance to drain before the queue actually fills. */
-    if (qlen >= ATH9K_TX_QUEUE_HIGH && !priv->tx_queues_stopped) {
-        ieee80211_stop_queues(hw);
-        priv->tx_queues_stopped = true;
+    if (!priv->relay_connected) {
+        dropped = true;
+    } else {
+        qlen = skb_queue_len(&priv->tx_queue);
+
+        if (qlen >= ATH9K_TX_QUEUE_HIGH && !priv->tx_queues_stopped) {
+            priv->tx_queues_stopped = true;
+            stop_queues_now = true;
+        }
+
+        if (qlen < ATH9K_TX_QUEUE_MAX) {
+            __skb_queue_tail(&priv->tx_queue, msg);
+        } else {
+            dropped = true;
+        }
     }
 
-    if (qlen < ATH9K_TX_QUEUE_MAX) {
-        skb_queue_tail(&priv->tx_queue, msg);
-        wake_up_interruptible(&priv->tx_waitq);
+    spin_unlock_irqrestore(&priv->state_lock, flags);
 
-        /* Frame is queued for transmission. Report success with the
-         * synthetic ACK; the medium has no real over-the-air ACK. */
-        ieee80211_tx_info_clear_status(tx_info);
-        tx_info->flags |= IEEE80211_TX_STAT_ACK;
-        ieee80211_tx_status_irqsafe(hw, skb);
-        priv->tx_count++;
-    } else {
-        /* Queue is at MAX even though we tried to backpressure earlier.
-         * Honestly report a TX failure: clear STAT_ACK so mac80211's
-         * retry counter and rate control see a real loss. */
+    /* mac80211 hooks called outside the lock */
+    if (stop_queues_now)
+        ieee80211_stop_queues(hw);
+
+    if (dropped) {
         kfree_skb(msg);
         priv->tx_drop_count++;
         ieee80211_tx_info_clear_status(tx_info);
-        /* No IEEE80211_TX_STAT_ACK flag -> mac80211 sees no-ACK -> retries */
+        /* No IEEE80211_TX_STAT_ACK -> mac80211 sees no-ACK -> retries
+         * (or for the !relay_connected case, the frame is lost cleanly). */
         ieee80211_tx_status_irqsafe(hw, skb);
+        return;
     }
+
+    wake_up_interruptible(&priv->tx_waitq);
+
+    /* Frame is queued for transmission. Report success with the
+     * synthetic ACK; the medium has no real over-the-air ACK. */
+    ieee80211_tx_info_clear_status(tx_info);
+    tx_info->flags |= IEEE80211_TX_STAT_ACK;
+    ieee80211_tx_status_irqsafe(hw, skb);
+    priv->tx_count++;
 }
 
 static int ath9k_host_start(struct ieee80211_hw *hw)
@@ -272,14 +311,21 @@ static int ath9k_host_start(struct ieee80211_hw *hw)
 static void ath9k_host_stop(struct ieee80211_hw *hw, bool suspend)
 {
     struct ath9k_host_priv *priv = hw->priv;
+    unsigned long flags;
+    bool was_stopped;
 
     priv->started = false;
+
+    spin_lock_irqsave(&priv->state_lock, flags);
+    was_stopped = priv->tx_queues_stopped;
+    priv->tx_queues_stopped = false;
+    spin_unlock_irqrestore(&priv->state_lock, flags);
+
     /* Leave the TX queues in the woken state so a subsequent start
      * doesn't inherit a stale stop. */
-    if (priv->tx_queues_stopped) {
+    if (was_stopped)
         ieee80211_wake_queues(hw);
-        priv->tx_queues_stopped = false;
-    }
+
     pr_info(DRV_NAME ": radio stopped (TX: %llu RX: %llu drops: %llu)\n",
             priv->tx_count, priv->rx_count, priv->tx_drop_count);
 }
@@ -488,17 +534,26 @@ static void ath9k_host_rx_frame(struct ath9k_host_priv *priv,
 static int ath9k_host_chrdev_open(struct inode *inode, struct file *filp)
 {
     struct ath9k_host_priv *priv = g_priv;
+    unsigned long flags;
+    bool taken;
 
     if (!priv) {
         return -ENODEV;
     }
 
-    if (priv->relay_connected) {
+    /* Atomically claim the single-relay slot. Without the lock two
+     * concurrent open()s could both observe relay_connected=false and
+     * both succeed, leaving two relays sharing the same tx_queue. */
+    spin_lock_irqsave(&priv->state_lock, flags);
+    taken = priv->relay_connected;
+    if (!taken)
+        priv->relay_connected = true;
+    spin_unlock_irqrestore(&priv->state_lock, flags);
+
+    if (taken)
         return -EBUSY;  /* only one relay at a time */
-    }
 
     filp->private_data = priv;
-    priv->relay_connected = true;
     pr_info(DRV_NAME ": relay daemon connected\n");
     return 0;
 }
@@ -506,19 +561,39 @@ static int ath9k_host_chrdev_open(struct inode *inode, struct file *filp)
 static int ath9k_host_chrdev_release(struct inode *inode, struct file *filp)
 {
     struct ath9k_host_priv *priv = filp->private_data;
+    struct sk_buff_head purge;
+    unsigned long flags;
+    bool was_stopped;
 
-    if (priv) {
-        priv->relay_connected = false;
-        /* Wake any stopped TX queues; with no relay, .tx will fast-drop
-         * anyway, but leaving queues stopped would block restart. */
-        if (priv->tx_queues_stopped) {
-            ieee80211_wake_queues(priv->hw);
-            priv->tx_queues_stopped = false;
-        }
-        /* Drain any frames still queued for the (now-departed) relay. */
-        skb_queue_purge(&priv->tx_queue);
-        pr_info(DRV_NAME ": relay daemon disconnected\n");
-    }
+    if (!priv)
+        return 0;
+
+    __skb_queue_head_init(&purge);
+
+    /*
+     * Flip relay_connected and detach the queue under the lock so any
+     * .tx running concurrently observes !relay_connected and either
+     * (a) drops the frame in the early fast-path check, or (b) takes
+     * the lock after us and sees relay_connected=false in the
+     * authoritative re-check. Either way no new skbs can land on the
+     * queue we're about to free.
+     */
+    spin_lock_irqsave(&priv->state_lock, flags);
+    priv->relay_connected = false;
+    was_stopped = priv->tx_queues_stopped;
+    priv->tx_queues_stopped = false;
+    skb_queue_splice_init(&priv->tx_queue, &purge);
+    spin_unlock_irqrestore(&priv->state_lock, flags);
+
+    /* Wake mac80211 so a future relay reattach starts from a clean
+     * state (otherwise the queues stay stopped across reconnect). */
+    if (was_stopped)
+        ieee80211_wake_queues(priv->hw);
+
+    /* Free orphaned skbs outside the lock. */
+    __skb_queue_purge(&purge);
+
+    pr_info(DRV_NAME ": relay daemon disconnected\n");
     return 0;
 }
 
@@ -535,6 +610,8 @@ static ssize_t ath9k_host_chrdev_read(struct file *filp, char __user *buf,
 {
     struct ath9k_host_priv *priv = filp->private_data;
     struct sk_buff *skb;
+    unsigned long flags;
+    bool wake_now = false;
     ssize_t len;
     int ret;
 
@@ -550,18 +627,23 @@ static ssize_t ath9k_host_chrdev_read(struct file *filp, char __user *buf,
         }
     }
 
-    skb = skb_dequeue(&priv->tx_queue);
+    /* Dequeue and evaluate the low-watermark wake under the lock so we
+     * see a consistent qlen and tx_queues_stopped pair. */
+    spin_lock_irqsave(&priv->state_lock, flags);
+    skb = __skb_dequeue(&priv->tx_queue);
+    if (skb && priv->tx_queues_stopped &&
+        skb_queue_len(&priv->tx_queue) <= ATH9K_TX_QUEUE_LOW) {
+        priv->tx_queues_stopped = false;
+        wake_now = true;
+    }
+    spin_unlock_irqrestore(&priv->state_lock, flags);
+
     if (!skb) {
         return -EAGAIN;
     }
 
-    /* If we're draining and have crossed back below the low watermark,
-     * release the TX backpressure so mac80211 can hand us frames again. */
-    if (priv->tx_queues_stopped &&
-        skb_queue_len(&priv->tx_queue) <= ATH9K_TX_QUEUE_LOW) {
+    if (wake_now)
         ieee80211_wake_queues(priv->hw);
-        priv->tx_queues_stopped = false;
-    }
 
     len = skb->len;
     if (len > count) {
@@ -739,6 +821,7 @@ static int __init ath9k_host_init(void)
     priv->hw = hw;
     memcpy(priv->mac_addr, mac, ETH_ALEN);
 
+    spin_lock_init(&priv->state_lock);
     skb_queue_head_init(&priv->tx_queue);
     init_waitqueue_head(&priv->tx_waitq);
 
