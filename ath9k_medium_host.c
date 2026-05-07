@@ -397,13 +397,26 @@ static void ath9k_host_rx_frame(struct ath9k_host_priv *priv,
     struct ieee80211_rx_status *rx_status;
     struct sk_buff *skb;
     u16 frame_len;
+    size_t hdr_len;
 
-    if (len < ATH9K_MEDIUM_HDR_SIZE) {
+    /* Accept either v1 (28-byte) or v2 (40-byte) headers.  v1 peers
+     * (older qemu-vwifi components, or anything that hasn't been
+     * upgraded yet) still send 28-byte headers per the documented
+     * backward-compat contract; rejecting them here would silently
+     * black-hole every legacy peer. */
+    if (len < ATH9K_MEDIUM_HDR_SIZE_V1) {
         pr_warn(DRV_NAME ": rx: short message (%zu bytes)\n", len);
         return;
     }
 
-    memcpy(&fhdr, data, ATH9K_MEDIUM_HDR_SIZE);
+    hdr_len = (len >= ATH9K_MEDIUM_HDR_SIZE)
+              ? ATH9K_MEDIUM_HDR_SIZE
+              : ATH9K_MEDIUM_HDR_SIZE_V1;
+
+    /* Zero the local fhdr first so v2-only fields (channel_freq etc.)
+     * read as 0 ("unknown") when copying from a v1 sender. */
+    memset(&fhdr, 0, sizeof(fhdr));
+    memcpy(&fhdr, data, hdr_len);
 
     if (le32_to_cpu(fhdr.magic) != ATH9K_MEDIUM_MAGIC) {
         pr_warn(DRV_NAME ": rx: bad magic 0x%08x\n", le32_to_cpu(fhdr.magic));
@@ -411,9 +424,9 @@ static void ath9k_host_rx_frame(struct ath9k_host_priv *priv,
     }
 
     frame_len = le16_to_cpu(fhdr.frame_len);
-    if (ATH9K_MEDIUM_HDR_SIZE + frame_len > len) {
-        pr_warn(DRV_NAME ": rx: truncated frame (need %u, have %zu)\n",
-                (unsigned)(ATH9K_MEDIUM_HDR_SIZE + frame_len), len);
+    if (hdr_len + frame_len > len) {
+        pr_warn(DRV_NAME ": rx: truncated frame (need %zu, have %zu)\n",
+                hdr_len + frame_len, len);
         return;
     }
 
@@ -432,7 +445,7 @@ static void ath9k_host_rx_frame(struct ath9k_host_priv *priv,
         return;
     }
 
-    skb_put_data(skb, data + ATH9K_MEDIUM_HDR_SIZE, frame_len);
+    skb_put_data(skb, data + hdr_len, frame_len);
 
     /* Fill in rx_status for mac80211 */
     rx_status = IEEE80211_SKB_RXCB(skb);
@@ -609,7 +622,9 @@ static ssize_t ath9k_host_chrdev_write(struct file *filp,
         memcpy(&len_be, kbuf + offset, 4);
         payload_len = ntohl(len_be);
 
-        if (payload_len < ATH9K_MEDIUM_HDR_SIZE ||
+        /* Accept v1 (28-byte) and v2 (40-byte) headers; ath9k_host_rx_frame
+         * detects which from `len` and zeros the missing v2 fields. */
+        if (payload_len < ATH9K_MEDIUM_HDR_SIZE_V1 ||
             payload_len > ATH9K_MEDIUM_HDR_SIZE + ATH9K_MEDIUM_MAX_FRAME) {
             break;  /* bad length — stop parsing */
         }
