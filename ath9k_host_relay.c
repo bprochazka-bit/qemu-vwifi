@@ -33,7 +33,17 @@
 #include "ath9k_medium.h"
 
 #define DEFAULT_CHRDEV  "/dev/" ATH9K_MEDIUM_CHRDEV_NAME
-#define READ_BUF_SIZE   (ATH9K_MEDIUM_MAX_MSG)
+
+/*
+ * The chardev returns a complete wire message per read():
+ *   [4-byte length prefix][header][802.11 frame]
+ * so the buffer must hold the prefix plus the largest possible
+ * payload. Sizing it to ATH9K_MEDIUM_MAX_MSG alone (header + frame)
+ * leaves 4 bytes short, which causes the kernel chrdev_read to return
+ * -EMSGSIZE and kfree_skb a maximum-sized frame -- silent data loss
+ * for jumbo AMSDUs. Same sizing is reused on the hub->chardev path.
+ */
+#define READ_BUF_SIZE   (4 + ATH9K_MEDIUM_MAX_MSG)
 
 static volatile sig_atomic_t g_running = 1;
 
