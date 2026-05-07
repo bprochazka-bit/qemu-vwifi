@@ -674,12 +674,30 @@ static void bind_peer_to_node(int pidx, const char *nid)
 {
     struct node_phys *nd = find_node(nid, true);
     if (!nd) { fprintf(stderr, "hub: node table full\n"); return; }
+
+    /* If this peer was already bound to an auto-named node and is now
+     * being moved to a different node (typically because a HELLO
+     * announced its real id after auto_bind_peer ran), retire the
+     * auto-named placeholder so the node table doesn't accumulate
+     * orphaned "nodeN" entries under reconnect/hello churn. User-named
+     * source nodes are left intact (they may have configured state). */
+    int prev_ni = peer_node[pidx];
+    int new_ni = node_index(nd);
+    if (prev_ni >= 0 && prev_ni != new_ni) {
+        struct node_phys *prev = &nodes[prev_ni];
+        prev->peer_idx = -1;
+        if (prev->auto_named) {
+            prev->active = false;
+            prev->num_macs = 0;
+        }
+    }
+
     if (nd->peer_idx >= 0 && nd->peer_idx != pidx) {
         fprintf(stderr, "hub: node %s: unbinding old peer %d\n", nid, nd->peer_idx);
         peer_node[nd->peer_idx] = -1;
     }
     nd->peer_idx = pidx;
-    peer_node[pidx] = node_index(nd);
+    peer_node[pidx] = new_ni;
     fprintf(stderr, "hub: peer %d -> node '%s'\n", pidx, nid);
 }
 
