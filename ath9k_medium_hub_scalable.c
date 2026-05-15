@@ -239,6 +239,67 @@ static const struct rate_info rate_table[] = {
     { 0xB7, 650.0,  28.0 },
     { 0xB8, 780.0,  31.0 },
     { 0xB9, 866.7,  33.0 },
+
+    /* ---- 802.11ac VHT 160 MHz, single spatial stream ----
+     * Same modulation/coding as VHT80 (same min_snr); double the rate.
+     * Wide channels also incur ~3 dB more noise from the larger band,
+     * but for our use case (low-error simulated medium) we keep
+     * thresholds aligned with VHT80 so rate-control behavior is the
+     * dominant effect. */
+    { 0xC0,  65.0,   5.0 },    /* VHT160 NSS=1 MCS0  */
+    { 0xC1, 130.0,   7.0 },
+    { 0xC2, 195.0,  10.0 },
+    { 0xC3, 260.0,  13.0 },
+    { 0xC4, 390.0,  17.0 },
+    { 0xC5, 520.0,  21.0 },
+    { 0xC6, 585.0,  23.0 },
+    { 0xC7, 650.0,  25.0 },
+    { 0xC8, 780.0,  28.0 },
+    { 0xC9, 866.7,  30.0 },
+
+    /* ---- 802.11ac VHT 160 MHz, two spatial streams ---- */
+    { 0xD0, 130.0,   8.0 },
+    { 0xD1, 260.0,  10.0 },
+    { 0xD2, 390.0,  13.0 },
+    { 0xD3, 520.0,  16.0 },
+    { 0xD4, 780.0,  20.0 },
+    { 0xD5, 1040.0, 24.0 },
+    { 0xD6, 1170.0, 26.0 },
+    { 0xD7, 1300.0, 28.0 },
+    { 0xD8, 1560.0, 31.0 },
+    { 0xD9, 1733.3, 33.0 },
+
+    /* ---- 802.11ax HE-SU 80 MHz, single spatial stream (MCS 0..11) ----
+     * MCS 10/11 add 1024-QAM, which needs substantially higher SNR
+     * than VHT's 256-QAM ceiling. Thresholds for 0..9 mirror VHT80
+     * (HE uses the same modulation/coding for that range); 10/11
+     * follow published 1024-QAM tables (~32/35 dB). */
+    { 0xE0,  36.0,   5.0 },    /* HE80 NSS=1 MCS0  */
+    { 0xE1,  72.1,   7.0 },
+    { 0xE2, 108.1,  10.0 },
+    { 0xE3, 144.1,  13.0 },
+    { 0xE4, 216.2,  17.0 },
+    { 0xE5, 288.2,  21.0 },
+    { 0xE6, 324.3,  23.0 },
+    { 0xE7, 360.3,  25.0 },
+    { 0xE8, 432.4,  28.0 },
+    { 0xE9, 480.4,  30.0 },
+    { 0xEA, 540.4,  32.0 },    /* HE80 NSS=1 MCS10 - 1024QAM 3/4 */
+    { 0xEB, 600.5,  35.0 },    /* HE80 NSS=1 MCS11 - 1024QAM 5/6 */
+
+    /* ---- 802.11ax HE-SU 80 MHz, two spatial streams ---- */
+    { 0xF0,  72.1,   8.0 },
+    { 0xF1, 144.1,  10.0 },
+    { 0xF2, 216.2,  13.0 },
+    { 0xF3, 288.2,  16.0 },
+    { 0xF4, 432.4,  20.0 },
+    { 0xF5, 576.5,  24.0 },
+    { 0xF6, 648.5,  26.0 },
+    { 0xF7, 720.6,  28.0 },
+    { 0xF8, 864.7,  31.0 },
+    { 0xF9, 960.8,  33.0 },
+    { 0xFA, 1080.9, 35.0 },
+    { 0xFB, 1201.0, 38.0 },
 };
 #define NUM_RATES   (int)(sizeof(rate_table) / sizeof(rate_table[0]))
 
