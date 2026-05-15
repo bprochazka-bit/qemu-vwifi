@@ -274,7 +274,77 @@ static struct ieee80211_supported_band ath9k_host_band_5ghz = {
                 (IEEE80211_VHT_MCS_NOT_SUPPORTED  << 14)),
         },
     },
-    /* HE iftype_data populated in subsequent commit. */
+    /* HE iftype_data assigned via .iftype_data / .n_iftype_data below. */
+};
+
+/* -------------------------------------------------------------------
+ *  802.11ax HE capabilities (single interface type: STATION).
+ *
+ *  HE is advertised per-iftype rather than as a single block on the
+ *  band, which is why we attach this through ieee80211_supported_band's
+ *  .iftype_data / .n_iftype_data pointers after struct definition.
+ *  For the simulator we expose HE on STATION mode only -- mac80211
+ *  will use it during association with a HE-capable AP.
+ *
+ *  Capability choices:
+ *    - HE-SU and HE-MU (operating in single-user mode is enough for
+ *      our medium; full MU-MIMO would need per-RU SNR modeling).
+ *    - 80 MHz operation on the 5 GHz band (HE40+ inherits HT40 prims).
+ *    - LDPC, TWT, BSR support flags set so STA-side mac80211 doesn't
+ *      reject the AP's elements during association.
+ *    - rx/tx_mcs_80: MCS 0..11 for NSS=1 and NSS=2 (matches the rate
+ *      table's HE80 codes 0xE0..0xEB / 0xF0..0xFB).
+ *    - 160 MHz and 80+80 MCS maps left as "NOT_SUPPORTED" because
+ *      the rate table doesn't have those bands yet -- advertising
+ *      them would invite mac80211 to pick rates we'd silently
+ *      downgrade. (Future: HE160 entries can be added to mirror
+ *      VHT160, then this can be widened.)
+ * ------------------------------------------------------------------- */
+
+#define HE_MCS_SUPPORT_0_11_MASK_NSS1_NSS2  \
+    ((IEEE80211_HE_MCS_SUPPORT_0_11 << 0) |  /* NSS=1 */ \
+     (IEEE80211_HE_MCS_SUPPORT_0_11 << 2) |  /* NSS=2 */ \
+     (IEEE80211_HE_MCS_NOT_SUPPORTED << 4) | \
+     (IEEE80211_HE_MCS_NOT_SUPPORTED << 6) | \
+     (IEEE80211_HE_MCS_NOT_SUPPORTED << 8) | \
+     (IEEE80211_HE_MCS_NOT_SUPPORTED << 10) | \
+     (IEEE80211_HE_MCS_NOT_SUPPORTED << 12) | \
+     (IEEE80211_HE_MCS_NOT_SUPPORTED << 14))
+
+#define HE_MCS_NOT_SUPPORTED_ALL  \
+    ((IEEE80211_HE_MCS_NOT_SUPPORTED << 0)  | \
+     (IEEE80211_HE_MCS_NOT_SUPPORTED << 2)  | \
+     (IEEE80211_HE_MCS_NOT_SUPPORTED << 4)  | \
+     (IEEE80211_HE_MCS_NOT_SUPPORTED << 6)  | \
+     (IEEE80211_HE_MCS_NOT_SUPPORTED << 8)  | \
+     (IEEE80211_HE_MCS_NOT_SUPPORTED << 10) | \
+     (IEEE80211_HE_MCS_NOT_SUPPORTED << 12) | \
+     (IEEE80211_HE_MCS_NOT_SUPPORTED << 14))
+
+static struct ieee80211_sband_iftype_data ath9k_host_he_5ghz[] = {
+    {
+        .types_mask = BIT(NL80211_IFTYPE_STATION),
+        .he_cap = {
+            .has_he = true,
+            .he_cap_elem = {
+                .mac_cap_info[0] = IEEE80211_HE_MAC_CAP0_HTC_HE,
+                .mac_cap_info[1] = IEEE80211_HE_MAC_CAP1_TF_MAC_PAD_DUR_16US,
+                .phy_cap_info[0] = IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_40MHZ_80MHZ_IN_5G,
+                .phy_cap_info[1] = IEEE80211_HE_PHY_CAP1_LDPC_CODING_IN_PAYLOAD,
+                .phy_cap_info[2] = 0,
+                .phy_cap_info[3] = IEEE80211_HE_PHY_CAP3_DCM_MAX_CONST_TX_NO_DCM |
+                                   IEEE80211_HE_PHY_CAP3_DCM_MAX_CONST_RX_NO_DCM,
+            },
+            .he_mcs_nss_supp = {
+                .rx_mcs_80  = cpu_to_le16(HE_MCS_SUPPORT_0_11_MASK_NSS1_NSS2),
+                .tx_mcs_80  = cpu_to_le16(HE_MCS_SUPPORT_0_11_MASK_NSS1_NSS2),
+                .rx_mcs_160 = cpu_to_le16(HE_MCS_NOT_SUPPORTED_ALL),
+                .tx_mcs_160 = cpu_to_le16(HE_MCS_NOT_SUPPORTED_ALL),
+                .rx_mcs_80p80 = cpu_to_le16(HE_MCS_NOT_SUPPORTED_ALL),
+                .tx_mcs_80p80 = cpu_to_le16(HE_MCS_NOT_SUPPORTED_ALL),
+            },
+        },
+    },
 };
 
 /* -------------------------------------------------------------------
@@ -950,6 +1020,11 @@ static int __init ath9k_host_init(void)
     hw->queues = 4;  /* AC_VO, AC_VI, AC_BE, AC_BK */
 
     hw->wiphy->bands[NL80211_BAND_2GHZ] = &ath9k_host_band_2ghz;
+    /* Attach HE iftype data to the 5 GHz band at runtime; the field
+     * isn't a designated initializer in older kernel headers, so
+     * setting it here keeps the static structs portable. */
+    ath9k_host_band_5ghz.iftype_data   = ath9k_host_he_5ghz;
+    ath9k_host_band_5ghz.n_iftype_data = ARRAY_SIZE(ath9k_host_he_5ghz);
     hw->wiphy->bands[NL80211_BAND_5GHZ] = &ath9k_host_band_5ghz;
 
     hw->wiphy->interface_modes =
