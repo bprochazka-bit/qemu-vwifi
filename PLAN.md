@@ -1,10 +1,10 @@
-# ath9k_phys_bridge.c — Implementation Prompt
+# vwifi-phys-bridge.c — Implementation Prompt
 
-**Task: Implement `ath9k_phys_bridge.c` — a daemon that bridges a physical WiFi interface (in monitor mode) to a virtual wireless medium hub.**
+**Task: Implement `vwifi-phys-bridge.c` — a daemon that bridges a physical WiFi interface (in monitor mode) to a virtual wireless medium hub.**
 
 ## What This Is
 
-The `ath9k_medium_hub` is a fan-out process that connects virtual WiFi devices (QEMU VMs) over Unix domain sockets using a length-prefixed wire protocol. Each peer sends/receives raw 802.11 frames wrapped in a 40-byte medium header.
+The `vwifi-medium` is a fan-out process that connects virtual WiFi devices (QEMU VMs) over Unix domain sockets using a length-prefixed wire protocol. Each peer sends/receives raw 802.11 frames wrapped in a 40-byte medium header.
 
 The bridge daemon connects to this hub as a regular peer, but instead of a virtual radio, it uses a real physical WiFi interface in monitor mode. It:
 - Receives frames from the hub and injects them over the air via the physical radio
@@ -14,12 +14,12 @@ This lets a real laptop connect to a virtual AP running inside a QEMU VM.
 
 ## File Location
 
-Create `/home/user/qemu-vwifi/ath9k_phys_bridge.c`. It `#include`s `"ath9k_medium.h"` which is in the same directory.
+Create `/home/user/qemu-vwifi/vwifi-phys-bridge.c`. It `#include`s `"vwifi.h"` which is in the same directory.
 
 ## Build Command
 
 ```
-gcc -Wall -Wextra -O2 -o ath9k_phys_bridge ath9k_phys_bridge.c
+gcc -Wall -Wextra -O2 -o vwifi-phys-bridge vwifi-phys-bridge.c
 ```
 
 No external dependencies beyond standard POSIX/libc.
@@ -27,7 +27,7 @@ No external dependencies beyond standard POSIX/libc.
 ## CLI
 
 ```
-sudo ./ath9k_phys_bridge <hub-socket-path> <interface> -c <channel> [options]
+sudo ./vwifi-phys-bridge <hub-socket-path> <interface> -c <channel> [options]
   -c <channel>       Required. Channel number (1-14, 36, 40, ...) or freq in MHz.
                      Values ≤200 treated as channel numbers, >200 as MHz.
   -w <bandwidth>     Channel width (default: HT20):
@@ -38,23 +38,23 @@ sudo ./ath9k_phys_bridge <hub-socket-path> <interface> -c <channel> [options]
   -h                 Help
 ```
 
-Example: `sudo ./ath9k_phys_bridge /tmp/ath9k.sock wlx90de801c625f -c 6 -v`
+Example: `sudo ./vwifi-phys-bridge /tmp/vwifi.sock wlx90de801c625f -c 6 -v`
 
-## Wire Protocol (from ath9k_medium.h)
+## Wire Protocol (from vwifi.h)
 
 Every message on the hub Unix socket is length-prefixed:
 
 ```
 [uint32_t length (network byte order)]   <- total bytes following
-[struct ath9k_medium_frame_hdr]          <- 40 bytes
+[struct vwifi_frame_hdr]          <- 40 bytes
 [uint8_t payload[...]]                   <- raw 802.11 frame
 ```
 
 The 40-byte medium header:
 
 ```c
-struct ath9k_medium_frame_hdr {
-    uint32_t    magic;              /* 0x41394B57 "A9KW" */
+struct vwifi_frame_hdr {
+    uint32_t    magic;              /* 0x46495756 "VWIF" */
     uint16_t    version;            /* 2 */
     uint16_t    frame_len;          /* Length of 802.11 frame following this header */
     uint8_t     tx_mac[6];          /* Transmitting device's MAC address */
@@ -77,22 +77,22 @@ All fields are **little-endian** (native x86). Only the 4-byte length prefix is 
 Key constants:
 
 ```c
-#define ATH9K_MEDIUM_MAGIC           0x41394B57
-#define ATH9K_MEDIUM_VERSION         2
-#define ATH9K_MEDIUM_MAX_FRAME_SIZE  8192
-#define ATH9K_MEDIUM_HDR_SIZE        40  /* sizeof(ath9k_medium_frame_hdr) */
-#define ATH9K_MEDIUM_DEFAULT_RSSI    (-30)
-#define ATH9K_MEDIUM_DEFAULT_RATE    0x0B  /* 6 Mbps OFDM */
+#define VWIFI_MAGIC           0x46495756
+#define VWIFI_VERSION         2
+#define VWIFI_MAX_FRAME_SIZE  8192
+#define VWIFI_HDR_SIZE        40  /* sizeof(vwifi_frame_hdr) */
+#define VWIFI_DEFAULT_RSSI    (-30)
+#define VWIFI_DEFAULT_RATE    0x0B  /* 6 Mbps OFDM */
 
 /* Channel flags */
-#define ATH9K_CHAN_FLAG_2GHZ         0x0001
-#define ATH9K_CHAN_FLAG_5GHZ         0x0002
-#define ATH9K_CHAN_FLAG_HT20         0x0004
-#define ATH9K_CHAN_FLAG_HT40PLUS     0x0008
-#define ATH9K_CHAN_FLAG_HT40MINUS    0x0010
-#define ATH9K_CHAN_FLAG_VHT80        0x0020
-#define ATH9K_CHAN_FLAG_VHT160       0x0040
-#define ATH9K_CHAN_FLAG_VHT80_80     0x0080
+#define VWIFI_CHAN_FLAG_2GHZ         0x0001
+#define VWIFI_CHAN_FLAG_5GHZ         0x0002
+#define VWIFI_CHAN_FLAG_HT20         0x0004
+#define VWIFI_CHAN_FLAG_HT40PLUS     0x0008
+#define VWIFI_CHAN_FLAG_HT40MINUS    0x0010
+#define VWIFI_CHAN_FLAG_VHT80        0x0020
+#define VWIFI_CHAN_FLAG_VHT160       0x0040
+#define VWIFI_CHAN_FLAG_VHT80_80     0x0080
 ```
 
 ## Hub Connection
@@ -103,7 +103,7 @@ Immediately after connecting, send a **hello message** to register a node identi
 
 ```
 [uint32_t length (network order)]  <- len of payload below
-[uint32_t 0x41394B52]              <- HELLO_MAGIC "A9KR"
+[uint32_t 0x52495756]              <- HELLO_MAGIC "VWIR"
 [node_id string, null-terminated]
 ```
 
@@ -178,10 +178,10 @@ If FLAGS indicates FCS present, strip the last 4 bytes from the 802.11 frame bef
 
 ### Rate code mapping table
 
-The medium protocol uses ath9k rate codes. Radiotap uses 500kbps units. Bidirectional mapping:
+The medium protocol uses legacy rate codes. Radiotap uses 500kbps units. Bidirectional mapping:
 
 ```c
-/* radiotap 500kbps <-> ath9k rate_code */
+/* radiotap 500kbps <-> legacy rate_code */
 static const struct { uint8_t rt_rate; uint8_t ath_code; } rate_map[] = {
     {  2, 0x1B },  /*  1   Mbps CCK */
     {  4, 0x1A },  /*  2   Mbps CCK */
@@ -226,7 +226,7 @@ Based on `-w` flag, compute the channel fields for the medium header AND the fre
 | VHT160 | band + VHT160 | 0 | center of 160MHz block | 0 | 8 channels in block |
 | VHT80+80 | band + VHT80_80 | 0 | center1 | from -s flag | 4+4 channels |
 
-Band flag: `ATH9K_CHAN_FLAG_2GHZ` if freq < 5000, else `ATH9K_CHAN_FLAG_5GHZ`.
+Band flag: `VWIFI_CHAN_FLAG_2GHZ` if freq < 5000, else `VWIFI_CHAN_FLAG_5GHZ`.
 
 For VHT80: the 80MHz blocks in 5GHz are: {36,40,44,48}, {52,56,60,64}, {100,104,108,112}, {116,120,124,128}, {132,136,140,144}, {149,153,157,161}. center_freq1 is the center of whichever block contains the primary channel. Store `freq_lo` and `freq_hi` (lowest and highest 20MHz channel center freq in the block) for filter matching.
 
@@ -235,7 +235,7 @@ For VHT160: pairs of adjacent 80MHz blocks.
 ## Hub-to-Physical Path
 
 1. Reassemble a complete length-prefixed message from the hub stream socket
-2. Validate: payload_len >= 28 (v1 min header), magic == 0x41394B57
+2. Validate: payload_len >= 28 (v1 min header), magic == 0x46495756
 3. Extract `channel_freq` from offset 28-29 of payload (little-endian u16). If payload is <30 bytes (v1), treat as channel_freq=0.
 4. **Channel filter**: accept if `channel_freq == 0` OR `channel_freq` falls within `[freq_lo, freq_hi]` of the bridge's configured bandwidth range
 5. Extract the 802.11 frame: `payload + 40` for v2 headers (or `payload + 28` for v1, but v1 is unlikely)
@@ -253,8 +253,8 @@ For VHT160: pairs of adjacent 80MHz blocks.
 6. Minimum frame size check: need at least 10 bytes (FC + dur + addr1)
 7. **Echo check**: compute hash, check ring, drop if echo (see below)
 8. Extract tx_mac from 802.11 header: Address 2 (transmitter) at offset 10-15 of the 802.11 frame. For control frames that lack addr2, skip forwarding.
-9. Build `ath9k_medium_frame_hdr`:
-   - magic = `0x41394B57`
+9. Build `vwifi_frame_hdr`:
+   - magic = `0x46495756`
    - version = 2
    - frame_len = length of 802.11 frame
    - tx_mac = addr2 from 802.11 header
@@ -369,7 +369,7 @@ static void handle_hub_data(void) {
 ## Style
 
 - Single-file C, no external deps
-- Follow the patterns in `ath9k_host_relay.c` for code style (same project)
+- Follow the patterns in `vwifi-host-relay.c` for code style (same project)
 - Use `fprintf(stderr, "bridge: ...")` for all logging
 - Verbose logging (`-v` flag) for per-frame messages; always log startup/shutdown/errors
 - `static` for all file-scope functions and variables

@@ -1,6 +1,6 @@
-# ath9k_phys_bridge.c — Implementation Steps
+# vwifi-phys-bridge.c — Implementation Steps
 
-Incremental build plan. Each step adds to `ath9k_phys_bridge.c` and should
+Incremental build plan. Each step adds to `vwifi-phys-bridge.c` and should
 compile cleanly before moving to the next.
 
 ## Step 1: Scaffolding + CLI parsing
@@ -8,7 +8,7 @@ compile cleanly before moving to the next.
 - Includes: `<stdio.h>`, `<stdlib.h>`, `<string.h>`, `<unistd.h>`, `<errno.h>`,
   `<signal.h>`, `<poll.h>`, `<getopt.h>`, `<stdint.h>`, `<time.h>`,
   `<net/if.h>`, `<sys/socket.h>`, `<sys/un.h>`, `<arpa/inet.h>`,
-  `<linux/if_packet.h>`, `<linux/if_ether.h>`, `"ath9k_medium.h"`
+  `<linux/if_packet.h>`, `<linux/if_ether.h>`, `"vwifi.h"`
 - Global config struct holding: hub socket path, interface name, channel,
   bandwidth mode string, center2 MHz, node ID, verbose flag
 - Bandwidth channel state struct: `channel_freq`, `channel_flags`,
@@ -20,7 +20,7 @@ compile cleanly before moving to the next.
 - Validate required args (hub path, interface, `-c`), print config, return 0
 - Stub `// TODO` comments for where later steps plug in
 
-**Compile test**: `gcc -Wall -Wextra -O2 -o ath9k_phys_bridge ath9k_phys_bridge.c`
+**Compile test**: `gcc -Wall -Wextra -O2 -o vwifi-phys-bridge vwifi-phys-bridge.c`
 
 ## Step 2: Channel/frequency helpers
 
@@ -34,7 +34,7 @@ compile cleanly before moving to the next.
 
 ## Step 3: Rate mapping helpers
 
-- Rate map table: radiotap 500kbps units <-> ath9k rate codes (12 entries)
+- Rate map table: radiotap 500kbps units <-> legacy rate codes (12 entries)
 - `rt_rate_to_ath(uint8_t rt)` — lookup, default 0x0B
 - `ath_rate_to_rt(uint8_t ath)` — lookup, default 12
 
@@ -52,7 +52,7 @@ compile cleanly before moving to the next.
 
 - `connect_hub(path)` — `AF_UNIX SOCK_STREAM` connect
 - `send_hello(fd, node_id)` — build and send hello message:
-  `[uint32_t len][uint32_t 0x41394B52][node_id\0]`
+  `[uint32_t len][uint32_t 0x52495756][node_id\0]`
 - `write_all(fd, buf, len)` — write with EINTR retry
 - Wire into `main()`: connect, send hello, print status
 
@@ -76,7 +76,7 @@ compile cleanly before moving to the next.
 ## Step 8: Hub-to-physical path
 
 - `process_hub_message(payload, payload_len)`:
-  1. Validate: len >= 28, magic == 0x41394B57
+  1. Validate: len >= 28, magic == 0x46495756
   2. Extract channel_freq from header
   3. Channel filter: accept if freq==0 or within [freq_lo, freq_hi]
   4. Extract 802.11 frame (payload + 40 for v2)
@@ -96,7 +96,7 @@ compile cleanly before moving to the next.
   5. Min frame size check (10 bytes)
   6. Echo check — drop if echo
   7. Extract tx_mac (addr2 at offset 10); skip control frames without addr2
-  8. Build `ath9k_medium_frame_hdr` with all fields
+  8. Build `vwifi_frame_hdr` with all fields
   9. Send: `[htonl(40+frame_len)][header][frame]`
   10. Increment `phys_to_hub` counter
 

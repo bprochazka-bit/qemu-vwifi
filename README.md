@@ -1,6 +1,6 @@
-# ath9k_medium_host — Host-Side Virtual Wireless Interface
+# vwifi_host — Host-Side Virtual Wireless Interface
 
-A Linux kernel module and userspace relay daemon that puts the host machine on the same virtual wireless medium as QEMU guests running ath9k-virt devices.
+A Linux kernel module and userspace relay daemon that puts the host machine on the same virtual wireless medium as QEMU guests running vwifi-virt devices.
 
 ## Architecture
 
@@ -11,13 +11,13 @@ A Linux kernel module and userspace relay daemon that puts the host machine on t
  │         │                                                    │
  │     mac80211  (wlanX)                                        │
  │         │                                                    │
- │   ath9k_medium_host.ko        ← kernel module                │
- │         │  /dev/ath9k_medium                                 │
- │   ath9k_host_relay            ← userspace daemon             │
+ │   vwifi_host.ko        ← kernel module                │
+ │         │  /dev/vwifi                                 │
+ │   vwifi-host-relay            ← userspace daemon             │
  │         │                                                    │
  └─────────┼────────────────────────────────────────────────────┘
            │  unix socket
-   ath9k_medium_hub              ← shared medium process
+   vwifi-medium              ← shared medium process
            │
     ┌──────┼──────┐
     │      │      │
@@ -31,9 +31,9 @@ The host's `wlanX` interface is a full mac80211 radio — it supports hostapd (A
 
 | File | Description |
 |------|-------------|
-| `ath9k_medium.h` | Shared wire protocol header (kernel + userspace) |
-| `ath9k_medium_host.c` | Kernel module — mac80211 radio + char device |
-| `ath9k_host_relay.c` | Userspace daemon — bridges chardev ↔ hub socket |
+| `vwifi.h` | Shared wire protocol header (kernel + userspace) |
+| `vwifi_host.c` | Kernel module — mac80211 radio + char device |
+| `vwifi-host-relay.c` | Userspace daemon — bridges chardev ↔ hub socket |
 | `Makefile` | Kernel module build system |
 
 ## Building
@@ -49,7 +49,7 @@ sudo apt install linux-headers-$(uname -r)
 # Build
 make
 
-# The module is: ath9k_medium_host.ko
+# The module is: vwifi_host.ko
 ```
 
 To build against a different kernel:
@@ -61,7 +61,7 @@ make KDIR=/path/to/kernel/source
 ### Relay Daemon
 
 ```bash
-gcc -Wall -O2 -o ath9k_host_relay ath9k_host_relay.c
+gcc -Wall -O2 -o vwifi-host-relay vwifi-host-relay.c
 ```
 
 No dependencies beyond standard POSIX/libc.
@@ -71,33 +71,33 @@ No dependencies beyond standard POSIX/libc.
 ### Step 1: Start the Hub
 
 ```bash
-./ath9k_medium_hub /tmp/ath9k.sock
+./vwifi-medium /tmp/vwifi.sock
 ```
 
 ### Step 2: Load the Kernel Module
 
 ```bash
-sudo insmod ath9k_medium_host.ko
+sudo insmod vwifi_host.ko
 # or with a custom MAC address:
-sudo insmod ath9k_medium_host.ko macaddr=00:03:7F:CC:DD:02
+sudo insmod vwifi_host.ko macaddr=00:03:7F:CC:DD:02
 ```
 
 This creates:
 - A new `wlanX` interface visible in `iw dev`
-- A char device at `/dev/ath9k_medium`
+- A char device at `/dev/vwifi`
 
 ### Step 3: Start the Relay Daemon
 
 ```bash
-sudo ./ath9k_host_relay /tmp/ath9k.sock
+sudo ./vwifi-host-relay /tmp/vwifi.sock
 ```
 
-The relay bridges `/dev/ath9k_medium` to the hub's unix socket. It logs to stderr:
+The relay bridges `/dev/vwifi` to the hub's unix socket. It logs to stderr:
 
 ```
-relay: chardev /dev/ath9k_medium opened (fd=3)
-relay: connected to hub /tmp/ath9k.sock (fd=4)
-relay: bridging /dev/ath9k_medium ↔ /tmp/ath9k.sock
+relay: chardev /dev/vwifi opened (fd=3)
+relay: connected to hub /tmp/vwifi.sock (fd=4)
+relay: bridging /dev/vwifi ↔ /tmp/vwifi.sock
 ```
 
 ### Step 4: Start QEMU VMs
@@ -105,8 +105,8 @@ relay: bridging /dev/ath9k_medium ↔ /tmp/ath9k.sock
 ```bash
 qemu-system-x86_64 -machine q35 -m 512 \
   -drive file=vm.qcow2,format=qcow2 \
-  -chardev socket,id=medium,path=/tmp/ath9k.sock,server=off \
-  -device ath9k-virt,chardev=medium \
+  -chardev socket,id=medium,path=/tmp/vwifi.sock,server=off \
+  -device vwifi-virt,chardev=medium \
   -nographic
 ```
 
@@ -153,14 +153,14 @@ The hub already supports TCP bridging between hosts. The kernel module and relay
 
 ```
 Host A:
-  ath9k_medium_hub /tmp/a.sock -t 5550
-  insmod ath9k_medium_host.ko
-  ./ath9k_host_relay /tmp/a.sock
+  vwifi-medium /tmp/a.sock -t 5550
+  insmod vwifi_host.ko
+  ./vwifi-host-relay /tmp/a.sock
 
 Host B:
-  ath9k_medium_hub /tmp/b.sock -u hostA:5550
-  insmod ath9k_medium_host.ko macaddr=00:03:7F:CC:DD:02
-  ./ath9k_host_relay /tmp/b.sock
+  vwifi-medium /tmp/b.sock -u hostA:5550
+  insmod vwifi_host.ko macaddr=00:03:7F:CC:DD:02
+  ./vwifi-host-relay /tmp/b.sock
 ```
 
 Now `wlanX` on Host A, `wlanX` on Host B, and all QEMU VMs on both hosts share the same wireless medium.
@@ -171,20 +171,20 @@ Now `wlanX` on Host A, `wlanX` on Host B, and all QEMU VMs on both hosts share t
 
 1. Application sends data through the `wlanX` interface
 2. mac80211 builds an 802.11 frame and calls our `.tx` callback
-3. The module wraps the frame in an `ath9k_medium_frame_hdr` with the wire protocol length prefix
+3. The module wraps the frame in an `vwifi_frame_hdr` with the wire protocol length prefix
 4. The frame is queued in the module's TX skb queue
-5. The relay daemon's `poll()` wakes up, `read()`s the frame from `/dev/ath9k_medium`
+5. The relay daemon's `poll()` wakes up, `read()`s the frame from `/dev/vwifi`
 6. The relay `write()`s the frame to the hub's unix socket
 7. The hub fans it out to all connected QEMU instances
-8. Each QEMU ath9k-virt device injects the frame into the guest's RX DMA path
+8. Each QEMU vwifi-virt device injects the frame into the guest's RX DMA path
 
 ### RX Path (VMs → host)
 
-1. QEMU ath9k-virt extracts an 802.11 frame from the guest's TX DMA
+1. QEMU vwifi-virt extracts an 802.11 frame from the guest's TX DMA
 2. The frame is sent to the hub via unix socket
 3. The hub fans it out, including to the relay daemon's connection
 4. The relay `read()`s the frame from the hub socket
-5. The relay `write()`s the frame to `/dev/ath9k_medium`
+5. The relay `write()`s the frame to `/dev/vwifi`
 6. The module's chardev write handler parses the wire protocol
 7. The module calls `ieee80211_rx_irqsafe()` to inject the frame into mac80211
 8. mac80211 delivers the frame to hostapd/wpa_supplicant/application
@@ -199,31 +199,31 @@ The module compares each received frame's `tx_mac` against its own MAC address a
 
 ## Troubleshooting
 
-### "No such device" when opening /dev/ath9k_medium
+### "No such device" when opening /dev/vwifi
 
 The module isn't loaded:
 ```bash
-sudo insmod ath9k_medium_host.ko
-ls -la /dev/ath9k_medium
+sudo insmod vwifi_host.ko
+ls -la /dev/vwifi
 ```
 
 ### "Device or resource busy" from relay
 
 Only one relay daemon can connect at a time. Check for stale processes:
 ```bash
-ps aux | grep ath9k_host_relay
+ps aux | grep vwifi-host-relay
 ```
 
 ### No wlanX interface after loading module
 
 Check dmesg for errors:
 ```bash
-dmesg | grep ath9k_medium_host
+dmesg | grep vwifi_host
 ```
 
 You should see:
 ```
-ath9k_medium_host v1.0: registered — MAC 00:03:7f:cc:dd:01, chardev /dev/ath9k_medium
+vwifi_host v1.0: registered — MAC 00:03:7f:cc:dd:01, chardev /dev/vwifi
 ```
 
 If mac80211 registration fails, ensure the `mac80211` module is loaded:
@@ -247,13 +247,13 @@ sudo modprobe mac80211
 
 ```bash
 # Stop the relay first
-kill $(pidof ath9k_host_relay)
+kill $(pidof vwifi-host-relay)
 
 # Bring down the interface
 sudo ip link set wlan0 down
 
 # Remove the module
-sudo rmmod ath9k_medium_host
+sudo rmmod vwifi_host
 ```
 
 ## Limitations

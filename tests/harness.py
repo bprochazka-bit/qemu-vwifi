@@ -32,7 +32,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 # =====================================================================
-# Wire-format helpers (must match ath9k_medium.h)
+# Wire-format helpers (must match vwifi.h)
 # =====================================================================
 VWIFI_MAGIC = 0x46495756   # "VWIF"
 HDR_V2_FMT  = '<I H H 6s B b I I I H H H H H 2s'  # 40 bytes

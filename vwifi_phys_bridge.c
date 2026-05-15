@@ -386,7 +386,7 @@ static int echo_check(const uint8_t *frame, size_t len)
  *  Step 5: hub connection + hello
  * ================================================================ */
 
-#define HELLO_MAGIC 0x41394B52  /* "A9KR" */
+#define HELLO_MAGIC 0x52495756  /* "VWIR" -- vwifi registration */
 
 /*
  * Write all bytes to fd, retrying on EINTR.

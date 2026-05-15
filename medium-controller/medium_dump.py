@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-medium_dump.py — Tap into the ath9k virtual medium hub and dump frames.
+medium_dump.py — Tap into the vwifi virtual medium hub and dump frames.
 
 Connects to the hub as a regular client and prints hex dumps of all
 frames seen on the medium. Optionally writes a pcap file with proper
@@ -29,7 +29,7 @@ import sys
 import time
 import os
 
-MAGIC = 0x41394B57  # "A9KW"
+MAGIC = 0x46495756  # "VWIF"
 HDR_SIZE_V1 = 28
 HDR_SIZE_V2 = 40
 
@@ -83,7 +83,7 @@ PCAP_SNAPLEN     = 65535
 PCAP_LINKTYPE_RADIOTAP = 127
 
 # Rate code to Mbps*2 mapping (for radiotap rate field, in 500kbps units)
-# These are the ath9k OFDM/CCK rate codes
+# These are the legacy OFDM/CCK rate codes
 RATE_CODE_TO_500KBPS = {
     # OFDM rates
     0x0B: 12,   # 6 Mbps
@@ -255,10 +255,10 @@ def main():
         print("                  (with radiotap headers for Wireshark)")
         print()
         print("Examples:")
-        print(f"  {sys.argv[0]} /tmp/ath9k.sock")
-        print(f"  {sys.argv[0]} /tmp/ath9k.sock -v")
-        print(f"  {sys.argv[0]} /tmp/ath9k.sock -w capture.pcap")
-        print(f"  {sys.argv[0]} /tmp/ath9k.sock -w capture.pcap -v")
+        print(f"  {sys.argv[0]} /tmp/vwifi.sock")
+        print(f"  {sys.argv[0]} /tmp/vwifi.sock -v")
+        print(f"  {sys.argv[0]} /tmp/vwifi.sock -w capture.pcap")
+        print(f"  {sys.argv[0]} /tmp/vwifi.sock -w capture.pcap -v")
         sys.exit(1)
 
     sock_path = sys.argv[1]
