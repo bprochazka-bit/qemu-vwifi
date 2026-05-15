@@ -155,15 +155,82 @@ static struct ieee80211_supported_band ath9k_host_band_2ghz = {
         .cap            = IEEE80211_HT_CAP_SUP_WIDTH_20_40 |
                           IEEE80211_HT_CAP_SGI_20 |
                           IEEE80211_HT_CAP_SGI_40 |
-                          IEEE80211_HT_CAP_DSSSCCK40,
+                          IEEE80211_HT_CAP_DSSSCCK40 |
+                          IEEE80211_HT_CAP_RX_STBC |
+                          IEEE80211_HT_CAP_TX_STBC,
         .ampdu_factor   = IEEE80211_HT_MAX_AMPDU_64K,
         .ampdu_density  = IEEE80211_HT_MPDU_DENSITY_8,
         .mcs = {
-            .rx_mask    = { 0xFF, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
-            .rx_highest = cpu_to_le16(72),
+            /* NSS=1 (MCS 0..7) AND NSS=2 (MCS 8..15) supported. */
+            .rx_mask    = { 0xFF, 0xFF, 0, 0, 0, 0, 0, 0, 0, 0 },
+            .rx_highest = cpu_to_le16(144),     /* MCS15 HT20 SGI */
             .tx_params  = IEEE80211_HT_MCS_TX_DEFINED,
         },
     },
+};
+
+/* -------------------------------------------------------------------
+ *  5 GHz band definition (for VHT / HE support)
+ *
+ *  We declare a representative slice of the U-NII bands that are
+ *  channel-bondable for VHT80/160: U-NII-1, U-NII-2A, and U-NII-3.
+ *  This is enough for mac80211 to allow association on VHT/HE-capable
+ *  channels without claiming DFS-restricted channels we don't model.
+ * ------------------------------------------------------------------- */
+
+/* OFDM rates for 5 GHz (no CCK). */
+static struct ieee80211_rate ath9k_host_rates_5ghz[] = {
+    { .bitrate = 60,  .hw_value = 0x0B },
+    { .bitrate = 90,  .hw_value = 0x0F },
+    { .bitrate = 120, .hw_value = 0x0A },
+    { .bitrate = 180, .hw_value = 0x0E },
+    { .bitrate = 240, .hw_value = 0x09 },
+    { .bitrate = 360, .hw_value = 0x0D },
+    { .bitrate = 480, .hw_value = 0x08 },
+    { .bitrate = 540, .hw_value = 0x0C },
+};
+
+static struct ieee80211_channel ath9k_host_channels_5ghz[] = {
+    /* U-NII-1 (5150-5250 MHz) */
+    { .band = NL80211_BAND_5GHZ, .center_freq = 5180, .hw_value = 36 },
+    { .band = NL80211_BAND_5GHZ, .center_freq = 5200, .hw_value = 40 },
+    { .band = NL80211_BAND_5GHZ, .center_freq = 5220, .hw_value = 44 },
+    { .band = NL80211_BAND_5GHZ, .center_freq = 5240, .hw_value = 48 },
+    /* U-NII-2A (5250-5350 MHz) */
+    { .band = NL80211_BAND_5GHZ, .center_freq = 5260, .hw_value = 52 },
+    { .band = NL80211_BAND_5GHZ, .center_freq = 5280, .hw_value = 56 },
+    { .band = NL80211_BAND_5GHZ, .center_freq = 5300, .hw_value = 60 },
+    { .band = NL80211_BAND_5GHZ, .center_freq = 5320, .hw_value = 64 },
+    /* U-NII-3 (5725-5825 MHz) */
+    { .band = NL80211_BAND_5GHZ, .center_freq = 5745, .hw_value = 149 },
+    { .band = NL80211_BAND_5GHZ, .center_freq = 5765, .hw_value = 153 },
+    { .band = NL80211_BAND_5GHZ, .center_freq = 5785, .hw_value = 157 },
+    { .band = NL80211_BAND_5GHZ, .center_freq = 5805, .hw_value = 161 },
+    { .band = NL80211_BAND_5GHZ, .center_freq = 5825, .hw_value = 165 },
+};
+
+static struct ieee80211_supported_band ath9k_host_band_5ghz = {
+    .band       = NL80211_BAND_5GHZ,
+    .channels   = ath9k_host_channels_5ghz,
+    .n_channels = ARRAY_SIZE(ath9k_host_channels_5ghz),
+    .bitrates   = ath9k_host_rates_5ghz,
+    .n_bitrates = ARRAY_SIZE(ath9k_host_rates_5ghz),
+    .ht_cap     = {
+        .ht_supported   = true,
+        .cap            = IEEE80211_HT_CAP_SUP_WIDTH_20_40 |
+                          IEEE80211_HT_CAP_SGI_20 |
+                          IEEE80211_HT_CAP_SGI_40 |
+                          IEEE80211_HT_CAP_RX_STBC |
+                          IEEE80211_HT_CAP_TX_STBC,
+        .ampdu_factor   = IEEE80211_HT_MAX_AMPDU_64K,
+        .ampdu_density  = IEEE80211_HT_MPDU_DENSITY_8,
+        .mcs = {
+            .rx_mask    = { 0xFF, 0xFF, 0, 0, 0, 0, 0, 0, 0, 0 },
+            .rx_highest = cpu_to_le16(144),
+            .tx_params  = IEEE80211_HT_MCS_TX_DEFINED,
+        },
+    },
+    /* .vht_cap and HE iftype_data populated in subsequent commits. */
 };
 
 /* -------------------------------------------------------------------
@@ -839,6 +906,7 @@ static int __init ath9k_host_init(void)
     hw->queues = 4;  /* AC_VO, AC_VI, AC_BE, AC_BK */
 
     hw->wiphy->bands[NL80211_BAND_2GHZ] = &ath9k_host_band_2ghz;
+    hw->wiphy->bands[NL80211_BAND_5GHZ] = &ath9k_host_band_5ghz;
 
     hw->wiphy->interface_modes =
         BIT(NL80211_IFTYPE_STATION) |
