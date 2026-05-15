@@ -182,7 +182,7 @@ The medium protocol uses legacy rate codes. Radiotap uses 500kbps units. Bidirec
 
 ```c
 /* radiotap 500kbps <-> legacy rate_code */
-static const struct { uint8_t rt_rate; uint8_t ath_code; } rate_map[] = {
+static const struct { uint8_t rt_rate; uint8_t code; } rate_map[] = {
     {  2, 0x1B },  /*  1   Mbps CCK */
     {  4, 0x1A },  /*  2   Mbps CCK */
     { 11, 0x19 },  /*  5.5 Mbps CCK */
@@ -198,7 +198,7 @@ static const struct { uint8_t rt_rate; uint8_t ath_code; } rate_map[] = {
 };
 ```
 
-Write two helper functions: `rt_rate_to_ath(uint8_t rt) -> uint8_t` and `ath_rate_to_rt(uint8_t ath) -> uint8_t`, with 0x0B/12 as defaults for unknown codes.
+Write a helper function `rt_rate_to_code(uint8_t rt) -> uint8_t` with 0x0B as the default for unknown codes. The reverse direction (medium -> radiotap) is currently unused; the inject path builds a fixed-rate radiotap header.
 
 ## Channel/Bandwidth Configuration
 

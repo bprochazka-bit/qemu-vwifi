@@ -35,8 +35,7 @@ compile cleanly before moving to the next.
 ## Step 3: Rate mapping helpers
 
 - Rate map table: radiotap 500kbps units <-> legacy rate codes (12 entries)
-- `rt_rate_to_ath(uint8_t rt)` — lookup, default 0x0B
-- `ath_rate_to_rt(uint8_t ath)` — lookup, default 12
+- `rt_rate_to_code(uint8_t rt)` — lookup, default 0x0B
 
 ## Step 4: Echo suppression
 

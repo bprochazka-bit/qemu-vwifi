@@ -269,10 +269,16 @@ static int compute_channel_config(void)
  *  Step 3: rate mapping helpers
  * ================================================================ */
 
-/* Radiotap uses 500 kbps units; medium protocol uses legacy rate codes */
+/* Radiotap uses 500 kbps units; the vwifi medium protocol uses the
+ * legacy PLCP rate codes from vwifi.h. This table maps between the
+ * two for the receive path (radiotap -> medium). The reverse
+ * direction (medium -> radiotap) is currently unused: the injection
+ * path builds a fixed-rate radiotap header rather than echoing the
+ * incoming rate. If/when we want to honor per-frame rates on the
+ * inject side, add the reverse helper back. */
 static const struct {
-    uint8_t rt_rate;    /* radiotap 500kbps */
-    uint8_t ath_code;   /* legacy rate code */
+    uint8_t rt_rate;        /* radiotap 500kbps units */
+    uint8_t code;           /* medium PLCP rate code */
 } rate_map[] = {
     {   2, 0x1B },  /*  1   Mbps CCK  */
     {   4, 0x1A },  /*  2   Mbps CCK  */
@@ -289,24 +295,14 @@ static const struct {
 };
 #define NUM_RATES (sizeof(rate_map) / sizeof(rate_map[0]))
 
-/* Convert radiotap rate (500kbps units) to legacy rate code */
-static uint8_t rt_rate_to_ath(uint8_t rt)
+/* Convert a radiotap rate (500 kbps units) to a vwifi medium rate code. */
+static uint8_t rt_rate_to_code(uint8_t rt)
 {
     for (size_t i = 0; i < NUM_RATES; i++) {
         if (rate_map[i].rt_rate == rt)
-            return rate_map[i].ath_code;
+            return rate_map[i].code;
     }
     return VWIFI_DEFAULT_RATE;  /* 6 Mbps OFDM */
-}
-
-/* Convert legacy rate code to radiotap rate (500kbps units) */
-static uint8_t ath_rate_to_rt(uint8_t ath)
-{
-    for (size_t i = 0; i < NUM_RATES; i++) {
-        if (rate_map[i].ath_code == ath)
-            return rate_map[i].rt_rate;
-    }
-    return 12;  /* 6 Mbps OFDM in 500kbps units */
 }
 
 /* ================================================================
@@ -893,7 +889,7 @@ static void handle_phys_data(void)
 
     /* Rate */
     hdr.rate_code = rt_info.has_rate
-                  ? rt_rate_to_ath(rt_info.rate)
+                  ? rt_rate_to_code(rt_info.rate)
                   : VWIFI_DEFAULT_RATE;
 
     /* RSSI */
