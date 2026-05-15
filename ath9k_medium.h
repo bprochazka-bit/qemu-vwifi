@@ -135,6 +135,59 @@ struct ath9k_medium_frame_hdr {
 #define ATH9K_CHAN_FLAG_VHT80        0x0020  /* VHT 80 MHz */
 #define ATH9K_CHAN_FLAG_VHT160       0x0040  /* VHT 160 MHz */
 #define ATH9K_CHAN_FLAG_VHT80_80     0x0080  /* VHT 80+80 MHz */
+#define ATH9K_CHAN_FLAG_HE20         0x0100  /* HE20 */
+#define ATH9K_CHAN_FLAG_HE40         0x0200  /* HE40 */
+#define ATH9K_CHAN_FLAG_HE80         0x0400  /* HE80 */
+#define ATH9K_CHAN_FLAG_HE160        0x0800  /* HE160 */
+#define ATH9K_CHAN_FLAG_HE80_80      0x1000  /* HE 80+80 */
+
+/* Convenience masks used by the hub's wide-channel filter logic. */
+#define ATH9K_CHAN_FLAG_WIDE80_MASK  \
+    (ATH9K_CHAN_FLAG_VHT80 | ATH9K_CHAN_FLAG_HE80)
+#define ATH9K_CHAN_FLAG_WIDE160_MASK \
+    (ATH9K_CHAN_FLAG_VHT160 | ATH9K_CHAN_FLAG_HE160)
+#define ATH9K_CHAN_FLAG_WIDE80_80_MASK \
+    (ATH9K_CHAN_FLAG_VHT80_80 | ATH9K_CHAN_FLAG_HE80_80)
+#define ATH9K_CHAN_FLAG_NEEDS_CENTER1 \
+    (ATH9K_CHAN_FLAG_WIDE80_MASK | ATH9K_CHAN_FLAG_WIDE160_MASK | \
+     ATH9K_CHAN_FLAG_WIDE80_80_MASK)
+#define ATH9K_CHAN_FLAG_NEEDS_CENTER2 \
+    ATH9K_CHAN_FLAG_WIDE80_80_MASK
+
+/* ================================================================
+ *  Rate-code namespace (one byte, internal to the medium)
+ *
+ *    0x00..0x1F   Legacy OFDM (802.11a/g) and CCK (802.11b)
+ *    0x80..0x87   HT20  NSS=1  MCS 0..7
+ *    0x88..0x8F   HT20  NSS=2  MCS 0..7    (i.e. MCS 8..15)
+ *    0x90..0x97   HT40  NSS=1  MCS 0..7
+ *    0x98..0x9F   HT40  NSS=2  MCS 0..7    (i.e. MCS 8..15)
+ *    0xA0..0xA9   VHT80 NSS=1  MCS 0..9
+ *    0xB0..0xB9   VHT80 NSS=2  MCS 0..9
+ *    0xC0..0xC9   VHT160 NSS=1 MCS 0..9
+ *    0xD0..0xD9   VHT160 NSS=2 MCS 0..9
+ *    0xE0..0xEB   HE-SU 80  NSS=1 MCS 0..11
+ *    0xF0..0xFB   HE-SU 80  NSS=2 MCS 0..11
+ *
+ *  The driver translates mac80211's tx_info->control.rates[0] (HT/VHT
+ *  MCS hint with NSS in the upper nibble of .idx) into one of these
+ *  codes; the hub uses the code to look up min_snr for the FER model.
+ *  HE rate codes are reachable via direct medium injection today --
+ *  mac80211 doesn't surface a clean per-frame HE MCS hint to drivers
+ *  in tx_info, so HE traffic from a real VM lands as VHT codes after
+ *  rate-control falls back through its MCS hierarchy.
+ * ================================================================ */
+#define ATH9K_RC_LEGACY_BASE    0x00
+#define ATH9K_RC_HT20_NSS1_BASE 0x80
+#define ATH9K_RC_HT20_NSS2_BASE 0x88
+#define ATH9K_RC_HT40_NSS1_BASE 0x90
+#define ATH9K_RC_HT40_NSS2_BASE 0x98
+#define ATH9K_RC_VHT80_NSS1_BASE  0xA0
+#define ATH9K_RC_VHT80_NSS2_BASE  0xB0
+#define ATH9K_RC_VHT160_NSS1_BASE 0xC0
+#define ATH9K_RC_VHT160_NSS2_BASE 0xD0
+#define ATH9K_RC_HE80_NSS1_BASE   0xE0
+#define ATH9K_RC_HE80_NSS2_BASE   0xF0
 
 /* ================================================================
  *  Channel bonding virtual channel
