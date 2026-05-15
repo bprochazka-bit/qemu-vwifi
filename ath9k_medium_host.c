@@ -62,9 +62,16 @@ MODULE_PARM_DESC(macaddr, "MAC address for the virtual radio (default: 00:03:7F:
 struct ath9k_host_priv {
     struct ieee80211_hw     *hw;
 
-    /* Current operating state */
+    /* Current operating state. The wide-channel fields mirror what
+     * the hub-side filter consumes (ath9k_medium.h channel_* layout);
+     * .tx copies them into every outgoing frame so the hub can match
+     * VHT80/HE80 peers by center frequency, not just primary. */
     bool                    started;
-    int                     channel_freq;       /* MHz */
+    int                     channel_freq;       /* MHz, primary 20 */
+    u16                     channel_bond_freq;  /* MHz, HT40 secondary, 0=HT20 */
+    u16                     channel_flags;      /* ATH9K_CHAN_FLAG_* */
+    u16                     center_freq1;       /* VHT/HE primary segment center */
+    u16                     center_freq2;       /* VHT80+80 secondary segment center */
     enum nl80211_band       channel_band;
     u8                      mac_addr[ETH_ALEN];
 
@@ -398,23 +405,111 @@ static void ath9k_host_tx(struct ieee80211_hw *hw,
         return;
     }
 
-    /* Extract rate code from tx_info if available */
-    if (tx_info->control.rates[0].idx >= 0 &&
-        tx_info->control.rates[0].idx < ARRAY_SIZE(ath9k_host_rates_2ghz)) {
-        rate_code = ath9k_host_rates_2ghz[tx_info->control.rates[0].idx].hw_value;
+    /*
+     * Translate mac80211's rate hint into our medium rate-code
+     * namespace (see ath9k_medium.h for the layout).
+     *
+     *   - IEEE80211_TX_RC_VHT_MCS: rate.idx packs (MCS in low 4 bits,
+     *     NSS-1 in upper bits). Width comes from the *_MHZ_WIDTH flags.
+     *   - IEEE80211_TX_RC_MCS: rate.idx is a flat HT MCS index 0..15.
+     *     NSS is implied (>=8 means second stream); width is HT40 if
+     *     IEEE80211_TX_RC_40_MHZ_WIDTH is set, else HT20.
+     *   - else: legacy bitrate lookup against the band's table.
+     */
+    {
+        struct ieee80211_tx_rate *r0 = &tx_info->control.rates[0];
+
+        if (r0->idx < 0) {
+            /* mac80211 didn't pick a rate; stick with default 6 Mbps. */
+        } else if (r0->flags & IEEE80211_TX_RC_VHT_MCS) {
+            u8 mcs = ieee80211_rate_get_vht_mcs(r0);
+            u8 nss = ieee80211_rate_get_vht_nss(r0);
+
+            if (mcs > 11) mcs = 11;
+            if (nss < 1) nss = 1;
+            if (nss > 2) nss = 2;
+
+            if (r0->flags & IEEE80211_TX_RC_160_MHZ_WIDTH) {
+                /* VHT160: codes 0xC0..0xC9 (NSS=1) / 0xD0..0xD9 (NSS=2)
+                 * Clamp MCS to 9 (VHT ceiling). */
+                if (mcs > 9) mcs = 9;
+                rate_code = (nss == 1)
+                    ? ATH9K_RC_VHT160_NSS1_BASE + mcs
+                    : ATH9K_RC_VHT160_NSS2_BASE + mcs;
+            } else if (r0->flags & IEEE80211_TX_RC_80_MHZ_WIDTH) {
+                if (mcs <= 9) {
+                    rate_code = (nss == 1)
+                        ? ATH9K_RC_VHT80_NSS1_BASE + mcs
+                        : ATH9K_RC_VHT80_NSS2_BASE + mcs;
+                } else {
+                    /* MCS 10/11 are HE-only -- if mac80211 hands us one
+                     * via the VHT path, emit the HE80 code so the hub's
+                     * physics models 1024-QAM correctly. */
+                    rate_code = (nss == 1)
+                        ? ATH9K_RC_HE80_NSS1_BASE + mcs
+                        : ATH9K_RC_HE80_NSS2_BASE + mcs;
+                }
+            } else if (r0->flags & IEEE80211_TX_RC_40_MHZ_WIDTH) {
+                if (mcs > 7) mcs = 7;   /* HT40 namespace is 0..7 per NSS */
+                rate_code = (nss == 1)
+                    ? ATH9K_RC_HT40_NSS1_BASE + mcs
+                    : ATH9K_RC_HT40_NSS2_BASE + mcs;
+            } else {
+                if (mcs > 7) mcs = 7;
+                rate_code = (nss == 1)
+                    ? ATH9K_RC_HT20_NSS1_BASE + mcs
+                    : ATH9K_RC_HT20_NSS2_BASE + mcs;
+            }
+        } else if (r0->flags & IEEE80211_TX_RC_MCS) {
+            u8 mcs = r0->idx & 0x0F;
+            bool ht40 = !!(r0->flags & IEEE80211_TX_RC_40_MHZ_WIDTH);
+            bool nss2 = (mcs >= 8);
+            u8 mcs_in_nss = nss2 ? (mcs - 8) : mcs;
+
+            if (ht40) {
+                rate_code = nss2
+                    ? ATH9K_RC_HT40_NSS2_BASE + mcs_in_nss
+                    : ATH9K_RC_HT40_NSS1_BASE + mcs_in_nss;
+            } else {
+                rate_code = nss2
+                    ? ATH9K_RC_HT20_NSS2_BASE + mcs_in_nss
+                    : ATH9K_RC_HT20_NSS1_BASE + mcs_in_nss;
+            }
+        } else {
+            /* Legacy bitrate -- pick from the band-appropriate table. */
+            const struct ieee80211_rate *tbl;
+            int n;
+
+            if (priv->channel_band == NL80211_BAND_5GHZ) {
+                tbl = ath9k_host_rates_5ghz;
+                n   = ARRAY_SIZE(ath9k_host_rates_5ghz);
+            } else {
+                tbl = ath9k_host_rates_2ghz;
+                n   = ARRAY_SIZE(ath9k_host_rates_2ghz);
+            }
+            if (r0->idx < n)
+                rate_code = tbl[r0->idx].hw_value;
+        }
     }
 
-    /* Build the medium frame header */
+    /* Build the medium frame header. Channel info comes from the
+     * cached chandef -- the hub uses it to filter peers that aren't
+     * tuned to a compatible channel (see channels_match). */
     memset(&fhdr, 0, sizeof(fhdr));
-    fhdr.magic      = cpu_to_le32(ATH9K_MEDIUM_MAGIC);
-    fhdr.version    = cpu_to_le16(ATH9K_MEDIUM_VERSION);
-    fhdr.frame_len  = cpu_to_le16(skb->len);
+    fhdr.magic              = cpu_to_le32(ATH9K_MEDIUM_MAGIC);
+    fhdr.version            = cpu_to_le16(ATH9K_MEDIUM_VERSION);
+    fhdr.frame_len          = cpu_to_le16(skb->len);
     memcpy(fhdr.tx_mac, hdr->addr2, ETH_ALEN);
-    fhdr.rate_code  = rate_code;
-    fhdr.rssi       = (int8_t)-30;      /* nominal RSSI */
-    fhdr.tsf_lo     = cpu_to_le32(0);   /* hub doesn't use this for TX */
-    fhdr.tsf_hi     = cpu_to_le32(0);
-    fhdr.flags      = cpu_to_le32(0);   /* TTL=0, hub will stamp it */
+    fhdr.rate_code          = rate_code;
+    fhdr.rssi               = (int8_t)-30;
+    fhdr.tsf_lo             = cpu_to_le32(0);
+    fhdr.tsf_hi             = cpu_to_le32(0);
+    fhdr.flags              = cpu_to_le32(0);   /* TTL=0; hub stamps */
+    fhdr.channel_freq       = cpu_to_le16((u16)priv->channel_freq);
+    fhdr.channel_flags      = cpu_to_le16(priv->channel_flags);
+    fhdr.channel_bond_freq  = cpu_to_le16(priv->channel_bond_freq);
+    fhdr.center_freq1       = cpu_to_le16(priv->center_freq1);
+    fhdr.center_freq2       = cpu_to_le16(priv->center_freq2);
 
     /* Build wire message: [len_be][fhdr][802.11 frame] */
     wire_len = ATH9K_MEDIUM_HDR_SIZE + skb->len;
@@ -530,9 +625,69 @@ static int ath9k_host_config(struct ieee80211_hw *hw, u32 changed)
     struct ieee80211_conf *conf = &hw->conf;
 
     if (changed & IEEE80211_CONF_CHANGE_CHANNEL) {
-        priv->channel_freq = conf->chandef.chan->center_freq;
-        priv->channel_band = conf->chandef.chan->band;
-        pr_info(DRV_NAME ": config channel %d MHz\n", priv->channel_freq);
+        struct cfg80211_chan_def *cdef = &conf->chandef;
+        u16 prim = (u16)cdef->chan->center_freq;
+        u16 cf1  = (u16)cdef->center_freq1;
+        u16 cf2  = (u16)cdef->center_freq2;
+        u16 flags = 0;
+        u16 bond  = 0;
+
+        priv->channel_freq = prim;
+        priv->channel_band = cdef->chan->band;
+
+        flags |= (cdef->chan->band == NL80211_BAND_5GHZ)
+                 ? ATH9K_CHAN_FLAG_5GHZ
+                 : ATH9K_CHAN_FLAG_2GHZ;
+
+        /*
+         * Derive bond_freq and width flags from the chandef width.
+         * HT40+/- bond_freq is the secondary 20-MHz channel; VHT/HE
+         * widths use center_freq1 (and center_freq2 for 80+80) but
+         * leave bond_freq for the implicit HT40 subset within the
+         * wide block, computed as the secondary 20-MHz adjacent to
+         * the primary.
+         */
+        switch (cdef->width) {
+        case NL80211_CHAN_WIDTH_20_NOHT:
+            /* No HT/VHT/HE flags set */
+            break;
+        case NL80211_CHAN_WIDTH_20:
+            flags |= ATH9K_CHAN_FLAG_HT20;
+            break;
+        case NL80211_CHAN_WIDTH_40:
+            if (cf1 > prim) {
+                flags |= ATH9K_CHAN_FLAG_HT40PLUS;
+                bond = prim + 20;
+            } else {
+                flags |= ATH9K_CHAN_FLAG_HT40MINUS;
+                bond = prim - 20;
+            }
+            break;
+        case NL80211_CHAN_WIDTH_80:
+            flags |= ATH9K_CHAN_FLAG_VHT80;
+            bond  = (cf1 > prim) ? prim + 20 : prim - 20;
+            break;
+        case NL80211_CHAN_WIDTH_160:
+            flags |= ATH9K_CHAN_FLAG_VHT160;
+            bond  = (cf1 > prim) ? prim + 20 : prim - 20;
+            break;
+        case NL80211_CHAN_WIDTH_80P80:
+            flags |= ATH9K_CHAN_FLAG_VHT80_80;
+            bond  = (cf1 > prim) ? prim + 20 : prim - 20;
+            break;
+        default:
+            /* Unknown / future width: treat as primary-only */
+            break;
+        }
+
+        priv->channel_bond_freq = bond;
+        priv->channel_flags     = flags;
+        priv->center_freq1      = cf1;
+        priv->center_freq2      = cf2;
+
+        pr_info(DRV_NAME ": config channel %d MHz "
+                "(bond=%u flags=0x%04x cf1=%u cf2=%u)\n",
+                priv->channel_freq, bond, flags, cf1, cf2);
     }
 
     return 0;
