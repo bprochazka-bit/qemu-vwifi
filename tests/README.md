@@ -44,7 +44,7 @@ the original bug. To validate:
 
 ```
 sudo insmod vwifi_host.ko
-./vwifi-host-relay /dev/vwifi /tmp/medium.sock
+./vwifi-host-relay /tmp/medium.sock /dev/vwifi
 # Run a V1-emitting peer (or patch the hub to downgrade outgoing
 # headers); confirm dmesg has no "rx: short message" warnings and
 # that the VM still receives frames.
@@ -57,7 +57,7 @@ attach/detach the relay while TX is hot:
 ```
 for i in $(seq 1 50); do
   killall vwifi-host-relay
-  ./vwifi-host-relay /dev/vwifi /tmp/medium.sock &
+  ./vwifi-host-relay /tmp/medium.sock &
   sleep 0.5
 done
 sudo dmesg | grep -iE "BUG|lockdep|kasan"   # should be empty

@@ -1,6 +1,6 @@
-# vwifi-phys-bridge.c — Implementation Steps
+# vwifi_phys_bridge.c — Implementation Steps
 
-Incremental build plan. Each step adds to `vwifi-phys-bridge.c` and should
+Incremental build plan. Each step adds to `vwifi_phys_bridge.c` and should
 compile cleanly before moving to the next.
 
 ## Step 1: Scaffolding + CLI parsing
@@ -20,7 +20,7 @@ compile cleanly before moving to the next.
 - Validate required args (hub path, interface, `-c`), print config, return 0
 - Stub `// TODO` comments for where later steps plug in
 
-**Compile test**: `gcc -Wall -Wextra -O2 -o vwifi-phys-bridge vwifi-phys-bridge.c`
+**Compile test**: `gcc -Wall -Wextra -O2 -o vwifi-phys-bridge vwifi_phys_bridge.c`
 
 ## Step 2: Channel/frequency helpers
 

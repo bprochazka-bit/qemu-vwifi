@@ -1,6 +1,6 @@
-# vwifi-phys-bridge.c — Implementation Prompt
+# vwifi_phys_bridge.c — Implementation Prompt
 
-**Task: Implement `vwifi-phys-bridge.c` — a daemon that bridges a physical WiFi interface (in monitor mode) to a virtual wireless medium hub.**
+**Task: Implement `vwifi_phys_bridge.c` — a daemon that bridges a physical WiFi interface (in monitor mode) to a virtual wireless medium hub.**
 
 ## What This Is
 
@@ -14,12 +14,12 @@ This lets a real laptop connect to a virtual AP running inside a QEMU VM.
 
 ## File Location
 
-Create `/home/user/qemu-vwifi/vwifi-phys-bridge.c`. It `#include`s `"vwifi.h"` which is in the same directory.
+Create `/home/user/qemu-vwifi/vwifi_phys_bridge.c`. It `#include`s `"vwifi.h"` which is in the same directory.
 
 ## Build Command
 
 ```
-gcc -Wall -Wextra -O2 -o vwifi-phys-bridge vwifi-phys-bridge.c
+gcc -Wall -Wextra -O2 -o vwifi-phys-bridge vwifi_phys_bridge.c
 ```
 
 No external dependencies beyond standard POSIX/libc.
@@ -369,7 +369,7 @@ static void handle_hub_data(void) {
 ## Style
 
 - Single-file C, no external deps
-- Follow the patterns in `vwifi-host-relay.c` for code style (same project)
+- Follow the patterns in `vwifi_host_relay.c` for code style (same project)
 - Use `fprintf(stderr, "bridge: ...")` for all logging
 - Verbose logging (`-v` flag) for per-frame messages; always log startup/shutdown/errors
 - `static` for all file-scope functions and variables
