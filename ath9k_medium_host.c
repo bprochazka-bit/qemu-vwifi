@@ -230,7 +230,51 @@ static struct ieee80211_supported_band ath9k_host_band_5ghz = {
             .tx_params  = IEEE80211_HT_MCS_TX_DEFINED,
         },
     },
-    /* .vht_cap and HE iftype_data populated in subsequent commits. */
+    .vht_cap = {
+        .vht_supported  = true,
+        /*
+         * Advertise the capabilities our simulated medium can actually
+         * model: 80 MHz and 160 MHz channel widths, short-GI, RX/TX
+         * STBC, and the max A-MPDU exponent. SU beamformee is on
+         * because mac80211's rate control likes to know the AP can
+         * receive sounding feedback even when we don't actually beam.
+         *
+         * MCS map: NSS=1 and NSS=2 support MCS 0..9 (256-QAM 5/6
+         * ceiling for VHT); higher NSS slots stay at "not supported"
+         * (0x3 in 2-bit field). The mask is built bit by bit so it's
+         * obvious what each NSS gets.
+         */
+        .cap            = IEEE80211_VHT_CAP_SUPP_CHAN_WIDTH_160MHZ |
+                          IEEE80211_VHT_CAP_SHORT_GI_80 |
+                          IEEE80211_VHT_CAP_SHORT_GI_160 |
+                          IEEE80211_VHT_CAP_RXSTBC_1 |
+                          IEEE80211_VHT_CAP_TXSTBC |
+                          IEEE80211_VHT_CAP_SU_BEAMFORMEE_CAPABLE |
+                          IEEE80211_VHT_CAP_MAX_A_MPDU_LENGTH_EXPONENT_MASK,
+        .vht_mcs = {
+            /* IEEE80211_VHT_MCS_SUPPORT_0_9 = 2, NOT_SUPPORTED = 3.
+             * Two-bit slots per NSS, indexed 0..7 in the 16-bit map. */
+            .rx_mcs_map = cpu_to_le16(
+                (IEEE80211_VHT_MCS_SUPPORT_0_9    << 0)  |  /* NSS=1 */
+                (IEEE80211_VHT_MCS_SUPPORT_0_9    << 2)  |  /* NSS=2 */
+                (IEEE80211_VHT_MCS_NOT_SUPPORTED  << 4)  |
+                (IEEE80211_VHT_MCS_NOT_SUPPORTED  << 6)  |
+                (IEEE80211_VHT_MCS_NOT_SUPPORTED  << 8)  |
+                (IEEE80211_VHT_MCS_NOT_SUPPORTED  << 10) |
+                (IEEE80211_VHT_MCS_NOT_SUPPORTED  << 12) |
+                (IEEE80211_VHT_MCS_NOT_SUPPORTED  << 14)),
+            .tx_mcs_map = cpu_to_le16(
+                (IEEE80211_VHT_MCS_SUPPORT_0_9    << 0)  |
+                (IEEE80211_VHT_MCS_SUPPORT_0_9    << 2)  |
+                (IEEE80211_VHT_MCS_NOT_SUPPORTED  << 4)  |
+                (IEEE80211_VHT_MCS_NOT_SUPPORTED  << 6)  |
+                (IEEE80211_VHT_MCS_NOT_SUPPORTED  << 8)  |
+                (IEEE80211_VHT_MCS_NOT_SUPPORTED  << 10) |
+                (IEEE80211_VHT_MCS_NOT_SUPPORTED  << 12) |
+                (IEEE80211_VHT_MCS_NOT_SUPPORTED  << 14)),
+        },
+    },
+    /* HE iftype_data populated in subsequent commit. */
 };
 
 /* -------------------------------------------------------------------
