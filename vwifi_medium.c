@@ -1,22 +1,22 @@
 /*
- * ath9k Virtual Wireless Medium Hub
+ * vwifi-medium — Virtual Wireless Medium Hub
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  *
- * A fan-out hub for the ath9k-virt virtual wireless medium with
- * per-link SNR simulation and a runtime control channel.
+ * A fan-out hub for the vwifi virtual wireless medium with per-link
+ * SNR simulation and a runtime control channel.
  *
  * Identity model:
  *   Each QEMU peer is bound to a "node" identified by a stable
- *   string node_id (e.g. "ap1", "sta2").  Node identity is
+ *   string node_id (e.g. "ap1", "sta2"). Node identity is
  *   independent of MAC addresses and survives guest reboots,
  *   MAC randomization, and even VM shutdown/restart.
  *
- *   Node IDs come from:  1) QEMU hello message (node_id= property),
+ *   Node IDs come from: 1) QEMU hello message (node_id= property),
  *   2) pre-created via control channel, 3) auto "node0","node1",...
  *
  * Hello protocol (sent by QEMU right after connecting):
- *   [uint32_t len (net order)] [uint32_t 0x41394B52] [node_id\0]
+ *   [uint32_t len (net order)] [uint32_t VWIFI_HELLO_MAGIC] [node_id\0]
  *   Hub absorbs the hello and binds peer to that node.
  *
  * Features:
@@ -28,28 +28,30 @@
  *   - Automatic reconnection to upstreams every 3 seconds
  *   - Per-link SNR with rate-dependent frame error simulation
  *   - Log-distance path loss model with position-based SNR
+ *   - Channel-aware filtering with HT40 / VHT80+ disambiguation
  *   - Runtime control channel for adjusting parameters live
  *   - Persistent node identity across reboots/MAC changes
  *
  * Usage:
- *   # Simple local hub (same as before):
- *   ./ath9k_medium_hub /tmp/ath9k-medium.sock
+ *   # Simple local hub:
+ *   ./vwifi-medium /tmp/vwifi.sock
  *
  *   # Hub with control socket:
- *   ./ath9k_medium_hub /tmp/ath9k.sock -c /tmp/ath9k.ctl
+ *   ./vwifi-medium /tmp/vwifi.sock -c /tmp/vwifi.ctl
  *
  *   # Hub with initial config + control socket:
- *   ./ath9k_medium_hub /tmp/ath9k.sock -c /tmp/ath9k.ctl -C medium.cfg
+ *   ./vwifi-medium /tmp/vwifi.sock -c /tmp/vwifi.ctl -C medium.cfg
  *
  *   # Hub with TCP bridge + control:
- *   ./ath9k_medium_hub /tmp/ath9k.sock -t 5550 -c /tmp/ath9k.ctl
+ *   ./vwifi-medium /tmp/vwifi.sock -t 5550 -c /tmp/vwifi.ctl
  *
  * Control channel (connect with socat/nc/python to the -c socket):
- *   echo "LIST_PEERS" | socat - UNIX-CONNECT:/tmp/ath9k.ctl
- *   echo "SET_SNR 02:00:00:00:00:00 02:00:00:00:01:00 25" | socat - UNIX-CONNECT:/tmp/ath9k.ctl
+ *   echo "LIST_PEERS" | socat - UNIX-CONNECT:/tmp/vwifi.ctl
+ *   echo "SET_SNR 02:00:00:00:00:00 02:00:00:00:01:00 25" | \
+ *       socat - UNIX-CONNECT:/tmp/vwifi.ctl
  *
  * Build:
- *   gcc -Wall -O2 -o ath9k_medium_hub ath9k_medium_hub_scalable.c -lm
+ *   make vwifi-medium
  */
 
 #include <stdio.h>
@@ -100,12 +102,17 @@
 #define MAX_NODES           256
 #define MAX_MACS_PER_NODE   16
 #define NODE_ID_LEN         32
-#define HELLO_MAGIC         0x41394B52  /* "A9KR" -- registration hello */
+/*
+ * Hub-internal "I am node X" hello magic, distinct from the
+ * wire-protocol VWIFI_MAGIC so a hello message can't be mistaken
+ * for a regular frame. "VWIR" = vwifi registration. */
+#define VWIFI_HELLO_MAGIC   0x52495756
+#define HELLO_MAGIC         VWIFI_HELLO_MAGIC
 
 /*
  * Medium header field offsets (bytes from start of payload, after the
  * 4-byte length prefix) -- derived from the canonical struct layout in
- * ath9k_medium.h so they can never drift.
+ * vwifi.h so they can never drift.
  *
  * TTL is the high byte of the v1 `flags` u32 (offset 27 = 24 + 3),
  * which is unused by the driver and repurposed by the hub for loop
@@ -135,7 +142,7 @@
  *  and VHT thresholds follow standard 802.11n/ac link-budget tables.
  *
  *  Rate-code namespace (single byte, internal to this medium):
- *    0x00..0x1F  legacy: ath9k PLCP codes (OFDM 802.11a/g, CCK 802.11b)
+ *    0x00..0x1F  legacy: legacy PLCP codes (OFDM 802.11a/g, CCK 802.11b)
  *    0x80..0x87  HT20  NSS=1  MCS 0..7
  *    0x88..0x8F  HT20  NSS=2  MCS 0..7  (i.e. MCS 8..15)
  *    0x90..0x97  HT40  NSS=1  MCS 0..7
@@ -910,7 +917,7 @@ static int peer_send_frame(int idx, const uint8_t *buf, uint32_t len)
 /* -------------------------------------------------------------------
  *  Channel-match policy.
  *
- *  Per the v2 wire protocol (ath9k_medium.h):
+ *  Per the v2 wire protocol (vwifi.h):
  *    - channel_freq == 0 means "unknown / broadcast" and matches anything
  *    - otherwise the primary 20-MHz frequency must match
  *    - if either side declares HT40 (bond_freq != 0), the bond pair
@@ -2004,20 +2011,20 @@ static void usage(const char *prog)
         "\n"
         "Examples:\n"
         "  # Local-only hub:\n"
-        "  %s /tmp/ath9k.sock\n"
+        "  %s /tmp/vwifi.sock\n"
         "\n"
         "  # Hub with control channel:\n"
-        "  %s /tmp/ath9k.sock -c /tmp/ath9k.ctl\n"
+        "  %s /tmp/vwifi.sock -c /tmp/vwifi.ctl\n"
         "\n"
         "  # Hub with startup config + control:\n"
-        "  %s /tmp/ath9k.sock -c /tmp/ath9k.ctl -C medium.cfg\n"
+        "  %s /tmp/vwifi.sock -c /tmp/vwifi.ctl -C medium.cfg\n"
         "\n"
         "  # Runtime control:\n"
         "  echo 'SET_SNR 02:00:00:00:00:00 02:00:00:00:01:00 25' "
-            "| socat - UNIX-CONNECT:/tmp/ath9k.ctl\n"
+            "| socat - UNIX-CONNECT:/tmp/vwifi.ctl\n"
         "\n"
         "  # Interactive control:\n"
-        "  socat READLINE UNIX-CONNECT:/tmp/ath9k.ctl\n"
+        "  socat READLINE UNIX-CONNECT:/tmp/vwifi.ctl\n"
         "\n",
         prog, MAX_UPSTREAMS, prog, prog, prog);
 }

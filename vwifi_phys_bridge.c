@@ -1,9 +1,9 @@
 /*
- * ath9k_phys_bridge — Bridge a physical WiFi interface to a virtual medium hub
+ * vwifi-phys-bridge — Bridge a physical WiFi interface to a vwifi-medium hub
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  *
- * Connects to an ath9k_medium_hub as a regular peer, but instead of a
+ * Connects to a vwifi-medium hub as a regular peer, but instead of a
  * virtual radio it uses a real physical WiFi interface in monitor mode.
  *
  * Hub -> bridge: receives 802.11 frames, injects them over the air
@@ -13,10 +13,10 @@
  * running inside a QEMU VM.
  *
  * Build:
- *   gcc -Wall -Wextra -O2 -o ath9k_phys_bridge ath9k_phys_bridge.c
+ *   make vwifi-phys-bridge
  *
  * Usage:
- *   sudo ./ath9k_phys_bridge <hub-socket-path> <interface> -c <channel> [opts]
+ *   sudo ./vwifi-phys-bridge <hub-socket-path> <interface> -c <channel> [opts]
  */
 
 #include <stdio.h>
@@ -269,10 +269,10 @@ static int compute_channel_config(void)
  *  Step 3: rate mapping helpers
  * ================================================================ */
 
-/* Radiotap uses 500 kbps units; medium protocol uses ath9k rate codes */
+/* Radiotap uses 500 kbps units; medium protocol uses legacy rate codes */
 static const struct {
     uint8_t rt_rate;    /* radiotap 500kbps */
-    uint8_t ath_code;   /* ath9k rate code */
+    uint8_t ath_code;   /* legacy rate code */
 } rate_map[] = {
     {   2, 0x1B },  /*  1   Mbps CCK  */
     {   4, 0x1A },  /*  2   Mbps CCK  */
@@ -289,7 +289,7 @@ static const struct {
 };
 #define NUM_RATES (sizeof(rate_map) / sizeof(rate_map[0]))
 
-/* Convert radiotap rate (500kbps units) to ath9k rate code */
+/* Convert radiotap rate (500kbps units) to legacy rate code */
 static uint8_t rt_rate_to_ath(uint8_t rt)
 {
     for (size_t i = 0; i < NUM_RATES; i++) {
@@ -299,7 +299,7 @@ static uint8_t rt_rate_to_ath(uint8_t rt)
     return VWIFI_DEFAULT_RATE;  /* 6 Mbps OFDM */
 }
 
-/* Convert ath9k rate code to radiotap rate (500kbps units) */
+/* Convert legacy rate code to radiotap rate (500kbps units) */
 static uint8_t ath_rate_to_rt(uint8_t ath)
 {
     for (size_t i = 0; i < NUM_RATES; i++) {
@@ -568,7 +568,7 @@ static int open_raw_socket(const char *iface)
 struct radiotap_info {
     uint8_t  rate;          /* 500 kbps units */
     uint16_t chan_freq;     /* MHz */
-    uint16_t chan_flags;    /* radiotap channel flags (not ath9k flags) */
+    uint16_t chan_flags;    /* radiotap channel flags (not vwifi flags) */
     int8_t   signal_dbm;
     uint64_t tsft;
     uint8_t  flags;         /* radiotap FLAGS field */
@@ -1015,7 +1015,7 @@ static void usage(const char *prog)
         "  -h               This help\n"
         "\n"
         "Example:\n"
-        "  sudo %s /tmp/ath9k.sock wlx90de801c625f -c 6 -v\n",
+        "  sudo %s /tmp/vwifi.sock wlx90de801c625f -c 6 -v\n",
         prog, prog);
 }
 
@@ -1101,7 +1101,7 @@ int main(int argc, char *argv[])
     /* Connect to the hub */
     hub_fd = connect_hub(hub_path);
     if (hub_fd < 0) {
-        fprintf(stderr, "bridge: is ath9k_medium_hub running at %s?\n",
+        fprintf(stderr, "bridge: is vwifi-medium running at %s?\n",
                 hub_path);
         return 1;
     }

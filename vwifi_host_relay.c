@@ -1,21 +1,21 @@
 /*
- * ath9k_host_relay — Userspace relay between kernel module and medium hub
+ * vwifi-host-relay — Userspace relay between kernel module and medium hub
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  *
- * This is a thin bidirectional byte pump that connects:
- *   /dev/ath9k_medium  (kernel module chardev)
+ * A thin bidirectional byte pump that connects:
+ *   /dev/vwifi   (vwifi_host.ko chardev)
  *       ↕
- *   Unix socket to ath9k_medium_hub
+ *   Unix socket to vwifi-medium
  *
- * Both sides speak the same length-prefixed wire protocol, so the relay
- * just copies complete messages in both directions.
+ * Both sides speak the same length-prefixed wire protocol, so the
+ * relay just copies complete messages in both directions.
  *
  * Usage:
- *   ./ath9k_host_relay /tmp/ath9k.sock [/dev/ath9k_medium]
+ *   ./vwifi-host-relay /tmp/vwifi.sock [/dev/vwifi]
  *
  * Build:
- *   gcc -Wall -O2 -o ath9k_host_relay ath9k_host_relay.c
+ *   make vwifi-host-relay
  */
 
 #include <stdio.h>
@@ -209,13 +209,13 @@ static void usage(const char *prog)
     fprintf(stderr,
             "Usage: %s <hub-socket-path> [chardev-path]\n"
             "\n"
-            "  hub-socket-path  Path to ath9k_medium_hub Unix socket\n"
+            "  hub-socket-path  Path to vwifi-medium Unix socket\n"
             "  chardev-path     Path to kernel module char device\n"
             "                   (default: " DEFAULT_CHRDEV ")\n"
             "\n"
             "Example:\n"
-            "  %s /tmp/ath9k.sock\n"
-            "  %s /tmp/ath9k.sock /dev/ath9k_medium\n",
+            "  %s /tmp/vwifi.sock\n"
+            "  %s /tmp/vwifi.sock /dev/vwifi\n",
             prog, prog, prog);
 }
 
@@ -246,7 +246,7 @@ int main(int argc, char *argv[])
     chrdev_fd = open(chrdev_path, O_RDWR);
     if (chrdev_fd < 0) {
         fprintf(stderr, "relay: open(%s): %s\n", chrdev_path, strerror(errno));
-        fprintf(stderr, "relay: is the ath9k_medium_host module loaded?\n");
+        fprintf(stderr, "relay: is the vwifi_host module loaded?\n");
         goto out;
     }
     fprintf(stderr, "relay: chardev %s opened (fd=%d)\n", chrdev_path, chrdev_fd);
@@ -254,7 +254,7 @@ int main(int argc, char *argv[])
     /* Connect to the hub */
     hub_fd = connect_hub(hub_path);
     if (hub_fd < 0) {
-        fprintf(stderr, "relay: is ath9k_medium_hub running at %s?\n", hub_path);
+        fprintf(stderr, "relay: is vwifi-medium running at %s?\n", hub_path);
         goto out;
     }
     fprintf(stderr, "relay: connected to hub %s (fd=%d)\n", hub_path, hub_fd);

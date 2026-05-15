@@ -1,13 +1,14 @@
 /*
- * ath9k_medium_host — Host-side virtual wireless interface
+ * vwifi_host — Host-side virtual wireless interface
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  *
  * This kernel module registers a mac80211 virtual radio on the host,
- * creating a standard wlanX interface.  Frames transmitted by the host's
- * wifi stack are forwarded to userspace (via a character device), where
- * the ath9k_host_relay daemon sends them to the ath9k_medium_hub.
- * Frames received from the hub are injected back into mac80211.
+ * creating a standard wlanX interface.  Frames transmitted by the
+ * host's wifi stack are forwarded to userspace (via a character
+ * device), where the vwifi-host-relay daemon sends them to the
+ * vwifi-medium hub. Frames received from the hub are injected back
+ * into mac80211.
  *
  * Architecture:
  *
@@ -15,16 +16,16 @@
  *         |
  *     mac80211  (wlanX)
  *         |
- *   ath9k_medium_host.ko  ← this module
- *         |  /dev/ath9k_medium
- *   ath9k_host_relay       (userspace daemon)
+ *   vwifi_host.ko          ← this module
+ *         |  /dev/vwifi
+ *   vwifi-host-relay        (userspace daemon)
  *         |  unix socket
- *   ath9k_medium_hub
+ *   vwifi-medium            (userspace hub)
  *         |
- *   QEMU VMs (ath9k-virt)
+ *   QEMU VMs (vwifi peers)
  *
- * The char device uses the same length-prefixed wire protocol as the
- * hub, so the relay daemon is just a bidirectional byte pump.
+ * The char device uses the same length-prefixed wire protocol as
+ * the hub, so the relay daemon is just a bidirectional byte pump.
  */
 
 #include <linux/module.h>
@@ -44,7 +45,7 @@
 
 #include "vwifi.h"
 
-#define DRV_NAME        "ath9k_medium_host"
+#define DRV_NAME        "vwifi_host"
 #define DRV_VERSION     "1.0"
 
 /* -------------------------------------------------------------------
@@ -59,11 +60,11 @@ MODULE_PARM_DESC(macaddr, "MAC address for the virtual radio (default: 00:03:7F:
 /* -------------------------------------------------------------------
  *  Per-radio state
  * ------------------------------------------------------------------- */
-struct ath9k_host_priv {
+struct vwifi_priv {
     struct ieee80211_hw     *hw;
 
     /* Current operating state. The wide-channel fields mirror what
-     * the hub-side filter consumes (ath9k_medium.h channel_* layout);
+     * the hub-side filter consumes (vwifi.h channel_* layout);
      * .tx copies them into every outgoing frame so the hub can match
      * VHT80/HE80 peers by center frequency, not just primary. */
     bool                    started;
@@ -110,7 +111,7 @@ struct ath9k_host_priv {
     u64                     tx_drop_count;
 };
 
-static struct ath9k_host_priv *g_priv;  /* single-radio for now */
+static struct vwifi_priv *g_priv;  /* single-radio for now */
 static struct platform_device *g_pdev; /* fake parent device for wiphy */
 
 /* -------------------------------------------------------------------
@@ -118,7 +119,7 @@ static struct platform_device *g_pdev; /* fake parent device for wiphy */
  * ------------------------------------------------------------------- */
 
 /* Supported rates for 2.4 GHz (802.11b/g/n) */
-static struct ieee80211_rate ath9k_host_rates_2ghz[] = {
+static struct ieee80211_rate vwifi_rates_2ghz[] = {
     { .bitrate = 10,  .hw_value = 0x1B, .flags = IEEE80211_RATE_SHORT_PREAMBLE },
     { .bitrate = 20,  .hw_value = 0x1A, .flags = IEEE80211_RATE_SHORT_PREAMBLE },
     { .bitrate = 55,  .hw_value = 0x19, .flags = IEEE80211_RATE_SHORT_PREAMBLE },
@@ -134,7 +135,7 @@ static struct ieee80211_rate ath9k_host_rates_2ghz[] = {
 };
 
 /* 2.4 GHz channels (1-14) */
-static struct ieee80211_channel ath9k_host_channels_2ghz[] = {
+static struct ieee80211_channel vwifi_channels_2ghz[] = {
     { .band = NL80211_BAND_2GHZ, .center_freq = 2412, .hw_value = 1 },
     { .band = NL80211_BAND_2GHZ, .center_freq = 2417, .hw_value = 2 },
     { .band = NL80211_BAND_2GHZ, .center_freq = 2422, .hw_value = 3 },
@@ -151,12 +152,12 @@ static struct ieee80211_channel ath9k_host_channels_2ghz[] = {
     { .band = NL80211_BAND_2GHZ, .center_freq = 2484, .hw_value = 14 },
 };
 
-static struct ieee80211_supported_band ath9k_host_band_2ghz = {
+static struct ieee80211_supported_band vwifi_band_2ghz = {
     .band       = NL80211_BAND_2GHZ,
-    .channels   = ath9k_host_channels_2ghz,
-    .n_channels = ARRAY_SIZE(ath9k_host_channels_2ghz),
-    .bitrates   = ath9k_host_rates_2ghz,
-    .n_bitrates = ARRAY_SIZE(ath9k_host_rates_2ghz),
+    .channels   = vwifi_channels_2ghz,
+    .n_channels = ARRAY_SIZE(vwifi_channels_2ghz),
+    .bitrates   = vwifi_rates_2ghz,
+    .n_bitrates = ARRAY_SIZE(vwifi_rates_2ghz),
     .ht_cap     = {
         .ht_supported   = true,
         .cap            = IEEE80211_HT_CAP_SUP_WIDTH_20_40 |
@@ -186,7 +187,7 @@ static struct ieee80211_supported_band ath9k_host_band_2ghz = {
  * ------------------------------------------------------------------- */
 
 /* OFDM rates for 5 GHz (no CCK). */
-static struct ieee80211_rate ath9k_host_rates_5ghz[] = {
+static struct ieee80211_rate vwifi_rates_5ghz[] = {
     { .bitrate = 60,  .hw_value = 0x0B },
     { .bitrate = 90,  .hw_value = 0x0F },
     { .bitrate = 120, .hw_value = 0x0A },
@@ -197,7 +198,7 @@ static struct ieee80211_rate ath9k_host_rates_5ghz[] = {
     { .bitrate = 540, .hw_value = 0x0C },
 };
 
-static struct ieee80211_channel ath9k_host_channels_5ghz[] = {
+static struct ieee80211_channel vwifi_channels_5ghz[] = {
     /* U-NII-1 (5150-5250 MHz) */
     { .band = NL80211_BAND_5GHZ, .center_freq = 5180, .hw_value = 36 },
     { .band = NL80211_BAND_5GHZ, .center_freq = 5200, .hw_value = 40 },
@@ -216,12 +217,12 @@ static struct ieee80211_channel ath9k_host_channels_5ghz[] = {
     { .band = NL80211_BAND_5GHZ, .center_freq = 5825, .hw_value = 165 },
 };
 
-static struct ieee80211_supported_band ath9k_host_band_5ghz = {
+static struct ieee80211_supported_band vwifi_band_5ghz = {
     .band       = NL80211_BAND_5GHZ,
-    .channels   = ath9k_host_channels_5ghz,
-    .n_channels = ARRAY_SIZE(ath9k_host_channels_5ghz),
-    .bitrates   = ath9k_host_rates_5ghz,
-    .n_bitrates = ARRAY_SIZE(ath9k_host_rates_5ghz),
+    .channels   = vwifi_channels_5ghz,
+    .n_channels = ARRAY_SIZE(vwifi_channels_5ghz),
+    .bitrates   = vwifi_rates_5ghz,
+    .n_bitrates = ARRAY_SIZE(vwifi_rates_5ghz),
     .ht_cap     = {
         .ht_supported   = true,
         .cap            = IEEE80211_HT_CAP_SUP_WIDTH_20_40 |
@@ -328,7 +329,7 @@ static struct ieee80211_supported_band ath9k_host_band_5ghz = {
      (IEEE80211_HE_MCS_NOT_SUPPORTED << 12) | \
      (IEEE80211_HE_MCS_NOT_SUPPORTED << 14))
 
-static struct ieee80211_sband_iftype_data ath9k_host_he_5ghz[] = {
+static struct ieee80211_sband_iftype_data vwifi_he_5ghz[] = {
     {
         .types_mask = BIT(NL80211_IFTYPE_STATION),
         .he_cap = {
@@ -361,7 +362,7 @@ static struct ieee80211_sband_iftype_data ath9k_host_he_5ghz[] = {
 /*
  * .tx — Called by mac80211 to transmit a frame.
  *
- * We wrap the 802.11 frame in an ath9k_medium_frame_hdr, prepend the
+ * We wrap the 802.11 frame in an vwifi_frame_hdr, prepend the
  * 4-byte length prefix, and enqueue it for the relay daemon to read
  * from the chardev.
  *
@@ -377,15 +378,15 @@ static struct ieee80211_sband_iftype_data ath9k_host_he_5ghz[] = {
  *     its retry/rate-control logic responds correctly. We do NOT fake
  *     an ACK on the drop path -- that would lie to the upper layers.
  */
-#define ATH9K_TX_QUEUE_MAX  1024
-#define ATH9K_TX_QUEUE_HIGH 768
-#define ATH9K_TX_QUEUE_LOW  256
+#define VWIFI_TX_QUEUE_MAX  1024
+#define VWIFI_TX_QUEUE_HIGH 768
+#define VWIFI_TX_QUEUE_LOW  256
 
-static void ath9k_host_tx(struct ieee80211_hw *hw,
+static void vwifi_tx(struct ieee80211_hw *hw,
                           struct ieee80211_tx_control *control,
                           struct sk_buff *skb)
 {
-    struct ath9k_host_priv *priv = hw->priv;
+    struct vwifi_priv *priv = hw->priv;
     struct ieee80211_tx_info *tx_info = IEEE80211_SKB_CB(skb);
     struct ieee80211_hdr *hdr = (struct ieee80211_hdr *)skb->data;
     struct sk_buff *msg;
@@ -407,7 +408,7 @@ static void ath9k_host_tx(struct ieee80211_hw *hw,
 
     /*
      * Translate mac80211's rate hint into our medium rate-code
-     * namespace (see ath9k_medium.h for the layout).
+     * namespace (see vwifi.h for the layout).
      *
      *   - IEEE80211_TX_RC_VHT_MCS: rate.idx packs (MCS in low 4 bits,
      *     NSS-1 in upper bits). Width comes from the *_MHZ_WIDTH flags.
@@ -481,11 +482,11 @@ static void ath9k_host_tx(struct ieee80211_hw *hw,
             int n;
 
             if (priv->channel_band == NL80211_BAND_5GHZ) {
-                tbl = ath9k_host_rates_5ghz;
-                n   = ARRAY_SIZE(ath9k_host_rates_5ghz);
+                tbl = vwifi_rates_5ghz;
+                n   = ARRAY_SIZE(vwifi_rates_5ghz);
             } else {
-                tbl = ath9k_host_rates_2ghz;
-                n   = ARRAY_SIZE(ath9k_host_rates_2ghz);
+                tbl = vwifi_rates_2ghz;
+                n   = ARRAY_SIZE(vwifi_rates_2ghz);
             }
             if (r0->idx < n)
                 rate_code = tbl[r0->idx].hw_value;
@@ -537,12 +538,12 @@ static void ath9k_host_tx(struct ieee80211_hw *hw,
     } else {
         qlen = skb_queue_len(&priv->tx_queue);
 
-        if (qlen >= ATH9K_TX_QUEUE_HIGH && !priv->tx_queues_stopped) {
+        if (qlen >= VWIFI_TX_QUEUE_HIGH && !priv->tx_queues_stopped) {
             priv->tx_queues_stopped = true;
             stop_queues_now = true;
         }
 
-        if (qlen < ATH9K_TX_QUEUE_MAX) {
+        if (qlen < VWIFI_TX_QUEUE_MAX) {
             __skb_queue_tail(&priv->tx_queue, msg);
         } else {
             dropped = true;
@@ -575,18 +576,18 @@ static void ath9k_host_tx(struct ieee80211_hw *hw,
     priv->tx_count++;
 }
 
-static int ath9k_host_start(struct ieee80211_hw *hw)
+static int vwifi_start(struct ieee80211_hw *hw)
 {
-    struct ath9k_host_priv *priv = hw->priv;
+    struct vwifi_priv *priv = hw->priv;
 
     priv->started = true;
     pr_info(DRV_NAME ": radio started\n");
     return 0;
 }
 
-static void ath9k_host_stop(struct ieee80211_hw *hw, bool suspend)
+static void vwifi_stop(struct ieee80211_hw *hw, bool suspend)
 {
-    struct ath9k_host_priv *priv = hw->priv;
+    struct vwifi_priv *priv = hw->priv;
     unsigned long flags;
     bool was_stopped;
 
@@ -606,22 +607,22 @@ static void ath9k_host_stop(struct ieee80211_hw *hw, bool suspend)
             priv->tx_count, priv->rx_count, priv->tx_drop_count);
 }
 
-static int ath9k_host_add_interface(struct ieee80211_hw *hw,
+static int vwifi_add_interface(struct ieee80211_hw *hw,
                                     struct ieee80211_vif *vif)
 {
     pr_info(DRV_NAME ": add_interface type=%d\n", vif->type);
     return 0;
 }
 
-static void ath9k_host_remove_interface(struct ieee80211_hw *hw,
+static void vwifi_remove_interface(struct ieee80211_hw *hw,
                                         struct ieee80211_vif *vif)
 {
     pr_info(DRV_NAME ": remove_interface\n");
 }
 
-static int ath9k_host_config(struct ieee80211_hw *hw, u32 changed)
+static int vwifi_config(struct ieee80211_hw *hw, u32 changed)
 {
-    struct ath9k_host_priv *priv = hw->priv;
+    struct vwifi_priv *priv = hw->priv;
     struct ieee80211_conf *conf = &hw->conf;
 
     if (changed & IEEE80211_CONF_CHANGE_CHANNEL) {
@@ -693,7 +694,7 @@ static int ath9k_host_config(struct ieee80211_hw *hw, u32 changed)
     return 0;
 }
 
-static void ath9k_host_configure_filter(struct ieee80211_hw *hw,
+static void vwifi_configure_filter(struct ieee80211_hw *hw,
                                         unsigned int changed_flags,
                                         unsigned int *total_flags,
                                         u64 multicast)
@@ -707,7 +708,7 @@ static void ath9k_host_configure_filter(struct ieee80211_hw *hw,
                      FIF_PROBE_REQ);
 }
 
-static void ath9k_host_bss_info_changed(struct ieee80211_hw *hw,
+static void vwifi_bss_info_changed(struct ieee80211_hw *hw,
                                         struct ieee80211_vif *vif,
                                         struct ieee80211_bss_conf *info,
                                         u64 changed)
@@ -715,7 +716,7 @@ static void ath9k_host_bss_info_changed(struct ieee80211_hw *hw,
     /* Accept BSS info changes silently */
 }
 
-static int ath9k_host_conf_tx(struct ieee80211_hw *hw,
+static int vwifi_conf_tx(struct ieee80211_hw *hw,
                               struct ieee80211_vif *vif,
                               unsigned int link_id,
                               u16 queue,
@@ -724,38 +725,38 @@ static int ath9k_host_conf_tx(struct ieee80211_hw *hw,
     return 0;
 }
 
-static void ath9k_host_sw_scan_start(struct ieee80211_hw *hw,
+static void vwifi_sw_scan_start(struct ieee80211_hw *hw,
                                      struct ieee80211_vif *vif,
                                      const u8 *mac_addr)
 {
     pr_info(DRV_NAME ": sw scan start\n");
 }
 
-static void ath9k_host_sw_scan_complete(struct ieee80211_hw *hw,
+static void vwifi_sw_scan_complete(struct ieee80211_hw *hw,
                                         struct ieee80211_vif *vif)
 {
     pr_info(DRV_NAME ": sw scan complete\n");
 }
 
-static int ath9k_host_set_rts_threshold(struct ieee80211_hw *hw, u32 value)
+static int vwifi_set_rts_threshold(struct ieee80211_hw *hw, u32 value)
 {
     return 0;
 }
 
-static const struct ieee80211_ops ath9k_host_ops = {
-    .tx                 = ath9k_host_tx,
+static const struct ieee80211_ops vwifi_ops = {
+    .tx                 = vwifi_tx,
     .wake_tx_queue      = ieee80211_handle_wake_tx_queue,
-    .start              = ath9k_host_start,
-    .stop               = ath9k_host_stop,
-    .add_interface      = ath9k_host_add_interface,
-    .remove_interface   = ath9k_host_remove_interface,
-    .config             = ath9k_host_config,
-    .configure_filter   = ath9k_host_configure_filter,
-    .bss_info_changed   = ath9k_host_bss_info_changed,
-    .conf_tx            = ath9k_host_conf_tx,
-    .sw_scan_start      = ath9k_host_sw_scan_start,
-    .sw_scan_complete   = ath9k_host_sw_scan_complete,
-    .set_rts_threshold  = ath9k_host_set_rts_threshold,
+    .start              = vwifi_start,
+    .stop               = vwifi_stop,
+    .add_interface      = vwifi_add_interface,
+    .remove_interface   = vwifi_remove_interface,
+    .config             = vwifi_config,
+    .configure_filter   = vwifi_configure_filter,
+    .bss_info_changed   = vwifi_bss_info_changed,
+    .conf_tx            = vwifi_conf_tx,
+    .sw_scan_start      = vwifi_sw_scan_start,
+    .sw_scan_complete   = vwifi_sw_scan_complete,
+    .set_rts_threshold  = vwifi_set_rts_threshold,
     /* Channel context emulation — required in 6.12+ */
     .add_chanctx        = ieee80211_emulate_add_chanctx,
     .remove_chanctx     = ieee80211_emulate_remove_chanctx,
@@ -772,7 +773,7 @@ static const struct ieee80211_ops ath9k_host_ops = {
  * Parses the wire-format message and injects the 802.11 frame
  * into mac80211 via ieee80211_rx_irqsafe().
  */
-static void ath9k_host_rx_frame(struct ath9k_host_priv *priv,
+static void vwifi_rx_frame(struct vwifi_priv *priv,
                                 const u8 *data, size_t len)
 {
     struct vwifi_frame_hdr fhdr;
@@ -846,8 +847,8 @@ static void ath9k_host_rx_frame(struct ath9k_host_priv *priv,
     rx_status->rate_idx = 4;  /* default: 6 Mbps (index 4 in our table) */
     {
         int i;
-        for (i = 0; i < ARRAY_SIZE(ath9k_host_rates_2ghz); i++) {
-            if (ath9k_host_rates_2ghz[i].hw_value == fhdr.rate_code) {
+        for (i = 0; i < ARRAY_SIZE(vwifi_rates_2ghz); i++) {
+            if (vwifi_rates_2ghz[i].hw_value == fhdr.rate_code) {
                 rx_status->rate_idx = i;
                 break;
             }
@@ -867,9 +868,9 @@ static void ath9k_host_rx_frame(struct ath9k_host_priv *priv,
  *  poll()  — relay waits for TX frames or chardev readiness
  * ------------------------------------------------------------------- */
 
-static int ath9k_host_chrdev_open(struct inode *inode, struct file *filp)
+static int vwifi_chrdev_open(struct inode *inode, struct file *filp)
 {
-    struct ath9k_host_priv *priv = g_priv;
+    struct vwifi_priv *priv = g_priv;
     unsigned long flags;
     bool taken;
 
@@ -894,9 +895,9 @@ static int ath9k_host_chrdev_open(struct inode *inode, struct file *filp)
     return 0;
 }
 
-static int ath9k_host_chrdev_release(struct inode *inode, struct file *filp)
+static int vwifi_chrdev_release(struct inode *inode, struct file *filp)
 {
-    struct ath9k_host_priv *priv = filp->private_data;
+    struct vwifi_priv *priv = filp->private_data;
     struct sk_buff_head purge;
     unsigned long flags;
     bool was_stopped;
@@ -941,10 +942,10 @@ static int ath9k_host_chrdev_release(struct inode *inode, struct file *filp)
  *
  * Blocks until a frame is available (unless O_NONBLOCK).
  */
-static ssize_t ath9k_host_chrdev_read(struct file *filp, char __user *buf,
+static ssize_t vwifi_chrdev_read(struct file *filp, char __user *buf,
                                       size_t count, loff_t *ppos)
 {
-    struct ath9k_host_priv *priv = filp->private_data;
+    struct vwifi_priv *priv = filp->private_data;
     struct sk_buff *skb;
     unsigned long flags;
     bool wake_now = false;
@@ -968,7 +969,7 @@ static ssize_t ath9k_host_chrdev_read(struct file *filp, char __user *buf,
     spin_lock_irqsave(&priv->state_lock, flags);
     skb = __skb_dequeue(&priv->tx_queue);
     if (skb && priv->tx_queues_stopped &&
-        skb_queue_len(&priv->tx_queue) <= ATH9K_TX_QUEUE_LOW) {
+        skb_queue_len(&priv->tx_queue) <= VWIFI_TX_QUEUE_LOW) {
         priv->tx_queues_stopped = false;
         wake_now = true;
     }
@@ -1006,11 +1007,11 @@ static ssize_t ath9k_host_chrdev_read(struct file *filp, char __user *buf,
  * Multiple messages may be written in a single write() call;
  * we parse them one by one.
  */
-static ssize_t ath9k_host_chrdev_write(struct file *filp,
+static ssize_t vwifi_chrdev_write(struct file *filp,
                                        const char __user *buf,
                                        size_t count, loff_t *ppos)
 {
-    struct ath9k_host_priv *priv = filp->private_data;
+    struct vwifi_priv *priv = filp->private_data;
     u8 *kbuf;
     size_t offset = 0;
 
@@ -1040,7 +1041,7 @@ static ssize_t ath9k_host_chrdev_write(struct file *filp,
         memcpy(&len_be, kbuf + offset, 4);
         payload_len = ntohl(len_be);
 
-        /* Accept v1 (28-byte) and v2 (40-byte) headers; ath9k_host_rx_frame
+        /* Accept v1 (28-byte) and v2 (40-byte) headers; vwifi_rx_frame
          * detects which from `len` and zeros the missing v2 fields. */
         if (payload_len < VWIFI_HDR_SIZE_V1 ||
             payload_len > VWIFI_HDR_SIZE + VWIFI_MAX_FRAME) {
@@ -1052,7 +1053,7 @@ static ssize_t ath9k_host_chrdev_write(struct file *filp,
         }
 
         /* Inject this frame */
-        ath9k_host_rx_frame(priv, kbuf + offset + 4, payload_len);
+        vwifi_rx_frame(priv, kbuf + offset + 4, payload_len);
         offset += 4 + payload_len;
     }
 
@@ -1060,10 +1061,10 @@ static ssize_t ath9k_host_chrdev_write(struct file *filp,
     return count;
 }
 
-static __poll_t ath9k_host_chrdev_poll(struct file *filp,
+static __poll_t vwifi_chrdev_poll(struct file *filp,
                                        struct poll_table_struct *wait)
 {
-    struct ath9k_host_priv *priv = filp->private_data;
+    struct vwifi_priv *priv = filp->private_data;
     __poll_t mask = 0;
 
     poll_wait(filp, &priv->tx_waitq, wait);
@@ -1077,19 +1078,19 @@ static __poll_t ath9k_host_chrdev_poll(struct file *filp,
     return mask;
 }
 
-static const struct file_operations ath9k_host_chrdev_fops = {
+static const struct file_operations vwifi_chrdev_fops = {
     .owner   = THIS_MODULE,
-    .open    = ath9k_host_chrdev_open,
-    .release = ath9k_host_chrdev_release,
-    .read    = ath9k_host_chrdev_read,
-    .write   = ath9k_host_chrdev_write,
-    .poll    = ath9k_host_chrdev_poll,
+    .open    = vwifi_chrdev_open,
+    .release = vwifi_chrdev_release,
+    .read    = vwifi_chrdev_read,
+    .write   = vwifi_chrdev_write,
+    .poll    = vwifi_chrdev_poll,
 };
 
-static struct miscdevice ath9k_host_miscdev = {
+static struct miscdevice vwifi_miscdev = {
     .minor  = MISC_DYNAMIC_MINOR,
     .name   = VWIFI_CHRDEV_NAME,
-    .fops   = &ath9k_host_chrdev_fops,
+    .fops   = &vwifi_chrdev_fops,
 };
 
 /* -------------------------------------------------------------------
@@ -1116,10 +1117,10 @@ static int parse_mac(const char *str, u8 *mac)
 /* -------------------------------------------------------------------
  *  Module init / exit
  * ------------------------------------------------------------------- */
-static int __init ath9k_host_init(void)
+static int __init vwifi_init(void)
 {
     struct ieee80211_hw *hw;
-    struct ath9k_host_priv *priv;
+    struct vwifi_priv *priv;
     u8 mac[ETH_ALEN];
     int ret;
 
@@ -1145,7 +1146,7 @@ static int __init ath9k_host_init(void)
     }
 
     /* Allocate ieee80211_hw with our private data */
-    hw = ieee80211_alloc_hw(sizeof(*priv), &ath9k_host_ops);
+    hw = ieee80211_alloc_hw(sizeof(*priv), &vwifi_ops);
     if (!hw) {
         pr_err(DRV_NAME ": ieee80211_alloc_hw failed\n");
         ret = -ENOMEM;
@@ -1174,13 +1175,13 @@ static int __init ath9k_host_init(void)
 
     hw->queues = 4;  /* AC_VO, AC_VI, AC_BE, AC_BK */
 
-    hw->wiphy->bands[NL80211_BAND_2GHZ] = &ath9k_host_band_2ghz;
+    hw->wiphy->bands[NL80211_BAND_2GHZ] = &vwifi_band_2ghz;
     /* Attach HE iftype data to the 5 GHz band at runtime; the field
      * isn't a designated initializer in older kernel headers, so
      * setting it here keeps the static structs portable. */
-    ath9k_host_band_5ghz.iftype_data   = ath9k_host_he_5ghz;
-    ath9k_host_band_5ghz.n_iftype_data = ARRAY_SIZE(ath9k_host_he_5ghz);
-    hw->wiphy->bands[NL80211_BAND_5GHZ] = &ath9k_host_band_5ghz;
+    vwifi_band_5ghz.iftype_data   = vwifi_he_5ghz;
+    vwifi_band_5ghz.n_iftype_data = ARRAY_SIZE(vwifi_he_5ghz);
+    hw->wiphy->bands[NL80211_BAND_5GHZ] = &vwifi_band_5ghz;
 
     hw->wiphy->interface_modes =
         BIT(NL80211_IFTYPE_STATION) |
@@ -1202,7 +1203,7 @@ static int __init ath9k_host_init(void)
     }
 
     /* Register the character device */
-    ret = misc_register(&ath9k_host_miscdev);
+    ret = misc_register(&vwifi_miscdev);
     if (ret) {
         pr_err(DRV_NAME ": misc_register failed: %d\n", ret);
         goto err_unreg_hw;
@@ -1227,9 +1228,9 @@ err_free_pdev:
     return ret;
 }
 
-static void __exit ath9k_host_exit(void)
+static void __exit vwifi_exit(void)
 {
-    struct ath9k_host_priv *priv = g_priv;
+    struct vwifi_priv *priv = g_priv;
 
     if (!priv) {
         return;
@@ -1237,7 +1238,7 @@ static void __exit ath9k_host_exit(void)
 
     g_priv = NULL;
 
-    misc_deregister(&ath9k_host_miscdev);
+    misc_deregister(&vwifi_miscdev);
 
     /* Drain the TX queue */
     skb_queue_purge(&priv->tx_queue);
@@ -1254,10 +1255,10 @@ static void __exit ath9k_host_exit(void)
     pr_info(DRV_NAME ": unloaded\n");
 }
 
-module_init(ath9k_host_init);
-module_exit(ath9k_host_exit);
+module_init(vwifi_init);
+module_exit(vwifi_exit);
 
 MODULE_AUTHOR("Virtual WiFi Project Contributors");
-MODULE_DESCRIPTION("Host-side mac80211 radio for ath9k virtual wireless medium");
+MODULE_DESCRIPTION("Host-side mac80211 radio for vwifi virtual wireless medium");
 MODULE_LICENSE("GPL");
 MODULE_VERSION(DRV_VERSION);
