@@ -4,14 +4,15 @@
 #   make                    — build kernel module against running kernel
 #   make KDIR=/path/to/src  — build module against specific kernel source
 #   make install            — install module (requires root)
-#   make userspace          — build userspace hub / relay / bridge binaries
+#   make userspace          — build vwifi-medium / vwifi-host-relay /
+#                             vwifi-phys-bridge userspace binaries
 #   make test               — run tests/harness.py (requires userspace built)
 #   make clean              — remove all build artifacts (kernel + userspace)
 
 KDIR ?= /lib/modules/$(shell uname -r)/build
 PWD  := $(shell pwd)
 
-obj-m += ath9k_medium_host.o
+obj-m += vwifi_host.o
 ccflags-y += -DDEBUG
 
 # ---------- Kernel module ----------
@@ -22,7 +23,7 @@ install:
 	$(MAKE) -C $(KDIR) M=$(PWD) modules_install
 	depmod -a
 
-ath9k_medium_host.o: vwifi.h
+vwifi_host.o: vwifi.h
 
 # ---------- Userspace utilities ----------
 # These don't require kernel headers, so they can be built standalone
@@ -30,21 +31,21 @@ ath9k_medium_host.o: vwifi.h
 CC      ?= gcc
 CFLAGS  ?= -Wall -Wextra -O2
 
-USERSPACE_BINS := ath9k_hub ath9k_host_relay ath9k_phys_bridge
+USERSPACE_BINS := vwifi-medium vwifi-host-relay vwifi-phys-bridge
 
-ath9k_hub: ath9k_medium_hub_scalable.c vwifi.h
+vwifi-medium: vwifi_medium.c vwifi.h
 	$(CC) $(CFLAGS) -o $@ $< -lm
 
-ath9k_host_relay: ath9k_host_relay.c vwifi.h
+vwifi-host-relay: vwifi_host_relay.c vwifi.h
 	$(CC) $(CFLAGS) -o $@ $<
 
-ath9k_phys_bridge: ath9k_phys_bridge.c vwifi.h
+vwifi-phys-bridge: vwifi_phys_bridge.c vwifi.h
 	$(CC) $(CFLAGS) -o $@ $<
 
 userspace: $(USERSPACE_BINS)
 
 # ---------- Tests ----------
-test: ath9k_hub
+test: vwifi-medium
 	python3 tests/harness.py
 
 # ---------- Clean ----------

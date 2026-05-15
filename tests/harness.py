@@ -2,7 +2,7 @@
 """
 Userspace regression harness for the audit fixes on this branch.
 
-Spawns ./ath9k_hub on temporary sockets and exercises every fix that
+Spawns ./vwifi-medium on temporary sockets and exercises every fix that
 can be exercised without a real kernel module / QEMU VM. Kernel-side
 fixes (driver V1 acceptance H2, driver locking H3, relay buffer H6)
 need a real kernel + module + VM and are NOT covered here -- see
@@ -84,7 +84,7 @@ class Harness:
 
     # ---- hub lifecycle ----
     def start_hub(self):
-        binary = REPO_ROOT / 'ath9k_hub'
+        binary = REPO_ROOT / 'vwifi-medium'
         if not binary.exists():
             sys.exit(f'FATAL: {binary} not built. Run "make userspace" first.')
         # remove leftover sockets if a previous run died

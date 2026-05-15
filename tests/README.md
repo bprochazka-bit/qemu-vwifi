@@ -2,13 +2,13 @@
 
 `harness.py` is a self-contained Python test runner for the audit
 fixes on the `claude/802-11-ack-packet-drops-qTLMc` branch. It spawns
-`./ath9k_hub` against temporary sockets and exercises everything that
+`./vwifi-medium` against temporary sockets and exercises everything that
 can be verified in userspace, no kernel module or QEMU VM required.
 
 ## Run
 
 ```
-make userspace      # builds ath9k_hub + ath9k_host_relay + ath9k_phys_bridge
+make userspace      # builds vwifi-medium + vwifi-host-relay + vwifi-phys-bridge
 make test           # runs python3 tests/harness.py
 ```
 
@@ -39,12 +39,12 @@ These three fixes touch the kernel driver or relay's chardev interaction
 and can't be exercised from userspace alone:
 
 **H2 — driver accepts V1 headers.** The hub already emits V2; only an
-older V1 sender (or a forced `ATH9K_MEDIUM_VERSION=1` build) triggers
+older V1 sender (or a forced `VWIFI_VERSION=1` build) triggers
 the original bug. To validate:
 
 ```
-sudo insmod ath9k_medium_host.ko
-./ath9k_host_relay /dev/ath9k_medium /tmp/medium.sock
+sudo insmod vwifi_host.ko
+./vwifi-host-relay /dev/vwifi /tmp/medium.sock
 # Run a V1-emitting peer (or patch the hub to downgrade outgoing
 # headers); confirm dmesg has no "rx: short message" warnings and
 # that the VM still receives frames.
@@ -56,8 +56,8 @@ attach/detach the relay while TX is hot:
 
 ```
 for i in $(seq 1 50); do
-  killall ath9k_host_relay
-  ./ath9k_host_relay /dev/ath9k_medium /tmp/medium.sock &
+  killall vwifi-host-relay
+  ./vwifi-host-relay /dev/vwifi /tmp/medium.sock &
   sleep 0.5
 done
 sudo dmesg | grep -iE "BUG|lockdep|kasan"   # should be empty
