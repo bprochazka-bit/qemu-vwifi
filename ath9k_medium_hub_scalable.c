@@ -119,7 +119,10 @@
 #define HDR_OFF_RSSI            offsetof(struct ath9k_medium_frame_hdr, rssi)
 #define HDR_OFF_FLAGS           offsetof(struct ath9k_medium_frame_hdr, flags)
 #define HDR_OFF_CHAN_FREQ       offsetof(struct ath9k_medium_frame_hdr, channel_freq)
+#define HDR_OFF_CHAN_FLAGS      offsetof(struct ath9k_medium_frame_hdr, channel_flags)
 #define HDR_OFF_CHAN_BOND_FREQ  offsetof(struct ath9k_medium_frame_hdr, channel_bond_freq)
+#define HDR_OFF_CENTER_FREQ1    offsetof(struct ath9k_medium_frame_hdr, center_freq1)
+#define HDR_OFF_CENTER_FREQ2    offsetof(struct ath9k_medium_frame_hdr, center_freq2)
 #define TTL_BYTE_OFFSET         (HDR_OFF_FLAGS + 3)
 #define MIN_HDR_SIZE            ATH9K_MEDIUM_HDR_SIZE_MIN
 
@@ -607,10 +610,16 @@ struct peer {
     char        label[64];
     uint64_t    tx_dropped;     /* frames dropped due to socket backpressure */
     /* Channel state learned from peer's most recent TX (v2 header).
-     * Both 0 means "unknown" -- such peers receive everything until
-     * they transmit and reveal their channel. */
+     * All four 0 means "unknown" -- such peers receive everything
+     * until they transmit and reveal their channel. The center freqs
+     * are only consulted when channel_flags indicates a wide channel
+     * (VHT80/160/80+80 or HE80/160/80+80); HT40 disambiguation uses
+     * channel_bond_freq alone. */
     uint16_t    channel_freq;
     uint16_t    channel_bond_freq;
+    uint16_t    channel_flags;
+    uint16_t    center_freq1;
+    uint16_t    center_freq2;
 };
 
 static struct peer peers[MAX_PEERS];
@@ -723,6 +732,9 @@ static int add_peer(int fd, int is_bridge, const char *label)
     peers[idx].tx_dropped = 0;
     peers[idx].channel_freq = 0;
     peers[idx].channel_bond_freq = 0;
+    peers[idx].channel_flags = 0;
+    peers[idx].center_freq1 = 0;
+    peers[idx].center_freq2 = 0;
     snprintf(peers[idx].label, sizeof(peers[idx].label), "%s", label);
     peer_node[idx] = -1;
     fprintf(stderr, "hub: peer %d connected: %s (fd=%d, %s)\n",
@@ -900,22 +912,55 @@ static int peer_send_frame(int idx, const uint8_t *buf, uint32_t len)
  *
  *  Per the v2 wire protocol (ath9k_medium.h):
  *    - channel_freq == 0 means "unknown / broadcast" and matches anything
- *    - otherwise the primary frequency must match
- *    - if either side has a bond_freq != 0, the bond_freq must also match
- *      (so HT40+ ch6 and HT40- ch6 don't collide with each other)
+ *    - otherwise the primary 20-MHz frequency must match
+ *    - if either side declares HT40 (bond_freq != 0), the bond pair
+ *      must also match -- this keeps HT40+ ch6 and HT40- ch6 from
+ *      colliding even though their primaries are both 2437.
+ *    - if either side declares a wide channel (VHT80/160/80+80 or
+ *      HE80/160/80+80 via channel_flags), the center_freq1 must
+ *      match -- this distinguishes two 80-MHz blocks that overlap
+ *      in 20-MHz primary space but have different center frequencies.
+ *    - if either side declares 80+80, center_freq2 must also match
+ *      (the secondary 80-MHz segment can be placed anywhere).
  *
- *  This is symmetric in the sender/receiver pair, which is what we want
- *  for the simulated medium.
+ *  Match is symmetric in (sender, receiver), as the simulated medium
+ *  requires.
  * ------------------------------------------------------------------- */
-static bool channels_match(uint16_t a_freq, uint16_t a_bond,
-                           uint16_t b_freq, uint16_t b_bond)
+struct chan_state {
+    uint16_t freq;
+    uint16_t bond_freq;
+    uint16_t flags;
+    uint16_t center1;
+    uint16_t center2;
+};
+
+static bool channels_match(const struct chan_state *a,
+                           const struct chan_state *b)
 {
-    if (a_freq == 0 || b_freq == 0)
+    if (a->freq == 0 || b->freq == 0)
         return true;
-    if (a_freq != b_freq)
+    if (a->freq != b->freq)
         return false;
-    if ((a_bond != 0 || b_bond != 0) && a_bond != b_bond)
+    if ((a->bond_freq != 0 || b->bond_freq != 0) &&
+        a->bond_freq != b->bond_freq)
         return false;
+
+    /* Wide-channel disambiguation: if either side asserts a flag in
+     * the NEEDS_CENTER1 set, center_freq1 must agree. Skip when both
+     * center_freq1 fields are zero (legacy v2 senders that omit the
+     * field but happen to share the same primary -- treat as match). */
+    uint16_t needs_c1 =
+        (a->flags | b->flags) & ATH9K_CHAN_FLAG_NEEDS_CENTER1;
+    if (needs_c1 && a->center1 != 0 && b->center1 != 0 &&
+        a->center1 != b->center1)
+        return false;
+
+    uint16_t needs_c2 =
+        (a->flags | b->flags) & ATH9K_CHAN_FLAG_NEEDS_CENTER2;
+    if (needs_c2 && a->center2 != 0 && b->center2 != 0 &&
+        a->center2 != b->center2)
+        return false;
+
     return true;
 }
 
@@ -940,8 +985,7 @@ static void forward_message(int sender_idx, const uint8_t *msg,
     int i;
     int dead[MAX_PEERS];
     int n_dead = 0;
-    uint16_t msg_chan_freq = 0;
-    uint16_t msg_chan_bond = 0;
+    struct chan_state msg_chan = { 0, 0, 0, 0, 0 };
 
     if (total_len < 4 || total_len > (4 + MAX_MSG_SIZE))
         return;
@@ -976,14 +1020,23 @@ static void forward_message(int sender_idx, const uint8_t *msg,
     uint8_t rate_code = tmp[4 + HDR_OFF_RATE_CODE];
 
     /* Extract channel info if the sender uses the v2 header. v1 senders
-     * are treated as channel=0 (broadcast) for backward compatibility. */
+     * are treated as channel=0 (broadcast) for backward compatibility.
+     * The wide-channel fields (flags / center_freq1 / center_freq2)
+     * are also pulled so VHT80+/HE80+ peers can be filtered with the
+     * full center-frequency tuple, not just the 20-MHz primary. */
     if (payload_len >= ATH9K_MEDIUM_HDR_SIZE) {
-        memcpy(&msg_chan_freq, tmp + 4 + HDR_OFF_CHAN_FREQ, 2);
-        memcpy(&msg_chan_bond, tmp + 4 + HDR_OFF_CHAN_BOND_FREQ, 2);
+        memcpy(&msg_chan.freq,      tmp + 4 + HDR_OFF_CHAN_FREQ,       2);
+        memcpy(&msg_chan.bond_freq, tmp + 4 + HDR_OFF_CHAN_BOND_FREQ,  2);
+        memcpy(&msg_chan.flags,     tmp + 4 + HDR_OFF_CHAN_FLAGS,      2);
+        memcpy(&msg_chan.center1,   tmp + 4 + HDR_OFF_CENTER_FREQ1,    2);
+        memcpy(&msg_chan.center2,   tmp + 4 + HDR_OFF_CENTER_FREQ2,    2);
         /* Cache the sender's current channel so symmetric filtering
          * can match it on subsequent frames sent toward this peer. */
-        peers[sender_idx].channel_freq = msg_chan_freq;
-        peers[sender_idx].channel_bond_freq = msg_chan_bond;
+        peers[sender_idx].channel_freq      = msg_chan.freq;
+        peers[sender_idx].channel_bond_freq = msg_chan.bond_freq;
+        peers[sender_idx].channel_flags     = msg_chan.flags;
+        peers[sender_idx].center_freq1      = msg_chan.center1;
+        peers[sender_idx].center_freq2      = msg_chan.center2;
     }
 
     /* --- TTL handling (unchanged logic) --- */
@@ -1014,12 +1067,18 @@ static void forward_message(int sender_idx, const uint8_t *msg,
             continue;
 
         /* Channel-aware filtering. If we know both sender and receiver
-         * channels and they don't match (with HT40 bond awareness),
+         * channels and they don't match (with HT40 bond awareness and
+         * VHT/HE wide-channel center-freq comparison where applicable),
          * the receiver wouldn't hear this transmission on a real
          * radio, so skip it. */
-        if (!channels_match(msg_chan_freq, msg_chan_bond,
-                            peers[i].channel_freq,
-                            peers[i].channel_bond_freq))
+        struct chan_state rx_chan = {
+            peers[i].channel_freq,
+            peers[i].channel_bond_freq,
+            peers[i].channel_flags,
+            peers[i].center_freq1,
+            peers[i].center_freq2,
+        };
+        if (!channels_match(&msg_chan, &rx_chan))
             continue;
 
         int rx_ni = peer_node[i];
