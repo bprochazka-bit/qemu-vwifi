@@ -36,6 +36,14 @@ the hub's stderr log in the temp directory.
 | 5-peer fanout           | C1        | sender on ch1 reaches only the ch1 receiver of 4          |
 | VHT80 center mismatch   | C1        | same primary, different center_freq1 -> dropped           |
 | VHT80 center match      | C1        | matching primary+center_freq1 -> delivered                |
+| HE80 center match       | C1        | matching primary+center_freq1 -> delivered                |
+| HE80 center mismatch    | C1        | same primary, different center_freq1 -> dropped           |
+| HE40 vs HE20 strict     | C1        | HE40+ frame is NOT delivered to HE20 receiver             |
+| VHT160 center match     | C1        | matching primary+center_freq1 -> delivered                |
+| VHT160 center mismatch  | C1        | same primary, different center_freq1 -> dropped           |
+| VHT80+80 center2 match  | C1        | matching primary+center1+center2 -> delivered             |
+| VHT80+80 center2 miss   | C1        | matching center1 but different center2 -> dropped         |
+| HE MCS thresholds       | M3        | SNR=20 dB: MCS0 delivers ~all, MCS9/MCS11 drop every frame |
 | channel change          | C1        | peer is reachable again after switching channels          |
 | node recycling          | H1+H2/H7  | 100 connect/disconnect cycles leave 0 online              |
 | garbage tolerance       | -         | bad length / truncated frames don't kill hub              |

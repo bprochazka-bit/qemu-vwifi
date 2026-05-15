@@ -650,6 +650,323 @@ def test_c1_vht80_center_match_delivers(h: Harness):
         a.close(); b.close()
 
 
+def _count_frames_with_prefix(sock, marker_prefix, settle=0.4):
+    """Drain a non-blocking socket and count occurrences of a byte
+    prefix in the combined buffer. Used by statistical FER tests
+    where the count of delivered frames is the assertion."""
+    time.sleep(settle)
+    sock.setblocking(False)
+    chunks = []
+    try:
+        while True:
+            d = sock.recv(65536)
+            if not d:
+                break
+            chunks.append(d)
+    except (BlockingIOError, OSError):
+        pass
+    sock.setblocking(True)
+    return b''.join(chunks).count(marker_prefix)
+
+
+def _mac_str(mac_bytes):
+    return ':'.join(f'{b:02x}' for b in mac_bytes)
+
+
+# ---------------------------------------------------------------------
+# HE / VHT specific channel-filter coverage
+# ---------------------------------------------------------------------
+
+def test_c1_he80_center_match_delivers(h: Harness):
+    h.section('HE80: matching primary+center_freq1 delivers')
+    h.restart_hub()
+    a = h.data_conn()
+    b = h.data_conn()
+    try:
+        mac_a = b'\x02\x00\x00\x00\xe1\xaa'
+        mac_b = b'\x02\x00\x00\x00\xe1\xbb'
+        _tune(a, mac_a, channel_freq=CH36, channel_bond_freq=CH40,
+              channel_flags=CHF_5GHZ | CHF_HE80,
+              center_freq1=VHT80_CENTER_36_48)
+        _tune(b, mac_b, channel_freq=CH36, channel_bond_freq=CH40,
+              channel_flags=CHF_5GHZ | CHF_HE80,
+              center_freq1=VHT80_CENTER_36_48)
+        _drain_all([a, b])
+
+        marker = b'HE80-MATCH-' + os.urandom(16)
+        a.sendall(make_frame(mac_a, channel_freq=CH36,
+                             channel_bond_freq=CH40,
+                             channel_flags=CHF_5GHZ | CHF_HE80,
+                             center_freq1=VHT80_CENTER_36_48,
+                             rate_code=0xE0,           # HE80 NSS=1 MCS0
+                             payload=marker.ljust(64, b'\x00')))
+        got, n = _recv_with_marker(b, marker)
+        h.expect(got, 'HE80 frame delivered to matching HE80 peer',
+                 f'received {n} bytes; marker not found')
+    finally:
+        a.close(); b.close()
+
+
+def test_c1_he80_center_mismatch_drops(h: Harness):
+    h.section('HE80: same primary, different center_freq1 -> dropped')
+    h.restart_hub()
+    a = h.data_conn()
+    b = h.data_conn()
+    try:
+        mac_a = b'\x02\x00\x00\x00\xe2\xaa'
+        mac_b = b'\x02\x00\x00\x00\xe2\xbb'
+
+        _tune(a, mac_a, channel_freq=CH36, channel_bond_freq=CH40,
+              channel_flags=CHF_5GHZ | CHF_HE80,
+              center_freq1=VHT80_CENTER_36_48)
+        # Synthetic: same primary, different center_freq1
+        _tune(b, mac_b, channel_freq=CH36, channel_bond_freq=CH40,
+              channel_flags=CHF_5GHZ | CHF_HE80,
+              center_freq1=VHT80_CENTER_52_64)
+        _drain_all([a, b])
+
+        marker = b'HE80-CENTER-MISMATCH-' + os.urandom(16)
+        a.sendall(make_frame(mac_a, channel_freq=CH36,
+                             channel_bond_freq=CH40,
+                             channel_flags=CHF_5GHZ | CHF_HE80,
+                             center_freq1=VHT80_CENTER_36_48,
+                             rate_code=0xE5,           # HE80 NSS=1 MCS5
+                             payload=marker.ljust(64, b'\x00')))
+        got, n = _recv_with_marker(b, marker)
+        h.expect(not got,
+                 'HE80 frame with mismatched center_freq1 is dropped',
+                 f'unexpectedly received {n} bytes')
+    finally:
+        a.close(); b.close()
+
+
+def test_c1_he40_vs_he20_strict_drops(h: Harness):
+    h.section('HE40+ vs HE20 on the same primary -> dropped (strict, no fallback)')
+    h.restart_hub()
+    a = h.data_conn()
+    b = h.data_conn()
+    try:
+        mac_a = b'\x02\x00\x00\x00\xe3\xaa'
+        mac_b = b'\x02\x00\x00\x00\xe3\xbb'
+
+        # A: HE40+ on ch36 (primary=5180, bond=5200)
+        _tune(a, mac_a, channel_freq=CH36, channel_bond_freq=CH40,
+              channel_flags=CHF_5GHZ | CHF_HE40)
+        # B: HE20 on ch36 (primary=5180, no bond)
+        _tune(b, mac_b, channel_freq=CH36, channel_bond_freq=0,
+              channel_flags=CHF_5GHZ | CHF_HE20)
+        _drain_all([a, b])
+
+        marker = b'HE40-VS-HE20-' + os.urandom(16)
+        a.sendall(make_frame(mac_a, channel_freq=CH36,
+                             channel_bond_freq=CH40,
+                             channel_flags=CHF_5GHZ | CHF_HE40,
+                             payload=marker.ljust(64, b'\x00')))
+        got, n = _recv_with_marker(b, marker)
+        h.expect(not got,
+                 'HE40+ frame is NOT delivered to a HE20 receiver',
+                 f'unexpectedly received {n} bytes')
+    finally:
+        a.close(); b.close()
+
+
+def test_c1_vht160_center_match_delivers(h: Harness):
+    h.section('VHT160: matching primary+center_freq1 delivers')
+    h.restart_hub()
+    a = h.data_conn()
+    b = h.data_conn()
+    try:
+        mac_a = b'\x02\x00\x00\x01\x60\xaa'
+        mac_b = b'\x02\x00\x00\x01\x60\xbb'
+
+        # Both on ch36 VHT160 (primary=5180, bond=5200, 160-MHz center=5250)
+        _tune(a, mac_a, channel_freq=CH36, channel_bond_freq=CH40,
+              channel_flags=CHF_5GHZ | CHF_VHT160,
+              center_freq1=VHT160_CENTER_36_64)
+        _tune(b, mac_b, channel_freq=CH36, channel_bond_freq=CH40,
+              channel_flags=CHF_5GHZ | CHF_VHT160,
+              center_freq1=VHT160_CENTER_36_64)
+        _drain_all([a, b])
+
+        marker = b'VHT160-MATCH-' + os.urandom(16)
+        a.sendall(make_frame(mac_a, channel_freq=CH36,
+                             channel_bond_freq=CH40,
+                             channel_flags=CHF_5GHZ | CHF_VHT160,
+                             center_freq1=VHT160_CENTER_36_64,
+                             rate_code=0xC0,           # VHT160 NSS=1 MCS0
+                             payload=marker.ljust(64, b'\x00')))
+        got, n = _recv_with_marker(b, marker)
+        h.expect(got, 'VHT160 frame delivered to matching VHT160 peer',
+                 f'received {n} bytes; marker not found')
+    finally:
+        a.close(); b.close()
+
+
+def test_c1_vht160_center_mismatch_drops(h: Harness):
+    h.section('VHT160: same primary, different center_freq1 -> dropped')
+    h.restart_hub()
+    a = h.data_conn()
+    b = h.data_conn()
+    try:
+        mac_a = b'\x02\x00\x00\x01\x61\xaa'
+        mac_b = b'\x02\x00\x00\x01\x61\xbb'
+
+        _tune(a, mac_a, channel_freq=CH36, channel_bond_freq=CH40,
+              channel_flags=CHF_5GHZ | CHF_VHT160,
+              center_freq1=VHT160_CENTER_36_64)
+        # Synthetic 160-MHz "block" with a different center
+        _tune(b, mac_b, channel_freq=CH36, channel_bond_freq=CH40,
+              channel_flags=CHF_5GHZ | CHF_VHT160,
+              center_freq1=5410)
+        _drain_all([a, b])
+
+        marker = b'VHT160-MISMATCH-' + os.urandom(16)
+        a.sendall(make_frame(mac_a, channel_freq=CH36,
+                             channel_bond_freq=CH40,
+                             channel_flags=CHF_5GHZ | CHF_VHT160,
+                             center_freq1=VHT160_CENTER_36_64,
+                             rate_code=0xC9,           # VHT160 NSS=1 MCS9
+                             payload=marker.ljust(64, b'\x00')))
+        got, n = _recv_with_marker(b, marker)
+        h.expect(not got,
+                 'VHT160 frame with mismatched center_freq1 is dropped',
+                 f'unexpectedly received {n} bytes')
+    finally:
+        a.close(); b.close()
+
+
+def test_c1_vht80_80_center2_match_delivers(h: Harness):
+    h.section('VHT80+80: matching primary+center_freq1+center_freq2 delivers')
+    h.restart_hub()
+    a = h.data_conn()
+    b = h.data_conn()
+    try:
+        mac_a = b'\x02\x00\x00\x01\x80\xaa'
+        mac_b = b'\x02\x00\x00\x01\x80\xbb'
+
+        # 80+80: primary ch36 block (center1=5210) + secondary block at ch149 (center2=5775)
+        _tune(a, mac_a, channel_freq=CH36, channel_bond_freq=CH40,
+              channel_flags=CHF_5GHZ | CHF_VHT80_80,
+              center_freq1=VHT80_CENTER_36_48,
+              center_freq2=5775)
+        _tune(b, mac_b, channel_freq=CH36, channel_bond_freq=CH40,
+              channel_flags=CHF_5GHZ | CHF_VHT80_80,
+              center_freq1=VHT80_CENTER_36_48,
+              center_freq2=5775)
+        _drain_all([a, b])
+
+        marker = b'VHT80+80-MATCH-' + os.urandom(16)
+        a.sendall(make_frame(mac_a, channel_freq=CH36,
+                             channel_bond_freq=CH40,
+                             channel_flags=CHF_5GHZ | CHF_VHT80_80,
+                             center_freq1=VHT80_CENTER_36_48,
+                             center_freq2=5775,
+                             payload=marker.ljust(64, b'\x00')))
+        got, n = _recv_with_marker(b, marker)
+        h.expect(got, 'VHT80+80 frame delivered to matching peer',
+                 f'received {n} bytes; marker not found')
+    finally:
+        a.close(); b.close()
+
+
+def test_c1_vht80_80_center2_mismatch_drops(h: Harness):
+    h.section('VHT80+80: matching center1 but different center2 -> dropped')
+    h.restart_hub()
+    a = h.data_conn()
+    b = h.data_conn()
+    try:
+        mac_a = b'\x02\x00\x00\x01\x81\xaa'
+        mac_b = b'\x02\x00\x00\x01\x81\xbb'
+
+        _tune(a, mac_a, channel_freq=CH36, channel_bond_freq=CH40,
+              channel_flags=CHF_5GHZ | CHF_VHT80_80,
+              center_freq1=VHT80_CENTER_36_48,
+              center_freq2=5775)        # secondary at ch149 block
+        _tune(b, mac_b, channel_freq=CH36, channel_bond_freq=CH40,
+              channel_flags=CHF_5GHZ | CHF_VHT80_80,
+              center_freq1=VHT80_CENTER_36_48,
+              center_freq2=5530)        # secondary at ch100 block (different)
+        _drain_all([a, b])
+
+        marker = b'VHT80+80-MISMATCH-' + os.urandom(16)
+        a.sendall(make_frame(mac_a, channel_freq=CH36,
+                             channel_bond_freq=CH40,
+                             channel_flags=CHF_5GHZ | CHF_VHT80_80,
+                             center_freq1=VHT80_CENTER_36_48,
+                             center_freq2=5775,
+                             payload=marker.ljust(64, b'\x00')))
+        got, n = _recv_with_marker(b, marker)
+        h.expect(not got,
+                 'VHT80+80 frame with mismatched center_freq2 is dropped',
+                 f'unexpectedly received {n} bytes')
+    finally:
+        a.close(); b.close()
+
+
+def test_m3_he_mcs_rate_thresholds(h: Harness):
+    h.section('M3: HE MCS rate codes drive FER thresholds (MCS0 delivers, MCS9 drops)')
+    h.restart_hub()
+    a = h.data_conn()
+    b = h.data_conn()
+    try:
+        mac_a = b'\x02\x00\x00\x02\xe0\xaa'
+        mac_b = b'\x02\x00\x00\x02\xe0\xbb'
+
+        chan_kwargs = dict(
+            channel_freq=CH36,
+            channel_bond_freq=CH40,
+            channel_flags=CHF_5GHZ | CHF_HE80,
+            center_freq1=VHT80_CENTER_36_48,
+        )
+        _tune(a, mac_a, **chan_kwargs)
+        _tune(b, mac_b, **chan_kwargs)
+        _drain_all([a, b])
+
+        # Pin SNR to 20 dB symmetric. SET_SNR auto-switches the hub to
+        # MODEL_SNR_TABLE so per-frame FER will fire.
+        r = h.ctl_cmd(f'SET_SNR {_mac_str(mac_a)} {_mac_str(mac_b)} 20 20')
+        h.expect('OK' in r, 'SET_SNR accepted via MAC strings', repr(r[:120]))
+
+        # Batch 1: HE80 NSS=1 MCS0 (rate_code 0xE0, min_snr=5 dB)
+        # margin = 20 - 5 = 15 dB, > 10 -> FER = 0 -> all deliver
+        N = 50
+        prefix0 = b'HEMCS0-'
+        for i in range(N):
+            payload = prefix0 + i.to_bytes(2, 'big') + b'\x00' * 32
+            a.sendall(make_frame(mac_a, rate_code=0xE0, payload=payload,
+                                 **chan_kwargs))
+        delivered0 = _count_frames_with_prefix(b, prefix0)
+        h.expect(delivered0 >= N - 2,
+                 f'HE80 MCS0 (margin=+15 dB) delivers ~all frames',
+                 f'got {delivered0}/{N}')
+
+        # Batch 2: HE80 NSS=1 MCS9 (rate_code 0xE9, min_snr=30 dB)
+        # margin = 20 - 30 = -10 dB, < -3 -> FER = 1 -> all drop
+        prefix9 = b'HEMCS9-'
+        for i in range(N):
+            payload = prefix9 + i.to_bytes(2, 'big') + b'\x00' * 32
+            a.sendall(make_frame(mac_a, rate_code=0xE9, payload=payload,
+                                 **chan_kwargs))
+        delivered9 = _count_frames_with_prefix(b, prefix9)
+        h.expect(delivered9 == 0,
+                 f'HE80 MCS9 (margin=-10 dB) drops every frame',
+                 f'got {delivered9}/{N}')
+
+        # Batch 3: HE80 MCS11 (rate_code 0xEB, min_snr=35 dB, 1024-QAM 5/6)
+        # margin = 20 - 35 = -15 dB -> FER = 1
+        prefix11 = b'HEMCS11-'
+        for i in range(N):
+            payload = prefix11 + i.to_bytes(2, 'big') + b'\x00' * 32
+            a.sendall(make_frame(mac_a, rate_code=0xEB, payload=payload,
+                                 **chan_kwargs))
+        delivered11 = _count_frames_with_prefix(b, prefix11)
+        h.expect(delivered11 == 0,
+                 f'HE80 MCS11 (1024-QAM 5/6, margin=-15 dB) drops every frame',
+                 f'got {delivered11}/{N}')
+    finally:
+        a.close(); b.close()
+
+
 def test_c1_channel_change_mid_stream(h: Harness):
     h.section('C1: peer that changes channel starts being heard on the new channel')
     h.restart_hub()
@@ -772,6 +1089,15 @@ TESTS = [
     test_c1_multichannel_fanout_isolation,
     test_c1_vht80_center_mismatch_drops,
     test_c1_vht80_center_match_delivers,
+    # HE / VHT160 / VHT80+80 + rate-table physics
+    test_c1_he80_center_match_delivers,
+    test_c1_he80_center_mismatch_drops,
+    test_c1_he40_vs_he20_strict_drops,
+    test_c1_vht160_center_match_delivers,
+    test_c1_vht160_center_mismatch_drops,
+    test_c1_vht80_80_center2_match_delivers,
+    test_c1_vht80_80_center2_mismatch_drops,
+    test_m3_he_mcs_rate_thresholds,
     test_c1_channel_change_mid_stream,
     # Resource lifecycle + defensive
     test_h1h2_h7_node_recycling,
