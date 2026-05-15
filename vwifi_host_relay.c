@@ -1,21 +1,21 @@
 /*
- * ath9k_host_relay — Userspace relay between kernel module and medium hub
+ * vwifi-host-relay — Userspace relay between kernel module and medium hub
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  *
- * This is a thin bidirectional byte pump that connects:
- *   /dev/ath9k_medium  (kernel module chardev)
+ * A thin bidirectional byte pump that connects:
+ *   /dev/vwifi   (vwifi_host.ko chardev)
  *       ↕
- *   Unix socket to ath9k_medium_hub
+ *   Unix socket to vwifi-medium
  *
- * Both sides speak the same length-prefixed wire protocol, so the relay
- * just copies complete messages in both directions.
+ * Both sides speak the same length-prefixed wire protocol, so the
+ * relay just copies complete messages in both directions.
  *
  * Usage:
- *   ./ath9k_host_relay /tmp/ath9k.sock [/dev/ath9k_medium]
+ *   ./vwifi-host-relay /tmp/vwifi.sock [/dev/vwifi]
  *
  * Build:
- *   gcc -Wall -O2 -o ath9k_host_relay ath9k_host_relay.c
+ *   make vwifi-host-relay
  */
 
 #include <stdio.h>
@@ -30,10 +30,20 @@
 #include <sys/un.h>
 #include <arpa/inet.h>  /* ntohl/htonl */
 
-#include "ath9k_medium.h"
+#include "vwifi.h"
 
-#define DEFAULT_CHRDEV  "/dev/" ATH9K_MEDIUM_CHRDEV_NAME
-#define READ_BUF_SIZE   (ATH9K_MEDIUM_MAX_MSG)
+#define DEFAULT_CHRDEV  "/dev/" VWIFI_CHRDEV_NAME
+
+/*
+ * The chardev returns a complete wire message per read():
+ *   [4-byte length prefix][header][802.11 frame]
+ * so the buffer must hold the prefix plus the largest possible
+ * payload. Sizing it to VWIFI_MAX_MSG alone (header + frame)
+ * leaves 4 bytes short, which causes the kernel chrdev_read to return
+ * -EMSGSIZE and kfree_skb a maximum-sized frame -- silent data loss
+ * for jumbo AMSDUs. Same sizing is reused on the hub->chardev path.
+ */
+#define READ_BUF_SIZE   (4 + VWIFI_MAX_MSG)
 
 static volatile sig_atomic_t g_running = 1;
 
@@ -139,7 +149,7 @@ static int forward_chardev_to_hub(int chrdev_fd, int hub_fd)
     }
 
     /* Validate minimum size: 4 (len prefix) + 28 (frame header) */
-    if (n < (ssize_t)(4 + ATH9K_MEDIUM_HDR_SIZE)) {
+    if (n < (ssize_t)(4 + VWIFI_HDR_SIZE)) {
         fprintf(stderr, "relay: chardev→hub: short read (%zd bytes)\n", n);
         return 0;
     }
@@ -170,8 +180,8 @@ static int forward_hub_to_chardev(int hub_fd, int chrdev_fd)
     }
 
     payload_len = ntohl(len_be);
-    if (payload_len < ATH9K_MEDIUM_HDR_SIZE ||
-        payload_len > ATH9K_MEDIUM_HDR_SIZE + ATH9K_MEDIUM_MAX_FRAME) {
+    if (payload_len < VWIFI_HDR_SIZE ||
+        payload_len > VWIFI_HDR_SIZE + VWIFI_MAX_FRAME) {
         fprintf(stderr, "relay: hub→chardev: bad length %u\n", payload_len);
         return -1;
     }
@@ -199,13 +209,13 @@ static void usage(const char *prog)
     fprintf(stderr,
             "Usage: %s <hub-socket-path> [chardev-path]\n"
             "\n"
-            "  hub-socket-path  Path to ath9k_medium_hub Unix socket\n"
+            "  hub-socket-path  Path to vwifi-medium Unix socket\n"
             "  chardev-path     Path to kernel module char device\n"
             "                   (default: " DEFAULT_CHRDEV ")\n"
             "\n"
             "Example:\n"
-            "  %s /tmp/ath9k.sock\n"
-            "  %s /tmp/ath9k.sock /dev/ath9k_medium\n",
+            "  %s /tmp/vwifi.sock\n"
+            "  %s /tmp/vwifi.sock /dev/vwifi\n",
             prog, prog, prog);
 }
 
@@ -236,7 +246,7 @@ int main(int argc, char *argv[])
     chrdev_fd = open(chrdev_path, O_RDWR);
     if (chrdev_fd < 0) {
         fprintf(stderr, "relay: open(%s): %s\n", chrdev_path, strerror(errno));
-        fprintf(stderr, "relay: is the ath9k_medium_host module loaded?\n");
+        fprintf(stderr, "relay: is the vwifi_host module loaded?\n");
         goto out;
     }
     fprintf(stderr, "relay: chardev %s opened (fd=%d)\n", chrdev_path, chrdev_fd);
@@ -244,7 +254,7 @@ int main(int argc, char *argv[])
     /* Connect to the hub */
     hub_fd = connect_hub(hub_path);
     if (hub_fd < 0) {
-        fprintf(stderr, "relay: is ath9k_medium_hub running at %s?\n", hub_path);
+        fprintf(stderr, "relay: is vwifi-medium running at %s?\n", hub_path);
         goto out;
     }
     fprintf(stderr, "relay: connected to hub %s (fd=%d)\n", hub_path, hub_fd);

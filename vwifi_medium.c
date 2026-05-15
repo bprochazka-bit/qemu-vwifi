@@ -1,22 +1,22 @@
 /*
- * ath9k Virtual Wireless Medium Hub
+ * vwifi-medium — Virtual Wireless Medium Hub
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  *
- * A fan-out hub for the ath9k-virt virtual wireless medium with
- * per-link SNR simulation and a runtime control channel.
+ * A fan-out hub for the vwifi virtual wireless medium with per-link
+ * SNR simulation and a runtime control channel.
  *
  * Identity model:
  *   Each QEMU peer is bound to a "node" identified by a stable
- *   string node_id (e.g. "ap1", "sta2").  Node identity is
+ *   string node_id (e.g. "ap1", "sta2"). Node identity is
  *   independent of MAC addresses and survives guest reboots,
  *   MAC randomization, and even VM shutdown/restart.
  *
- *   Node IDs come from:  1) QEMU hello message (node_id= property),
+ *   Node IDs come from: 1) QEMU hello message (node_id= property),
  *   2) pre-created via control channel, 3) auto "node0","node1",...
  *
  * Hello protocol (sent by QEMU right after connecting):
- *   [uint32_t len (net order)] [uint32_t 0x41394B52] [node_id\0]
+ *   [uint32_t len (net order)] [uint32_t VWIFI_HELLO_MAGIC] [node_id\0]
  *   Hub absorbs the hello and binds peer to that node.
  *
  * Features:
@@ -28,28 +28,30 @@
  *   - Automatic reconnection to upstreams every 3 seconds
  *   - Per-link SNR with rate-dependent frame error simulation
  *   - Log-distance path loss model with position-based SNR
+ *   - Channel-aware filtering with HT40 / VHT80+ disambiguation
  *   - Runtime control channel for adjusting parameters live
  *   - Persistent node identity across reboots/MAC changes
  *
  * Usage:
- *   # Simple local hub (same as before):
- *   ./ath9k_medium_hub /tmp/ath9k-medium.sock
+ *   # Simple local hub:
+ *   ./vwifi-medium /tmp/vwifi.sock
  *
  *   # Hub with control socket:
- *   ./ath9k_medium_hub /tmp/ath9k.sock -c /tmp/ath9k.ctl
+ *   ./vwifi-medium /tmp/vwifi.sock -c /tmp/vwifi.ctl
  *
  *   # Hub with initial config + control socket:
- *   ./ath9k_medium_hub /tmp/ath9k.sock -c /tmp/ath9k.ctl -C medium.cfg
+ *   ./vwifi-medium /tmp/vwifi.sock -c /tmp/vwifi.ctl -C medium.cfg
  *
  *   # Hub with TCP bridge + control:
- *   ./ath9k_medium_hub /tmp/ath9k.sock -t 5550 -c /tmp/ath9k.ctl
+ *   ./vwifi-medium /tmp/vwifi.sock -t 5550 -c /tmp/vwifi.ctl
  *
  * Control channel (connect with socat/nc/python to the -c socket):
- *   echo "LIST_PEERS" | socat - UNIX-CONNECT:/tmp/ath9k.ctl
- *   echo "SET_SNR 02:00:00:00:00:00 02:00:00:00:01:00 25" | socat - UNIX-CONNECT:/tmp/ath9k.ctl
+ *   echo "LIST_PEERS" | socat - UNIX-CONNECT:/tmp/vwifi.ctl
+ *   echo "SET_SNR 02:00:00:00:00:00 02:00:00:00:01:00 25" | \
+ *       socat - UNIX-CONNECT:/tmp/vwifi.ctl
  *
  * Build:
- *   gcc -Wall -O2 -o ath9k_medium_hub ath9k_medium_hub_scalable.c -lm
+ *   make vwifi-medium
  */
 
 #include <stdio.h>
@@ -67,14 +69,18 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <stdint.h>
 #include <inttypes.h>
 #include <stdarg.h>
+#include <stddef.h>
 #include <time.h>
 #include <stdbool.h>
+
+#include "vwifi.h"
 
 /* -------------------------------------------------------------------
  *  Configuration constants
@@ -83,45 +89,72 @@
 #define MAX_UPSTREAMS       16
 #define MAX_CTL_CLIENTS     8
 #define MAX_LINK_OVERRIDES  256
-#define RECV_BUF_SIZE       (4 + 8192 + 64)
-#define MAX_MSG_SIZE        (8192 + 64)
+
+/* Wire-protocol sizes derived from the canonical header definition. */
+#define MAX_MSG_SIZE        (VWIFI_MAX_MSG_SIZE)
+#define RECV_BUF_SIZE       (4 + MAX_MSG_SIZE)
 #define CTL_BUF_SIZE        4096
 #define CTL_RESP_SIZE       4096
 
-#define TTL_BYTE_OFFSET     27
 #define DEFAULT_TTL         8
-#define MIN_HDR_SIZE        28
 #define UPSTREAM_RETRY_SEC  3
 
 #define MAX_NODES           256
 #define MAX_MACS_PER_NODE   16
 #define NODE_ID_LEN         32
-#define HELLO_MAGIC         0x41394B52  /* "A9KR" -- registration hello */
+/*
+ * Hub-internal "I am node X" hello magic, distinct from the
+ * wire-protocol VWIFI_MAGIC so a hello message can't be mistaken
+ * for a regular frame. "VWIR" = vwifi registration. */
+#define VWIFI_HELLO_MAGIC   0x52495756
+#define HELLO_MAGIC         VWIFI_HELLO_MAGIC
 
 /*
  * Medium header field offsets (bytes from start of payload, after the
- * 4-byte length prefix).  These must match ath9k_medium.h layout:
- *   [0]  uint32  magic
- *   [4]  uint16  version
- *   [6]  uint16  frame_len
- *   [8]  uint8[6] tx_mac
- *   [14] uint8   rate_code
- *   [15] int8    rssi
- *   [16] uint32  tsf_lo
- *   [20] uint32  tsf_hi
- *   [24] uint32  flags   (byte 27 = TTL)
+ * 4-byte length prefix) -- derived from the canonical struct layout in
+ * vwifi.h so they can never drift.
+ *
+ * TTL is the high byte of the v1 `flags` u32 (offset 27 = 24 + 3),
+ * which is unused by the driver and repurposed by the hub for loop
+ * prevention in multi-hub topologies.
+ *
+ * The minimum header size we'll accept is the v1 layout (28 bytes);
+ * the v2 channel fields are an optional extension.
  */
-#define HDR_OFF_MAGIC       0
-#define HDR_OFF_TX_MAC      8
-#define HDR_OFF_RATE_CODE   14
-#define HDR_OFF_RSSI        15
+#define HDR_OFF_TX_MAC          offsetof(struct vwifi_frame_hdr, tx_mac)
+#define HDR_OFF_RATE_CODE       offsetof(struct vwifi_frame_hdr, rate_code)
+#define HDR_OFF_RSSI            offsetof(struct vwifi_frame_hdr, rssi)
+#define HDR_OFF_FLAGS           offsetof(struct vwifi_frame_hdr, flags)
+#define HDR_OFF_CHAN_FREQ       offsetof(struct vwifi_frame_hdr, channel_freq)
+#define HDR_OFF_CHAN_FLAGS      offsetof(struct vwifi_frame_hdr, channel_flags)
+#define HDR_OFF_CHAN_BOND_FREQ  offsetof(struct vwifi_frame_hdr, channel_bond_freq)
+#define HDR_OFF_CENTER_FREQ1    offsetof(struct vwifi_frame_hdr, center_freq1)
+#define HDR_OFF_CENTER_FREQ2    offsetof(struct vwifi_frame_hdr, center_freq2)
+#define TTL_BYTE_OFFSET         (HDR_OFF_FLAGS + 3)
+#define MIN_HDR_SIZE            VWIFI_HDR_SIZE_MIN
 
 /* -------------------------------------------------------------------
- *  802.11a/g OFDM rate table
+ *  Rate table: legacy + HT + VHT
  *
  *  Rate code → data rate in Mbps, and minimum SNR (dB) required for
- *  <10% frame error rate at 1500-byte frames.  These thresholds are
- *  derived from the same curves wmediumd uses (IEEE 802.11a BER).
+ *  <10% frame error rate at 1500-byte frames.  Legacy thresholds are
+ *  derived from the same curves wmediumd uses (IEEE 802.11a BER); HT
+ *  and VHT thresholds follow standard 802.11n/ac link-budget tables.
+ *
+ *  Rate-code namespace (single byte, internal to this medium):
+ *    0x00..0x1F  legacy: legacy PLCP codes (OFDM 802.11a/g, CCK 802.11b)
+ *    0x80..0x87  HT20  NSS=1  MCS 0..7
+ *    0x88..0x8F  HT20  NSS=2  MCS 0..7  (i.e. MCS 8..15)
+ *    0x90..0x97  HT40  NSS=1  MCS 0..7
+ *    0x98..0x9F  HT40  NSS=2  MCS 0..7  (i.e. MCS 8..15)
+ *    0xA0..0xA9  VHT80 NSS=1  MCS 0..9
+ *    0xB0..0xB9  VHT80 NSS=2  MCS 0..9
+ *
+ *  The driver currently only emits legacy codes; HT/VHT entries here
+ *  let the physics layer respond correctly once the driver is taught
+ *  to encode MCS rates from tx_info->control.rates[0]. Until then,
+ *  unknown codes fall through to the 6 Mbps default in
+ *  get_frame_error_prob() and behave exactly as before.
  * ------------------------------------------------------------------- */
 struct rate_info {
     uint8_t     code;
@@ -131,23 +164,152 @@ struct rate_info {
 
 /*
  * SNR thresholds for ~10% FER at 1500-byte frames.
- * Sources: wmediumd per_packet_delivery(), 802.11a simulation data.
+ * Sources: wmediumd per_packet_delivery(), 802.11a/n/ac simulation data,
+ * standard MCS link-budget tables.
  */
 static const struct rate_info rate_table[] = {
-    /* OFDM rates (802.11a/g) */
-    { 0x0B,  6.0,   4.0 },     /* 6 Mbps   - BPSK 1/2 */
-    { 0x0F,  9.0,   5.0 },     /* 9 Mbps   - BPSK 3/4 */
-    { 0x0A, 12.0,   7.0 },     /* 12 Mbps  - QPSK 1/2 */
-    { 0x0E, 18.0,  10.0 },     /* 18 Mbps  - QPSK 3/4 */
-    { 0x09, 24.0,  14.0 },     /* 24 Mbps  - 16-QAM 1/2 */
-    { 0x0D, 36.0,  18.0 },     /* 36 Mbps  - 16-QAM 3/4 */
-    { 0x08, 48.0,  22.0 },     /* 48 Mbps  - 64-QAM 2/3 */
-    { 0x0C, 54.0,  25.0 },     /* 54 Mbps  - 64-QAM 3/4 */
-    /* CCK rates (802.11b) */
-    { 0x1B,  1.0,   2.0 },     /* 1 Mbps   - DBPSK */
-    { 0x1A,  2.0,   4.0 },     /* 2 Mbps   - DQPSK */
-    { 0x19,  5.5,   6.0 },     /* 5.5 Mbps - CCK */
-    { 0x18, 11.0,   9.0 },     /* 11 Mbps  - CCK */
+    /* ---- Legacy OFDM rates (802.11a/g) ---- */
+    { 0x0B,   6.0,   4.0 },    /* 6 Mbps   - BPSK 1/2 */
+    { 0x0F,   9.0,   5.0 },    /* 9 Mbps   - BPSK 3/4 */
+    { 0x0A,  12.0,   7.0 },    /* 12 Mbps  - QPSK 1/2 */
+    { 0x0E,  18.0,  10.0 },    /* 18 Mbps  - QPSK 3/4 */
+    { 0x09,  24.0,  14.0 },    /* 24 Mbps  - 16-QAM 1/2 */
+    { 0x0D,  36.0,  18.0 },    /* 36 Mbps  - 16-QAM 3/4 */
+    { 0x08,  48.0,  22.0 },    /* 48 Mbps  - 64-QAM 2/3 */
+    { 0x0C,  54.0,  25.0 },    /* 54 Mbps  - 64-QAM 3/4 */
+    /* ---- Legacy CCK rates (802.11b) ---- */
+    { 0x1B,   1.0,   2.0 },    /* 1 Mbps   - DBPSK */
+    { 0x1A,   2.0,   4.0 },    /* 2 Mbps   - DQPSK */
+    { 0x19,   5.5,   6.0 },    /* 5.5 Mbps - CCK */
+    { 0x18,  11.0,   9.0 },    /* 11 Mbps  - CCK */
+
+    /* ---- 802.11n HT20, single spatial stream (MCS 0..7) ---- */
+    { 0x80,   6.5,   5.0 },    /* HT20 NSS=1 MCS0  - BPSK 1/2 */
+    { 0x81,  13.0,   7.0 },    /* HT20 NSS=1 MCS1  - QPSK 1/2 */
+    { 0x82,  19.5,  10.0 },    /* HT20 NSS=1 MCS2  - QPSK 3/4 */
+    { 0x83,  26.0,  13.0 },    /* HT20 NSS=1 MCS3  - 16QAM 1/2 */
+    { 0x84,  39.0,  17.0 },    /* HT20 NSS=1 MCS4  - 16QAM 3/4 */
+    { 0x85,  52.0,  21.0 },    /* HT20 NSS=1 MCS5  - 64QAM 2/3 */
+    { 0x86,  58.5,  23.0 },    /* HT20 NSS=1 MCS6  - 64QAM 3/4 */
+    { 0x87,  65.0,  25.0 },    /* HT20 NSS=1 MCS7  - 64QAM 5/6 */
+
+    /* ---- 802.11n HT20, two spatial streams (MCS 8..15) ---- */
+    /* SU-MIMO needs ~3 dB more SNR than the equivalent NSS=1 MCS. */
+    { 0x88,  13.0,   8.0 },    /* HT20 NSS=2 MCS8  */
+    { 0x89,  26.0,  10.0 },    /* HT20 NSS=2 MCS9  */
+    { 0x8A,  39.0,  13.0 },    /* HT20 NSS=2 MCS10 */
+    { 0x8B,  52.0,  16.0 },    /* HT20 NSS=2 MCS11 */
+    { 0x8C,  78.0,  20.0 },    /* HT20 NSS=2 MCS12 */
+    { 0x8D, 104.0,  24.0 },    /* HT20 NSS=2 MCS13 */
+    { 0x8E, 117.0,  26.0 },    /* HT20 NSS=2 MCS14 */
+    { 0x8F, 130.0,  28.0 },    /* HT20 NSS=2 MCS15 */
+
+    /* ---- 802.11n HT40, single spatial stream ---- */
+    /* Same modulation as HT20 → same SNR threshold; double the rate. */
+    { 0x90,  13.5,   5.0 },    /* HT40 NSS=1 MCS0  */
+    { 0x91,  27.0,   7.0 },    /* HT40 NSS=1 MCS1  */
+    { 0x92,  40.5,  10.0 },    /* HT40 NSS=1 MCS2  */
+    { 0x93,  54.0,  13.0 },    /* HT40 NSS=1 MCS3  */
+    { 0x94,  81.0,  17.0 },    /* HT40 NSS=1 MCS4  */
+    { 0x95, 108.0,  21.0 },    /* HT40 NSS=1 MCS5  */
+    { 0x96, 121.5,  23.0 },    /* HT40 NSS=1 MCS6  */
+    { 0x97, 135.0,  25.0 },    /* HT40 NSS=1 MCS7  */
+
+    /* ---- 802.11n HT40, two spatial streams ---- */
+    { 0x98,  27.0,   8.0 },
+    { 0x99,  54.0,  10.0 },
+    { 0x9A,  81.0,  13.0 },
+    { 0x9B, 108.0,  16.0 },
+    { 0x9C, 162.0,  20.0 },
+    { 0x9D, 216.0,  24.0 },
+    { 0x9E, 243.0,  26.0 },
+    { 0x9F, 270.0,  28.0 },
+
+    /* ---- 802.11ac VHT 80 MHz, single spatial stream (MCS 0..9) ---- */
+    /* MCS 8/9 add 256-QAM modulation → much higher SNR floors. */
+    { 0xA0,  32.5,   5.0 },    /* VHT80 NSS=1 MCS0  */
+    { 0xA1,  65.0,   7.0 },    /* VHT80 NSS=1 MCS1  */
+    { 0xA2,  97.5,  10.0 },    /* VHT80 NSS=1 MCS2  */
+    { 0xA3, 130.0,  13.0 },    /* VHT80 NSS=1 MCS3  */
+    { 0xA4, 195.0,  17.0 },    /* VHT80 NSS=1 MCS4  */
+    { 0xA5, 260.0,  21.0 },    /* VHT80 NSS=1 MCS5  */
+    { 0xA6, 292.5,  23.0 },    /* VHT80 NSS=1 MCS6  */
+    { 0xA7, 325.0,  25.0 },    /* VHT80 NSS=1 MCS7  */
+    { 0xA8, 390.0,  28.0 },    /* VHT80 NSS=1 MCS8  - 256QAM 3/4 */
+    { 0xA9, 433.3,  30.0 },    /* VHT80 NSS=1 MCS9  - 256QAM 5/6 */
+
+    /* ---- 802.11ac VHT 80 MHz, two spatial streams ---- */
+    { 0xB0,  65.0,   8.0 },
+    { 0xB1, 130.0,  10.0 },
+    { 0xB2, 195.0,  13.0 },
+    { 0xB3, 260.0,  16.0 },
+    { 0xB4, 390.0,  20.0 },
+    { 0xB5, 520.0,  24.0 },
+    { 0xB6, 585.0,  26.0 },
+    { 0xB7, 650.0,  28.0 },
+    { 0xB8, 780.0,  31.0 },
+    { 0xB9, 866.7,  33.0 },
+
+    /* ---- 802.11ac VHT 160 MHz, single spatial stream ----
+     * Same modulation/coding as VHT80 (same min_snr); double the rate.
+     * Wide channels also incur ~3 dB more noise from the larger band,
+     * but for our use case (low-error simulated medium) we keep
+     * thresholds aligned with VHT80 so rate-control behavior is the
+     * dominant effect. */
+    { 0xC0,  65.0,   5.0 },    /* VHT160 NSS=1 MCS0  */
+    { 0xC1, 130.0,   7.0 },
+    { 0xC2, 195.0,  10.0 },
+    { 0xC3, 260.0,  13.0 },
+    { 0xC4, 390.0,  17.0 },
+    { 0xC5, 520.0,  21.0 },
+    { 0xC6, 585.0,  23.0 },
+    { 0xC7, 650.0,  25.0 },
+    { 0xC8, 780.0,  28.0 },
+    { 0xC9, 866.7,  30.0 },
+
+    /* ---- 802.11ac VHT 160 MHz, two spatial streams ---- */
+    { 0xD0, 130.0,   8.0 },
+    { 0xD1, 260.0,  10.0 },
+    { 0xD2, 390.0,  13.0 },
+    { 0xD3, 520.0,  16.0 },
+    { 0xD4, 780.0,  20.0 },
+    { 0xD5, 1040.0, 24.0 },
+    { 0xD6, 1170.0, 26.0 },
+    { 0xD7, 1300.0, 28.0 },
+    { 0xD8, 1560.0, 31.0 },
+    { 0xD9, 1733.3, 33.0 },
+
+    /* ---- 802.11ax HE-SU 80 MHz, single spatial stream (MCS 0..11) ----
+     * MCS 10/11 add 1024-QAM, which needs substantially higher SNR
+     * than VHT's 256-QAM ceiling. Thresholds for 0..9 mirror VHT80
+     * (HE uses the same modulation/coding for that range); 10/11
+     * follow published 1024-QAM tables (~32/35 dB). */
+    { 0xE0,  36.0,   5.0 },    /* HE80 NSS=1 MCS0  */
+    { 0xE1,  72.1,   7.0 },
+    { 0xE2, 108.1,  10.0 },
+    { 0xE3, 144.1,  13.0 },
+    { 0xE4, 216.2,  17.0 },
+    { 0xE5, 288.2,  21.0 },
+    { 0xE6, 324.3,  23.0 },
+    { 0xE7, 360.3,  25.0 },
+    { 0xE8, 432.4,  28.0 },
+    { 0xE9, 480.4,  30.0 },
+    { 0xEA, 540.4,  32.0 },    /* HE80 NSS=1 MCS10 - 1024QAM 3/4 */
+    { 0xEB, 600.5,  35.0 },    /* HE80 NSS=1 MCS11 - 1024QAM 5/6 */
+
+    /* ---- 802.11ax HE-SU 80 MHz, two spatial streams ---- */
+    { 0xF0,  72.1,   8.0 },
+    { 0xF1, 144.1,  10.0 },
+    { 0xF2, 216.2,  13.0 },
+    { 0xF3, 288.2,  16.0 },
+    { 0xF4, 432.4,  20.0 },
+    { 0xF5, 576.5,  24.0 },
+    { 0xF6, 648.5,  26.0 },
+    { 0xF7, 720.6,  28.0 },
+    { 0xF8, 864.7,  31.0 },
+    { 0xF9, 960.8,  33.0 },
+    { 0xFA, 1080.9, 35.0 },
+    { 0xFB, 1201.0, 38.0 },
 };
 #define NUM_RATES   (int)(sizeof(rate_table) / sizeof(rate_table[0]))
 
@@ -255,6 +417,7 @@ struct node_phys {
     uint64_t    rx_dropped;
     int         peer_idx;       /* bound peer, or -1 if offline */
     bool        active;
+    bool        auto_named;     /* true = auto "node%d" id (recycled on disconnect) */
 };
 
 static struct node_phys nodes[MAX_NODES];
@@ -266,13 +429,25 @@ static struct node_phys *find_node(const char *nid, bool create)
     for (int i = 0; i < num_nodes; i++)
         if (nodes[i].active && strcmp(nodes[i].node_id, nid) == 0)
             return &nodes[i];
-    if (!create || num_nodes >= MAX_NODES) return NULL;
-    struct node_phys *nd = &nodes[num_nodes++];
+    if (!create) return NULL;
+
+    /* Reuse an inactive slot before extending the array, so a churning
+     * peer doesn't permanently consume node-table capacity. */
+    struct node_phys *nd = NULL;
+    for (int i = 0; i < num_nodes; i++) {
+        if (!nodes[i].active) { nd = &nodes[i]; break; }
+    }
+    if (!nd) {
+        if (num_nodes >= MAX_NODES) return NULL;
+        nd = &nodes[num_nodes++];
+    }
+
     memset(nd, 0, sizeof(*nd));
     snprintf(nd->node_id, NODE_ID_LEN, "%s", nid);
     nd->tx_power_dbm = 15.0;
     nd->peer_idx = -1;
     nd->active = true;
+    nd->auto_named = false;
     return nd;
 }
 
@@ -339,8 +514,19 @@ static struct link_override *find_link(const char *id_a, const char *id_b,
              strcmp(link_overrides[i].node_b, id_a) == 0))
             return &link_overrides[i];
     }
-    if (!create || num_link_overrides >= MAX_LINK_OVERRIDES) return NULL;
-    struct link_override *lk = &link_overrides[num_link_overrides++];
+    if (!create) return NULL;
+
+    /* Reuse an inactive slot before extending the array, so repeated
+     * SET_SNR/CLEAR_SNR cycles don't permanently exhaust capacity. */
+    struct link_override *lk = NULL;
+    for (int i = 0; i < num_link_overrides; i++) {
+        if (!link_overrides[i].active) { lk = &link_overrides[i]; break; }
+    }
+    if (!lk) {
+        if (num_link_overrides >= MAX_LINK_OVERRIDES) return NULL;
+        lk = &link_overrides[num_link_overrides++];
+    }
+
     snprintf(lk->node_a, NODE_ID_LEN, "%s", id_a);
     snprintf(lk->node_b, NODE_ID_LEN, "%s", id_b);
     lk->snr_ab = NAN;  lk->snr_ba = NAN;
@@ -429,6 +615,18 @@ struct peer {
     uint32_t    buf_used;
     int         is_bridge;
     char        label[64];
+    uint64_t    tx_dropped;     /* frames dropped due to socket backpressure */
+    /* Channel state learned from peer's most recent TX (v2 header).
+     * All four 0 means "unknown" -- such peers receive everything
+     * until they transmit and reveal their channel. The center freqs
+     * are only consulted when channel_flags indicates a wide channel
+     * (VHT80/160/80+80 or HE80/160/80+80); HT40 disambiguation uses
+     * channel_bond_freq alone. */
+    uint16_t    channel_freq;
+    uint16_t    channel_bond_freq;
+    uint16_t    channel_flags;
+    uint16_t    center_freq1;
+    uint16_t    center_freq2;
 };
 
 static struct peer peers[MAX_PEERS];
@@ -458,18 +656,38 @@ static struct upstream_state upstream_state[MAX_UPSTREAMS];
 static int ctl_listen_fd = -1;
 static char *ctl_socket_path = NULL;
 
+/* Per-client outbound buffer: lets ctl_respond keep writing across
+ * EAGAIN without dropping the response. Sized for the worst-case
+ * LIST_PEERS dump (256 nodes * ~120 chars). Excess is dropped (with
+ * a warning) -- the responses were always best-effort. */
+#define CTL_OUTBUF_SIZE     (64 * 1024)
+
 struct ctl_client {
     int         fd;
     char        buf[CTL_BUF_SIZE];
     uint32_t    buf_used;
+    char        outbuf[CTL_OUTBUF_SIZE];
+    uint32_t    outbuf_used;
     bool        active;
 };
 
 static struct ctl_client ctl_clients[MAX_CTL_CLIENTS];
 
+/* Look up ctl_client index by fd, or -1 if fd isn't a tracked client
+ * (e.g. STDERR_FILENO from the startup config-load path). */
+static int ctl_client_by_fd(int fd)
+{
+    for (int i = 0; i < MAX_CTL_CLIENTS; i++) {
+        if (ctl_clients[i].active && ctl_clients[i].fd == fd)
+            return i;
+    }
+    return -1;
+}
+
 /* Global stats */
 static uint64_t total_frames_forwarded = 0;
-static uint64_t total_frames_dropped = 0;
+static uint64_t total_frames_dropped = 0;       /* physics-model drops */
+static uint64_t total_frames_tx_dropped = 0;    /* hub->peer socket-backpressure drops */
 
 /* -------------------------------------------------------------------
  *  Utility
@@ -508,10 +726,22 @@ static int add_peer(int fd, int is_bridge, const char *label)
         close(fd); return -1;
     }
     set_nonblock(fd);
+    /* Enlarge the send buffer so short bursts don't immediately
+     * overflow and trigger backpressure drops. */
+    {
+        int sndbuf = 1024 * 1024;
+        setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+    }
     int idx = num_peers;
     peers[idx].fd = fd;
     peers[idx].buf_used = 0;
     peers[idx].is_bridge = is_bridge;
+    peers[idx].tx_dropped = 0;
+    peers[idx].channel_freq = 0;
+    peers[idx].channel_bond_freq = 0;
+    peers[idx].channel_flags = 0;
+    peers[idx].center_freq1 = 0;
+    peers[idx].center_freq2 = 0;
     snprintf(peers[idx].label, sizeof(peers[idx].label), "%s", label);
     peer_node[idx] = -1;
     fprintf(stderr, "hub: peer %d connected: %s (fd=%d, %s)\n",
@@ -524,12 +754,30 @@ static void bind_peer_to_node(int pidx, const char *nid)
 {
     struct node_phys *nd = find_node(nid, true);
     if (!nd) { fprintf(stderr, "hub: node table full\n"); return; }
+
+    /* If this peer was already bound to an auto-named node and is now
+     * being moved to a different node (typically because a HELLO
+     * announced its real id after auto_bind_peer ran), retire the
+     * auto-named placeholder so the node table doesn't accumulate
+     * orphaned "nodeN" entries under reconnect/hello churn. User-named
+     * source nodes are left intact (they may have configured state). */
+    int prev_ni = peer_node[pidx];
+    int new_ni = node_index(nd);
+    if (prev_ni >= 0 && prev_ni != new_ni) {
+        struct node_phys *prev = &nodes[prev_ni];
+        prev->peer_idx = -1;
+        if (prev->auto_named) {
+            prev->active = false;
+            prev->num_macs = 0;
+        }
+    }
+
     if (nd->peer_idx >= 0 && nd->peer_idx != pidx) {
         fprintf(stderr, "hub: node %s: unbinding old peer %d\n", nid, nd->peer_idx);
         peer_node[nd->peer_idx] = -1;
     }
     nd->peer_idx = pidx;
-    peer_node[pidx] = node_index(nd);
+    peer_node[pidx] = new_ni;
     fprintf(stderr, "hub: peer %d -> node '%s'\n", pidx, nid);
 }
 
@@ -539,6 +787,9 @@ static void auto_bind_peer(int pidx)
     char id[NODE_ID_LEN];
     snprintf(id, NODE_ID_LEN, "node%d", next_auto_id++);
     bind_peer_to_node(pidx, id);
+    int ni = peer_node[pidx];
+    if (ni >= 0)
+        nodes[ni].auto_named = true;
 }
 
 static void remove_peer(int idx)
@@ -547,7 +798,21 @@ static void remove_peer(int idx)
 
     fprintf(stderr, "hub: peer %d disconnected: %s (fd=%d)\n",
             idx, peers[idx].label, peers[idx].fd);
-    close(peers[idx].fd);
+    if (peers[idx].fd >= 0)
+        close(peers[idx].fd);
+
+    /* Detach from node. Auto-named nodes are recycled on disconnect so
+     * the table doesn't grow without bound under reconnect churn;
+     * user-named nodes persist with their physical state intact. */
+    int ni = peer_node[idx];
+    if (ni >= 0) {
+        nodes[ni].peer_idx = -1;
+        if (nodes[ni].auto_named) {
+            nodes[ni].active = false;
+            nodes[ni].num_macs = 0;
+        }
+    }
+    peer_node[idx] = -1;
 
     /* Update upstream_state references before the swap */
     for (i = 0; i < num_upstreams; i++) {
@@ -558,9 +823,14 @@ static void remove_peer(int idx)
         }
     }
 
-    /* Swap with last — also swap phys */
+    /* Swap with last -- also move the node->peer back-reference and
+     * the peer_node[] entry so they stay in sync after the swap. */
     if (idx < num_peers - 1) {
-        peers[idx] = peers[num_peers - 1];
+        int last = num_peers - 1;
+        peers[idx] = peers[last];
+        peer_node[idx] = peer_node[last];
+        if (peer_node[idx] >= 0)
+            nodes[peer_node[idx]].peer_idx = idx;
     }
     num_peers--;
 }
@@ -602,21 +872,129 @@ static void process_hello(int pidx, const uint8_t *payload, uint32_t len)
 }
 
 /* -------------------------------------------------------------------
- *  Frame forwarding with TTL + physics
+ *  Non-blocking framed send to a peer.
+ *
+ *  The peer's socket is non-blocking. When the peer's kernel send
+ *  buffer is full at frame boundary we drop the frame rather than
+ *  spin -- a slow or hung peer must not stall the whole hub. This
+ *  matches the lossy-medium semantics of the simulated radio.
+ *
+ *  In the rare case where the buffer fills *mid-frame* (after we've
+ *  already written some bytes), continuing without finishing the
+ *  frame would corrupt the receiver's stream framing. We treat the
+ *  peer as broken and let the caller remove it.
+ *
+ *  Returns:
+ *      1  -- whole message written
+ *      0  -- dropped at frame boundary (peer slow, but still healthy)
+ *     -1  -- peer is broken (partial-write stall or fatal error);
+ *            caller must remove this peer.
  * ------------------------------------------------------------------- */
+static int peer_send_frame(int idx, const uint8_t *buf, uint32_t len)
+{
+    uint32_t offset = 0;
+    while (offset < len) {
+        ssize_t sent = write(peers[idx].fd, buf + offset, len - offset);
+        if (sent > 0) {
+            offset += (uint32_t)sent;
+            continue;
+        }
+        if (sent < 0 && errno == EINTR)
+            continue;
+        if (sent < 0 && errno == EAGAIN) {
+            if (offset == 0) {
+                peers[idx].tx_dropped++;
+                total_frames_tx_dropped++;
+                return 0;
+            }
+            return -1;
+        }
+        return -1;
+    }
+    return 1;
+}
+
+/* -------------------------------------------------------------------
+ *  Channel-match policy.
+ *
+ *  Per the v2 wire protocol (vwifi.h):
+ *    - channel_freq == 0 means "unknown / broadcast" and matches anything
+ *    - otherwise the primary 20-MHz frequency must match
+ *    - if either side declares HT40 (bond_freq != 0), the bond pair
+ *      must also match -- this keeps HT40+ ch6 and HT40- ch6 from
+ *      colliding even though their primaries are both 2437.
+ *    - if either side declares a wide channel (VHT80/160/80+80 or
+ *      HE80/160/80+80 via channel_flags), the center_freq1 must
+ *      match -- this distinguishes two 80-MHz blocks that overlap
+ *      in 20-MHz primary space but have different center frequencies.
+ *    - if either side declares 80+80, center_freq2 must also match
+ *      (the secondary 80-MHz segment can be placed anywhere).
+ *
+ *  Match is symmetric in (sender, receiver), as the simulated medium
+ *  requires.
+ * ------------------------------------------------------------------- */
+struct chan_state {
+    uint16_t freq;
+    uint16_t bond_freq;
+    uint16_t flags;
+    uint16_t center1;
+    uint16_t center2;
+};
+
+static bool channels_match(const struct chan_state *a,
+                           const struct chan_state *b)
+{
+    if (a->freq == 0 || b->freq == 0)
+        return true;
+    if (a->freq != b->freq)
+        return false;
+    if ((a->bond_freq != 0 || b->bond_freq != 0) &&
+        a->bond_freq != b->bond_freq)
+        return false;
+
+    /* Wide-channel disambiguation: if either side asserts a flag in
+     * the NEEDS_CENTER1 set, center_freq1 must agree. Skip when both
+     * center_freq1 fields are zero (legacy v2 senders that omit the
+     * field but happen to share the same primary -- treat as match). */
+    uint16_t needs_c1 =
+        (a->flags | b->flags) & VWIFI_CHAN_FLAG_NEEDS_CENTER1;
+    if (needs_c1 && a->center1 != 0 && b->center1 != 0 &&
+        a->center1 != b->center1)
+        return false;
+
+    uint16_t needs_c2 =
+        (a->flags | b->flags) & VWIFI_CHAN_FLAG_NEEDS_CENTER2;
+    if (needs_c2 && a->center2 != 0 && b->center2 != 0 &&
+        a->center2 != b->center2)
+        return false;
+
+    return true;
+}
+
+/* -------------------------------------------------------------------
+ *  Frame forwarding with TTL + physics
+ *
+ *  forward_message is invoked sequentially from the single-threaded
+ *  main loop, so the scratch buffer can be allocated once and reused
+ *  -- this keeps an 8 KB+ array off the stack (matters for restricted
+ *  stack environments) and avoids per-frame allocation overhead.
+ * ------------------------------------------------------------------- */
+static uint8_t *fwd_scratch = NULL;     /* 4 + MAX_MSG_SIZE bytes */
+
 static void forward_message(int sender_idx, const uint8_t *msg,
                             uint32_t total_len)
 {
-    uint8_t tmp[4 + MAX_MSG_SIZE];
+    uint8_t *tmp = fwd_scratch;
     uint32_t payload_len;
     int sender_is_bridge;
     uint8_t ttl;
     int forward_to_bridges;
     int i;
-    ssize_t sent;
-    uint32_t offset;
+    int dead[MAX_PEERS];
+    int n_dead = 0;
+    struct chan_state msg_chan = { 0, 0, 0, 0, 0 };
 
-    if (total_len < 4 || total_len > sizeof(tmp))
+    if (total_len < 4 || total_len > (4 + MAX_MSG_SIZE))
         return;
     payload_len = total_len - 4;
 
@@ -648,6 +1026,26 @@ static void forward_message(int sender_idx, const uint8_t *msg,
     /* Extract rate code from the medium header */
     uint8_t rate_code = tmp[4 + HDR_OFF_RATE_CODE];
 
+    /* Extract channel info if the sender uses the v2 header. v1 senders
+     * are treated as channel=0 (broadcast) for backward compatibility.
+     * The wide-channel fields (flags / center_freq1 / center_freq2)
+     * are also pulled so VHT80+/HE80+ peers can be filtered with the
+     * full center-frequency tuple, not just the 20-MHz primary. */
+    if (payload_len >= VWIFI_HDR_SIZE) {
+        memcpy(&msg_chan.freq,      tmp + 4 + HDR_OFF_CHAN_FREQ,       2);
+        memcpy(&msg_chan.bond_freq, tmp + 4 + HDR_OFF_CHAN_BOND_FREQ,  2);
+        memcpy(&msg_chan.flags,     tmp + 4 + HDR_OFF_CHAN_FLAGS,      2);
+        memcpy(&msg_chan.center1,   tmp + 4 + HDR_OFF_CENTER_FREQ1,    2);
+        memcpy(&msg_chan.center2,   tmp + 4 + HDR_OFF_CENTER_FREQ2,    2);
+        /* Cache the sender's current channel so symmetric filtering
+         * can match it on subsequent frames sent toward this peer. */
+        peers[sender_idx].channel_freq      = msg_chan.freq;
+        peers[sender_idx].channel_bond_freq = msg_chan.bond_freq;
+        peers[sender_idx].channel_flags     = msg_chan.flags;
+        peers[sender_idx].center_freq1      = msg_chan.center1;
+        peers[sender_idx].center_freq2      = msg_chan.center2;
+    }
+
     /* --- TTL handling (unchanged logic) --- */
     ttl = tmp[4 + TTL_BYTE_OFFSET];
 
@@ -669,7 +1067,25 @@ static void forward_message(int sender_idx, const uint8_t *msg,
         if (i == sender_idx)
             continue;
 
+        if (peers[i].fd < 0)
+            continue;
+
         if (peers[i].is_bridge && !forward_to_bridges)
+            continue;
+
+        /* Channel-aware filtering. If we know both sender and receiver
+         * channels and they don't match (with HT40 bond awareness and
+         * VHT/HE wide-channel center-freq comparison where applicable),
+         * the receiver wouldn't hear this transmission on a real
+         * radio, so skip it. */
+        struct chan_state rx_chan = {
+            peers[i].channel_freq,
+            peers[i].channel_bond_freq,
+            peers[i].channel_flags,
+            peers[i].center_freq1,
+            peers[i].center_freq2,
+        };
+        if (!channels_match(&msg_chan, &rx_chan))
             continue;
 
         int rx_ni = peer_node[i];
@@ -702,38 +1118,36 @@ static void forward_message(int sender_idx, const uint8_t *msg,
         if (rx_ni >= 0) nodes[rx_ni].rx_frames++;
         total_frames_forwarded++;
 
+        int rc;
         if (!peers[i].is_bridge) {
             uint8_t saved_ttl = tmp[4 + TTL_BYTE_OFFSET];
             tmp[4 + TTL_BYTE_OFFSET] = 0;
 
-            offset = 0;
-            while (offset < total_len) {
-                sent = write(peers[i].fd, tmp + offset,
-                             total_len - offset);
-                if (sent <= 0) {
-                    if (sent < 0 && (errno == EAGAIN || errno == EINTR))
-                        continue;
-                    break;
-                }
-                offset += (uint32_t)sent;
-            }
+            rc = peer_send_frame(i, tmp, total_len);
+
             tmp[4 + TTL_BYTE_OFFSET] = saved_ttl;
 
             /* Restore original RSSI for next peer (may differ per-link) */
             tmp[4 + HDR_OFF_RSSI] = msg[4 + HDR_OFF_RSSI];
         } else {
-            offset = 0;
-            while (offset < total_len) {
-                sent = write(peers[i].fd, tmp + offset,
-                             total_len - offset);
-                if (sent <= 0) {
-                    if (sent < 0 && (errno == EAGAIN || errno == EINTR))
-                        continue;
-                    break;
-                }
-                offset += (uint32_t)sent;
-            }
+            rc = peer_send_frame(i, tmp, total_len);
         }
+
+        if (rc < 0) {
+            /* Peer is broken (partial-write stall or fatal error).
+             * Close fd now and queue for removal after the loop so
+             * we don't disturb iteration. */
+            fprintf(stderr, "hub: peer %d (%s) broken on send -- removing\n",
+                    i, peers[i].label);
+            close(peers[i].fd);
+            peers[i].fd = -1;
+            dead[n_dead++] = i;
+        }
+    }
+
+    /* Remove broken peers in reverse order (remove_peer swaps with last). */
+    while (n_dead > 0) {
+        remove_peer(dead[--n_dead]);
     }
 }
 
@@ -782,6 +1196,18 @@ static void handle_peer_data(int idx)
 /* -------------------------------------------------------------------
  *  TCP upstream connection + auto-reconnect
  * ------------------------------------------------------------------- */
+/*
+ * Bounded-time connect for upstream hubs.
+ *
+ * The previous implementation used a blocking connect(), which stalls
+ * the entire single-threaded hub for the kernel's full TCP connect
+ * timeout (~75 s on Linux) every time an upstream is unreachable.
+ * Switch to a non-blocking connect with a short poll wait so a dead
+ * upstream costs at most CONNECT_TIMEOUT_MS rather than freezing
+ * fanout for everyone.
+ */
+#define UPSTREAM_CONNECT_TIMEOUT_MS  500
+
 static int connect_upstream(int upstream_idx)
 {
     struct addrinfo hints, *res, *rp;
@@ -801,10 +1227,39 @@ static int connect_upstream(int upstream_idx)
     for (rp = res; rp != NULL; rp = rp->ai_next) {
         fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
         if (fd < 0) continue;
-        if (connect(fd, rp->ai_addr, rp->ai_addrlen) == 0)
-            break;
-        close(fd);
-        fd = -1;
+
+        set_nonblock(fd);
+        int rc = connect(fd, rp->ai_addr, rp->ai_addrlen);
+        if (rc == 0)
+            break;  /* connected immediately */
+
+        if (errno != EINPROGRESS) {
+            close(fd);
+            fd = -1;
+            continue;
+        }
+
+        /* Wait up to UPSTREAM_CONNECT_TIMEOUT_MS for the connection
+         * to complete (or fail). */
+        struct pollfd p = { .fd = fd, .events = POLLOUT };
+        int pr = poll(&p, 1, UPSTREAM_CONNECT_TIMEOUT_MS);
+        if (pr <= 0) {
+            /* Timeout or poll error: abandon this address. */
+            close(fd);
+            fd = -1;
+            continue;
+        }
+
+        /* Check actual connect result via SO_ERROR. */
+        int soerr = 0;
+        socklen_t solen = sizeof(soerr);
+        if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &solen) < 0
+            || soerr != 0) {
+            close(fd);
+            fd = -1;
+            continue;
+        }
+        break;  /* connected */
     }
     freeaddrinfo(res);
 
@@ -845,6 +1300,41 @@ static void try_reconnect_upstreams(void)
  * ------------------------------------------------------------------- */
 
 /* Write a response string to a control client fd */
+/*
+ * Try to drain a ctl_client's outbuf. Returns true if the buffer is
+ * now empty (POLLOUT can be unregistered), false if bytes remain.
+ */
+static bool ctl_drain_outbuf(int idx)
+{
+    struct ctl_client *c = &ctl_clients[idx];
+    while (c->outbuf_used > 0) {
+        ssize_t wr = write(c->fd, c->outbuf, c->outbuf_used);
+        if (wr > 0) {
+            uint32_t left = c->outbuf_used - (uint32_t)wr;
+            if (left > 0)
+                memmove(c->outbuf, c->outbuf + wr, left);
+            c->outbuf_used = left;
+            continue;
+        }
+        if (wr < 0 && (errno == EAGAIN || errno == EINTR))
+            return false;
+        /* Other write errors: client is dead. Drop the buffered
+         * output and let the main loop notice the disconnect. */
+        c->outbuf_used = 0;
+        return true;
+    }
+    return true;
+}
+
+/*
+ * Send formatted text to a control client.
+ *
+ * If `fd` matches an active ctl_client, the response is written
+ * directly when possible and buffered into the client's outbuf when
+ * the kernel buffer is full. The main loop arms POLLOUT to drain.
+ * If `fd` doesn't match a tracked client (e.g. STDERR_FILENO during
+ * startup config load), we just do a best-effort blocking-style write.
+ */
 static void ctl_respond(int fd, const char *fmt, ...)
 {
     char buf[CTL_RESP_SIZE];
@@ -852,11 +1342,47 @@ static void ctl_respond(int fd, const char *fmt, ...)
     va_start(ap, fmt);
     int len = vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
-    if (len > 0) {
-        /* Best-effort write to control client */
+    if (len <= 0)
+        return;
+
+    int idx = ctl_client_by_fd(fd);
+    if (idx < 0) {
+        /* Untracked fd (stderr, ad-hoc): legacy best-effort write. */
         ssize_t wr = write(fd, buf, (size_t)len);
         (void)wr;
+        return;
     }
+
+    struct ctl_client *c = &ctl_clients[idx];
+    size_t off = 0;
+    size_t need = (size_t)len;
+
+    /* If the outbuf is empty, try a direct write first to avoid the
+     * memcpy on the fast path. */
+    if (c->outbuf_used == 0) {
+        ssize_t wr = write(fd, buf, need);
+        if (wr > 0) {
+            off = (size_t)wr;
+            if (off >= need)
+                return;
+        } else if (wr < 0 && errno != EAGAIN && errno != EINTR) {
+            /* Hard write error: drop. The next read will see the
+             * disconnect and clean up. */
+            return;
+        }
+    }
+
+    /* Buffer the remainder. If it would overflow, log and truncate. */
+    size_t leftover = need - off;
+    if (c->outbuf_used + leftover > sizeof(c->outbuf)) {
+        size_t fit = sizeof(c->outbuf) - c->outbuf_used;
+        fprintf(stderr,
+                "hub: ctl client %d outbuf overflow (dropping %zu bytes)\n",
+                idx, leftover - fit);
+        leftover = fit;
+    }
+    memcpy(c->outbuf + c->outbuf_used, buf + off, leftover);
+    c->outbuf_used += (uint32_t)leftover;
 }
 
 /*
@@ -871,28 +1397,47 @@ static int ctl_process_command(int fd, char *line)
 
     /* ---- LIST_PEERS ---- */
     if (strncasecmp(cmd, "LIST_PEERS", 10) == 0) {
-        ctl_respond(fd, "OK %d nodes (%d peers online)\n", num_nodes, num_peers);
+        /* Sized for MAX_MACS_PER_NODE (16) entries of 17 chars + 1
+         * separator each, plus the "(none)" placeholder, with comfortable
+         * headroom so output never silently truncates. */
+        char maclist[512];
+        ctl_respond(fd, "OK %d nodes (%d peers online)\n",
+                    num_nodes, num_peers);
         for (int ni = 0; ni < num_nodes; ni++) {
             struct node_phys *nd = &nodes[ni];
             if (!nd->active) continue;
-            char maclist[256] = "";
+
+            maclist[0] = '\0';
+            size_t mused = 0;
             for (int m = 0; m < nd->num_macs; m++) {
-                char ms[20]; mac_to_str(nd->macs[m], ms, sizeof(ms));
-                if (m > 0) strncat(maclist, ",", sizeof(maclist)-strlen(maclist)-1);
-                strncat(maclist, ms, sizeof(maclist)-strlen(maclist)-1);
+                char ms[20];
+                mac_to_str(nd->macs[m], ms, sizeof(ms));
+                int w = snprintf(maclist + mused, sizeof(maclist) - mused,
+                                 "%s%s", (m > 0) ? "," : "", ms);
+                if (w < 0 || (size_t)w >= sizeof(maclist) - mused) break;
+                mused += (size_t)w;
             }
-            if (nd->num_macs == 0) strncpy(maclist, "(none)", sizeof(maclist)-1);
+            if (nd->num_macs == 0)
+                snprintf(maclist, sizeof(maclist), "(none)");
+
             const char *st = (nd->peer_idx >= 0) ? "online" : "offline";
+            uint64_t txd = (nd->peer_idx >= 0)
+                ? peers[nd->peer_idx].tx_dropped : 0;
+
             if (nd->pos_set)
                 ctl_respond(fd, "  %-12s %s macs=[%s] pos=(%.1f,%.1f,%.1f) "
-                    "txpow=%.1f tx=%" PRIu64 " rx=%" PRIu64 " drop=%" PRIu64 "\n",
+                    "txpow=%.1f tx=%" PRIu64 " rx=%" PRIu64
+                    " rx_drop=%" PRIu64 " tx_drop=%" PRIu64 "\n",
                     nd->node_id, st, maclist, nd->pos_x, nd->pos_y, nd->pos_z,
-                    nd->tx_power_dbm, nd->tx_frames, nd->rx_frames, nd->rx_dropped);
+                    nd->tx_power_dbm, nd->tx_frames, nd->rx_frames,
+                    nd->rx_dropped, txd);
             else
                 ctl_respond(fd, "  %-12s %s macs=[%s] pos=none txpow=%.1f "
-                    "tx=%" PRIu64 " rx=%" PRIu64 " drop=%" PRIu64 "\n",
+                    "tx=%" PRIu64 " rx=%" PRIu64
+                    " rx_drop=%" PRIu64 " tx_drop=%" PRIu64 "\n",
                     nd->node_id, st, maclist, nd->tx_power_dbm,
-                    nd->tx_frames, nd->rx_frames, nd->rx_dropped);
+                    nd->tx_frames, nd->rx_frames,
+                    nd->rx_dropped, txd);
         }
         return 0;
     }
@@ -1116,17 +1661,30 @@ static int ctl_process_command(int fd, char *line)
     /* ---- STATS ---- */
     if (strncasecmp(cmd, "STATS", 5) == 0) {
         ctl_respond(fd, "OK fwd=%" PRIu64 " drop=%" PRIu64
+                    " tx_drop=%" PRIu64
                     " peers=%d nodes=%d links=%d\n",
                     total_frames_forwarded, total_frames_dropped,
+                    total_frames_tx_dropped,
                     num_peers, num_nodes, num_link_overrides);
         return 0;
     }
 
     /* ---- LOAD_CONFIG <path> ---- */
     if (strncasecmp(cmd, "LOAD_CONFIG ", 12) == 0) {
+        /* Cap recursion so a config file that LOAD_CONFIGs itself (or
+         * mutually recursive configs) can't blow the stack. The hub is
+         * single-threaded, so a static counter is sufficient. */
+        #define MAX_LOAD_CONFIG_DEPTH 4
+        static int load_depth = 0;
+
         char path[256];
         if (sscanf(cmd + 12, "%255s", path) != 1) {
             ctl_respond(fd, "ERR usage: LOAD_CONFIG <path>\n");
+            return 0;
+        }
+        if (load_depth >= MAX_LOAD_CONFIG_DEPTH) {
+            ctl_respond(fd, "ERR LOAD_CONFIG too deeply nested (max %d)\n",
+                        MAX_LOAD_CONFIG_DEPTH);
             return 0;
         }
         FILE *f = fopen(path, "r");
@@ -1135,15 +1693,27 @@ static int ctl_process_command(int fd, char *line)
                         path, strerror(errno));
             return 0;
         }
+        load_depth++;
         char cfgline[512];
         int count = 0;
+        int rc = 0;
         while (fgets(cfgline, sizeof(cfgline), f)) {
             char *cl = trim(cfgline);
             if (cl[0] == '\0' || cl[0] == '#') continue;
-            ctl_process_command(fd, cl);
+            /* If a nested command is QUIT (returns -1), stop reading
+             * the file -- the fd has been closed and any further
+             * ctl_respond would be a write to a dead socket. Propagate
+             * the -1 up so handle_ctl_data also stops processing. */
+            if (ctl_process_command(fd, cl) < 0) {
+                rc = -1;
+                break;
+            }
             count++;
         }
+        load_depth--;
         fclose(f);
+        if (rc < 0)
+            return -1;
         ctl_respond(fd, "OK loaded %d commands from %s\n", count, path);
         return 0;
     }
@@ -1345,10 +1915,19 @@ static int setup_tcp_listen(const char *port_str)
     return fd;
 }
 
-static int setup_unix_listen(const char *path)
+/*
+ * Bind a listening Unix socket at `path` with file mode `mode`.
+ *
+ * The umask is temporarily restricted around bind() so the socket file
+ * is created with the requested permissions atomically -- without this,
+ * an attacker could race a connect() through the bind→chmod window.
+ * A follow-up chmod() handles the case where bind() ignored the umask.
+ */
+static int setup_unix_listen(const char *path, mode_t mode)
 {
     struct sockaddr_un addr;
-    int fd;
+    int fd, rc;
+    mode_t old_umask;
 
     unlink(path);
 
@@ -1362,10 +1941,20 @@ static int setup_unix_listen(const char *path)
     addr.sun_family = AF_UNIX;
     strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
 
-    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+    old_umask = umask((mode_t)(~mode & 0777));
+    rc = bind(fd, (struct sockaddr *)&addr, sizeof(addr));
+    umask(old_umask);
+    if (rc < 0) {
         perror("hub: Unix bind");
         close(fd);
         return -1;
+    }
+
+    if (chmod(path, mode) < 0) {
+        /* Non-fatal: log but keep going. The umask above already
+         * restricted creation perms in the typical case. */
+        fprintf(stderr, "hub: chmod %s 0%o: %s\n",
+                path, (unsigned)mode, strerror(errno));
     }
 
     if (listen(fd, 16) < 0) {
@@ -1395,6 +1984,8 @@ static void cleanup(void)
     }
     if (socket_path) unlink(socket_path);
     if (ctl_socket_path) unlink(ctl_socket_path);
+    free(fwd_scratch);
+    fwd_scratch = NULL;
 }
 
 static void sighandler(int sig)
@@ -1420,20 +2011,20 @@ static void usage(const char *prog)
         "\n"
         "Examples:\n"
         "  # Local-only hub:\n"
-        "  %s /tmp/ath9k.sock\n"
+        "  %s /tmp/vwifi.sock\n"
         "\n"
         "  # Hub with control channel:\n"
-        "  %s /tmp/ath9k.sock -c /tmp/ath9k.ctl\n"
+        "  %s /tmp/vwifi.sock -c /tmp/vwifi.ctl\n"
         "\n"
         "  # Hub with startup config + control:\n"
-        "  %s /tmp/ath9k.sock -c /tmp/ath9k.ctl -C medium.cfg\n"
+        "  %s /tmp/vwifi.sock -c /tmp/vwifi.ctl -C medium.cfg\n"
         "\n"
         "  # Runtime control:\n"
         "  echo 'SET_SNR 02:00:00:00:00:00 02:00:00:00:01:00 25' "
-            "| socat - UNIX-CONNECT:/tmp/ath9k.ctl\n"
+            "| socat - UNIX-CONNECT:/tmp/vwifi.ctl\n"
         "\n"
         "  # Interactive control:\n"
-        "  socat READLINE UNIX-CONNECT:/tmp/ath9k.ctl\n"
+        "  socat READLINE UNIX-CONNECT:/tmp/vwifi.ctl\n"
         "\n",
         prog, MAX_UPSTREAMS, prog, prog, prog);
 }
@@ -1508,12 +2099,25 @@ int main(int argc, char **argv)
     /* Seed the PRNG */
     rng_state = (uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32);
 
+    /* Allocate the per-frame forwarding scratch buffer once -- keeps
+     * an 8 KB+ array off forward_message's stack frame. */
+    fwd_scratch = malloc(4 + MAX_MSG_SIZE);
+    if (!fwd_scratch) {
+        perror("malloc fwd_scratch");
+        return 1;
+    }
+
     signal(SIGINT, sighandler);
     signal(SIGTERM, sighandler);
     signal(SIGPIPE, SIG_IGN);
 
-    /* Setup listen sockets */
-    unix_listen_fd = setup_unix_listen(socket_path);
+    /* Setup listen sockets.
+     *
+     * The data socket is world-accessible (0666) so unprivileged QEMU
+     * processes from any user can connect. The control socket is owner-
+     * only (0600) because its commands are unauthenticated and include
+     * SAVE_CONFIG which would otherwise be a privesc primitive. */
+    unix_listen_fd = setup_unix_listen(socket_path, 0666);
     if (unix_listen_fd < 0)
         return 1;
     fprintf(stderr, "hub: Unix socket %s\n", socket_path);
@@ -1528,12 +2132,13 @@ int main(int argc, char **argv)
     }
 
     if (ctl_socket_path) {
-        ctl_listen_fd = setup_unix_listen(ctl_socket_path);
+        ctl_listen_fd = setup_unix_listen(ctl_socket_path, 0600);
         if (ctl_listen_fd < 0) {
             cleanup();
             return 1;
         }
-        fprintf(stderr, "hub: control socket %s\n", ctl_socket_path);
+        fprintf(stderr, "hub: control socket %s (mode 0600)\n",
+                ctl_socket_path);
     }
 
     /* Initialize upstream state */
@@ -1626,12 +2231,16 @@ int main(int argc, char **argv)
             nfds++;
         }
 
-        /* Control clients */
+        /* Control clients (POLLIN always; POLLOUT when there's
+         * buffered response output that didn't fit in the kernel
+         * send buffer earlier). */
         ctl_base = nfds;
         for (i = 0; i < MAX_CTL_CLIENTS; i++) {
             if (ctl_clients[i].active) {
                 pfds[nfds].fd = ctl_clients[i].fd;
                 pfds[nfds].events = POLLIN;
+                if (ctl_clients[i].outbuf_used > 0)
+                    pfds[nfds].events |= POLLOUT;
                 pfds[nfds].revents = 0;
                 nfds++;
             }
@@ -1689,6 +2298,7 @@ int main(int argc, char **argv)
                     if (!ctl_clients[i].active) {
                         ctl_clients[i].fd = cfd;
                         ctl_clients[i].buf_used = 0;
+                        ctl_clients[i].outbuf_used = 0;
                         ctl_clients[i].active = true;
                         placed = true;
                         fprintf(stderr,
@@ -1706,11 +2316,32 @@ int main(int argc, char **argv)
             }
         }
 
-        /* Handle data peer I/O (backwards for safe removal) */
+        /*
+         * Handle data peer I/O (backwards iteration for safe removal).
+         *
+         * forward_message can call remove_peer for *other* indices
+         * (peers that fail a fanout write) before the dispatch loop
+         * gets to them. remove_peer swaps with last, so a previously-
+         * polled fd at index N may have been replaced by a different
+         * peer with no events to handle. Two protections:
+         *
+         *   1. i may now be >= num_peers (slot was discarded).
+         *   2. peers[i].fd may not match pfds[pfd_idx].fd (slot was
+         *      swapped to a different peer whose events live elsewhere
+         *      in pfds, or whose events arrive in the next poll
+         *      iteration).
+         *
+         * In either case, skip dispatching -- spurious read() on the
+         * wrong peer would corrupt its rx state or misattribute
+         * counters.
+         */
         for (i = num_peers - 1; i >= 0; i--) {
             int pfd_idx = peer_base + i;
-            if (pfd_idx < nfds &&
-                (pfds[pfd_idx].revents & (POLLIN | POLLHUP | POLLERR)))
+            if (pfd_idx >= nfds)
+                continue;
+            if (pfds[pfd_idx].fd != peers[i].fd)
+                continue;   /* slot swapped after a remove_peer */
+            if (pfds[pfd_idx].revents & (POLLIN | POLLHUP | POLLERR))
                 handle_peer_data(i);
         }
 
@@ -1719,18 +2350,27 @@ int main(int argc, char **argv)
             int pfd_idx = ctl_base;
             for (i = 0; i < MAX_CTL_CLIENTS; i++) {
                 if (!ctl_clients[i].active) continue;
-                if (pfd_idx < nfds &&
-                    (pfds[pfd_idx].revents &
-                     (POLLIN | POLLHUP | POLLERR)))
-                    handle_ctl_data(i);
+                if (pfd_idx < nfds) {
+                    short rev = pfds[pfd_idx].revents;
+                    /* Drain pending response bytes first so a client
+                     * blocked on POLLOUT doesn't get a fresh response
+                     * appended ahead of the queued one. */
+                    if ((rev & POLLOUT) && ctl_clients[i].active)
+                        ctl_drain_outbuf(i);
+                    if ((rev & (POLLIN | POLLHUP | POLLERR))
+                        && ctl_clients[i].active)
+                        handle_ctl_data(i);
+                }
                 pfd_idx++;
             }
         }
     }
 
     fprintf(stderr, "hub: shutting down (%d peers, %" PRIu64
-            " forwarded, %" PRIu64 " dropped)\n",
-            num_peers, total_frames_forwarded, total_frames_dropped);
+            " forwarded, %" PRIu64 " phys-dropped, %" PRIu64
+            " tx-dropped)\n",
+            num_peers, total_frames_forwarded,
+            total_frames_dropped, total_frames_tx_dropped);
     free(pfds);
     cleanup();
     return 0;

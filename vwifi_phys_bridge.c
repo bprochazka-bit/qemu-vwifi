@@ -1,9 +1,9 @@
 /*
- * ath9k_phys_bridge — Bridge a physical WiFi interface to a virtual medium hub
+ * vwifi-phys-bridge — Bridge a physical WiFi interface to a vwifi-medium hub
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  *
- * Connects to an ath9k_medium_hub as a regular peer, but instead of a
+ * Connects to a vwifi-medium hub as a regular peer, but instead of a
  * virtual radio it uses a real physical WiFi interface in monitor mode.
  *
  * Hub -> bridge: receives 802.11 frames, injects them over the air
@@ -13,10 +13,10 @@
  * running inside a QEMU VM.
  *
  * Build:
- *   gcc -Wall -Wextra -O2 -o ath9k_phys_bridge ath9k_phys_bridge.c
+ *   make vwifi-phys-bridge
  *
  * Usage:
- *   sudo ./ath9k_phys_bridge <hub-socket-path> <interface> -c <channel> [opts]
+ *   sudo ./vwifi-phys-bridge <hub-socket-path> <interface> -c <channel> [opts]
  */
 
 #include <stdio.h>
@@ -36,7 +36,7 @@
 #include <linux/if_packet.h>
 #include <linux/if_ether.h>
 
-#include "ath9k_medium.h"
+#include "vwifi.h"
 
 /* ================================================================
  *  Global state
@@ -165,7 +165,7 @@ static int compute_channel_config(void)
     }
 
     chan_cfg.channel_freq = freq;
-    band_flag = (freq < 5000) ? ATH9K_CHAN_FLAG_2GHZ : ATH9K_CHAN_FLAG_5GHZ;
+    band_flag = (freq < 5000) ? VWIFI_CHAN_FLAG_2GHZ : VWIFI_CHAN_FLAG_5GHZ;
 
     /* Default: single 20 MHz channel */
     chan_cfg.freq_lo = freq;
@@ -175,15 +175,15 @@ static int compute_channel_config(void)
     chan_cfg.center_freq2 = 0;
 
     if (strcmp(bw_str, "HT20") == 0) {
-        chan_cfg.channel_flags = band_flag | ATH9K_CHAN_FLAG_HT20;
+        chan_cfg.channel_flags = band_flag | VWIFI_CHAN_FLAG_HT20;
 
     } else if (strcmp(bw_str, "HT40+") == 0) {
-        chan_cfg.channel_flags = band_flag | ATH9K_CHAN_FLAG_HT40PLUS;
+        chan_cfg.channel_flags = band_flag | VWIFI_CHAN_FLAG_HT40PLUS;
         chan_cfg.channel_bond_freq = freq + 20;
         chan_cfg.freq_hi = freq + 20;
 
     } else if (strcmp(bw_str, "HT40-") == 0) {
-        chan_cfg.channel_flags = band_flag | ATH9K_CHAN_FLAG_HT40MINUS;
+        chan_cfg.channel_flags = band_flag | VWIFI_CHAN_FLAG_HT40MINUS;
         chan_cfg.channel_bond_freq = freq - 20;
         chan_cfg.freq_lo = freq - 20;
 
@@ -194,7 +194,7 @@ static int compute_channel_config(void)
                     freq);
             return -1;
         }
-        chan_cfg.channel_flags = band_flag | ATH9K_CHAN_FLAG_VHT80;
+        chan_cfg.channel_flags = band_flag | VWIFI_CHAN_FLAG_VHT80;
         chan_cfg.center_freq1 = vht80_blocks[blk].center;
         chan_cfg.freq_lo = vht80_blocks[blk].lo_freq;
         chan_cfg.freq_hi = vht80_blocks[blk].hi_freq;
@@ -215,7 +215,7 @@ static int compute_channel_config(void)
                 freq);
             return -1;
         }
-        chan_cfg.channel_flags = band_flag | ATH9K_CHAN_FLAG_VHT160;
+        chan_cfg.channel_flags = band_flag | VWIFI_CHAN_FLAG_VHT160;
         chan_cfg.center_freq1 =
             (vht80_blocks[blk].center + vht80_blocks[blk2].center) / 2;
         chan_cfg.freq_lo = vht80_blocks[blk].lo_freq;
@@ -247,7 +247,7 @@ static int compute_channel_config(void)
                 center2_mhz);
             return -1;
         }
-        chan_cfg.channel_flags = band_flag | ATH9K_CHAN_FLAG_VHT80_80;
+        chan_cfg.channel_flags = band_flag | VWIFI_CHAN_FLAG_VHT80_80;
         chan_cfg.center_freq1 = vht80_blocks[blk1].center;
         chan_cfg.center_freq2 = (uint16_t)center2_mhz;
         /* Acceptance range covers both blocks */
@@ -269,10 +269,16 @@ static int compute_channel_config(void)
  *  Step 3: rate mapping helpers
  * ================================================================ */
 
-/* Radiotap uses 500 kbps units; medium protocol uses ath9k rate codes */
+/* Radiotap uses 500 kbps units; the vwifi medium protocol uses the
+ * legacy PLCP rate codes from vwifi.h. This table maps between the
+ * two for the receive path (radiotap -> medium). The reverse
+ * direction (medium -> radiotap) is currently unused: the injection
+ * path builds a fixed-rate radiotap header rather than echoing the
+ * incoming rate. If/when we want to honor per-frame rates on the
+ * inject side, add the reverse helper back. */
 static const struct {
-    uint8_t rt_rate;    /* radiotap 500kbps */
-    uint8_t ath_code;   /* ath9k rate code */
+    uint8_t rt_rate;        /* radiotap 500kbps units */
+    uint8_t code;           /* medium PLCP rate code */
 } rate_map[] = {
     {   2, 0x1B },  /*  1   Mbps CCK  */
     {   4, 0x1A },  /*  2   Mbps CCK  */
@@ -289,24 +295,14 @@ static const struct {
 };
 #define NUM_RATES (sizeof(rate_map) / sizeof(rate_map[0]))
 
-/* Convert radiotap rate (500kbps units) to ath9k rate code */
-static uint8_t rt_rate_to_ath(uint8_t rt)
+/* Convert a radiotap rate (500 kbps units) to a vwifi medium rate code. */
+static uint8_t rt_rate_to_code(uint8_t rt)
 {
     for (size_t i = 0; i < NUM_RATES; i++) {
         if (rate_map[i].rt_rate == rt)
-            return rate_map[i].ath_code;
+            return rate_map[i].code;
     }
-    return ATH9K_MEDIUM_DEFAULT_RATE;  /* 6 Mbps OFDM */
-}
-
-/* Convert ath9k rate code to radiotap rate (500kbps units) */
-static uint8_t ath_rate_to_rt(uint8_t ath)
-{
-    for (size_t i = 0; i < NUM_RATES; i++) {
-        if (rate_map[i].ath_code == ath)
-            return rate_map[i].rt_rate;
-    }
-    return 12;  /* 6 Mbps OFDM in 500kbps units */
+    return VWIFI_DEFAULT_RATE;  /* 6 Mbps OFDM */
 }
 
 /* ================================================================
@@ -386,7 +382,7 @@ static int echo_check(const uint8_t *frame, size_t len)
  *  Step 5: hub connection + hello
  * ================================================================ */
 
-#define HELLO_MAGIC 0x41394B52  /* "A9KR" */
+#define HELLO_MAGIC 0x52495756  /* "VWIR" -- vwifi registration */
 
 /*
  * Write all bytes to fd, retrying on EINTR.
@@ -568,7 +564,7 @@ static int open_raw_socket(const char *iface)
 struct radiotap_info {
     uint8_t  rate;          /* 500 kbps units */
     uint16_t chan_freq;     /* MHz */
-    uint16_t chan_flags;    /* radiotap channel flags (not ath9k flags) */
+    uint16_t chan_flags;    /* radiotap channel flags (not vwifi flags) */
     int8_t   signal_dbm;
     uint64_t tsft;
     uint8_t  flags;         /* radiotap FLAGS field */
@@ -705,25 +701,25 @@ static const uint8_t inject_radiotap[8] = {
  */
 static void process_hub_message(const uint8_t *payload, uint32_t payload_len)
 {
-    const struct ath9k_medium_frame_hdr *hdr;
+    const struct vwifi_frame_hdr *hdr;
     const uint8_t *frame;
     uint16_t frame_len;
     uint16_t msg_chan_freq;
-    uint8_t inject_buf[8 + ATH9K_MEDIUM_MAX_FRAME_SIZE];
+    uint8_t inject_buf[8 + VWIFI_MAX_FRAME_SIZE];
     ssize_t n;
 
     /* Need at least a v1 header */
-    if (payload_len < ATH9K_MEDIUM_HDR_SIZE_V1) {
+    if (payload_len < VWIFI_HDR_SIZE_V1) {
         if (verbose)
             fprintf(stderr, "bridge: hub->phys: short message (%u bytes)\n",
                     payload_len);
         return;
     }
 
-    hdr = (const struct ath9k_medium_frame_hdr *)payload;
+    hdr = (const struct vwifi_frame_hdr *)payload;
 
     /* Validate magic */
-    if (hdr->magic != ATH9K_MEDIUM_MAGIC) {
+    if (hdr->magic != VWIFI_MAGIC) {
         if (verbose)
             fprintf(stderr, "bridge: hub->phys: bad magic 0x%08x\n",
                     hdr->magic);
@@ -731,7 +727,7 @@ static void process_hub_message(const uint8_t *payload, uint32_t payload_len)
     }
 
     /* Extract channel frequency (v2 has it at offset 28; v1 = treat as 0) */
-    if (payload_len >= ATH9K_MEDIUM_HDR_SIZE)
+    if (payload_len >= VWIFI_HDR_SIZE)
         msg_chan_freq = hdr->channel_freq;
     else
         msg_chan_freq = 0;
@@ -748,13 +744,13 @@ static void process_hub_message(const uint8_t *payload, uint32_t payload_len)
 
     /* Locate the 802.11 frame */
     frame_len = hdr->frame_len;
-    if (payload_len >= ATH9K_MEDIUM_HDR_SIZE)
-        frame = payload + ATH9K_MEDIUM_HDR_SIZE;
+    if (payload_len >= VWIFI_HDR_SIZE)
+        frame = payload + VWIFI_HDR_SIZE;
     else
-        frame = payload + ATH9K_MEDIUM_HDR_SIZE_V1;
+        frame = payload + VWIFI_HDR_SIZE_V1;
 
     /* Sanity check frame length */
-    if (frame_len == 0 || frame_len > ATH9K_MEDIUM_MAX_FRAME_SIZE) {
+    if (frame_len == 0 || frame_len > VWIFI_MAX_FRAME_SIZE) {
         if (verbose)
             fprintf(stderr, "bridge: hub->phys: bad frame_len=%u\n",
                     frame_len);
@@ -812,17 +808,17 @@ static int ctl_frame_has_addr2(uint16_t fc)
 
 static void handle_phys_data(void)
 {
-    uint8_t buf[8 + ATH9K_MEDIUM_MAX_FRAME_SIZE + 64];
+    uint8_t buf[8 + VWIFI_MAX_FRAME_SIZE + 64];
     ssize_t nread;
     struct radiotap_info rt_info;
     size_t rt_len;
     const uint8_t *frame;
     size_t frame_len;
     uint16_t fc;
-    struct ath9k_medium_frame_hdr hdr;
+    struct vwifi_frame_hdr hdr;
     uint32_t msg_len;
     uint32_t len_be;
-    uint8_t sendbuf[4 + sizeof(hdr) + ATH9K_MEDIUM_MAX_FRAME_SIZE];
+    uint8_t sendbuf[4 + sizeof(hdr) + VWIFI_MAX_FRAME_SIZE];
 
     nread = read(raw_fd, buf, sizeof(buf));
     if (nread <= 0) {
@@ -858,7 +854,7 @@ static void handle_phys_data(void)
         return;
 
     /* Oversized frame check */
-    if (frame_len > ATH9K_MEDIUM_MAX_FRAME_SIZE)
+    if (frame_len > VWIFI_MAX_FRAME_SIZE)
         return;
 
     /* Echo check — drop frames we injected */
@@ -884,8 +880,8 @@ static void handle_phys_data(void)
 
     /* Build medium header */
     memset(&hdr, 0, sizeof(hdr));
-    hdr.magic   = ATH9K_MEDIUM_MAGIC;
-    hdr.version = ATH9K_MEDIUM_VERSION;
+    hdr.magic   = VWIFI_MAGIC;
+    hdr.version = VWIFI_VERSION;
     hdr.frame_len = (uint16_t)frame_len;
 
     /* tx_mac = Address 2 (transmitter) at offset 10 */
@@ -893,13 +889,13 @@ static void handle_phys_data(void)
 
     /* Rate */
     hdr.rate_code = rt_info.has_rate
-                  ? rt_rate_to_ath(rt_info.rate)
-                  : ATH9K_MEDIUM_DEFAULT_RATE;
+                  ? rt_rate_to_code(rt_info.rate)
+                  : VWIFI_DEFAULT_RATE;
 
     /* RSSI */
     hdr.rssi = rt_info.has_signal
              ? rt_info.signal_dbm
-             : ATH9K_MEDIUM_DEFAULT_RSSI;
+             : VWIFI_DEFAULT_RSSI;
 
     /* TSF */
     if (rt_info.has_tsft) {
@@ -953,7 +949,7 @@ static void handle_phys_data(void)
  *  each one.
  * ================================================================ */
 
-static uint8_t hub_rxbuf[4 + ATH9K_MEDIUM_HDR_SIZE + ATH9K_MEDIUM_MAX_FRAME_SIZE];
+static uint8_t hub_rxbuf[4 + VWIFI_HDR_SIZE + VWIFI_MAX_FRAME_SIZE];
 static size_t  hub_rxlen;
 
 static void handle_hub_data(void)
@@ -975,7 +971,7 @@ static void handle_hub_data(void)
         uint32_t payload_len = ntohl(*(uint32_t *)hub_rxbuf);
 
         /* Sanity check */
-        if (payload_len > ATH9K_MEDIUM_HDR_SIZE + ATH9K_MEDIUM_MAX_FRAME_SIZE) {
+        if (payload_len > VWIFI_HDR_SIZE + VWIFI_MAX_FRAME_SIZE) {
             fprintf(stderr, "bridge: hub stream corrupt (len=%u), resetting\n",
                     payload_len);
             hub_rxlen = 0;
@@ -1015,7 +1011,7 @@ static void usage(const char *prog)
         "  -h               This help\n"
         "\n"
         "Example:\n"
-        "  sudo %s /tmp/ath9k.sock wlx90de801c625f -c 6 -v\n",
+        "  sudo %s /tmp/vwifi.sock wlx90de801c625f -c 6 -v\n",
         prog, prog);
 }
 
@@ -1101,7 +1097,7 @@ int main(int argc, char *argv[])
     /* Connect to the hub */
     hub_fd = connect_hub(hub_path);
     if (hub_fd < 0) {
-        fprintf(stderr, "bridge: is ath9k_medium_hub running at %s?\n",
+        fprintf(stderr, "bridge: is vwifi-medium running at %s?\n",
                 hub_path);
         return 1;
     }

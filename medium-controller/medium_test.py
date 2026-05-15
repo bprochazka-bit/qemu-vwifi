@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-medium_test.py — Transport-layer test for the ath9k virtual wireless medium.
+medium_test.py — Transport-layer test for the vwifi virtual wireless medium.
 
 Connects to the hub as a fake "device" and tests frame delivery,
-integrity, ordering, and buffer stress — without involving any
-ath9k driver or QEMU at all.
+integrity, ordering, and buffer stress — without involving the
+vwifi_host kernel module or QEMU at all.
 
 Modes:
   sender   — Sends test frames to the medium
@@ -37,12 +37,15 @@ import hashlib
 import random
 import json
 
-# ── Protocol constants (must match ath9k_medium.h) ──────────────────
-MAGIC       = 0x41394B57   # "A9KW"
-VERSION     = 1
-HDR_SIZE    = 28           # sizeof(ath9k_medium_frame_hdr)
+# ── Protocol constants (must match vwifi.h) ──────────────────────────
+MAGIC       = 0x46495756   # "VWIF"
+VERSION     = 2
+HDR_SIZE    = 40           # sizeof(struct vwifi_frame_hdr) v2 layout
 MAX_FRAME   = 8192
-HDR_STRUCT  = '<IHH6sBbIII'  # little-endian to match QEMU native
+# v2 layout: magic, version, frame_len, tx_mac[6], rate_code, rssi,
+#            tsf_lo, tsf_hi, flags, channel_freq, channel_flags,
+#            channel_bond_freq, center_freq1, center_freq2, reserved[2]
+HDR_STRUCT  = '<IHH6sBbIIIHHHHH2s'
 
 # Test frame marker in the 802.11 payload
 TEST_MAGIC  = b'MTEST'
@@ -56,19 +59,28 @@ def make_mac(node_id):
 def mac_str(mac_bytes):
     return ':'.join(f'{b:02x}' for b in mac_bytes)
 
-def build_medium_msg(tx_mac, payload):
-    """Build a complete wire message: [u32 len BE][header LE][payload]."""
+def build_medium_msg(tx_mac, payload, channel_freq=0):
+    """Build a complete wire message: [u32 len BE][header LE][payload].
+
+    channel_freq=0 means "broadcast / unknown" and matches any
+    receiver per the v2 channel-filter rules.
+    """
     frame_len = len(payload)
     hdr = struct.pack(HDR_STRUCT,
         MAGIC,              # magic
         VERSION,            # version
         frame_len,          # frame_len
         tx_mac,             # tx_mac (6 bytes)
-        0x0B,               # rate_code
+        0x0B,               # rate_code (6 Mbps OFDM)
         -30,                # rssi
         0,                  # tsf_lo
         0,                  # tsf_hi
-        0,                  # flags
+        0,                  # flags (TTL=0; hub stamps it)
+        channel_freq,       # channel_freq (MHz, 0 = unknown)
+        0,                  # channel_flags
+        0,                  # channel_bond_freq
+        0, 0,               # center_freq1, center_freq2
+        b'\x00\x00',        # reserved
     )
     assert len(hdr) == HDR_SIZE, f"Header size mismatch: {len(hdr)} != {HDR_SIZE}"
     msg = hdr + payload
@@ -80,15 +92,20 @@ def parse_medium_msg(msg):
         return None, None
     fields = struct.unpack(HDR_STRUCT, msg[:HDR_SIZE])
     hdr = {
-        'magic':     fields[0],
-        'version':   fields[1],
-        'frame_len': fields[2],
-        'tx_mac':    fields[3],
-        'rate_code': fields[4],
-        'rssi':      fields[5],
-        'tsf_lo':    fields[6],
-        'tsf_hi':    fields[7],
-        'flags':     fields[8],
+        'magic':             fields[0],
+        'version':           fields[1],
+        'frame_len':         fields[2],
+        'tx_mac':            fields[3],
+        'rate_code':         fields[4],
+        'rssi':              fields[5],
+        'tsf_lo':            fields[6],
+        'tsf_hi':            fields[7],
+        'flags':             fields[8],
+        'channel_freq':      fields[9],
+        'channel_flags':     fields[10],
+        'channel_bond_freq': fields[11],
+        'center_freq1':      fields[12],
+        'center_freq2':      fields[13],
     }
     payload = msg[HDR_SIZE:HDR_SIZE + hdr['frame_len']]
     return hdr, payload

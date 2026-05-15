@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-ath9k Virtual Wireless Medium Controller
+vwifi Medium Controller
 
-Web-based GUI for the ath9k_medium_hub control socket.
+Web-based GUI for the vwifi-medium control socket.
 Designed for offline Debian 13 -- all assets served locally.
 
 Install (Debian 13):
     apt install python3-uvicorn python3-starlette
 
 Run:
-    python3 app.py --ctl /tmp/ath9k.ctl [--host 0.0.0.0] [--port 8080]
+    python3 app.py --ctl /tmp/vwifi.ctl [--host 0.0.0.0] [--port 8080]
 """
 
 import argparse
@@ -33,7 +33,7 @@ BASE_DIR = Path(__file__).resolve().parent
 # ---------------------------------------------------------------------------
 
 class MediumHubClient:
-    """Thread-safe client for the ath9k_medium_hub control socket.
+    """Thread-safe client for the vwifi-medium control socket.
 
     The hub keeps control connections alive (it never closes them after
     a response).  To avoid blocking on recv() until a timeout expires,
@@ -354,8 +354,8 @@ app = Starlette(routes=routes)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="ath9k Medium Controller Web UI")
-    parser.add_argument("--ctl", default="/tmp/ath9k.ctl",
+    parser = argparse.ArgumentParser(description="vwifi Medium Controller Web UI")
+    parser.add_argument("--ctl", default="/tmp/vwifi.ctl",
                         help="Path to the medium hub control socket")
     parser.add_argument("--host", default="127.0.0.1",
                         help="Listen address (default: 127.0.0.1)")
@@ -366,7 +366,7 @@ def main():
     global hub
     hub = MediumHubClient(args.ctl)
 
-    print(f"ath9k Medium Controller")
+    print(f"vwifi Medium Controller")
     print(f"  Control socket: {args.ctl}")
     print(f"  Listening on:   http://{args.host}:{args.port}")
     print()

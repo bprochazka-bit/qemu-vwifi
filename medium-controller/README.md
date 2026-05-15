@@ -1,6 +1,6 @@
-# ath9k Medium Controller
+# vwifi Medium Controller
 
-Web-based GUI for controlling the `ath9k_medium_hub` virtual wireless medium
+Web-based GUI for controlling the `vwifi-medium` virtual wireless medium
 via its Unix control socket. Mirrors the design of the React reference UI
 (`medium-gui.jsx`) but runs as a standalone Python web application.
 
@@ -30,10 +30,10 @@ served locally from the `static/` directory.
 
 ```bash
 # 1. Start the medium hub with a control socket
-./ath9k_medium_hub /tmp/ath9k.sock -c /tmp/ath9k.ctl
+./vwifi-medium /tmp/vwifi.sock -c /tmp/vwifi.ctl
 
 # 2. Start the web controller
-python3 app.py --ctl /tmp/ath9k.ctl --host 0.0.0.0 --port 8080
+python3 app.py --ctl /tmp/vwifi.ctl --host 0.0.0.0 --port 8080
 
 # 3. Open in browser
 xdg-open http://localhost:8080
@@ -44,7 +44,7 @@ xdg-open http://localhost:8080
 ```
 python3 app.py [OPTIONS]
 
-  --ctl PATH    Path to hub control socket (default: /tmp/ath9k.ctl)
+  --ctl PATH    Path to hub control socket (default: /tmp/vwifi.ctl)
   --host ADDR   Listen address (default: 127.0.0.1)
   --port PORT   Listen port (default: 8080)
 ```
@@ -61,7 +61,7 @@ uvicorn app:app --host 0.0.0.0 --port 8080
 The web UI communicates with the hub through a REST API layer:
 
 ```
-Browser  ──HTTP──▶  app.py (uvicorn)  ──Unix socket──▶  ath9k_medium_hub
+Browser  ──HTTP──▶  app.py (uvicorn)  ──Unix socket──▶  vwifi-medium
 ```
 
 ### API Endpoints
