@@ -39,30 +39,64 @@ HDR_V2_FMT  = '<I H H 6s B b I I I H H H H H 2s'  # 40 bytes
 HDR_V2_SIZE = struct.calcsize(HDR_V2_FMT)
 assert HDR_V2_SIZE == 40, HDR_V2_SIZE
 
+# Channel flags (mirror vwifi.h VWIFI_CHAN_FLAG_*)
+CHF_2GHZ      = 0x0001
+CHF_5GHZ      = 0x0002
+CHF_HT20      = 0x0004
+CHF_HT40PLUS  = 0x0008
+CHF_HT40MINUS = 0x0010
+CHF_VHT80     = 0x0020
+CHF_VHT160    = 0x0040
+CHF_VHT80_80  = 0x0080
+CHF_HE20      = 0x0100
+CHF_HE40      = 0x0200
+CHF_HE80      = 0x0400
+CHF_HE160     = 0x0800
+
+# Common channel center frequencies (MHz)
+CH1, CH6, CH11             = 2412, 2437, 2462
+CH36, CH40, CH44, CH48     = 5180, 5200, 5220, 5240
+CH52, CH56, CH60, CH64     = 5260, 5280, 5300, 5320
+CH149                      = 5745
+
+# VHT80 block centers (5 GHz)
+VHT80_CENTER_36_48 = 5210   # block covering ch36-ch48
+VHT80_CENTER_52_64 = 5290   # block covering ch52-ch64
+VHT160_CENTER_36_64 = 5250  # 160 MHz block covering ch36-ch64
+
 
 def make_frame(tx_mac: bytes,
                channel_freq: int = 0,
                channel_bond_freq: int = 0,
+               channel_flags: int = 0,
+               center_freq1: int = 0,
+               center_freq2: int = 0,
                payload: bytes = b'\x00' * 32,
                rate_code: int = 0x0B) -> bytes:
-    """Build a complete wire message: [len_be][hdr V2][payload]."""
+    """Build a complete wire message: [len_be][hdr V2][payload].
+
+    All channel fields default to 0 which is the "unknown / broadcast"
+    sentinel; pass real values to exercise the hub's channel-aware
+    filter.
+    """
     assert len(tx_mac) == 6
     frame_len = len(payload)
     hdr = struct.pack(
         HDR_V2_FMT,
         VWIFI_MAGIC,
-        2,                  # version
+        2,                      # version
         frame_len,
         tx_mac,
         rate_code,
-        -30,                # rssi
-        0, 0,               # tsf_lo, tsf_hi
-        0,                  # flags (TTL=0; hub stamps it)
+        -30,                    # rssi
+        0, 0,                   # tsf_lo, tsf_hi
+        0,                      # flags (TTL=0; hub stamps it)
         channel_freq,
-        0,                  # channel_flags
+        channel_flags,
         channel_bond_freq,
-        0, 0,               # center_freq1, _freq2
-        b'\x00\x00',        # reserved
+        center_freq1,
+        center_freq2,
+        b'\x00\x00',            # reserved
     )
     wire = hdr + payload
     return struct.pack('!I', len(wire)) + wire
@@ -365,6 +399,292 @@ def test_c1_v1_broadcast(h: Harness):
         a.close(); b.close()
 
 
+# ---------------------------------------------------------------------
+# Channel-filter coverage: HT40 plus/minus, VHT80 center, multi-peer
+# fanout, mid-stream channel changes. The single-pair sender/receiver
+# helper below keeps each test compact; each peer "tunes" by sending
+# one registration frame so the hub learns its channel, and the
+# receiver's pre-test backlog is drained before the assertion frame.
+# ---------------------------------------------------------------------
+
+def _tune(sock, mac, **chan_kwargs):
+    """Tell the hub which channel this peer is on by transmitting one
+    frame with the desired channel fields. Returns immediately; caller
+    is responsible for draining the receiver afterwards."""
+    sock.sendall(make_frame(mac, **chan_kwargs))
+
+
+def _drain_all(socks, settle=0.1):
+    """Drain any pending bytes on a list of sockets."""
+    time.sleep(settle)
+    for s in socks:
+        s.setblocking(False)
+        try:
+            while s.recv(8192):
+                pass
+        except (BlockingIOError, OSError):
+            pass
+        s.setblocking(True)
+
+
+def _recv_with_marker(sock, marker, timeout=0.4):
+    """Read up to one chunk and return True iff `marker` appears in it."""
+    sock.settimeout(timeout)
+    try:
+        got = sock.recv(8192)
+    except socket.timeout:
+        return False, 0
+    return marker in got, len(got)
+
+
+def test_c1_ht40_plus_minus_dont_collide(h: Harness):
+    h.section('C1: HT40+ and HT40- on the same primary do NOT collide')
+    h.restart_hub()
+    a = h.data_conn()
+    b = h.data_conn()
+    try:
+        mac_a = b'\x02\x00\x00\x00\x40\xaa'
+        mac_b = b'\x02\x00\x00\x00\x40\xbb'
+
+        # A is on ch6 HT40+ (primary=2437, bond=2457).
+        # B is on ch6 HT40- (primary=2437, bond=2417).
+        # Same primary, different bond pair -> filter must drop.
+        _tune(a, mac_a, channel_freq=CH6, channel_bond_freq=2457,
+              channel_flags=CHF_2GHZ | CHF_HT40PLUS)
+        _tune(b, mac_b, channel_freq=CH6, channel_bond_freq=2417,
+              channel_flags=CHF_2GHZ | CHF_HT40MINUS)
+        _drain_all([a, b])
+
+        marker = b'PLUSMINUS-NEVER-DELIVER-' + os.urandom(16)
+        a.sendall(make_frame(mac_a, channel_freq=CH6, channel_bond_freq=2457,
+                             channel_flags=CHF_2GHZ | CHF_HT40PLUS,
+                             payload=marker.ljust(64, b'\x00')))
+
+        got, n = _recv_with_marker(b, marker)
+        h.expect(not got,
+                 'HT40+ frame is NOT delivered to HT40- peer',
+                 f'unexpectedly received {n} bytes containing marker')
+    finally:
+        a.close(); b.close()
+
+
+def test_c1_ht40_strict_no_fallback_to_ht20(h: Harness):
+    h.section('C1: HT40+ frame is NOT delivered to a HT20 receiver on the same primary')
+    h.restart_hub()
+    a = h.data_conn()
+    b = h.data_conn()
+    try:
+        mac_a = b'\x02\x00\x00\x00\x41\xaa'
+        mac_b = b'\x02\x00\x00\x00\x41\xbb'
+
+        # A on ch1 HT40+ (primary=2412, bond=2432). B on ch1 HT20.
+        # Strict mode: one side has bond_freq != 0, the other has 0,
+        # so the bond comparison fails and the frame is dropped.
+        # (Real hardware would fall back to HT20; the simulator chose
+        # the strict interpretation -- the test pins that decision.)
+        _tune(a, mac_a, channel_freq=CH1, channel_bond_freq=2432,
+              channel_flags=CHF_2GHZ | CHF_HT40PLUS)
+        _tune(b, mac_b, channel_freq=CH1, channel_bond_freq=0,
+              channel_flags=CHF_2GHZ | CHF_HT20)
+        _drain_all([a, b])
+
+        marker = b'HT40-VS-HT20-' + os.urandom(16)
+        a.sendall(make_frame(mac_a, channel_freq=CH1, channel_bond_freq=2432,
+                             channel_flags=CHF_2GHZ | CHF_HT40PLUS,
+                             payload=marker.ljust(64, b'\x00')))
+
+        got, n = _recv_with_marker(b, marker)
+        h.expect(not got,
+                 'HT40+ frame is NOT delivered to a HT20 receiver',
+                 f'unexpectedly received {n} bytes containing marker')
+    finally:
+        a.close(); b.close()
+
+
+def test_c1_ht40_match_delivers(h: Harness):
+    h.section('C1: HT40+ peers on matching primary+bond deliver')
+    h.restart_hub()
+    a = h.data_conn()
+    b = h.data_conn()
+    try:
+        mac_a = b'\x02\x00\x00\x00\x42\xaa'
+        mac_b = b'\x02\x00\x00\x00\x42\xbb'
+
+        # Both on ch1 HT40+ (primary=2412, bond=2432).
+        _tune(a, mac_a, channel_freq=CH1, channel_bond_freq=2432,
+              channel_flags=CHF_2GHZ | CHF_HT40PLUS)
+        _tune(b, mac_b, channel_freq=CH1, channel_bond_freq=2432,
+              channel_flags=CHF_2GHZ | CHF_HT40PLUS)
+        _drain_all([a, b])
+
+        marker = b'HT40-MATCH-' + os.urandom(16)
+        a.sendall(make_frame(mac_a, channel_freq=CH1, channel_bond_freq=2432,
+                             channel_flags=CHF_2GHZ | CHF_HT40PLUS,
+                             payload=marker.ljust(64, b'\x00')))
+
+        got, n = _recv_with_marker(b, marker)
+        h.expect(got,
+                 'HT40+ frame is delivered to a matching HT40+ peer',
+                 f'received {n} bytes; marker not found')
+    finally:
+        a.close(); b.close()
+
+
+def test_c1_multichannel_fanout_isolation(h: Harness):
+    h.section('C1: 5-peer fanout: only same-channel receiver gets the frame')
+    h.restart_hub()
+    # One sender (ch1), four receivers (ch1, ch6, ch11, ch36). The
+    # one on ch1 should receive; the other three should not.
+    sender = h.data_conn()
+    rx_ch1  = h.data_conn()
+    rx_ch6  = h.data_conn()
+    rx_ch11 = h.data_conn()
+    rx_ch36 = h.data_conn()
+    all_socks = [sender, rx_ch1, rx_ch6, rx_ch11, rx_ch36]
+
+    try:
+        macs = {
+            'send':  b'\x02\x00\x00\x00\x50\x01',
+            'ch1':   b'\x02\x00\x00\x00\x50\x02',
+            'ch6':   b'\x02\x00\x00\x00\x50\x03',
+            'ch11':  b'\x02\x00\x00\x00\x50\x04',
+            'ch36':  b'\x02\x00\x00\x00\x50\x05',
+        }
+
+        _tune(sender,  macs['send'], channel_freq=CH1,  channel_flags=CHF_2GHZ | CHF_HT20)
+        _tune(rx_ch1,  macs['ch1'],  channel_freq=CH1,  channel_flags=CHF_2GHZ | CHF_HT20)
+        _tune(rx_ch6,  macs['ch6'],  channel_freq=CH6,  channel_flags=CHF_2GHZ | CHF_HT20)
+        _tune(rx_ch11, macs['ch11'], channel_freq=CH11, channel_flags=CHF_2GHZ | CHF_HT20)
+        _tune(rx_ch36, macs['ch36'], channel_freq=CH36, channel_flags=CHF_5GHZ | CHF_HT20)
+        _drain_all(all_socks)
+
+        marker = b'FANOUT-CH1-' + os.urandom(16)
+        sender.sendall(make_frame(macs['send'],
+                                  channel_freq=CH1,
+                                  channel_flags=CHF_2GHZ | CHF_HT20,
+                                  payload=marker.ljust(64, b'\x00')))
+
+        got_ch1, _  = _recv_with_marker(rx_ch1, marker)
+        got_ch6, _  = _recv_with_marker(rx_ch6, marker)
+        got_ch11, _ = _recv_with_marker(rx_ch11, marker)
+        got_ch36, _ = _recv_with_marker(rx_ch36, marker)
+
+        h.expect(got_ch1,      'ch1 receiver got the frame')
+        h.expect(not got_ch6,  'ch6 receiver did NOT get the frame')
+        h.expect(not got_ch11, 'ch11 receiver did NOT get the frame')
+        h.expect(not got_ch36, 'ch36 receiver did NOT get the frame')
+    finally:
+        for s in all_socks:
+            s.close()
+
+
+def test_c1_vht80_center_mismatch_drops(h: Harness):
+    h.section('C1: VHT80 peers with same primary but different center_freq1 do NOT collide')
+    h.restart_hub()
+    a = h.data_conn()
+    b = h.data_conn()
+    try:
+        mac_a = b'\x02\x00\x00\x00\x80\xaa'
+        mac_b = b'\x02\x00\x00\x00\x80\xbb'
+
+        # Both peers on primary=5180 declaring VHT80, but the test
+        # forces different center_freq1 values. Real hardware can't
+        # actually be in this state (primary determines the 80-MHz
+        # block), but the filter logic must still distinguish if a
+        # crafted frame arrives -- otherwise overlapping 80-MHz blocks
+        # would silently cross-deliver.
+        _tune(a, mac_a, channel_freq=CH36,
+              channel_bond_freq=CH40,
+              channel_flags=CHF_5GHZ | CHF_VHT80,
+              center_freq1=VHT80_CENTER_36_48)
+        _tune(b, mac_b, channel_freq=CH36,
+              channel_bond_freq=CH40,
+              channel_flags=CHF_5GHZ | CHF_VHT80,
+              center_freq1=VHT80_CENTER_52_64)  # synthetic mismatch
+        _drain_all([a, b])
+
+        marker = b'VHT80-CENTER-MISMATCH-' + os.urandom(16)
+        a.sendall(make_frame(mac_a, channel_freq=CH36,
+                             channel_bond_freq=CH40,
+                             channel_flags=CHF_5GHZ | CHF_VHT80,
+                             center_freq1=VHT80_CENTER_36_48,
+                             payload=marker.ljust(64, b'\x00')))
+
+        got, n = _recv_with_marker(b, marker)
+        h.expect(not got,
+                 'VHT80 frame with mismatched center_freq1 is dropped',
+                 f'unexpectedly received {n} bytes containing marker')
+    finally:
+        a.close(); b.close()
+
+
+def test_c1_vht80_center_match_delivers(h: Harness):
+    h.section('C1: VHT80 peers with matching primary+center_freq1 deliver')
+    h.restart_hub()
+    a = h.data_conn()
+    b = h.data_conn()
+    try:
+        mac_a = b'\x02\x00\x00\x00\x81\xaa'
+        mac_b = b'\x02\x00\x00\x00\x81\xbb'
+
+        _tune(a, mac_a, channel_freq=CH36, channel_bond_freq=CH40,
+              channel_flags=CHF_5GHZ | CHF_VHT80,
+              center_freq1=VHT80_CENTER_36_48)
+        _tune(b, mac_b, channel_freq=CH36, channel_bond_freq=CH40,
+              channel_flags=CHF_5GHZ | CHF_VHT80,
+              center_freq1=VHT80_CENTER_36_48)
+        _drain_all([a, b])
+
+        marker = b'VHT80-CENTER-MATCH-' + os.urandom(16)
+        a.sendall(make_frame(mac_a, channel_freq=CH36,
+                             channel_bond_freq=CH40,
+                             channel_flags=CHF_5GHZ | CHF_VHT80,
+                             center_freq1=VHT80_CENTER_36_48,
+                             payload=marker.ljust(64, b'\x00')))
+
+        got, n = _recv_with_marker(b, marker)
+        h.expect(got,
+                 'VHT80 frame with matching center_freq1 is delivered',
+                 f'received {n} bytes; marker not found')
+    finally:
+        a.close(); b.close()
+
+
+def test_c1_channel_change_mid_stream(h: Harness):
+    h.section('C1: peer that changes channel starts being heard on the new channel')
+    h.restart_hub()
+    a = h.data_conn()
+    b = h.data_conn()
+    try:
+        mac_a = b'\x02\x00\x00\x00\x60\xaa'
+        mac_b = b'\x02\x00\x00\x00\x60\xbb'
+
+        # A starts on ch1, B starts on ch6.
+        _tune(a, mac_a, channel_freq=CH1,
+              channel_flags=CHF_2GHZ | CHF_HT20)
+        _tune(b, mac_b, channel_freq=CH6,
+              channel_flags=CHF_2GHZ | CHF_HT20)
+        _drain_all([a, b])
+
+        # Frame 1: A still on ch1 -> B must NOT receive.
+        m1 = b'CHANGE-PRE-CH1-' + os.urandom(16)
+        a.sendall(make_frame(mac_a, channel_freq=CH1,
+                             channel_flags=CHF_2GHZ | CHF_HT20,
+                             payload=m1.ljust(64, b'\x00')))
+        got1, _ = _recv_with_marker(b, m1, timeout=0.3)
+        h.expect(not got1, 'B does not hear A while A is on ch1')
+
+        # A switches to ch6 (next TX carries the new channel info).
+        m2 = b'CHANGE-POST-CH6-' + os.urandom(16)
+        a.sendall(make_frame(mac_a, channel_freq=CH6,
+                             channel_flags=CHF_2GHZ | CHF_HT20,
+                             payload=m2.ljust(64, b'\x00')))
+        got2, _ = _recv_with_marker(b, m2, timeout=0.5)
+        h.expect(got2, 'B hears A after A switches to ch6')
+    finally:
+        a.close(); b.close()
+
+
 def test_h1h2_h7_node_recycling(h: Harness):
     h.section('H1+H2 / H7: node and peer recycling under churn')
     h.restart_hub()
@@ -442,9 +762,18 @@ TESTS = [
     test_c2_load_config_recursion,
     test_h5_quit_in_load_config,
     test_h5_orig_large_response,
+    # Channel-filter family
     test_c1_channel_mismatch_drops,
     test_c1_channel_match_delivers,
     test_c1_v1_broadcast,
+    test_c1_ht40_plus_minus_dont_collide,
+    test_c1_ht40_strict_no_fallback_to_ht20,
+    test_c1_ht40_match_delivers,
+    test_c1_multichannel_fanout_isolation,
+    test_c1_vht80_center_mismatch_drops,
+    test_c1_vht80_center_match_delivers,
+    test_c1_channel_change_mid_stream,
+    # Resource lifecycle + defensive
     test_h1h2_h7_node_recycling,
     test_hub_survives_garbage,
 ]

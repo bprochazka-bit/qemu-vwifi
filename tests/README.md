@@ -18,20 +18,27 @@ the hub's stderr log in the temp directory.
 
 ## What's covered (userspace only)
 
-| Test                  | Fix       | What it proves                                    |
-|-----------------------|-----------|---------------------------------------------------|
-| socket permissions    | C4        | control 0600, data 0666                           |
-| LIST_PEERS empty      | -         | hub starts clean                                  |
-| tx_drop column        | L6        | new column rendered                               |
-| maclist capacity      | C3        | MAC list block isn't truncated                    |
-| LOAD_CONFIG recursion | C2        | self-referential config refused, hub survives     |
-| QUIT in LOAD_CONFIG   | H5        | -1 propagates, post-QUIT lines skipped            |
-| large LIST_PEERS      | H5-orig   | 120-node dump arrives intact (POLLOUT drain)      |
-| channel mismatch      | C1        | ch1 sender to ch11 receiver -> dropped            |
-| channel match         | C1        | ch1 -> ch1 delivered                              |
-| V1 broadcast          | C1        | channel_freq=0 still broadcasts                   |
-| node recycling        | H1+H2/H7  | 100 connect/disconnect cycles leave 0 online      |
-| garbage tolerance     | -         | bad length / truncated frames don't kill hub      |
+| Test                    | Fix       | What it proves                                            |
+|-------------------------|-----------|-----------------------------------------------------------|
+| socket permissions      | C4        | control 0600, data 0666                                   |
+| LIST_PEERS empty        | -         | hub starts clean                                          |
+| tx_drop column          | L6        | new column rendered                                       |
+| maclist capacity        | C3        | MAC list block isn't truncated                            |
+| LOAD_CONFIG recursion   | C2        | self-referential config refused, hub survives             |
+| QUIT in LOAD_CONFIG     | H5        | -1 propagates, post-QUIT lines skipped                    |
+| large LIST_PEERS        | H5-orig   | 120-node dump arrives intact (POLLOUT drain)              |
+| channel mismatch (HT20) | C1        | ch1 sender to ch11 receiver -> dropped                    |
+| channel match (HT20)    | C1        | ch1 -> ch1 delivered                                      |
+| V1 broadcast            | C1        | channel_freq=0 still broadcasts                           |
+| HT40+ vs HT40- same ch  | C1        | same primary, different bond pair -> dropped              |
+| HT40+ vs HT20 strict    | C1        | one side HT40 + one HT20 same primary -> dropped (strict) |
+| HT40+ match             | C1        | matching primary+bond -> delivered                        |
+| 5-peer fanout           | C1        | sender on ch1 reaches only the ch1 receiver of 4          |
+| VHT80 center mismatch   | C1        | same primary, different center_freq1 -> dropped           |
+| VHT80 center match      | C1        | matching primary+center_freq1 -> delivered                |
+| channel change          | C1        | peer is reachable again after switching channels          |
+| node recycling          | H1+H2/H7  | 100 connect/disconnect cycles leave 0 online              |
+| garbage tolerance       | -         | bad length / truncated frames don't kill hub              |
 
 ## What's NOT covered (needs a real kernel + VM)
 
