@@ -78,7 +78,7 @@
 #include <time.h>
 #include <stdbool.h>
 
-#include "ath9k_medium.h"
+#include "vwifi.h"
 
 /* -------------------------------------------------------------------
  *  Configuration constants
@@ -89,7 +89,7 @@
 #define MAX_LINK_OVERRIDES  256
 
 /* Wire-protocol sizes derived from the canonical header definition. */
-#define MAX_MSG_SIZE        (ATH9K_MEDIUM_MAX_MSG_SIZE)
+#define MAX_MSG_SIZE        (VWIFI_MAX_MSG_SIZE)
 #define RECV_BUF_SIZE       (4 + MAX_MSG_SIZE)
 #define CTL_BUF_SIZE        4096
 #define CTL_RESP_SIZE       4096
@@ -114,17 +114,17 @@
  * The minimum header size we'll accept is the v1 layout (28 bytes);
  * the v2 channel fields are an optional extension.
  */
-#define HDR_OFF_TX_MAC          offsetof(struct ath9k_medium_frame_hdr, tx_mac)
-#define HDR_OFF_RATE_CODE       offsetof(struct ath9k_medium_frame_hdr, rate_code)
-#define HDR_OFF_RSSI            offsetof(struct ath9k_medium_frame_hdr, rssi)
-#define HDR_OFF_FLAGS           offsetof(struct ath9k_medium_frame_hdr, flags)
-#define HDR_OFF_CHAN_FREQ       offsetof(struct ath9k_medium_frame_hdr, channel_freq)
-#define HDR_OFF_CHAN_FLAGS      offsetof(struct ath9k_medium_frame_hdr, channel_flags)
-#define HDR_OFF_CHAN_BOND_FREQ  offsetof(struct ath9k_medium_frame_hdr, channel_bond_freq)
-#define HDR_OFF_CENTER_FREQ1    offsetof(struct ath9k_medium_frame_hdr, center_freq1)
-#define HDR_OFF_CENTER_FREQ2    offsetof(struct ath9k_medium_frame_hdr, center_freq2)
+#define HDR_OFF_TX_MAC          offsetof(struct vwifi_frame_hdr, tx_mac)
+#define HDR_OFF_RATE_CODE       offsetof(struct vwifi_frame_hdr, rate_code)
+#define HDR_OFF_RSSI            offsetof(struct vwifi_frame_hdr, rssi)
+#define HDR_OFF_FLAGS           offsetof(struct vwifi_frame_hdr, flags)
+#define HDR_OFF_CHAN_FREQ       offsetof(struct vwifi_frame_hdr, channel_freq)
+#define HDR_OFF_CHAN_FLAGS      offsetof(struct vwifi_frame_hdr, channel_flags)
+#define HDR_OFF_CHAN_BOND_FREQ  offsetof(struct vwifi_frame_hdr, channel_bond_freq)
+#define HDR_OFF_CENTER_FREQ1    offsetof(struct vwifi_frame_hdr, center_freq1)
+#define HDR_OFF_CENTER_FREQ2    offsetof(struct vwifi_frame_hdr, center_freq2)
 #define TTL_BYTE_OFFSET         (HDR_OFF_FLAGS + 3)
-#define MIN_HDR_SIZE            ATH9K_MEDIUM_HDR_SIZE_MIN
+#define MIN_HDR_SIZE            VWIFI_HDR_SIZE_MIN
 
 /* -------------------------------------------------------------------
  *  Rate table: legacy + HT + VHT
@@ -950,13 +950,13 @@ static bool channels_match(const struct chan_state *a,
      * center_freq1 fields are zero (legacy v2 senders that omit the
      * field but happen to share the same primary -- treat as match). */
     uint16_t needs_c1 =
-        (a->flags | b->flags) & ATH9K_CHAN_FLAG_NEEDS_CENTER1;
+        (a->flags | b->flags) & VWIFI_CHAN_FLAG_NEEDS_CENTER1;
     if (needs_c1 && a->center1 != 0 && b->center1 != 0 &&
         a->center1 != b->center1)
         return false;
 
     uint16_t needs_c2 =
-        (a->flags | b->flags) & ATH9K_CHAN_FLAG_NEEDS_CENTER2;
+        (a->flags | b->flags) & VWIFI_CHAN_FLAG_NEEDS_CENTER2;
     if (needs_c2 && a->center2 != 0 && b->center2 != 0 &&
         a->center2 != b->center2)
         return false;
@@ -1024,7 +1024,7 @@ static void forward_message(int sender_idx, const uint8_t *msg,
      * The wide-channel fields (flags / center_freq1 / center_freq2)
      * are also pulled so VHT80+/HE80+ peers can be filtered with the
      * full center-frequency tuple, not just the 20-MHz primary. */
-    if (payload_len >= ATH9K_MEDIUM_HDR_SIZE) {
+    if (payload_len >= VWIFI_HDR_SIZE) {
         memcpy(&msg_chan.freq,      tmp + 4 + HDR_OFF_CHAN_FREQ,       2);
         memcpy(&msg_chan.bond_freq, tmp + 4 + HDR_OFF_CHAN_BOND_FREQ,  2);
         memcpy(&msg_chan.flags,     tmp + 4 + HDR_OFF_CHAN_FLAGS,      2);

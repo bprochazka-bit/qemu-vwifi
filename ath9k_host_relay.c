@@ -30,20 +30,20 @@
 #include <sys/un.h>
 #include <arpa/inet.h>  /* ntohl/htonl */
 
-#include "ath9k_medium.h"
+#include "vwifi.h"
 
-#define DEFAULT_CHRDEV  "/dev/" ATH9K_MEDIUM_CHRDEV_NAME
+#define DEFAULT_CHRDEV  "/dev/" VWIFI_CHRDEV_NAME
 
 /*
  * The chardev returns a complete wire message per read():
  *   [4-byte length prefix][header][802.11 frame]
  * so the buffer must hold the prefix plus the largest possible
- * payload. Sizing it to ATH9K_MEDIUM_MAX_MSG alone (header + frame)
+ * payload. Sizing it to VWIFI_MAX_MSG alone (header + frame)
  * leaves 4 bytes short, which causes the kernel chrdev_read to return
  * -EMSGSIZE and kfree_skb a maximum-sized frame -- silent data loss
  * for jumbo AMSDUs. Same sizing is reused on the hub->chardev path.
  */
-#define READ_BUF_SIZE   (4 + ATH9K_MEDIUM_MAX_MSG)
+#define READ_BUF_SIZE   (4 + VWIFI_MAX_MSG)
 
 static volatile sig_atomic_t g_running = 1;
 
@@ -149,7 +149,7 @@ static int forward_chardev_to_hub(int chrdev_fd, int hub_fd)
     }
 
     /* Validate minimum size: 4 (len prefix) + 28 (frame header) */
-    if (n < (ssize_t)(4 + ATH9K_MEDIUM_HDR_SIZE)) {
+    if (n < (ssize_t)(4 + VWIFI_HDR_SIZE)) {
         fprintf(stderr, "relay: chardev→hub: short read (%zd bytes)\n", n);
         return 0;
     }
@@ -180,8 +180,8 @@ static int forward_hub_to_chardev(int hub_fd, int chrdev_fd)
     }
 
     payload_len = ntohl(len_be);
-    if (payload_len < ATH9K_MEDIUM_HDR_SIZE ||
-        payload_len > ATH9K_MEDIUM_HDR_SIZE + ATH9K_MEDIUM_MAX_FRAME) {
+    if (payload_len < VWIFI_HDR_SIZE ||
+        payload_len > VWIFI_HDR_SIZE + VWIFI_MAX_FRAME) {
         fprintf(stderr, "relay: hub→chardev: bad length %u\n", payload_len);
         return -1;
     }

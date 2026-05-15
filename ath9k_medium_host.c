@@ -42,7 +42,7 @@
 #include <linux/platform_device.h>
 #include <net/mac80211.h>
 
-#include "ath9k_medium.h"
+#include "vwifi.h"
 
 #define DRV_NAME        "ath9k_medium_host"
 #define DRV_VERSION     "1.0"
@@ -69,7 +69,7 @@ struct ath9k_host_priv {
     bool                    started;
     int                     channel_freq;       /* MHz, primary 20 */
     u16                     channel_bond_freq;  /* MHz, HT40 secondary, 0=HT20 */
-    u16                     channel_flags;      /* ATH9K_CHAN_FLAG_* */
+    u16                     channel_flags;      /* VWIFI_CHAN_FLAG_* */
     u16                     center_freq1;       /* VHT/HE primary segment center */
     u16                     center_freq2;       /* VHT80+80 secondary segment center */
     enum nl80211_band       channel_band;
@@ -389,7 +389,7 @@ static void ath9k_host_tx(struct ieee80211_hw *hw,
     struct ieee80211_tx_info *tx_info = IEEE80211_SKB_CB(skb);
     struct ieee80211_hdr *hdr = (struct ieee80211_hdr *)skb->data;
     struct sk_buff *msg;
-    struct ath9k_medium_frame_hdr fhdr;
+    struct vwifi_frame_hdr fhdr;
     unsigned long flags;
     bool stop_queues_now = false;
     bool dropped = false;
@@ -434,31 +434,31 @@ static void ath9k_host_tx(struct ieee80211_hw *hw,
                  * Clamp MCS to 9 (VHT ceiling). */
                 if (mcs > 9) mcs = 9;
                 rate_code = (nss == 1)
-                    ? ATH9K_RC_VHT160_NSS1_BASE + mcs
-                    : ATH9K_RC_VHT160_NSS2_BASE + mcs;
+                    ? VWIFI_RC_VHT160_NSS1_BASE + mcs
+                    : VWIFI_RC_VHT160_NSS2_BASE + mcs;
             } else if (r0->flags & IEEE80211_TX_RC_80_MHZ_WIDTH) {
                 if (mcs <= 9) {
                     rate_code = (nss == 1)
-                        ? ATH9K_RC_VHT80_NSS1_BASE + mcs
-                        : ATH9K_RC_VHT80_NSS2_BASE + mcs;
+                        ? VWIFI_RC_VHT80_NSS1_BASE + mcs
+                        : VWIFI_RC_VHT80_NSS2_BASE + mcs;
                 } else {
                     /* MCS 10/11 are HE-only -- if mac80211 hands us one
                      * via the VHT path, emit the HE80 code so the hub's
                      * physics models 1024-QAM correctly. */
                     rate_code = (nss == 1)
-                        ? ATH9K_RC_HE80_NSS1_BASE + mcs
-                        : ATH9K_RC_HE80_NSS2_BASE + mcs;
+                        ? VWIFI_RC_HE80_NSS1_BASE + mcs
+                        : VWIFI_RC_HE80_NSS2_BASE + mcs;
                 }
             } else if (r0->flags & IEEE80211_TX_RC_40_MHZ_WIDTH) {
                 if (mcs > 7) mcs = 7;   /* HT40 namespace is 0..7 per NSS */
                 rate_code = (nss == 1)
-                    ? ATH9K_RC_HT40_NSS1_BASE + mcs
-                    : ATH9K_RC_HT40_NSS2_BASE + mcs;
+                    ? VWIFI_RC_HT40_NSS1_BASE + mcs
+                    : VWIFI_RC_HT40_NSS2_BASE + mcs;
             } else {
                 if (mcs > 7) mcs = 7;
                 rate_code = (nss == 1)
-                    ? ATH9K_RC_HT20_NSS1_BASE + mcs
-                    : ATH9K_RC_HT20_NSS2_BASE + mcs;
+                    ? VWIFI_RC_HT20_NSS1_BASE + mcs
+                    : VWIFI_RC_HT20_NSS2_BASE + mcs;
             }
         } else if (r0->flags & IEEE80211_TX_RC_MCS) {
             u8 mcs = r0->idx & 0x0F;
@@ -468,12 +468,12 @@ static void ath9k_host_tx(struct ieee80211_hw *hw,
 
             if (ht40) {
                 rate_code = nss2
-                    ? ATH9K_RC_HT40_NSS2_BASE + mcs_in_nss
-                    : ATH9K_RC_HT40_NSS1_BASE + mcs_in_nss;
+                    ? VWIFI_RC_HT40_NSS2_BASE + mcs_in_nss
+                    : VWIFI_RC_HT40_NSS1_BASE + mcs_in_nss;
             } else {
                 rate_code = nss2
-                    ? ATH9K_RC_HT20_NSS2_BASE + mcs_in_nss
-                    : ATH9K_RC_HT20_NSS1_BASE + mcs_in_nss;
+                    ? VWIFI_RC_HT20_NSS2_BASE + mcs_in_nss
+                    : VWIFI_RC_HT20_NSS1_BASE + mcs_in_nss;
             }
         } else {
             /* Legacy bitrate -- pick from the band-appropriate table. */
@@ -496,8 +496,8 @@ static void ath9k_host_tx(struct ieee80211_hw *hw,
      * cached chandef -- the hub uses it to filter peers that aren't
      * tuned to a compatible channel (see channels_match). */
     memset(&fhdr, 0, sizeof(fhdr));
-    fhdr.magic              = cpu_to_le32(ATH9K_MEDIUM_MAGIC);
-    fhdr.version            = cpu_to_le16(ATH9K_MEDIUM_VERSION);
+    fhdr.magic              = cpu_to_le32(VWIFI_MAGIC);
+    fhdr.version            = cpu_to_le16(VWIFI_VERSION);
     fhdr.frame_len          = cpu_to_le16(skb->len);
     memcpy(fhdr.tx_mac, hdr->addr2, ETH_ALEN);
     fhdr.rate_code          = rate_code;
@@ -512,7 +512,7 @@ static void ath9k_host_tx(struct ieee80211_hw *hw,
     fhdr.center_freq2       = cpu_to_le16(priv->center_freq2);
 
     /* Build wire message: [len_be][fhdr][802.11 frame] */
-    wire_len = ATH9K_MEDIUM_HDR_SIZE + skb->len;
+    wire_len = VWIFI_HDR_SIZE + skb->len;
     msg = alloc_skb(4 + wire_len, GFP_ATOMIC);
     if (!msg) {
         ieee80211_free_txskb(hw, skb);
@@ -522,7 +522,7 @@ static void ath9k_host_tx(struct ieee80211_hw *hw,
 
     len_be = htonl(wire_len);
     skb_put_data(msg, &len_be, 4);
-    skb_put_data(msg, &fhdr, ATH9K_MEDIUM_HDR_SIZE);
+    skb_put_data(msg, &fhdr, VWIFI_HDR_SIZE);
     skb_put_data(msg, skb->data, skb->len);
 
     /*
@@ -636,8 +636,8 @@ static int ath9k_host_config(struct ieee80211_hw *hw, u32 changed)
         priv->channel_band = cdef->chan->band;
 
         flags |= (cdef->chan->band == NL80211_BAND_5GHZ)
-                 ? ATH9K_CHAN_FLAG_5GHZ
-                 : ATH9K_CHAN_FLAG_2GHZ;
+                 ? VWIFI_CHAN_FLAG_5GHZ
+                 : VWIFI_CHAN_FLAG_2GHZ;
 
         /*
          * Derive bond_freq and width flags from the chandef width.
@@ -652,27 +652,27 @@ static int ath9k_host_config(struct ieee80211_hw *hw, u32 changed)
             /* No HT/VHT/HE flags set */
             break;
         case NL80211_CHAN_WIDTH_20:
-            flags |= ATH9K_CHAN_FLAG_HT20;
+            flags |= VWIFI_CHAN_FLAG_HT20;
             break;
         case NL80211_CHAN_WIDTH_40:
             if (cf1 > prim) {
-                flags |= ATH9K_CHAN_FLAG_HT40PLUS;
+                flags |= VWIFI_CHAN_FLAG_HT40PLUS;
                 bond = prim + 20;
             } else {
-                flags |= ATH9K_CHAN_FLAG_HT40MINUS;
+                flags |= VWIFI_CHAN_FLAG_HT40MINUS;
                 bond = prim - 20;
             }
             break;
         case NL80211_CHAN_WIDTH_80:
-            flags |= ATH9K_CHAN_FLAG_VHT80;
+            flags |= VWIFI_CHAN_FLAG_VHT80;
             bond  = (cf1 > prim) ? prim + 20 : prim - 20;
             break;
         case NL80211_CHAN_WIDTH_160:
-            flags |= ATH9K_CHAN_FLAG_VHT160;
+            flags |= VWIFI_CHAN_FLAG_VHT160;
             bond  = (cf1 > prim) ? prim + 20 : prim - 20;
             break;
         case NL80211_CHAN_WIDTH_80P80:
-            flags |= ATH9K_CHAN_FLAG_VHT80_80;
+            flags |= VWIFI_CHAN_FLAG_VHT80_80;
             bond  = (cf1 > prim) ? prim + 20 : prim - 20;
             break;
         default:
@@ -775,7 +775,7 @@ static const struct ieee80211_ops ath9k_host_ops = {
 static void ath9k_host_rx_frame(struct ath9k_host_priv *priv,
                                 const u8 *data, size_t len)
 {
-    struct ath9k_medium_frame_hdr fhdr;
+    struct vwifi_frame_hdr fhdr;
     struct ieee80211_rx_status *rx_status;
     struct sk_buff *skb;
     u16 frame_len;
@@ -786,21 +786,21 @@ static void ath9k_host_rx_frame(struct ath9k_host_priv *priv,
      * upgraded yet) still send 28-byte headers per the documented
      * backward-compat contract; rejecting them here would silently
      * black-hole every legacy peer. */
-    if (len < ATH9K_MEDIUM_HDR_SIZE_V1) {
+    if (len < VWIFI_HDR_SIZE_V1) {
         pr_warn(DRV_NAME ": rx: short message (%zu bytes)\n", len);
         return;
     }
 
-    hdr_len = (len >= ATH9K_MEDIUM_HDR_SIZE)
-              ? ATH9K_MEDIUM_HDR_SIZE
-              : ATH9K_MEDIUM_HDR_SIZE_V1;
+    hdr_len = (len >= VWIFI_HDR_SIZE)
+              ? VWIFI_HDR_SIZE
+              : VWIFI_HDR_SIZE_V1;
 
     /* Zero the local fhdr first so v2-only fields (channel_freq etc.)
      * read as 0 ("unknown") when copying from a v1 sender. */
     memset(&fhdr, 0, sizeof(fhdr));
     memcpy(&fhdr, data, hdr_len);
 
-    if (le32_to_cpu(fhdr.magic) != ATH9K_MEDIUM_MAGIC) {
+    if (le32_to_cpu(fhdr.magic) != VWIFI_MAGIC) {
         pr_warn(DRV_NAME ": rx: bad magic 0x%08x\n", le32_to_cpu(fhdr.magic));
         return;
     }
@@ -812,7 +812,7 @@ static void ath9k_host_rx_frame(struct ath9k_host_priv *priv,
         return;
     }
 
-    if (frame_len == 0 || frame_len > ATH9K_MEDIUM_MAX_FRAME) {
+    if (frame_len == 0 || frame_len > VWIFI_MAX_FRAME) {
         return;
     }
 
@@ -1018,7 +1018,7 @@ static ssize_t ath9k_host_chrdev_write(struct file *filp,
         return -ENODEV;
     }
 
-    if (count > ATH9K_MEDIUM_MAX_MSG * 8) {
+    if (count > VWIFI_MAX_MSG * 8) {
         return -EINVAL;
     }
 
@@ -1042,8 +1042,8 @@ static ssize_t ath9k_host_chrdev_write(struct file *filp,
 
         /* Accept v1 (28-byte) and v2 (40-byte) headers; ath9k_host_rx_frame
          * detects which from `len` and zeros the missing v2 fields. */
-        if (payload_len < ATH9K_MEDIUM_HDR_SIZE_V1 ||
-            payload_len > ATH9K_MEDIUM_HDR_SIZE + ATH9K_MEDIUM_MAX_FRAME) {
+        if (payload_len < VWIFI_HDR_SIZE_V1 ||
+            payload_len > VWIFI_HDR_SIZE + VWIFI_MAX_FRAME) {
             break;  /* bad length — stop parsing */
         }
 
@@ -1088,7 +1088,7 @@ static const struct file_operations ath9k_host_chrdev_fops = {
 
 static struct miscdevice ath9k_host_miscdev = {
     .minor  = MISC_DYNAMIC_MINOR,
-    .name   = ATH9K_MEDIUM_CHRDEV_NAME,
+    .name   = VWIFI_CHRDEV_NAME,
     .fops   = &ath9k_host_chrdev_fops,
 };
 
@@ -1213,7 +1213,7 @@ static int __init ath9k_host_init(void)
     priv->channel_band = NL80211_BAND_2GHZ;
 
     pr_info(DRV_NAME " v" DRV_VERSION ": registered — "
-            "MAC %pM, chardev /dev/" ATH9K_MEDIUM_CHRDEV_NAME "\n", mac);
+            "MAC %pM, chardev /dev/" VWIFI_CHRDEV_NAME "\n", mac);
 
     return 0;
 

@@ -22,7 +22,7 @@ install:
 	$(MAKE) -C $(KDIR) M=$(PWD) modules_install
 	depmod -a
 
-ath9k_medium_host.o: ath9k_medium.h
+ath9k_medium_host.o: vwifi.h
 
 # ---------- Userspace utilities ----------
 # These don't require kernel headers, so they can be built standalone
@@ -32,13 +32,13 @@ CFLAGS  ?= -Wall -Wextra -O2
 
 USERSPACE_BINS := ath9k_hub ath9k_host_relay ath9k_phys_bridge
 
-ath9k_hub: ath9k_medium_hub_scalable.c ath9k_medium.h
+ath9k_hub: ath9k_medium_hub_scalable.c vwifi.h
 	$(CC) $(CFLAGS) -o $@ $< -lm
 
-ath9k_host_relay: ath9k_host_relay.c ath9k_medium.h
+ath9k_host_relay: ath9k_host_relay.c vwifi.h
 	$(CC) $(CFLAGS) -o $@ $<
 
-ath9k_phys_bridge: ath9k_phys_bridge.c ath9k_medium.h
+ath9k_phys_bridge: ath9k_phys_bridge.c vwifi.h
 	$(CC) $(CFLAGS) -o $@ $<
 
 userspace: $(USERSPACE_BINS)

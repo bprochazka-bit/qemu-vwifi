@@ -34,7 +34,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # =====================================================================
 # Wire-format helpers (must match ath9k_medium.h)
 # =====================================================================
-ATH9K_MAGIC = 0x41394B57   # "A9KW"
+VWIFI_MAGIC = 0x46495756   # "VWIF"
 HDR_V2_FMT  = '<I H H 6s B b I I I H H H H H 2s'  # 40 bytes
 HDR_V2_SIZE = struct.calcsize(HDR_V2_FMT)
 assert HDR_V2_SIZE == 40, HDR_V2_SIZE
@@ -50,7 +50,7 @@ def make_frame(tx_mac: bytes,
     frame_len = len(payload)
     hdr = struct.pack(
         HDR_V2_FMT,
-        ATH9K_MAGIC,
+        VWIFI_MAGIC,
         2,                  # version
         frame_len,
         tx_mac,
