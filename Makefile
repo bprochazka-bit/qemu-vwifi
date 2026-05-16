@@ -4,6 +4,8 @@
 #   make                    — build kernel module against running kernel
 #   make KDIR=/path/to/src  — build module against specific kernel source
 #   make install            — install module (requires root)
+#   make install SKIP_SIGN=1 — install without the (failing) module-signing
+#                             step on distros that ship no signing key
 #   make userspace          — build vwifi-medium / vwifi-host-relay /
 #                             vwifi-phys-bridge userspace binaries
 #   make install-userspace  — install userspace binaries only, no kernel
@@ -22,8 +24,18 @@ ccflags-y += -DDEBUG
 all:
 	$(MAKE) -C $(KDIR) M=$(PWD) modules
 
+# Module signing: stock Debian/Ubuntu kernel-headers packages do not ship
+# the private signing key, so Kbuild's post-install sign-file step fails
+# harmlessly (the module is simply left unsigned, which is fine unless
+# Secure Boot is enabled). Pass SKIP_SIGN=1 to skip signing and silence
+# that noisy OpenSSL "no such file" error.
+SKIP_SIGN ?=
+ifeq ($(SKIP_SIGN),1)
+MODINST_ARGS := mod_sign_cmd=true
+endif
+
 install:
-	$(MAKE) -C $(KDIR) M=$(PWD) modules_install
+	$(MAKE) -C $(KDIR) M=$(PWD) modules_install $(MODINST_ARGS)
 	depmod -a
 
 vwifi_host.o: vwifi.h
