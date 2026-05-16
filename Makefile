@@ -6,6 +6,9 @@
 #   make install            — install module (requires root)
 #   make userspace          — build vwifi-medium / vwifi-host-relay /
 #                             vwifi-phys-bridge userspace binaries
+#   make install-userspace  — install userspace binaries only, no kernel
+#                             module (honors PREFIX, DESTDIR)
+#   make uninstall-userspace — remove installed userspace binaries
 #   make test               — run tests/harness.py (requires userspace built)
 #   make clean              — remove all build artifacts (kernel + userspace)
 
@@ -44,6 +47,18 @@ vwifi-phys-bridge: vwifi_phys_bridge.c vwifi.h
 
 userspace: $(USERSPACE_BINS)
 
+# Install destination (DESTDIR for staged/packaged installs).
+PREFIX  ?= /usr/local
+BINDIR  ?= $(PREFIX)/bin
+INSTALL ?= install
+
+install-userspace: $(USERSPACE_BINS)
+	$(INSTALL) -d $(DESTDIR)$(BINDIR)
+	$(INSTALL) -m 0755 $(USERSPACE_BINS) $(DESTDIR)$(BINDIR)
+
+uninstall-userspace:
+	rm -f $(addprefix $(DESTDIR)$(BINDIR)/,$(USERSPACE_BINS))
+
 # ---------- Tests ----------
 test: vwifi-medium
 	python3 tests/harness.py
@@ -53,4 +68,4 @@ clean:
 	-$(MAKE) -C $(KDIR) M=$(PWD) clean 2>/dev/null || true
 	rm -f $(USERSPACE_BINS)
 
-.PHONY: all install userspace test clean
+.PHONY: all install userspace install-userspace uninstall-userspace test clean
