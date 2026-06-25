@@ -30,7 +30,14 @@
 #ifndef VWIFI_H
 #define VWIFI_H
 
+#ifdef __KERNEL__
+#include <linux/types.h>
+/* The kernel's <linux/types.h> provides uint8_t/uint16_t/uint32_t/uint64_t
+ * but not the signed fixed-width aliases; vwifi_frame_hdr uses int8_t. */
+typedef __s8 int8_t;
+#else
 #include <stdint.h>
+#endif
 
 /* ================================================================
  *  Wire protocol constants
