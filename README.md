@@ -203,12 +203,22 @@ sudo tcpdump -i wlan0 -e -n
 ## Bridging in a real radio (optional)
 
 `vwifi-phys-bridge` connects a physical WiFi interface in monitor
-mode to the medium, so an external device can associate with a
-virtual AP running inside a QEMU VM.
+mode to the medium, making the virtual APs/clients **observable** over
+the air (and real traffic injectable into the sim).
 
 ```bash
 sudo ./vwifi-phys-bridge /tmp/vwifi.sock wlx90de801c625f -c 6 -v
 ```
+
+> **Association caveat.** Plain monitor mode lets a real device *see*
+> the virtual APs but **not reliably *join* one**: an 802.11 STA needs
+> its frames ACKed within SIFS (~10–16 µs), which only a real radio's
+> MAC hardware can do — a software relay is ~1000× too slow. To let an
+> unmodifiable real station (e.g. an Android phone) actually associate
+> to a virtual OpenWRT AP using a single radio, see
+> [`docs/ar9271-phys-bridge-lab.md`](docs/ar9271-phys-bridge-lab.md),
+> which keeps the VM as the literal AP and adds a hardware-ACK hook on
+> an AR9271 (open firmware).
 
 Options:
 
