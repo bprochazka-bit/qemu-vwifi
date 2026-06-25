@@ -102,6 +102,23 @@ def make_frame(tx_mac: bytes,
     return struct.pack('!I', len(wire)) + wire
 
 
+HELLO_MAGIC = 0x52495756   # "VWIR"
+HELLO_FLAG_PHYSICAL = 0x01
+
+
+def make_hello(node_id: str, physical: bool = False) -> bytes:
+    """Build a hello/registration message: [len_be][HELLO_MAGIC][node_id\\0][flags?].
+
+    `physical=True` appends the flag byte that marks the peer as a real
+    radio (the phys bridge), so the hub exempts its links from the
+    simulated physics model.
+    """
+    payload = struct.pack('<I', HELLO_MAGIC) + node_id.encode() + b'\x00'
+    if physical:
+        payload += bytes([HELLO_FLAG_PHYSICAL])
+    return struct.pack('!I', len(payload)) + payload
+
+
 # =====================================================================
 # Harness
 # =====================================================================
@@ -1169,6 +1186,52 @@ def test_b_bridge_trunk_not_channel_filtered(h: Harness):
         a.close(); br.close()
 
 
+def test_phys_bridge_exempt_from_physics(h: Harness):
+    h.section('Bridge: a physical-radio peer is exempt from the simulated '
+              'physics model')
+    h.restart_hub()
+    ap = h.data_conn()
+    physbr = h.data_conn()
+    normal = h.data_conn()
+    try:
+        mac_ap = b'\x02\x00\x00\x05\x00\xaa'
+        mac_pb = b'\x02\x00\x00\x05\x00\xbb'
+        mac_nm = b'\x02\x00\x00\x05\x00\xcc'
+
+        # Name the nodes via hello; the bridge announces itself physical.
+        ap.sendall(make_hello('apnode'))
+        physbr.sendall(make_hello('physbr', physical=True))
+        normal.sendall(make_hello('normalnode'))
+
+        # Reveal channels (all ch6 HT20) so the channel filter passes.
+        _tune(ap,     mac_ap, channel_freq=CH6, channel_flags=CHF_2GHZ | CHF_HT20)
+        _tune(physbr, mac_pb, channel_freq=CH6, channel_flags=CHF_2GHZ | CHF_HT20)
+        _tune(normal, mac_nm, channel_freq=CH6, channel_flags=CHF_2GHZ | CHF_HT20)
+
+        # 100% simulated loss from the AP toward both receivers. Only the
+        # physical peer is exempt and should still hear the frame; the
+        # ordinary peer is the control that proves the loss link is live.
+        r1 = h.ctl_cmd('SET_LOSS apnode physbr 1.0')
+        r2 = h.ctl_cmd('SET_LOSS apnode normalnode 1.0')
+        h.expect('OK' in r1 and 'OK' in r2, 'both 100% loss links set',
+                 repr((r1[:60], r2[:60])))
+        _drain_all([ap, physbr, normal])
+
+        marker = b'PHYS-EXEMPT-' + os.urandom(16)
+        ap.sendall(make_frame(mac_ap, channel_freq=CH6,
+                              channel_flags=CHF_2GHZ | CHF_HT20,
+                              payload=marker.ljust(64, b'\x00')))
+
+        got_pb, _ = _recv_with_marker(physbr, marker, timeout=0.5)
+        got_nm, _ = _recv_with_marker(normal, marker, timeout=0.5)
+        h.expect(got_pb,
+                 'physical-radio peer receives frame despite 100% simulated loss')
+        h.expect(not got_nm,
+                 'non-physical peer is dropped by the 100% loss link (control)')
+    finally:
+        ap.close(); physbr.close(); normal.close()
+
+
 def test_hub_survives_garbage(h: Harness):
     h.section('Defensive: hub survives garbage on data socket')
     s = h.data_conn()
@@ -1230,6 +1293,8 @@ TESTS = [
     test_c1_channel_change_mid_stream,
     # B: inter-hub bridge trunk must not be channel-filtered
     test_b_bridge_trunk_not_channel_filtered,
+    # Physical bridge: real-radio links bypass the simulated physics
+    test_phys_bridge_exempt_from_physics,
     # Resource lifecycle + defensive
     test_h1h2_h7_node_recycling,
     test_hub_survives_garbage,

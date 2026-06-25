@@ -70,6 +70,18 @@ typedef __s8 int8_t;
  * The relay opens this path; the driver uses it as miscdevice .name. */
 #define VWIFI_CHRDEV_NAME        "vwifi"
 
+/* Hello/registration message: [uint32 HELLO_MAGIC][node_id\0][flags?]
+ *
+ * The flags byte is optional and trails the node_id's null terminator;
+ * hellos that omit it (QEMU guests, older bridges) imply flags = 0.
+ *
+ * VWIFI_HELLO_FLAG_PHYSICAL marks the peer as a real radio (the physical
+ * bridge): the hub exempts every link touching it from the simulated
+ * propagation model -- no synthetic frame-error drops and no RSSI
+ * rewrite -- because real-world RF is already the channel. Channel
+ * filtering still applies (a real radio only hears its own channel). */
+#define VWIFI_HELLO_FLAG_PHYSICAL  0x01
+
 /* ================================================================
  *  Frame header – prepended to every 802.11 frame on the wire
  *

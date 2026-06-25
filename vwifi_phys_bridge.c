@@ -434,16 +434,20 @@ static int connect_hub(const char *path)
 
 /*
  * Send the hello/registration message to the hub.
- * Format: [uint32_t len (net order)][uint32_t HELLO_MAGIC][node_id\0]
+ * Format: [uint32_t len (net order)][uint32_t HELLO_MAGIC][node_id\0][flags]
+ *
+ * The trailing flags byte announces this peer as a physical radio so the
+ * hub exempts its links from the simulated propagation model -- real RF
+ * is the only thing that should drop or attenuate these frames.
  */
 static int send_hello(int fd, const char *id)
 {
     size_t id_len = strlen(id) + 1;  /* include null terminator */
-    uint32_t payload_len = 4 + id_len;
+    uint32_t payload_len = 4 + id_len + 1;  /* + flags byte */
     uint32_t len_be = htonl(payload_len);
     uint32_t magic = HELLO_MAGIC;
 
-    uint8_t buf[4 + 4 + 64];
+    uint8_t buf[4 + 4 + 64 + 1];
     if (4 + payload_len > sizeof(buf)) {
         fprintf(stderr, "bridge: node_id too long\n");
         return -1;
@@ -452,6 +456,7 @@ static int send_hello(int fd, const char *id)
     memcpy(buf, &len_be, 4);
     memcpy(buf + 4, &magic, 4);
     memcpy(buf + 8, id, id_len);
+    buf[8 + id_len] = VWIFI_HELLO_FLAG_PHYSICAL;
 
     if (write_all(fd, buf, 4 + payload_len) < 0) {
         fprintf(stderr, "bridge: send_hello: %s\n", strerror(errno));

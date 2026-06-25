@@ -312,9 +312,17 @@ The MAC must be unique on the medium.
    `/dev/vwifi`, and `write()`s it to the hub's Unix socket.
 6. The hub looks up each peer's last known channel and fans the
    frame out only to peers whose channel matches (including HT40
-   bond_freq and VHT80+ center_freq disambiguation). A per-link
-   SNR model decides per-frame whether to drop based on the
-   sender's rate code and the receiver's link SNR.
+   bond_freq and VHT80+ center_freq disambiguation; the HT40 bond
+   pair is only enforced when both peers declare one, so a narrow
+   station still hears a bonded AP on the shared primary). A
+   per-link SNR model decides per-frame whether to drop based on
+   the sender's rate code and the receiver's link SNR. Links that
+   touch a **physical radio** (the phys bridge, which registers
+   with the `physical` hello flag) are exempt from this model:
+   real-world RF is the channel, so the hub never adds simulated
+   loss or rewrites their RSSI. Inter-hub TCP **bridges** are
+   multi-channel trunks and are likewise never channel-filtered;
+   the downstream hub filters per-receiver.
 7. Each QEMU vwifi-virt device injects the frame into the guest's
    RX path.
 

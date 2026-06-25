@@ -418,6 +418,9 @@ struct node_phys {
     int         peer_idx;       /* bound peer, or -1 if offline */
     bool        active;
     bool        auto_named;     /* true = auto "node%d" id (recycled on disconnect) */
+    bool        physical;       /* true = real radio (phys bridge): links to
+                                 * this node bypass the simulated physics
+                                 * model and keep their on-air RSSI. */
 };
 
 static struct node_phys nodes[MAX_NODES];
@@ -867,8 +870,24 @@ static void process_hello(int pidx, const uint8_t *payload, uint32_t len)
     if (slen == 0 || slen >= NODE_ID_LEN) return;
     char nid[NODE_ID_LEN];
     memcpy(nid, id, slen); nid[slen] = '\0';
-    fprintf(stderr, "hub: peer %d: hello node_id='%s'\n", pidx, nid);
+
+    /* Optional flags byte trails the node_id's null terminator. */
+    uint8_t flags = 0;
+    size_t after_id = 4 + slen + 1;     /* magic + id + '\0' */
+    if (len > after_id)
+        flags = payload[after_id];
+    bool physical = (flags & VWIFI_HELLO_FLAG_PHYSICAL) != 0;
+
+    fprintf(stderr, "hub: peer %d: hello node_id='%s'%s\n", pidx, nid,
+            physical ? " (physical radio)" : "");
     bind_peer_to_node(pidx, nid);
+
+    /* Record whether this node is a real radio so its links bypass the
+     * simulated physics. Set explicitly (not just when true) so a node_id
+     * reused by a non-physical peer doesn't inherit a stale flag. */
+    int ni = peer_node[pidx];
+    if (ni >= 0)
+        nodes[ni].physical = physical;
 }
 
 /* -------------------------------------------------------------------
@@ -1116,9 +1135,16 @@ static void forward_message(int sender_idx, const uint8_t *msg,
 
         int rx_ni = peer_node[i];
 
-        /* Physics filtering for local peers with bound nodes */
+        /* Physics filtering for local peers with bound nodes.
+         *
+         * A link with a physical radio on either end (the phys bridge)
+         * is exempt: real-world RF already governs delivery and signal
+         * strength, so layering the simulated FER model and RSSI rewrite
+         * on top would be exactly the artificial interference the bridge
+         * use case must avoid. Such frames pass through untouched. */
         if (!peers[i].is_bridge && model.type != MODEL_NONE &&
-            sender_ni >= 0 && rx_ni >= 0)
+            sender_ni >= 0 && rx_ni >= 0 &&
+            !nodes[sender_ni].physical && !nodes[rx_ni].physical)
         {
             double fixed = get_fixed_loss(sender_ni, rx_ni);
             if (!isnan(fixed)) {
