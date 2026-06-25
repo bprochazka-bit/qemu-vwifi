@@ -112,12 +112,13 @@ class Harness:
         self.ctl  = self.tmp / 'medium.ctl'
         self.log  = self.tmp / 'hub.log'
         self.hub: subprocess.Popen | None = None
+        self.tcp_port: int | None = None
         self.passed = 0
         self.failed = 0
         self.failures: list[tuple[str, str]] = []
 
     # ---- hub lifecycle ----
-    def start_hub(self):
+    def start_hub(self, tcp_port: int | None = None):
         binary = REPO_ROOT / 'vwifi-medium'
         if not binary.exists():
             sys.exit(f'FATAL: {binary} not built. Run "make userspace" first.')
@@ -125,8 +126,12 @@ class Harness:
         for p in (self.sock, self.ctl):
             if p.exists():
                 p.unlink()
+        self.tcp_port = tcp_port
+        cmd = [str(binary), str(self.sock), '-c', str(self.ctl)]
+        if tcp_port is not None:
+            cmd += ['-t', str(tcp_port)]
         self.hub = subprocess.Popen(
-            [str(binary), str(self.sock), '-c', str(self.ctl)],
+            cmd,
             stdout=open(self.log, 'w'),
             stderr=subprocess.STDOUT,
             cwd=str(self.tmp),
@@ -155,9 +160,17 @@ class Harness:
                 self.hub.wait()
         self.hub = None
 
-    def restart_hub(self):
+    def restart_hub(self, tcp_port: int | None = None):
         self.stop_hub()
-        self.start_hub()
+        self.start_hub(tcp_port=tcp_port)
+
+    def bridge_conn(self) -> socket.socket:
+        """Open a TCP connection to the hub's bridge port. The hub treats
+        TCP peers as inter-hub bridges (is_bridge=1)."""
+        assert self.tcp_port is not None, 'hub started without a TCP port'
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.connect(('127.0.0.1', self.tcp_port))
+        return s
 
     def cleanup(self):
         self.stop_hub()
@@ -468,8 +481,8 @@ def test_c1_ht40_plus_minus_dont_collide(h: Harness):
         a.close(); b.close()
 
 
-def test_c1_ht40_strict_no_fallback_to_ht20(h: Harness):
-    h.section('C1: HT40+ frame is NOT delivered to a HT20 receiver on the same primary')
+def test_c1_ht40_to_ht20_delivers(h: Harness):
+    h.section('C1: HT40+ frame IS delivered to a HT20 receiver on the same primary')
     h.restart_hub()
     a = h.data_conn()
     b = h.data_conn()
@@ -477,26 +490,27 @@ def test_c1_ht40_strict_no_fallback_to_ht20(h: Harness):
         mac_a = b'\x02\x00\x00\x00\x41\xaa'
         mac_b = b'\x02\x00\x00\x00\x41\xbb'
 
-        # A on ch1 HT40+ (primary=2412, bond=2432). B on ch1 HT20.
-        # Strict mode: one side has bond_freq != 0, the other has 0,
-        # so the bond comparison fails and the frame is dropped.
-        # (Real hardware would fall back to HT20; the simulator chose
-        # the strict interpretation -- the test pins that decision.)
+        # A on ch1 HT40+ (primary=2412, bond=2432). B on ch1 HT20 (bond=0).
+        # Mixed width: only one side declares a bond pair, so the bond
+        # check is skipped and the shared primary governs -- mirroring
+        # real 802.11 where an HT20 station hears an HT40 AP on the
+        # primary. The bond pair only separates two *bonded* peers
+        # (see test_c1_ht40_plus_minus_dont_collide).
         _tune(a, mac_a, channel_freq=CH1, channel_bond_freq=2432,
               channel_flags=CHF_2GHZ | CHF_HT40PLUS)
         _tune(b, mac_b, channel_freq=CH1, channel_bond_freq=0,
               channel_flags=CHF_2GHZ | CHF_HT20)
         _drain_all([a, b])
 
-        marker = b'HT40-VS-HT20-' + os.urandom(16)
+        marker = b'HT40-TO-HT20-' + os.urandom(16)
         a.sendall(make_frame(mac_a, channel_freq=CH1, channel_bond_freq=2432,
                              channel_flags=CHF_2GHZ | CHF_HT40PLUS,
                              payload=marker.ljust(64, b'\x00')))
 
         got, n = _recv_with_marker(b, marker)
-        h.expect(not got,
-                 'HT40+ frame is NOT delivered to a HT20 receiver',
-                 f'unexpectedly received {n} bytes containing marker')
+        h.expect(got,
+                 'HT40+ frame is delivered to a HT20 receiver on shared primary',
+                 f'received {n} bytes; marker not found')
     finally:
         a.close(); b.close()
 
@@ -650,6 +664,81 @@ def test_c1_vht80_center_match_delivers(h: Harness):
         a.close(); b.close()
 
 
+def test_a_vht80_mixed_bond_delivers(h: Harness):
+    h.section('A: VHT80 VM-style (bond set) and bridge-style (bond=0) on the '
+              'same block deliver')
+    h.restart_hub()
+    a = h.data_conn()
+    b = h.data_conn()
+    try:
+        mac_a = b'\x02\x00\x00\x03\x80\xaa'
+        mac_b = b'\x02\x00\x00\x03\x80\xbb'
+
+        # A models the kernel driver, which sets channel_bond_freq for
+        # VHT80 (the implicit HT40 secondary). B models vwifi-phys-bridge,
+        # which leaves bond_freq=0 for VHT80 and relies on center_freq1.
+        # Both are genuinely on the same 80-MHz block (ch36-48, center
+        # 5210); they MUST hear each other. Pre-fix, the strict bond rule
+        # split them apart and broke the physical bridge for VHT/HE.
+        _tune(a, mac_a, channel_freq=CH36, channel_bond_freq=CH40,
+              channel_flags=CHF_5GHZ | CHF_VHT80,
+              center_freq1=VHT80_CENTER_36_48)
+        _tune(b, mac_b, channel_freq=CH36, channel_bond_freq=0,
+              channel_flags=CHF_5GHZ | CHF_VHT80,
+              center_freq1=VHT80_CENTER_36_48)
+        _drain_all([a, b])
+
+        marker = b'VHT80-MIXED-BOND-' + os.urandom(16)
+        a.sendall(make_frame(mac_a, channel_freq=CH36, channel_bond_freq=CH40,
+                             channel_flags=CHF_5GHZ | CHF_VHT80,
+                             center_freq1=VHT80_CENTER_36_48,
+                             payload=marker.ljust(64, b'\x00')))
+
+        got, n = _recv_with_marker(b, marker)
+        h.expect(got,
+                 'VHT80 frame crosses a bond_freq encoding mismatch when '
+                 'center_freq1 agrees',
+                 f'received {n} bytes; marker not found')
+    finally:
+        a.close(); b.close()
+
+
+def test_a_vht80_mixed_bond_center_mismatch_still_drops(h: Harness):
+    h.section('A: VHT80 mixed bond but different center_freq1 still drops '
+              '(center disambiguation intact)')
+    h.restart_hub()
+    a = h.data_conn()
+    b = h.data_conn()
+    try:
+        mac_a = b'\x02\x00\x00\x03\x81\xaa'
+        mac_b = b'\x02\x00\x00\x03\x81\xbb'
+
+        # Same primary, one side bond-set / one side bond=0, but the
+        # 80-MHz centers differ. Relaxing the bond rule must NOT collapse
+        # wide-channel center disambiguation: this still drops.
+        _tune(a, mac_a, channel_freq=CH36, channel_bond_freq=CH40,
+              channel_flags=CHF_5GHZ | CHF_VHT80,
+              center_freq1=VHT80_CENTER_36_48)
+        _tune(b, mac_b, channel_freq=CH36, channel_bond_freq=0,
+              channel_flags=CHF_5GHZ | CHF_VHT80,
+              center_freq1=VHT80_CENTER_52_64)  # synthetic center mismatch
+        _drain_all([a, b])
+
+        marker = b'VHT80-MIXED-BOND-MISMATCH-' + os.urandom(16)
+        a.sendall(make_frame(mac_a, channel_freq=CH36, channel_bond_freq=CH40,
+                             channel_flags=CHF_5GHZ | CHF_VHT80,
+                             center_freq1=VHT80_CENTER_36_48,
+                             payload=marker.ljust(64, b'\x00')))
+
+        got, n = _recv_with_marker(b, marker)
+        h.expect(not got,
+                 'VHT80 frame with mismatched center_freq1 still drops despite '
+                 'mixed bond encoding',
+                 f'unexpectedly received {n} bytes containing marker')
+    finally:
+        a.close(); b.close()
+
+
 def _count_frames_with_prefix(sock, marker_prefix, settle=0.4):
     """Drain a non-blocking socket and count occurrences of a byte
     prefix in the combined buffer. Used by statistical FER tests
@@ -740,8 +829,8 @@ def test_c1_he80_center_mismatch_drops(h: Harness):
         a.close(); b.close()
 
 
-def test_c1_he40_vs_he20_strict_drops(h: Harness):
-    h.section('HE40+ vs HE20 on the same primary -> dropped (strict, no fallback)')
+def test_c1_he40_to_he20_delivers(h: Harness):
+    h.section('HE40+ frame IS delivered to a HE20 receiver on the same primary')
     h.restart_hub()
     a = h.data_conn()
     b = h.data_conn()
@@ -752,20 +841,22 @@ def test_c1_he40_vs_he20_strict_drops(h: Harness):
         # A: HE40+ on ch36 (primary=5180, bond=5200)
         _tune(a, mac_a, channel_freq=CH36, channel_bond_freq=CH40,
               channel_flags=CHF_5GHZ | CHF_HE40)
-        # B: HE20 on ch36 (primary=5180, no bond)
+        # B: HE20 on ch36 (primary=5180, no bond). Mixed width: only one
+        # side sets bond, so the shared primary governs and the frame is
+        # heard -- the HE analogue of test_c1_ht40_to_ht20_delivers.
         _tune(b, mac_b, channel_freq=CH36, channel_bond_freq=0,
               channel_flags=CHF_5GHZ | CHF_HE20)
         _drain_all([a, b])
 
-        marker = b'HE40-VS-HE20-' + os.urandom(16)
+        marker = b'HE40-TO-HE20-' + os.urandom(16)
         a.sendall(make_frame(mac_a, channel_freq=CH36,
                              channel_bond_freq=CH40,
                              channel_flags=CHF_5GHZ | CHF_HE40,
                              payload=marker.ljust(64, b'\x00')))
         got, n = _recv_with_marker(b, marker)
-        h.expect(not got,
-                 'HE40+ frame is NOT delivered to a HE20 receiver',
-                 f'unexpectedly received {n} bytes')
+        h.expect(got,
+                 'HE40+ frame is delivered to a HE20 receiver on shared primary',
+                 f'received {n} bytes; marker not found')
     finally:
         a.close(); b.close()
 
@@ -1043,6 +1134,41 @@ def test_h1h2_h7_node_recycling(h: Harness):
              'LIST_PEERS header has node count', repr(header))
 
 
+def test_b_bridge_trunk_not_channel_filtered(h: Harness):
+    h.section('B: a TCP bridge (multi-channel trunk) is not channel-filtered')
+    h.restart_hub(tcp_port=54330)
+    a = h.data_conn()       # local single-radio peer on ch1
+    br = h.bridge_conn()    # TCP peer == inter-hub bridge (is_bridge=1)
+    try:
+        mac_a  = b'\x02\x00\x00\x04\x00\xaa'
+        mac_br = b'\x02\x00\x00\x04\x00\xbb'
+
+        # The bridge last relayed a ch36 frame, so the hub caches ch36 as
+        # "the bridge's channel". A real trunk carries every channel, so
+        # this cached value must NOT gate what the bridge receives.
+        br.sendall(make_frame(mac_br, channel_freq=CH36,
+                              channel_flags=CHF_5GHZ | CHF_HT20))
+        # A is a single radio on ch1.
+        _tune(a, mac_a, channel_freq=CH1, channel_flags=CHF_2GHZ | CHF_HT20)
+        _drain_all([a, br])
+
+        # A transmits on ch1. The bridge is on a different cached channel
+        # (ch36) but must still receive it -- downstream hubs do their own
+        # per-receiver filtering. Pre-fix, the frame was dropped at the
+        # trunk and cross-channel multi-hub traffic vanished.
+        marker = b'BRIDGE-TRUNK-CH1-' + os.urandom(16)
+        a.sendall(make_frame(mac_a, channel_freq=CH1,
+                             channel_flags=CHF_2GHZ | CHF_HT20,
+                             payload=marker.ljust(64, b'\x00')))
+
+        got, n = _recv_with_marker(br, marker, timeout=0.5)
+        h.expect(got,
+                 'bridge receives a ch1 frame despite its cached ch36 channel',
+                 f'received {n} bytes; marker not found')
+    finally:
+        a.close(); br.close()
+
+
 def test_hub_survives_garbage(h: Harness):
     h.section('Defensive: hub survives garbage on data socket')
     s = h.data_conn()
@@ -1084,21 +1210,26 @@ TESTS = [
     test_c1_channel_match_delivers,
     test_c1_v1_broadcast,
     test_c1_ht40_plus_minus_dont_collide,
-    test_c1_ht40_strict_no_fallback_to_ht20,
+    test_c1_ht40_to_ht20_delivers,
     test_c1_ht40_match_delivers,
     test_c1_multichannel_fanout_isolation,
     test_c1_vht80_center_mismatch_drops,
     test_c1_vht80_center_match_delivers,
+    # A: wide-channel bond-encoding mismatch (VM vs phys-bridge)
+    test_a_vht80_mixed_bond_delivers,
+    test_a_vht80_mixed_bond_center_mismatch_still_drops,
     # HE / VHT160 / VHT80+80 + rate-table physics
     test_c1_he80_center_match_delivers,
     test_c1_he80_center_mismatch_drops,
-    test_c1_he40_vs_he20_strict_drops,
+    test_c1_he40_to_he20_delivers,
     test_c1_vht160_center_match_delivers,
     test_c1_vht160_center_mismatch_drops,
     test_c1_vht80_80_center2_match_delivers,
     test_c1_vht80_80_center2_mismatch_drops,
     test_m3_he_mcs_rate_thresholds,
     test_c1_channel_change_mid_stream,
+    # B: inter-hub bridge trunk must not be channel-filtered
+    test_b_bridge_trunk_not_channel_filtered,
     # Resource lifecycle + defensive
     test_h1h2_h7_node_recycling,
     test_hub_survives_garbage,

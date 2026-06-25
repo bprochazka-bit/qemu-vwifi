@@ -30,20 +30,23 @@ the hub's stderr log in the temp directory.
 | channel mismatch (HT20) | C1        | ch1 sender to ch11 receiver -> dropped                    |
 | channel match (HT20)    | C1        | ch1 -> ch1 delivered                                      |
 | V1 broadcast            | C1        | channel_freq=0 still broadcasts                           |
-| HT40+ vs HT40- same ch  | C1        | same primary, different bond pair -> dropped              |
-| HT40+ vs HT20 strict    | C1        | one side HT40 + one HT20 same primary -> dropped (strict) |
+| HT40+ vs HT40- same ch  | C1        | both bonded, different bond pair -> dropped               |
+| HT40+ to HT20 deliver   | C1        | one HT40 + one HT20 same primary -> delivered (mixed bw)  |
 | HT40+ match             | C1        | matching primary+bond -> delivered                        |
 | 5-peer fanout           | C1        | sender on ch1 reaches only the ch1 receiver of 4          |
 | VHT80 center mismatch   | C1        | same primary, different center_freq1 -> dropped           |
 | VHT80 center match      | C1        | matching primary+center_freq1 -> delivered                |
+| VHT80 mixed bond match  | A         | VM-style (bond set) + bridge-style (bond=0) -> delivered  |
+| VHT80 mixed bond miss   | A         | mixed bond but different center_freq1 -> still dropped     |
 | HE80 center match       | C1        | matching primary+center_freq1 -> delivered                |
 | HE80 center mismatch    | C1        | same primary, different center_freq1 -> dropped           |
-| HE40 vs HE20 strict     | C1        | HE40+ frame is NOT delivered to HE20 receiver             |
+| HE40 to HE20 deliver    | C1        | HE40+ frame IS delivered to HE20 receiver (mixed bw)      |
 | VHT160 center match     | C1        | matching primary+center_freq1 -> delivered                |
 | VHT160 center mismatch  | C1        | same primary, different center_freq1 -> dropped           |
 | VHT80+80 center2 match  | C1        | matching primary+center1+center2 -> delivered             |
 | VHT80+80 center2 miss   | C1        | matching center1 but different center2 -> dropped         |
 | HE MCS thresholds       | M3        | SNR=20 dB: MCS0 delivers ~all, MCS9/MCS11 drop every frame |
+| bridge trunk no filter  | B         | TCP bridge receives off-channel frames (trunk, not radio) |
 | channel change          | C1        | peer is reachable again after switching channels          |
 | node recycling          | H1+H2/H7  | 100 connect/disconnect cycles leave 0 online              |
 | garbage tolerance       | -         | bad length / truncated frames don't kill hub              |

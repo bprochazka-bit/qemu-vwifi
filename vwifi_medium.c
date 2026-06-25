@@ -920,9 +920,17 @@ static int peer_send_frame(int idx, const uint8_t *buf, uint32_t len)
  *  Per the v2 wire protocol (vwifi.h):
  *    - channel_freq == 0 means "unknown / broadcast" and matches anything
  *    - otherwise the primary 20-MHz frequency must match
- *    - if either side declares HT40 (bond_freq != 0), the bond pair
- *      must also match -- this keeps HT40+ ch6 and HT40- ch6 from
- *      colliding even though their primaries are both 2437.
+ *    - if BOTH sides declare a bond pair (bond_freq != 0), the pairs
+ *      must match -- this keeps HT40+ ch6 and HT40- ch6 from colliding
+ *      even though their primaries are both 2437. When only one side
+ *      sets bond_freq the check is skipped, so a narrow (HT20/bond=0)
+ *      peer and a bonded peer on the same primary still match. This
+ *      mirrors real 802.11 (an HT20 station associates with an HT40 AP
+ *      on the shared primary) and -- importantly -- keeps VHT/HE
+ *      encoders that disagree about whether to populate bond_freq for a
+ *      wide channel (e.g. the kernel driver sets it, the phys-bridge
+ *      leaves it 0) from silently failing to communicate. Wide channels
+ *      are disambiguated by center_freq1/2 below, not the bond pair.
  *    - if either side declares a wide channel (VHT80/160/80+80 or
  *      HE80/160/80+80 via channel_flags), the center_freq1 must
  *      match -- this distinguishes two 80-MHz blocks that overlap
@@ -948,7 +956,13 @@ static bool channels_match(const struct chan_state *a,
         return true;
     if (a->freq != b->freq)
         return false;
-    if ((a->bond_freq != 0 || b->bond_freq != 0) &&
+    /* HT40 bond pair: enforced only when BOTH sides declare a bond
+     * frequency, so a narrow peer (HT20, bond=0) still matches a bonded
+     * peer on the same primary, and wide-channel (VHT/HE) encoders that
+     * disagree on whether to set bond_freq are not split apart. Two
+     * bonded peers that picked different secondaries (HT40+ vs HT40-)
+     * still differ here and remain correctly separated. */
+    if (a->bond_freq != 0 && b->bond_freq != 0 &&
         a->bond_freq != b->bond_freq)
         return false;
 
@@ -1073,20 +1087,32 @@ static void forward_message(int sender_idx, const uint8_t *msg,
         if (peers[i].is_bridge && !forward_to_bridges)
             continue;
 
-        /* Channel-aware filtering. If we know both sender and receiver
-         * channels and they don't match (with HT40 bond awareness and
-         * VHT/HE wide-channel center-freq comparison where applicable),
-         * the receiver wouldn't hear this transmission on a real
-         * radio, so skip it. */
-        struct chan_state rx_chan = {
-            peers[i].channel_freq,
-            peers[i].channel_bond_freq,
-            peers[i].channel_flags,
-            peers[i].center_freq1,
-            peers[i].center_freq2,
-        };
-        if (!channels_match(&msg_chan, &rx_chan))
-            continue;
+        /* Channel-aware filtering applies only to single-radio
+         * receivers. If we know both sender and receiver channels and
+         * they don't match (with HT40 bond awareness and VHT/HE
+         * wide-channel center-freq comparison where applicable), the
+         * receiver wouldn't hear this transmission on a real radio, so
+         * skip it.
+         *
+         * A bridge peer is NOT a single radio -- it is a trunk to a
+         * remote hub that aggregates many channels and performs its own
+         * per-receiver filtering downstream. Gating the trunk on the
+         * last channel this bridge happened to relay would silently
+         * drop every other channel's traffic in a multi-hub topology,
+         * so bridges always receive the frame and filter on their end.
+         * (The local phys-bridge connects as an ordinary local peer,
+         * not a bridge, so it is still channel-filtered correctly.) */
+        if (!peers[i].is_bridge) {
+            struct chan_state rx_chan = {
+                peers[i].channel_freq,
+                peers[i].channel_bond_freq,
+                peers[i].channel_flags,
+                peers[i].center_freq1,
+                peers[i].center_freq2,
+            };
+            if (!channels_match(&msg_chan, &rx_chan))
+                continue;
+        }
 
         int rx_ni = peer_node[i];
 
@@ -1867,43 +1893,53 @@ static void handle_ctl_data(int ctl_idx)
 /* -------------------------------------------------------------------
  *  Socket setup
  * ------------------------------------------------------------------- */
-static int setup_tcp_listen(const char *port_str)
+/*
+ * Try to bind+listen a TCP socket for one address family. Returns the
+ * listening fd on success, or -1 if this family can't be used (so the
+ * caller can fall back to another family).
+ *
+ * The previous version asked getaddrinfo for AF_INET6 and only fell back
+ * to AF_INET when *resolution* failed. On an IPv6-disabled host,
+ * getaddrinfo(AF_INET6) still succeeds but socket(AF_INET6) returns
+ * EAFNOSUPPORT -- the old code then bailed and the hub exited with the
+ * TCP bridge listener never coming up. Splitting per-family and falling
+ * back on socket()/bind() failure (not just resolution) fixes that.
+ */
+static int setup_tcp_listen_family(const char *port_str, int family)
 {
-    struct addrinfo hints, *res;
-    int fd, val = 1;
+    struct addrinfo hints, *res, *rp;
+    int fd = -1, val = 1;
 
     memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_INET6;
+    hints.ai_family = family;
     hints.ai_socktype = SOCK_STREAM;
-    hints.ai_flags = AI_PASSIVE | AI_V4MAPPED;
+    hints.ai_flags = AI_PASSIVE | (family == AF_INET6 ? AI_V4MAPPED : 0);
 
-    if (getaddrinfo(NULL, port_str, &hints, &res) != 0) {
-        hints.ai_family = AF_INET;
-        if (getaddrinfo(NULL, port_str, &hints, &res) != 0) {
-            fprintf(stderr, "hub: cannot resolve TCP port %s\n", port_str);
-            return -1;
+    if (getaddrinfo(NULL, port_str, &hints, &res) != 0)
+        return -1;
+
+    for (rp = res; rp != NULL; rp = rp->ai_next) {
+        fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+        if (fd < 0)
+            continue;   /* e.g. EAFNOSUPPORT -- try the next address */
+
+        val = 1;
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &val, sizeof(val));
+        if (rp->ai_family == AF_INET6) {
+            val = 0;    /* accept v4-mapped too, so one socket serves both */
+            setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &val, sizeof(val));
         }
-    }
 
-    fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (fd < 0) {
-        freeaddrinfo(res);
-        return -1;
-    }
+        if (bind(fd, rp->ai_addr, rp->ai_addrlen) == 0)
+            break;      /* success */
 
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &val, sizeof(val));
-    if (res->ai_family == AF_INET6) {
-        val = 0;
-        setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &val, sizeof(val));
-    }
-
-    if (bind(fd, res->ai_addr, res->ai_addrlen) < 0) {
-        perror("hub: TCP bind");
         close(fd);
-        freeaddrinfo(res);
-        return -1;
+        fd = -1;
     }
     freeaddrinfo(res);
+
+    if (fd < 0)
+        return -1;
 
     if (listen(fd, 16) < 0) {
         perror("hub: TCP listen");
@@ -1912,6 +1948,19 @@ static int setup_tcp_listen(const char *port_str)
     }
 
     set_nonblock(fd);
+    return fd;
+}
+
+static int setup_tcp_listen(const char *port_str)
+{
+    /* Prefer a dual-stack IPv6 socket; fall back to IPv4-only on hosts
+     * where IPv6 is unavailable. */
+    int fd = setup_tcp_listen_family(port_str, AF_INET6);
+    if (fd < 0)
+        fd = setup_tcp_listen_family(port_str, AF_INET);
+    if (fd < 0)
+        fprintf(stderr, "hub: cannot set up TCP listener on port %s\n",
+                port_str);
     return fd;
 }
 
