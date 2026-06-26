@@ -137,32 +137,34 @@ Goal: make the AR9271 **auto-ACK uplink frames addressed to the masked BSSID
 set while in monitor mode**, still delivering all frames raw to the host and
 accepting raw injection.
 
-Because the ACK runs on the open target firmware, this is deterministic to
-implement. Two integration points:
+**Source analysis says this is driver-only — probably no firmware rebuild.**
+Reading mainline ath9k:
 
-1. **Host (`ath9k_htc`)** — program the standard address-match registers for the
-   monitor vif (shared `ath9k_hw` names):
-   - `AR_STA_ID0/AR_STA_ID1` ← `base` (`02:11:22:33:44:00`)
-   - `AR_BSSMSKL/AR_BSSMSKU` ← `mask` (`FF:FF:FF:FF:FF:FC`)
-   Expose this via a small private command / debugfs knob (e.g. a `ackmon_base`
-   / `ackmon_mask` pair) since stock monitor mode never programs a meaningful
-   match.
-2. **Target firmware (`qca/open-ath9k-htc-firmware`)** — ensure the RX/ACK
-   responder stays enabled for RA-matching frames in the raw/monitor RX path. If
-   the target's monitor path force-disables the ACK responder, gate it on an
-   "ackmon" flag so it honors the programmed `STA_ID`/`BSSMSK` instead.
-   *(Exact symbols live in the WLAN target RX path; confirm against the source —
-   do not assume names.)*
+- The PCU ACKs a frame when `(RA & bssidmask) == (macaddr & bssidmask)`.
+  `macaddr` → `AR_STA_ID` (carried to the AR9271 target as the monitor vif's
+  `myaddr`); `bssidmask` → `AR_BSSMSK`, set by `ath_hw_setbssidmask()`.
+- **`AR_DIAG_ACK_DIS` is defined but never used** — ACK is not disabled in
+  monitor mode; it just never fires because nothing is addressed to the
+  sniffer's MAC.
+- `ath9k_htc_set_mac_bssid_mask()` already derives `macaddr`/`bssidmask` from
+  the active vif addresses.
 
-Validation (do this **before** building the lab around it): with a *second*
-radio sniffing ch6, send a unicast from a STA to each BSSID and confirm an
-`ACK` (RA = STA) appears ~SIFS later. Also confirm capture + injection still
-work concurrently on the same vif.
+So ackmon overrides `macaddr` = base and `bssidmask` = the covering mask on a
+monitor vif, and the chip ACKs the whole BSSID set while capturing/injecting
+raw. The draft patch and full instructions are in
+[`../ackmon/`](../ackmon/) (`ath9k_htc-ackmon.patch` + `README.md`).
 
-Fallback if firmware work stalls: run a stock local `hostapd` on the AR9271 as a
-"dumb AP" bridged into the VM at L2 (local-MAC split). Reliable today, but the
-phone then appears in the *host's* station table, not the OpenWRT VM's — which
-is exactly the property "ackmon" buys back.
+**Validate the one residual risk first** (whether the AR9271 *firmware*
+suppresses ACK in `HTC_M_MONITOR` regardless of `AR_STA_ID`): the zero-patch
+injection test in `ackmon/README.md` — set the card's MAC to a BSSID in monitor,
+inject a unicast to it from a second radio, and watch a third for the SIFS ACK.
+Only if that test shows monitor ACK is firmware-gated do you fall back to
+patching `qca/open-ath9k-htc-firmware`.
+
+Fallback if even the firmware route stalls: run a stock local `hostapd` on the
+AR9271 as a "dumb AP" bridged into the VM at L2 (local-MAC split). Reliable
+today, but the phone then appears in the *host's* station table, not the
+OpenWRT VM's — which is exactly the property "ackmon" buys back.
 
 ---
 
@@ -230,4 +232,7 @@ Only the ACK ever needed SIFS, and the AR9271 supplies it.
 | vwifi medium: physical-link physics exemption (`physical` hello flag) | done |
 | vwifi-phys-bridge: single-channel multi-BSSID relay | works as-is |
 | OpenWRT hostapd profiles (legacy, no-BA, prefix BSSIDs) | `examples/hostapd/` |
-| AR9271 ackmon (firmware + `ath9k_htc` knob) | **to build** |
+| ackmon source analysis (ACK = address-match, driver-only) | done — `ackmon/` |
+| AR9271 ackmon `ath9k_htc` patch | **draft, untested** — `ackmon/` |
+| Monitor-ACK feasibility test | **run first** — `ackmon/README.md` |
+| Firmware fallback (`open-ath9k-htc-firmware`) | only if the test fails |
