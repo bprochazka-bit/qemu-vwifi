@@ -1097,21 +1097,56 @@ static void vwifi_ath9k_inject_rx_frame(VwifiAth9kState *s,
         return;
     }
 
-    /* Write frame data to guest buffer */
-    pci_dma_write(&s->parent_obj, ds_data, frame, frame_len);
+    /*
+     * Re-insert the 802.11 header alignment padding the guest's ath9k
+     * driver expects on RX -- the mirror image of the TX padding strip.
+     *
+     * Real AR9285 hardware DMAs (hdrlen & 3) padding bytes between the
+     * 802.11 header and the payload so the payload is 4-byte aligned.
+     * The driver removes them (memmove header forward + skb_pull) before
+     * handing the frame to mac80211.  If we DON'T insert them, the driver
+     * strips real payload bytes instead: for a QoS-Data frame (hdrlen=26,
+     * padsize=2) that eats the first two bytes of the LLC/SNAP header
+     * (AA AA), so mac80211 fails SNAP demux and silently drops all L3
+     * traffic.  hdrlen is derived from Frame Control exactly as on TX.
+     */
+    uint16_t hdrlen = 24;
+    uint8_t  padsize = 0;
+    if (frame_len >= 2) {
+        uint16_t fc = frame[0] | (frame[1] << 8);
+        uint8_t ftype = (fc >> 2) & 3;
+        uint8_t stype = (fc >> 4) & 0xF;
+        if (ftype == 2 && (stype & 0x8))   /* Data frame with QoS */
+            hdrlen = 26;
+        if ((fc & 0x0300) == 0x0300)       /* 4-addr (ToDS + FromDS) */
+            hdrlen += 6;
+        padsize = hdrlen & 3;
+    }
+
+    if (padsize > 0 && frame_len > hdrlen) {
+        static const uint8_t pad_bytes[4] = {0x00, 0x00, 0x00, 0x00};
+        /* header, then padding, then payload */
+        pci_dma_write(&s->parent_obj, ds_data, frame, hdrlen);
+        pci_dma_write(&s->parent_obj, ds_data + hdrlen, pad_bytes, padsize);
+        pci_dma_write(&s->parent_obj, ds_data + hdrlen + padsize,
+                      frame + hdrlen, frame_len - hdrlen);
+    } else {
+        padsize = 0;  /* nothing to align (e.g. management frames) */
+        pci_dma_write(&s->parent_obj, ds_data, frame, frame_len);
+    }
 
     /*
-     * Append 4 dummy FCS bytes after the frame.
+     * Append 4 dummy FCS bytes after the (padded) frame.
      * Real hardware includes FCS in the received data and reports
      * DataLen inclusive of FCS.  The driver trims FCS_LEN (4) bytes.
      * Without this, the driver would strip 4 real bytes from the end.
      */
     {
         static const uint8_t dummy_fcs[4] = {0x00, 0x00, 0x00, 0x00};
-        pci_dma_write(&s->parent_obj, ds_data + frame_len,
+        pci_dma_write(&s->parent_obj, ds_data + frame_len + padsize,
                       dummy_fcs, 4);
     }
-    rx_len = frame_len + 4;  /* DataLen includes FCS */
+    rx_len = frame_len + padsize + 4;  /* DataLen includes padding + FCS */
 
     /* Convert signed RSSI to unsigned (ath9k expects 0..127 range) */
     rssi_u8 = (uint8_t)((int)(hdr->rssi) + 95);  /* noise floor -95 */
