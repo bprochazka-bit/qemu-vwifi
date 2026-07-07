@@ -56,6 +56,13 @@ static int raw_fd = -1;
 static uint8_t own_mac[6];
 static int forward_all;   /* -A: disable the relevance filter (sniff mode) */
 
+/* -b <bssid>: address the relevance filter matches on, instead of the
+ * interface MAC. Needed for the two-radio setup where a dedicated ACK
+ * radio holds MAC == BSSID and a *separate* radio runs this bridge for
+ * capture/injection (its MAC is not the BSSID). */
+static uint8_t filter_bssid[6];
+static int have_filter_bssid;
+
 /* Raise the interface MTU this high at startup so a full-size downlink
  * frame (radiotap + 802.11 header + 1500-byte payload, ~1540 bytes) can
  * be injected without EMSGSIZE ("Message too long"). */
@@ -562,11 +569,13 @@ static int open_raw_socket(const char *iface)
         strncpy(ifr.ifr_name, iface, IFNAMSIZ - 1);
         if (ioctl(fd, SIOCGIFHWADDR, &ifr) == 0) {
             memcpy(own_mac, ifr.ifr_hwaddr.sa_data, 6);
-            fprintf(stderr, "bridge: interface MAC %02x:%02x:%02x:%02x:%02x:%02x"
-                    " (relevance filter %s)\n",
+            const uint8_t *k = have_filter_bssid ? filter_bssid : own_mac;
+            fprintf(stderr, "bridge: interface MAC %02x:%02x:%02x:%02x:%02x:%02x;"
+                    " relevance filter %s (match %02x:%02x:%02x:%02x:%02x:%02x)\n",
                     own_mac[0], own_mac[1], own_mac[2],
                     own_mac[3], own_mac[4], own_mac[5],
-                    forward_all ? "OFF (-A)" : "on");
+                    forward_all ? "OFF (-A)" : "on",
+                    k[0], k[1], k[2], k[3], k[4], k[5]);
         } else {
             fprintf(stderr, "bridge: SIOCGIFHWADDR: %s "
                     "(relevance filter disabled)\n", strerror(errno));
@@ -932,8 +941,9 @@ static void handle_phys_data(void)
      * discover, etc.). Disable with -A to forward everything. */
     if (!forward_all) {
         const uint8_t *ra = frame + 4;
+        const uint8_t *key = have_filter_bssid ? filter_bssid : own_mac;
         int is_group = (ra[0] & 0x01);
-        if (!is_group && memcmp(ra, own_mac, 6) != 0)
+        if (!is_group && memcmp(ra, key, 6) != 0)
             return;
     }
 
@@ -1087,6 +1097,9 @@ static void usage(const char *prog)
         "                   HT20, HT40+, HT40-, VHT80, VHT160, VHT80+80\n"
         "  -s <center2_mhz> Secondary 80MHz center freq (VHT80+80 only)\n"
         "  -n <node_id>     Node ID for hub registration (default: phys-<ifname>)\n"
+        "  -b <bssid>       Relevance-filter on this BSSID instead of the\n"
+        "                   interface MAC (two-radio setup: dedicated ACK radio\n"
+        "                   holds MAC=BSSID, this radio does capture/inject)\n"
         "  -A               Forward ALL captured frames (disable the relevance\n"
         "                   filter; only for sniffing -- floods the hub on a\n"
         "                   busy channel)\n"
@@ -1117,8 +1130,20 @@ int main(int argc, char *argv[])
     /* Reset getopt to start scanning from argv[3] */
     optind = 3;
 
-    while ((opt = getopt(argc, argv, "c:w:s:n:Avh")) != -1) {
+    while ((opt = getopt(argc, argv, "c:w:s:n:b:Avh")) != -1) {
         switch (opt) {
+        case 'b': {
+            unsigned int m[6];
+            if (sscanf(optarg, "%x:%x:%x:%x:%x:%x",
+                       &m[0], &m[1], &m[2], &m[3], &m[4], &m[5]) != 6) {
+                fprintf(stderr, "bridge: bad -b BSSID: %s\n", optarg);
+                return 1;
+            }
+            for (int i = 0; i < 6; i++)
+                filter_bssid[i] = (uint8_t)m[i];
+            have_filter_bssid = 1;
+            break;
+        }
         case 'c':
             channel_num = atoi(optarg);
             if (channel_num <= 0) {
