@@ -574,20 +574,30 @@ static int open_raw_socket(const char *iface)
         }
     }
 
-    /* Raise the MTU so full-size downlink frames can be injected. Best
-     * effort: if the driver refuses, warn but keep going. */
+    /* Raise the MTU so full-size downlink frames can be injected. Drivers
+     * cap this differently (ath9k_htc rejects 2400), so probe a descending
+     * list and keep the highest the driver accepts. Best effort: if none
+     * take, warn -- the operator can clamp MSS on the AP instead. */
     {
-        struct ifreq ifr;
-        memset(&ifr, 0, sizeof(ifr));
-        strncpy(ifr.ifr_name, iface, IFNAMSIZ - 1);
-        ifr.ifr_mtu = INJECT_MTU;
-        if (ioctl(fd, SIOCSIFMTU, &ifr) < 0)
-            fprintf(stderr, "bridge: could not raise %s MTU to %d: %s "
-                    "(large frames may fail to inject -- "
-                    "'sudo ip link set %s mtu %d' manually, or clamp MSS)\n",
-                    iface, INJECT_MTU, strerror(errno), iface, INJECT_MTU);
+        static const int mtu_try[] = { INJECT_MTU, 2304, 2048, 1800, 1600 };
+        int set_mtu = 0;
+        for (size_t i = 0; i < sizeof(mtu_try) / sizeof(mtu_try[0]); i++) {
+            struct ifreq ifr;
+            memset(&ifr, 0, sizeof(ifr));
+            strncpy(ifr.ifr_name, iface, IFNAMSIZ - 1);
+            ifr.ifr_mtu = mtu_try[i];
+            if (ioctl(fd, SIOCSIFMTU, &ifr) == 0) {
+                set_mtu = mtu_try[i];
+                break;
+            }
+        }
+        if (set_mtu)
+            fprintf(stderr, "bridge: %s MTU set to %d\n", iface, set_mtu);
         else
-            fprintf(stderr, "bridge: %s MTU set to %d\n", iface, INJECT_MTU);
+            fprintf(stderr, "bridge: could not raise %s MTU (driver cap): %s "
+                    "-- large downlink frames will fail; clamp MSS on the AP "
+                    "(e.g. lower br-lan MTU to 1400)\n",
+                    iface, strerror(errno));
     }
 
     return fd;
