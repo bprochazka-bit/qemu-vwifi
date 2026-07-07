@@ -759,13 +759,34 @@ static size_t parse_radiotap(const uint8_t *buf, size_t len,
  *  over the air via the monitor-mode interface.
  * ================================================================ */
 
-/* Minimal radiotap header for injection: 8 bytes, no fields */
-static const uint8_t inject_radiotap[8] = {
+/*
+ * Radiotap header for injection.
+ *
+ * We MUST advertise IEEE80211_RADIOTAP_TX_FLAGS with the NO_ACK bit set.
+ * Without it, mac80211 treats an injected frame as an ordinary transmit that
+ * expects a hardware ACK, and when the injecting radio does not hear one it
+ * retransmits the frame up to the driver's retry limit (~15x). For a virtual
+ * AP whose real ACKs are produced by a *different* logical entity (the phone
+ * ACKs the downlink in the air; the AR9271 ACKs the uplink), those hardware
+ * retransmits are pure self-inflicted airtime: each downlink EAPOL/data frame
+ * hits the air ~15 times with the retry flag set, saturating the SIFS window
+ * that the station's uplink ACK needs and stalling the 4-way handshake.
+ *
+ * NO_ACK => inject exactly once, do not wait for an ACK, do not retransmit.
+ * The medium is the retransmit authority; the air is a single-shot relay.
+ *
+ *   present = 1 << 15 (IEEE80211_RADIOTAP_TX_FLAGS)   = 0x00008000
+ *   tx_flags = 0x0008 (IEEE80211_RADIOTAP_F_TX_NOACK)
+ */
+#define RADIOTAP_TX_FLAG_NOACK 0x0008
+static const uint8_t inject_radiotap[] = {
     0x00,                   /* version */
     0x00,                   /* pad */
-    0x08, 0x00,             /* length = 8 (LE) */
-    0x00, 0x00, 0x00, 0x00  /* present = 0 */
+    0x0a, 0x00,             /* length = 10 (LE) */
+    0x00, 0x80, 0x00, 0x00, /* present = TX_FLAGS (bit 15) */
+    0x08, 0x00              /* tx_flags = NO_ACK (LE) */
 };
+#define INJECT_RADIOTAP_LEN (sizeof(inject_radiotap))
 
 /*
  * Process a single hub message (payload after the 4-byte length prefix).
@@ -777,7 +798,7 @@ static void process_hub_message(const uint8_t *payload, uint32_t payload_len)
     const uint8_t *frame;
     uint16_t frame_len;
     uint16_t msg_chan_freq;
-    uint8_t inject_buf[8 + VWIFI_MAX_FRAME_SIZE];
+    uint8_t inject_buf[INJECT_RADIOTAP_LEN + VWIFI_MAX_FRAME_SIZE];
     ssize_t n;
 
     /* Need at least a v1 header */
@@ -833,15 +854,15 @@ static void process_hub_message(const uint8_t *payload, uint32_t payload_len)
     echo_record(frame, frame_len);
 
     /* Build injection buffer: radiotap header + 802.11 frame */
-    memcpy(inject_buf, inject_radiotap, 8);
-    memcpy(inject_buf + 8, frame, frame_len);
+    memcpy(inject_buf, inject_radiotap, INJECT_RADIOTAP_LEN);
+    memcpy(inject_buf + INJECT_RADIOTAP_LEN, frame, frame_len);
 
-    n = write(raw_fd, inject_buf, 8 + frame_len);
+    n = write(raw_fd, inject_buf, INJECT_RADIOTAP_LEN + frame_len);
     if (n < 0) {
         if (errno == EMSGSIZE)
             fprintf(stderr, "bridge: inject write: Message too long "
-                    "(frame=%u, need MTU >= %u; raise it or clamp MSS)\n",
-                    frame_len, 8 + frame_len);
+                    "(frame=%u, need MTU >= %zu; raise it or clamp MSS)\n",
+                    frame_len, INJECT_RADIOTAP_LEN + frame_len);
         else if (errno != EAGAIN && errno != ENOBUFS)
             fprintf(stderr, "bridge: inject write: %s\n", strerror(errno));
         return;
