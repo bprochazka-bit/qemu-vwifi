@@ -30,6 +30,7 @@
 #include <stdint.h>
 #include <time.h>
 #include <net/if.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <arpa/inet.h>
@@ -47,6 +48,18 @@ static volatile sig_atomic_t g_running = 1;
 /* File descriptors */
 static int hub_fd = -1;
 static int raw_fd = -1;
+
+/* Our interface MAC (== the AP BSSID when bridging a single AP). Used by
+ * the phys->hub relevance filter so a busy channel's ambient traffic
+ * isn't dumped wholesale into the medium (which floods the hub and can
+ * crash the USB radio firmware). */
+static uint8_t own_mac[6];
+static int forward_all;   /* -A: disable the relevance filter (sniff mode) */
+
+/* Raise the interface MTU this high at startup so a full-size downlink
+ * frame (radiotap + 802.11 header + 1500-byte payload, ~1540 bytes) can
+ * be injected without EMSGSIZE ("Message too long"). */
+#define INJECT_MTU  2400
 
 /* CLI configuration */
 static const char *hub_path;
@@ -542,6 +555,41 @@ static int open_raw_socket(const char *iface)
         return -1;
     }
 
+    /* Read our own MAC (== the AP BSSID) for the relevance filter. */
+    {
+        struct ifreq ifr;
+        memset(&ifr, 0, sizeof(ifr));
+        strncpy(ifr.ifr_name, iface, IFNAMSIZ - 1);
+        if (ioctl(fd, SIOCGIFHWADDR, &ifr) == 0) {
+            memcpy(own_mac, ifr.ifr_hwaddr.sa_data, 6);
+            fprintf(stderr, "bridge: interface MAC %02x:%02x:%02x:%02x:%02x:%02x"
+                    " (relevance filter %s)\n",
+                    own_mac[0], own_mac[1], own_mac[2],
+                    own_mac[3], own_mac[4], own_mac[5],
+                    forward_all ? "OFF (-A)" : "on");
+        } else {
+            fprintf(stderr, "bridge: SIOCGIFHWADDR: %s "
+                    "(relevance filter disabled)\n", strerror(errno));
+            forward_all = 1;
+        }
+    }
+
+    /* Raise the MTU so full-size downlink frames can be injected. Best
+     * effort: if the driver refuses, warn but keep going. */
+    {
+        struct ifreq ifr;
+        memset(&ifr, 0, sizeof(ifr));
+        strncpy(ifr.ifr_name, iface, IFNAMSIZ - 1);
+        ifr.ifr_mtu = INJECT_MTU;
+        if (ioctl(fd, SIOCSIFMTU, &ifr) < 0)
+            fprintf(stderr, "bridge: could not raise %s MTU to %d: %s "
+                    "(large frames may fail to inject -- "
+                    "'sudo ip link set %s mtu %d' manually, or clamp MSS)\n",
+                    iface, INJECT_MTU, strerror(errno), iface, INJECT_MTU);
+        else
+            fprintf(stderr, "bridge: %s MTU set to %d\n", iface, INJECT_MTU);
+    }
+
     return fd;
 }
 
@@ -771,7 +819,11 @@ static void process_hub_message(const uint8_t *payload, uint32_t payload_len)
 
     n = write(raw_fd, inject_buf, 8 + frame_len);
     if (n < 0) {
-        if (errno != EAGAIN && errno != ENOBUFS)
+        if (errno == EMSGSIZE)
+            fprintf(stderr, "bridge: inject write: Message too long "
+                    "(frame=%u, need MTU >= %u; raise it or clamp MSS)\n",
+                    frame_len, 8 + frame_len);
+        else if (errno != EAGAIN && errno != ENOBUFS)
             fprintf(stderr, "bridge: inject write: %s\n", strerror(errno));
         return;
     }
@@ -861,6 +913,19 @@ static void handle_phys_data(void)
     /* Oversized frame check */
     if (frame_len > VWIFI_MAX_FRAME_SIZE)
         return;
+
+    /* Relevance filter: on a busy channel the radio hears tens of
+     * thousands of unrelated frames; forwarding them all floods the hub
+     * and can crash the USB firmware. Only forward frames whose receiver
+     * address (Addr1, offset 4) is our own MAC (== the AP BSSID) or a
+     * group address (broadcast/multicast -- probe requests, ARP, DHCP
+     * discover, etc.). Disable with -A to forward everything. */
+    if (!forward_all) {
+        const uint8_t *ra = frame + 4;
+        int is_group = (ra[0] & 0x01);
+        if (!is_group && memcmp(ra, own_mac, 6) != 0)
+            return;
+    }
 
     /* Echo check — drop frames we injected */
     if (echo_check(frame, frame_len)) {
@@ -1012,6 +1077,9 @@ static void usage(const char *prog)
         "                   HT20, HT40+, HT40-, VHT80, VHT160, VHT80+80\n"
         "  -s <center2_mhz> Secondary 80MHz center freq (VHT80+80 only)\n"
         "  -n <node_id>     Node ID for hub registration (default: phys-<ifname>)\n"
+        "  -A               Forward ALL captured frames (disable the relevance\n"
+        "                   filter; only for sniffing -- floods the hub on a\n"
+        "                   busy channel)\n"
         "  -v               Verbose logging\n"
         "  -h               This help\n"
         "\n"
@@ -1039,7 +1107,7 @@ int main(int argc, char *argv[])
     /* Reset getopt to start scanning from argv[3] */
     optind = 3;
 
-    while ((opt = getopt(argc, argv, "c:w:s:n:vh")) != -1) {
+    while ((opt = getopt(argc, argv, "c:w:s:n:Avh")) != -1) {
         switch (opt) {
         case 'c':
             channel_num = atoi(optarg);
@@ -1056,6 +1124,9 @@ int main(int argc, char *argv[])
             break;
         case 'n':
             snprintf(node_id, sizeof(node_id), "%s", optarg);
+            break;
+        case 'A':
+            forward_all = 1;
             break;
         case 'v':
             verbose = 1;
