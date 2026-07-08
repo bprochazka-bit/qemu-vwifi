@@ -643,6 +643,38 @@ static int open_raw_socket(const char *iface)
     return fd;
 }
 
+/* Set when the capture interface flaps (e.g. an mt76 USB reset produces
+ * ENETDOWN on read). The main loop reopens the raw socket instead of exiting,
+ * so a momentary radio reset is a self-healing blip rather than a full outage
+ * that needs a manual restart. */
+static int raw_needs_reopen;
+
+/* Close and reopen the raw capture socket, retrying with backoff until the
+ * interface comes back up (or shutdown is requested). Updates the global
+ * raw_fd; the main loop rebinds its pollfd to it each iteration. */
+static void reopen_raw_socket(void)
+{
+    if (raw_fd >= 0) {
+        close(raw_fd);
+        raw_fd = -1;
+    }
+    fprintf(stderr, "bridge: capture interface %s down -- reopening...\n", ifname);
+    int backoff_ms = 200;
+    while (g_running) {
+        int fd = open_raw_socket(ifname);
+        if (fd >= 0) {
+            raw_fd = fd;
+            fprintf(stderr, "bridge: %s recovered\n", ifname);
+            return;
+        }
+        struct timespec ts = { backoff_ms / 1000,
+                               (long)(backoff_ms % 1000) * 1000000L };
+        nanosleep(&ts, NULL);
+        if (backoff_ms < 2000)
+            backoff_ms *= 2;
+    }
+}
+
 /* ================================================================
  *  Step 7: radiotap parsing
  *
@@ -969,9 +1001,11 @@ static void handle_phys_data(void)
     if (nread <= 0) {
         if (nread < 0 && (errno == EAGAIN || errno == EINTR))
             return;
-        fprintf(stderr, "bridge: raw socket read error: %s\n",
+        /* ENETDOWN and friends: the capture radio flapped (mt76 USB reset).
+         * Recover by reopening the socket rather than exiting. */
+        fprintf(stderr, "bridge: raw socket read error: %s -- recovering\n",
                 strerror(errno));
-        g_running = 0;
+        raw_needs_reopen = 1;
         return;
     }
 
@@ -1352,10 +1386,19 @@ int main(int argc, char *argv[])
     /* Main poll loop */
     {
         struct pollfd pfds[2];
-        pfds[0].fd = raw_fd;   pfds[0].events = POLLIN;
         pfds[1].fd = hub_fd;   pfds[1].events = POLLIN;
 
         while (g_running) {
+            /* A capture-interface flap (mt76 USB reset) is recoverable: reopen
+             * the raw socket rather than tearing the whole bridge down. */
+            if (raw_needs_reopen) {
+                reopen_raw_socket();
+                raw_needs_reopen = 0;
+                if (!g_running)
+                    break;
+            }
+
+            pfds[0].fd = raw_fd;   pfds[0].events = POLLIN;
             pfds[0].revents = 0;
             pfds[1].revents = 0;
 
@@ -1366,8 +1409,6 @@ int main(int argc, char *argv[])
                 perror("bridge: poll");
                 break;
             }
-            if (nready == 0)
-                continue;
 
             /* Hub -> physical */
             if (pfds[1].revents & POLLIN)
@@ -1377,12 +1418,15 @@ int main(int argc, char *argv[])
             if (pfds[0].revents & POLLIN)
                 handle_phys_data();
 
+            /* Capture interface error (flap): reopen on the next iteration. */
+            if (pfds[0].revents & (POLLERR | POLLHUP | POLLNVAL))
+                raw_needs_reopen = 1;
+
             /* Hub disconnect is fatal */
             if (pfds[1].revents & (POLLERR | POLLHUP)) {
                 fprintf(stderr, "bridge: hub connection lost\n");
                 break;
             }
-            /* Raw socket errors are transient (interface flap) — ignore */
         }
     }
 
