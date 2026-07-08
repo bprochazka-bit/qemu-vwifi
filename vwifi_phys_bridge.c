@@ -74,10 +74,13 @@ static uint8_t filter_mask[6] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
  * never hear "its" ACK -- the frame's source is the VM BSSID, not this radio),
  * so on a congested/co-located channel a single collision drops a handshake
  * frame with only slow ~1s EAPOL recovery. Sending 2-3 copies (retry bit set
- * on copies 2+, so the STA's duplicate filter discards the extras) trades a
- * little airtime for a much better 4-way / assoc completion rate. Beacons and
- * probe responses are never duplicated (they are periodic; losing one is
- * harmless and tripling them just adds congestion). */
+ * on copies 2+) trades a little airtime for a much better 4-way / assoc
+ * completion rate. Only association-critical frames are duplicated: management
+ * and the unprotected EAPOL handshake. Beacons/probe-responses (periodic) and
+ * encrypted user data are always injected once -- the latter because upper
+ * layers already retransmit and injected copies are not reliably de-duplicated
+ * by the receiver, so they would surface as application-level dupes (ping
+ * "DUP!"). */
 static int inject_copies = 1;
 
 /* Raise the interface MTU this high at startup so a full-size downlink
@@ -920,13 +923,24 @@ static void process_hub_message(const uint8_t *payload, uint32_t payload_len)
     memcpy(inject_buf, inject_radiotap, INJECT_RADIOTAP_LEN);
     memcpy(inject_buf + INJECT_RADIOTAP_LEN, frame, frame_len);
 
-    /* Duplicate for reliability, but never multiply the beacon/probe-resp
-     * flood -- those are periodic and one loss is harmless. */
+    /* Redundant injection is only for the one-shot, association-critical
+     * frames that have no L2 retransmit and whose loss stalls the connection:
+     * management (auth/assoc/deauth/disassoc) and the unprotected EAPOL
+     * handshake (data frames sent before the key is installed). Everything
+     * else is injected once:
+     *   - beacons / probe responses: periodic, one loss is harmless;
+     *   - encrypted user data (Protected bit set): duplicating it delivers
+     *     duplicates all the way to the application (ping "DUP!", etc.) --
+     *     the receiver's dup filter does not reliably drop injected copies --
+     *     and TCP/ARP/DHCP already retransmit on their own. */
     int copies = inject_copies;
     {
-        int ftype = (frame[0] >> 2) & 0x3;   /* 0=mgmt,1=ctrl,2=data */
-        int fsub  = (frame[0] >> 4) & 0xf;
+        int ftype       = (frame[0] >> 2) & 0x3;   /* 0=mgmt,1=ctrl,2=data */
+        int fsub        = (frame[0] >> 4) & 0xf;
+        int protected_f = frame[1] & 0x40;         /* FC Protected bit */
         if (ftype == 0 && (fsub == 8 || fsub == 5))   /* beacon / probe-resp */
+            copies = 1;
+        else if (ftype == 2 && protected_f)           /* encrypted user data */
             copies = 1;
     }
 
@@ -1231,8 +1245,9 @@ static void usage(const char *prog)
         "                   BSSID set, e.g. -b 02:11:22:33:44:00 -m ff:ff:ff:ff:ff:00\n"
         "                   forwards 02:11:22:33:44:00..FF\n"
         "  -r <n>           Inject each critical downlink frame N times (default\n"
-        "                   1; try 2-3 on a lossy/congested channel). Beacons and\n"
-        "                   probe responses are never duplicated.\n"
+        "                   1; try 2-3 on a lossy/congested channel). Only\n"
+        "                   management + EAPOL are duplicated; beacons and\n"
+        "                   encrypted data are always injected once.\n"
         "  -A               Forward ALL captured frames (disable the relevance\n"
         "                   filter; only for sniffing -- floods the hub on a\n"
         "                   busy channel)\n"
