@@ -108,6 +108,18 @@
 #define AR_MoreAggr                 0x20000000
 #define AR_IsAggr                   0x40000000
 
+/* ds_ctl6 – encryption type for hardware crypto offload.
+ * The driver writes SM(keytype, AR_EncrType); the value is the
+ * ath9k_key_type enum below. */
+#define AR_EncrType                 0x0c000000
+#define AR_EncrType_S               26
+
+/* ath9k_key_type values placed in the AR_EncrType field */
+#define AR_ENCR_TYPE_CLEAR          0  /* no encryption */
+#define AR_ENCR_TYPE_WEP            1
+#define AR_ENCR_TYPE_AES            2  /* AES-CCM (WPA2/CCMP) */
+#define AR_ENCR_TYPE_TKIP           3
+
 /* ================================================================
  *  TX status word bit definitions (status8 = ds_txstatus8)
  * ================================================================ */

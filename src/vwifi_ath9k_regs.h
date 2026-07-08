@@ -358,6 +358,43 @@
 #define AR_PHY_RFBUS_GRANT_EN       0x00000001
 
 /* ================================================================
+ *  Hardware key cache (WEP/TKIP/CCMP offload)
+ *
+ *  Values from Linux kernel drivers/net/wireless/ath/ath9k/reg.h.
+ *  Each entry is 8 registers (32 bytes) wide.  The driver programs
+ *  keys here via ath_hw_set_keycache_entry(); on real silicon the MAC
+ *  encrypts/decrypts frames using the matching entry.  We emulate the
+ *  cache and perform CCMP in software (see vwifi_ath9k_crypto.h).
+ * ================================================================ */
+#define AR_KEY_CACHE_SIZE           128
+#define AR_KEYTABLE_0               0x8800
+#define AR_KEYTABLE(_n)             (AR_KEYTABLE_0 + ((_n) * 32))
+#define AR_KEYTABLE_KEY0(_n)        (AR_KEYTABLE(_n) + 0)
+#define AR_KEYTABLE_KEY1(_n)        (AR_KEYTABLE(_n) + 4)
+#define AR_KEYTABLE_KEY2(_n)        (AR_KEYTABLE(_n) + 8)
+#define AR_KEYTABLE_KEY3(_n)        (AR_KEYTABLE(_n) + 12)
+#define AR_KEYTABLE_KEY4(_n)        (AR_KEYTABLE(_n) + 16)
+#define AR_KEYTABLE_TYPE(_n)        (AR_KEYTABLE(_n) + 20)
+#define AR_KEYTABLE_MAC0(_n)        (AR_KEYTABLE(_n) + 24)
+#define AR_KEYTABLE_MAC1(_n)        (AR_KEYTABLE(_n) + 28)
+
+/* First and last byte offsets of the key cache in the MMIO window */
+#define AR_KEYTABLE_END             (AR_KEYTABLE_0 + AR_KEY_CACHE_SIZE * 32)
+
+/* AR_KEYTABLE_TYPE field (low 3 bits) */
+#define AR_KEYTABLE_TYPE_MASK       0x00000007
+#define AR_KEYTABLE_TYPE_40         0x00000000  /* WEP-40  */
+#define AR_KEYTABLE_TYPE_104        0x00000001  /* WEP-104 */
+#define AR_KEYTABLE_TYPE_128        0x00000003  /* WEP-128 */
+#define AR_KEYTABLE_TYPE_TKIP       0x00000004
+#define AR_KEYTABLE_TYPE_AES        0x00000005  /* AES-OCB (unused) */
+#define AR_KEYTABLE_TYPE_CCM        0x00000006  /* AES-CCM (WPA2/CCMP) */
+#define AR_KEYTABLE_TYPE_CLR        0x00000007  /* entry disabled */
+
+/* AR_KEYTABLE_MAC1: valid (unicast) flag + high MAC bits */
+#define AR_KEYTABLE_VALID           0x00008000
+
+/* ================================================================
  *  Misc constants
  * ================================================================ */
 #define AR5416_MAGIC                0x19641014

@@ -356,7 +356,38 @@ The following registers are explicitly handled in Phase 1:
 | AR_WA | 0x4004 | ✓ | ✓ | Workaround register, AR9285 default |
 | AR_STA_ID0/1 | 0x8000/4 | ✓ | ✓ | Station MAC, shadow |
 | AR_PM_STATE | 0x4008 | ✓ | — | Reports awake |
+| AR_KEYTABLE | 0x8800–0x97FF | ✓ | ✓ | Hardware key cache (CCMP offload) |
 | All others | * | ✓ | ✓ | Shadow register + UNHANDLED warning |
+
+## Hardware Crypto (WPA2 / CCMP)
+
+Real ath9k hardware offloads CCMP (AES-CCM) to an on-chip crypto engine
+driven by the key cache, and advertises that capability to mac80211.  Because
+of that advertisement, mac80211 stops doing software CCMP and depends on the
+hardware for the encrypted data path.  A virtual radio with no crypto engine
+therefore associates and completes the WPA2 4-way handshake (EAPOL is computed
+in userspace) but carries **no** data — every encrypted frame is dropped and
+`rx drop misc` climbs.
+
+This device emulates that engine:
+
+- **Key cache** (`AR_KEYTABLE`, 0x8800): the driver's key-programming writes
+  are shadowed in the register file; `vwifi_ath9k_keycache_ccm()` reconstructs
+  the 128-bit key from the same `key0..key4` split that
+  `ath_hw_set_keycache_entry()` uses.
+- **TX**: when a TX descriptor requests encryption (valid `AR_DestIdx` +
+  `AR_EncrType` = AES), the payload is encrypted with AES-CCM and the 8-byte
+  MIC appended, exactly as the silicon would.
+- **RX**: protected frames are decrypted (the matching key is found by MIC
+  verification) and the RX status reports a valid key index so the driver sets
+  `RX_FLAG_DECRYPTED` and mac80211 strips the CCMP header and MIC.
+
+The AES-CCM implementation lives in `src/vwifi_ath9k_crypto.h` and follows
+IEEE 802.11-2016 §12.5.3 / RFC 3610 (M = 8, L = 2).  It is verified against
+OpenSSL's `EVP_aes_128_ccm` and by encrypt→decrypt round-trip and forgery
+rejection (see `tests/test_ccmp.c`).  Only CCMP (WPA2/WPA3-personal data) is
+emulated; TKIP and WEP keys are stored but not decrypted, so those ciphers are
+unsupported.
 
 ## EEPROM Image
 

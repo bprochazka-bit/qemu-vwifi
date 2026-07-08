@@ -124,6 +124,16 @@ clean: check-qemu-src
 	@test -d "$(QEMU_BUILD_DIR)" && \
 		$(MAKE) -C "$(QEMU_BUILD_DIR)" clean || true
 
+# ---- CCMP crypto unit test (host build, requires OpenSSL) ---------
+
+.PHONY: test-crypto
+test-crypto:
+	@echo "=== Building and running CCMP crypto unit test ==="
+	@command -v cc >/dev/null 2>&1 || { echo "cc not found"; exit 1; }
+	cc -O2 -Wall -Wno-deprecated-declarations -Isrc \
+		-o tests/test_ccmp tests/test_ccmp.c -lcrypto
+	./tests/test_ccmp
+
 # ---- Static analysis (optional, requires cppcheck) ----------------
 
 .PHONY: lint
