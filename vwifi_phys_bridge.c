@@ -69,6 +69,17 @@ static int have_filter_bssid;
  * instead of a single exact address. Defaults to all-ones == exact match. */
 static uint8_t filter_mask[6] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
 
+/* -r <n>: inject each critical downlink frame N times (default 1). Injected
+ * frames are NO_ACK single-shot with no hardware retransmit (the injector can
+ * never hear "its" ACK -- the frame's source is the VM BSSID, not this radio),
+ * so on a congested/co-located channel a single collision drops a handshake
+ * frame with only slow ~1s EAPOL recovery. Sending 2-3 copies (retry bit set
+ * on copies 2+, so the STA's duplicate filter discards the extras) trades a
+ * little airtime for a much better 4-way / assoc completion rate. Beacons and
+ * probe responses are never duplicated (they are periodic; losing one is
+ * harmless and tripling them just adds congestion). */
+static int inject_copies = 1;
+
 /* Raise the interface MTU this high at startup so a full-size downlink
  * frame (radiotap + 802.11 header + 1500-byte payload, ~1540 bytes) can
  * be injected without EMSGSIZE ("Message too long"). */
@@ -366,6 +377,17 @@ static uint64_t now_ms(void)
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+}
+
+/* True if (addr & mask) == (key & mask) -- the same match the hardware
+ * bssidmask uses. Lets the relevance filter accept a prefix-aligned set. */
+static int addr_in_range(const uint8_t *addr, const uint8_t *key,
+                         const uint8_t *mask)
+{
+    for (int i = 0; i < 6; i++)
+        if ((addr[i] & mask[i]) != (key[i] & mask[i]))
+            return 0;
+    return 1;
 }
 
 /*
@@ -866,21 +888,38 @@ static void process_hub_message(const uint8_t *payload, uint32_t payload_len)
     memcpy(inject_buf, inject_radiotap, INJECT_RADIOTAP_LEN);
     memcpy(inject_buf + INJECT_RADIOTAP_LEN, frame, frame_len);
 
-    n = write(raw_fd, inject_buf, INJECT_RADIOTAP_LEN + frame_len);
-    if (n < 0) {
-        if (errno == EMSGSIZE)
-            fprintf(stderr, "bridge: inject write: Message too long "
-                    "(frame=%u, need MTU >= %zu; raise it or clamp MSS)\n",
-                    frame_len, INJECT_RADIOTAP_LEN + frame_len);
-        else if (errno != EAGAIN && errno != ENOBUFS)
-            fprintf(stderr, "bridge: inject write: %s\n", strerror(errno));
-        return;
+    /* Duplicate for reliability, but never multiply the beacon/probe-resp
+     * flood -- those are periodic and one loss is harmless. */
+    int copies = inject_copies;
+    {
+        int ftype = (frame[0] >> 2) & 0x3;   /* 0=mgmt,1=ctrl,2=data */
+        int fsub  = (frame[0] >> 4) & 0xf;
+        if (ftype == 0 && (fsub == 8 || fsub == 5))   /* beacon / probe-resp */
+            copies = 1;
+    }
+
+    for (int c = 0; c < copies; c++) {
+        /* Mark copies 2+ as retransmissions so the receiver's duplicate
+         * filter drops them when an earlier copy already arrived. */
+        if (c == 1)
+            inject_buf[INJECT_RADIOTAP_LEN + 1] |= 0x08;  /* FC retry bit */
+
+        n = write(raw_fd, inject_buf, INJECT_RADIOTAP_LEN + frame_len);
+        if (n < 0) {
+            if (errno == EMSGSIZE)
+                fprintf(stderr, "bridge: inject write: Message too long "
+                        "(frame=%u, need MTU >= %zu; raise it or clamp MSS)\n",
+                        frame_len, INJECT_RADIOTAP_LEN + frame_len);
+            else if (errno != EAGAIN && errno != ENOBUFS)
+                fprintf(stderr, "bridge: inject write: %s\n", strerror(errno));
+            return;
+        }
     }
 
     stats_hub_to_phys++;
     if (verbose)
-        fprintf(stderr, "bridge: hub->phys: injected %u bytes (ch=%u)\n",
-                frame_len, msg_chan_freq);
+        fprintf(stderr, "bridge: hub->phys: injected %u bytes x%d (ch=%u)\n",
+                frame_len, copies, msg_chan_freq);
 }
 
 /* ================================================================
@@ -963,25 +1002,41 @@ static void handle_phys_data(void)
     if (frame_len > VWIFI_MAX_FRAME_SIZE)
         return;
 
-    /* Relevance filter: on a busy channel the radio hears tens of
-     * thousands of unrelated frames; forwarding them all floods the hub
-     * and can crash the USB firmware. Only forward frames whose receiver
-     * address (Addr1, offset 4) is our own MAC (== the AP BSSID) or a
-     * group address (broadcast/multicast -- probe requests, ARP, DHCP
-     * discover, etc.). Disable with -A to forward everything. */
+    /* Relevance filter: on a busy channel the radio hears tens of thousands
+     * of unrelated frames; forwarding them all floods the hub, loads the
+     * bridge, and can crash the USB firmware. Keep only frames that belong to
+     * our lab BSSID set. Disable with -A to forward everything.
+     *
+     *  - Control frames (ACK/RTS/CTS/BlockAck): never forwarded. They are
+     *    PHY-local and meaningless in the medium.
+     *  - Unicast: Addr1 (RA, offset 4) must be in our BSSID range.
+     *  - Group-addressed: forward probe requests (discovery) and any frame
+     *    whose BSSID (Addr3, offset 16) is in our range; drop foreign beacons
+     *    and neighbours' broadcasts -- the bulk of the ambient flood. A
+     *    client's broadcast uplink (DHCP/ARP) is toDS with RA == BSSID, so it
+     *    is unicast-at-L2 and already covered by the RA test above. */
     if (!forward_all) {
+        int ftype = (frame[0] >> 2) & 0x3;   /* 0=mgmt,1=ctrl,2=data */
+        int fsub  = (frame[0] >> 4) & 0xf;
+
+        if (ftype == 1)                      /* control frame */
+            return;
+
         const uint8_t *ra = frame + 4;
         const uint8_t *key = have_filter_bssid ? filter_bssid : own_mac;
         int is_group = (ra[0] & 0x01);
-        int match = 1;
-        for (int i = 0; i < 6; i++) {
-            if ((ra[i] & filter_mask[i]) != (key[i] & filter_mask[i])) {
-                match = 0;
-                break;
-            }
+
+        if (!is_group) {
+            if (!addr_in_range(ra, key, filter_mask))
+                return;
+        } else {
+            int is_probe_req = (ftype == 0 && fsub == 4);
+            const uint8_t *bssid = frame + 16;   /* Addr3 (mgmt: == BSSID) */
+            int have_bssid = (frame_len >= 24);
+            if (!is_probe_req &&
+                !(have_bssid && addr_in_range(bssid, key, filter_mask)))
+                return;
         }
-        if (!is_group && !match)
-            return;
     }
 
     /* Echo check — drop frames we injected */
@@ -1141,6 +1196,9 @@ static void usage(const char *prog)
         "                   default ff:ff:ff:ff:ff:ff). Forward a prefix-aligned\n"
         "                   BSSID set, e.g. -b 02:11:22:33:44:00 -m ff:ff:ff:ff:ff:00\n"
         "                   forwards 02:11:22:33:44:00..FF\n"
+        "  -r <n>           Inject each critical downlink frame N times (default\n"
+        "                   1; try 2-3 on a lossy/congested channel). Beacons and\n"
+        "                   probe responses are never duplicated.\n"
         "  -A               Forward ALL captured frames (disable the relevance\n"
         "                   filter; only for sniffing -- floods the hub on a\n"
         "                   busy channel)\n"
@@ -1171,7 +1229,7 @@ int main(int argc, char *argv[])
     /* Reset getopt to start scanning from argv[3] */
     optind = 3;
 
-    while ((opt = getopt(argc, argv, "c:w:s:n:b:m:Avh")) != -1) {
+    while ((opt = getopt(argc, argv, "c:w:s:n:b:m:r:Avh")) != -1) {
         switch (opt) {
         case 'b': {
             unsigned int m[6];
@@ -1211,6 +1269,13 @@ int main(int argc, char *argv[])
             break;
         case 'n':
             snprintf(node_id, sizeof(node_id), "%s", optarg);
+            break;
+        case 'r':
+            inject_copies = atoi(optarg);
+            if (inject_copies < 1 || inject_copies > 8) {
+                fprintf(stderr, "bridge: -r must be 1..8: %s\n", optarg);
+                return 1;
+            }
             break;
         case 'A':
             forward_all = 1;

@@ -124,6 +124,10 @@ channel=$CHANNEL
 ieee80211n=0
 wmm_enabled=0
 ap_isolate=1
+# Beacon slowly: these APs exist only to hold AP opmode (for the ACK) and to be
+# survey-able decoys. A low beacon rate cuts the AR9271's on-air duty cycle so
+# it does not desense the co-located MT7921U mid-injection. ~1.02s interval.
+beacon_int=1000
 
 ssid=$SSID_LO
 bssid=$BSSID_LO
@@ -163,9 +167,10 @@ say "Starting witness capture -> $WITNESS_PCAP"
 tcpdump -i "$MT_IF" -w "$WITNESS_PCAP" -U >/dev/null 2>&1 &
 sleep 1
 
-say "Starting bridge on $MT_IF (forwarding $FILTER_BASE / $FILTER_MASK)"
+INJECT_COPIES="${INJECT_COPIES:-3}"   # redundant injection for the lossy channel
+say "Starting bridge on $MT_IF (forwarding $FILTER_BASE / $FILTER_MASK, -r $INJECT_COPIES)"
 "$BRIDGE_BIN" "$HUB_SOCK" "$MT_IF" -c "$CHANNEL" \
-    -b "$FILTER_BASE" -m "$FILTER_MASK" -v \
+    -b "$FILTER_BASE" -m "$FILTER_MASK" -r "$INJECT_COPIES" -v \
     > "$RUN_DIR/bridge.log" 2>&1 &
 sleep 1
 
