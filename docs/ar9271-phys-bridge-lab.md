@@ -1,238 +1,250 @@
-# Single-radio physical bridge: real STA → virtual OpenWRT APs (AR9271)
+# Real STA → virtual OpenWRT VM AP, over the vwifi medium
 
-This runbook describes how to let an **unmodifiable real station** (e.g. an
-Android phone) *associate* to **OpenWRT VM access points that live on the vwifi
-medium**, using a **single** physical radio that serves **multiple BSSIDs on one
-channel**. The VMs remain the literal APs; the real radio only provides the
-PHY and the one timing-critical thing software cannot: the **MAC-layer ACK**.
+This runbook is the **proven, working** procedure for letting an **unmodifiable
+real station** (an Android phone, a Linux laptop, any STA) *associate with WPA2*
+to **OpenWRT VM access points that live on the vwifi medium** — using a physical
+bridge on the host. The VMs remain the literal APs; the phone lands in the VM's
+station table; the real radios only provide the PHY and the one thing software
+can't: the SIFS-timed MAC ACK.
 
-> Scope note. The monitor `vwifi-phys-bridge` is great for *observation*
-> (sniffing/injecting between real air and the sim). Letting a real STA
-> *join* a virtual AP additionally requires hardware ACKs at SIFS, which is
-> the subject of this document.
+Status: **validated end to end** — VM client, Linux laptop, and an Android phone
+all associate with WPA2-PSK, complete the 4-way handshake, get a DHCP lease, and
+pass traffic.
 
 ---
 
-## 1. Why this is hard, in one paragraph
+## 0. TL;DR — the four things that had to be true
+
+Each was a hard blocker discovered in turn; all four are now fixed/handled:
+
+1. **The medium must ACK the STA's uplink at SIFS.** Only hardware can. The
+   AR9271 (`ath9k_htc`) will **not** ACK in *monitor* mode, but **does** ACK in
+   **AP opmode** for any address its `bssidmask` covers. So we run decoy hostapd
+   APs on the AR9271 whose mask spans the VM BSSIDs. (§2, §3)
+2. **Injected downlink must not self-retransmit.** Inject with radiotap
+   `TX_FLAGS = NO_ACK` (the injecting radio can never hear "its" ACK, since the
+   frame's source is the VM BSSID). Otherwise every frame hits the air ~15× and
+   drowns the channel. (built into `vwifi-phys-bridge`)
+3. **The handshake must survive a lossy, co-located channel.** Inject the
+   critical frames redundantly (`-r 3`) and drop ambient junk from the medium.
+   (§3)
+4. **The VM must actually do the CCMP crypto.** The emulated `ath9k` in the VMs
+   advertises hardware crypto it doesn't perform, so encrypted data was dropped
+   (`rx drop misc`). Load the VM `ath9k` with **`nohwcrypt=1`** to force software
+   crypto. This is the single most important fix — without it WPA2 associates
+   but no data ever flows. (§4)
+
+---
+
+## 1. Why a SIFS ACK is the whole problem
 
 Every unicast frame a STA sends must be ACKed within **SIFS (~10–16 µs)**. That
-ACK is produced by the receiver's MAC **hardware/firmware**, keyed only on the
-frame's `addr1` (RA) matching the radio's address filter — it does **not**
-depend on association state, keys, or sequence numbers. No host-side software
-can hit SIFS across an air→host→hub→VM→back path. Therefore the radio the phone
-talks to must auto-ACK locally. Everything *else* in association
-(Auth/Assoc/EAPOL/data) has soft, millisecond-to-second timeouts and can be
-relayed to the VM, which stays the real AP.
-
-Only **ACK** is on the SIFS hot path. The phone ACKs the *downlink* itself, and
-the vwifi driver already reports the VM's TX as ACKed, so the proxy's entire job
-is: **auto-ACK uplink frames addressed to the AP BSSID set.**
+ACK is produced by the receiver's MAC hardware, keyed only on the frame's
+`addr1` (RA) matching the radio's address filter under its BSSID mask — it does
+**not** depend on association, keys, or sequence numbers. No host-side software
+path (air → host → hub → VM → back) can hit SIFS. So the radio the STA talks to
+must auto-ACK locally. Everything else in association (Auth/Assoc/EAPOL/data) has
+millisecond-to-second timeouts and is relayed to the VM, which stays the real AP.
 
 ---
 
-## 2. Why AR9271
+## 2. The AP-opmode ACK trick (the key insight)
 
-| Property | AR9271 | Consequence |
-|---|---|---|
-| MAC offload | **open, on-target firmware** (`qca/open-ath9k-htc-firmware`) | we can change ACK/address-filter behavior |
-| ACK generation | on the device target | meets SIFS despite USB |
-| Driver | `ath9k_htc` (shares `ath9k_hw` register layer) | standard BSSID-mask machinery available |
-| Band / PHY | 2.4 GHz only, 11n 1×1, HT20/40 | fine for a single-channel lab; phone air link is 11n/legacy |
-| Cost | TL-WN722N **v1**, Alfa AWUS036NHA | cheap, common |
+Measured facts on the AR9271 (`ath9k_htc`, USB):
 
-The 11ac/ax USB parts (mt76, etc.) hide the MAC in **closed** firmware, which is
-exactly what removes the ACK control. AR9271's open firmware is the unlock.
+- In **monitor** mode with its MAC set to a BSSID, it captures fine but emits
+  **zero** ACKs — the firmware gates the ACK responder off in `HTC_M_MONITOR`.
+  (Verified with a co-channel witness: 0 ACKs to the STA, STA retransmits to its
+  limit, handshake stalls.)
+- The card's interface combinations **forbid `AP + monitor` on one radio**
+  (`iw phy … info`: `#{AP,mesh,P2P-GO} ≤ 2`, monitor not combinable). So you
+  cannot "add a monitor vif" next to an AP for capture on the same AR9271.
+- But in **AP opmode** the PCU auto-ACKs any received frame matching
+  `(RA & bssidmask) == (macaddr & bssidmask)` — **including BSSIDs no vif owns**,
+  because the mask is a bitmask, not a list.
+
+So: run **two decoy hostapd BSSes on the AR9271** at the extremes of the BSSID
+range (e.g. `02:11:22:33:44:00` and `…:FF`). The driver derives
+`bssidmask = ff:ff:ff:ff:ff:00`, and the chip hardware-ACKs the whole
+`02:11:22:33:44:00..FF` range. The VM APs live at `…:01..FE`; the AR9271 ACKs
+their uplink even though hostapd only *owns* `…:00`/`…:FF`. Those two decoys
+double as the survey "wrong APs."
+
+Capture + injection run on a **second** radio (the MT7921U, `mt76`) in monitor
+mode, since the AR9271 can't do AP+monitor.
+
+### BSSID mask math
+
+The mask is `~(XOR of the AP-vif addresses)`; a bit is "don't-care" (ACK-matched)
+only where the addresses differ. To span the whole last byte you need two vifs
+that differ in all 8 low bits:
+
+```
+02:11:22:33:44:00  XOR  02:11:22:33:44:FF  = 00:00:00:00:00:FF
+  -> mask ff:ff:ff:ff:ff:00  -> ACKs 02:11:22:33:44:00 .. :FF  (256 BSSIDs)
+```
+
+Keep the fixed prefix a locally-administered address (`02:…`) you own, and make
+the mask no wider than your BSSID pool — every don't-care bit widens the set of
+addresses the card will ACK, and if it ever overlaps a real neighbour's MAC the
+card will ACK traffic that isn't yours.
 
 ---
 
 ## 3. Architecture
 
 ```
-  OpenWRT VM1  hostapd  bssid 02:11:22:33:44:00  ┐
-  OpenWRT VM2  hostapd  bssid 02:11:22:33:44:01  ├─ all on channel 6, all virtual
-  OpenWRT VM3  hostapd  bssid 02:11:22:33:44:02  ┘   (the *literal* APs)
+  OpenWRT VM1  hostapd  bssid 02:11:22:33:44:01  ┐  the REAL, joinable APs
+  OpenWRT VM2  hostapd  bssid 02:11:22:33:44:02  ├─ ch 11, legacy, WPA2-PSK
+  OpenWRT VM3  hostapd  bssid 02:11:22:33:44:03  ┘  (ath9k, nohwcrypt=1)
         │  vwifi medium (hub)
         ▼
-   vwifi-phys-bridge ──► AR9271 (ath9k_htc), ch6, monitor capture + inject
-                          + on-target auto-ACK for the masked BSSID set  ◄─┐
-                                                                           │ ACK (SIFS)
-  Android phone ))) sees 3 SSIDs on ch6, joins ANY one ─────────────────────┘
+   vwifi-phys-bridge on MT7921U (mt76), ch 11, monitor:
+        capture STA uplink -> hub;  inject VM downlink (NO_ACK, -r 3)
+        relevance filter -b 02:11:22:33:44:00 -m ff:ff:ff:ff:ff:00
+        │
+   AR9271 (ath9k_htc), ch 11: two decoy hostapd BSSes at :00 and :FF
+        -> AP opmode; hardware-ACKs the STA's uplink to :01..:FE  ◄─┐ ACK (SIFS)
+                                                                     │
+  Real STA ))) sees the SSIDs on ch 11, joins one, associates ──────┘
 ```
 
-What already works (no code changes):
-
-- **Air → medium**: the bridge forwards every captured frame to the hub tagged
-  with its configured channel. All three APs share that channel, so every frame
-  reaches all three VM AP peers; each VM's hostapd accepts only frames addressed
-  to its own BSSID and drops the rest. **The VMs self-demultiplex** — the bridge
-  stays BSSID-agnostic.
-- **Medium → air**: the bridge injects everything for that channel, so all three
-  VMs' beacons/responses go out and the phone sees three SSIDs on one channel.
-- Echo suppression and the per-channel accept filter are already in place.
-
-The **only** missing capability is the hardware ACK (Section 6).
+Two radios, one channel. Put them on **USB extension cables a foot+ apart** — co-
+located transmitters desense each other and that is the main source of the
+periodic beacon-loss reconnects.
 
 ---
 
-## 4. BSSID allocation (keep the mask tight)
+## 4. VM (OpenWRT AP) configuration — including the crypto fix
 
-The AR9271 auto-ACKs a frame when `(RA & mask) == (base & mask)`. The mask is a
-bitmask, not a list, so choose BSSIDs that share a prefix and differ only in the
-low bits:
-
-| AP | BSSID |
-|----|-------|
-| AP1 | `02:11:22:33:44:00` |
-| AP2 | `02:11:22:33:44:01` |
-| AP3 | `02:11:22:33:44:02` |
-
-Only the low two bits differ →
-
-```
-base = 02:11:22:33:44:00
-mask = FF:FF:FF:FF:FF:FC      (care about everything except the low 2 bits)
-```
-
-The hardware then ACKs `02:11:22:33:44:00..03`: your three real BSSIDs plus one
-unused phantom (`…:03`). Use locally-administered addresses (`02:…`) so you fully
-own the space. Add more APs by widening the low-bit field (4 APs → mask
-`…:FC` covers `00..03`; 8 APs → `…:F8`, etc.).
-
----
-
-## 5. OpenWRT VM AP configuration
-
-Run each AP on the **same channel** with its assigned BSSID, in **legacy
-(non-HT) mode** so every data frame uses a simple ACK — this removes
-**Block-Ack** and **RTS/CTS**, which are *also* SIFS responses the proxy does not
-generate. See `examples/hostapd/lab-ap1.conf` … `lab-ap3.conf`. Key lines:
-
-```ini
-interface=wlan0          # the VM's vwifi virtual radio
-driver=nl80211
-channel=6
-hw_mode=g
-ieee80211n=0             # legacy → simple per-frame ACK, no A-MPDU/Block-Ack
-wmm_enabled=0            # no QoS → no Block-Ack negotiation
-ssid=Lab-AP-1
-bssid=02:11:22:33:44:00
-auth_algs=1
-wpa=2
-wpa_key_mgmt=WPA-PSK
-rsn_pairwise=CCMP
-wpa_passphrase=correcthorse1
-```
-
-Crypto stays in the VM. **Install no keys on the AR9271** (it relays the data
-frames raw/encrypted; the ACK is pre-decryption).
-
-> APs that only ever serve *virtual* clients can stay HT/VHT/HE at any width —
-> the legacy restriction applies only to the APs a real phone will join.
-
----
-
-## 6. The one component to build: AR9271 "ackmon"
-
-Goal: make the AR9271 **auto-ACK uplink frames addressed to the masked BSSID
-set while in monitor mode**, still delivering all frames raw to the host and
-accepting raw injection.
-
-**Source analysis says this is driver-only — probably no firmware rebuild.**
-Reading mainline ath9k:
-
-- The PCU ACKs a frame when `(RA & bssidmask) == (macaddr & bssidmask)`.
-  `macaddr` → `AR_STA_ID` (carried to the AR9271 target as the monitor vif's
-  `myaddr`); `bssidmask` → `AR_BSSMSK`, set by `ath_hw_setbssidmask()`.
-- **`AR_DIAG_ACK_DIS` is defined but never used** — ACK is not disabled in
-  monitor mode; it just never fires because nothing is addressed to the
-  sniffer's MAC.
-- `ath9k_htc_set_mac_bssid_mask()` already derives `macaddr`/`bssidmask` from
-  the active vif addresses.
-
-So ackmon overrides `macaddr` = base and `bssidmask` = the covering mask on a
-monitor vif, and the chip ACKs the whole BSSID set while capturing/injecting
-raw. The draft patch and full instructions are in
-[`../ackmon/`](../ackmon/) (`ath9k_htc-ackmon.patch` + `README.md`).
-
-**Validate the one residual risk first** (whether the AR9271 *firmware*
-suppresses ACK in `HTC_M_MONITOR` regardless of `AR_STA_ID`): the zero-patch
-injection test in `ackmon/README.md` — set the card's MAC to a BSSID in monitor,
-inject a unicast to it from a second radio, and watch a third for the SIFS ACK.
-Only if that test shows monitor ACK is firmware-gated do you fall back to
-patching `qca/open-ath9k-htc-firmware`.
-
-Fallback if even the firmware route stalls: run a stock local `hostapd` on the
-AR9271 as a "dumb AP" bridged into the VM at L2 (local-MAC split). Reliable
-today, but the phone then appears in the *host's* station table, not the
-OpenWRT VM's — which is exactly the property "ackmon" buys back.
-
----
-
-## 7. Host bring-up (once ackmon firmware/driver is in place)
+**The crypto fix (mandatory).** The emulated `ath9k` in the VM advertises hardware
+crypto it does not perform, so mac80211 hands it plaintext to "encrypt" and marks
+RX frames "decrypted" when they aren't → all CCMP data is dropped
+(`rx drop misc` climbs, DHCP gets no lease). Force software crypto:
 
 ```sh
-# 1. Put the AR9271 into monitor on the lab channel
-sudo ip link set wlan0 down
-sudo iw dev wlan0 set type monitor
-sudo ip link set wlan0 up
-sudo iw dev wlan0 set channel 6
-
-# 2. Enable ackmon for the BSSID set (interface defined by the ackmon hook)
-#    e.g. via debugfs:
-echo 02:11:22:33:44:00 | sudo tee /sys/kernel/debug/ieee80211/phyX/ath9k_htc/ackmon_base
-echo FF:FF:FF:FF:FF:FC | sudo tee /sys/kernel/debug/ieee80211/phyX/ath9k_htc/ackmon_mask
-echo 1                 | sudo tee /sys/kernel/debug/ieee80211/phyX/ath9k_htc/ackmon
-
-# 3. Start the relay against the hub (single channel = ch6 = 2437 MHz)
-sudo ./vwifi-phys-bridge /tmp/vwifi.sock wlan0 -c 6 -v
+mkdir -p /etc/modprobe.d
+echo 'options ath9k nohwcrypt=1' > /etc/modprobe.d/ath9k.conf   # MUST end in .conf
+# apply now without a reboot (OpenWRT modprobe ignores CLI params; insmod honors them):
+wifi down
+rmmod ath9k
+insmod "$(find /lib/modules/$(uname -r) -name 'ath9k.ko*' | head -1)" nohwcrypt=1
+cat /sys/module/ath9k/parameters/nohwcrypt      # must read 1
+wifi up
 ```
 
-The bridge needs no per-BSSID configuration — it relays all of ch6 and the VMs
-sort frames by their own BSSID.
+Set this on **every** VM that does crypto (each AP and any VM client). After a
+reboot the `.conf` makes it stick. Note: OpenWRT's `/etc/modules.d/` is only a
+list of modules to load — module *options* must go in `/etc/modprobe.d/*.conf`.
+
+**AP profile.** Same channel, assigned BSSID in `…:01..FE`, legacy (non-HT, no
+WMM) so every data frame uses a simple per-frame ACK — no Block-Ack or RTS/CTS
+(those are additional SIFS responses the bridge doesn't generate). Attach it to a
+network that has a DHCP server (`network='lan'`).
+
+```sh
+uci set wireless.radio0.channel='11'
+uci set wireless.radio0.htmode='NONE'
+uci set wireless.default_radio0.macaddr='02:11:22:33:44:01'   # NOT :00 (host owns it)
+uci set wireless.default_radio0.ssid='Lab-Real'
+uci set wireless.default_radio0.network='lan'                 # DHCP lives here
+uci set wireless.default_radio0.encryption='psk2'
+uci set wireless.default_radio0.key='correcthorse1'
+uci commit wireless && wifi reload
+```
+
+Crypto stays entirely in the VM; the AR9271 and the bridge are crypto-agnostic
+(they relay the encrypted frames raw — the ACK is pre-decryption).
 
 ---
 
-## 8. Association walk-through (what happens on the wire)
+## 5. Host bring-up
 
-1. Each VM beacons its BSSID → medium → bridge injects on ch6 → phone sees 3 SSIDs.
-2. Phone → **Auth** (RA = BSSID). **AR9271 hardware ACKs** (BSSID in mask). Bridge
-   relays Auth to the medium → the matching VM replies with Auth Resp → bridge
-   injects → phone hardware-ACKs in the air.
-3. Phone → **Assoc Req** → HW ACK → relay → VM → Assoc Resp → relay → phone.
-4. **EAPOL 4-way** (data frames): each phone→AP frame HW-ACKed by the AR9271;
-   relayed; the VM's hostapd runs the handshake; PTK derived in the VM and phone.
-5. **Data**: phone→AP CCMP frames HW-ACKed and relayed raw (encrypted) to the VM,
-   which holds the PTK; VM→phone frames injected, phone ACKs in the air.
+Use `scripts/lab-bringup.sh` (set `AR9271_IF` / `MT_IF` to your interface names):
 
-Only the ACK ever needed SIFS, and the AR9271 supplies it.
+```sh
+git pull && make
+sudo AR9271_IF=wlxc01c300da281 MT_IF=wlx00c0cab57e6f ./scripts/lab-bringup.sh
+sudo ./scripts/lab-bringup.sh stop     # tear down
+```
+
+It: sets the AR9271 to the low decoy BSSID and starts a 2-BSS hostapd (`:00`,
+`:FF`, ch 11, legacy, slow beacons); puts the MT7921U in monitor on ch 11; starts
+`vwifi-phys-bridge` with `-r 3 -b 02:11:22:33:44:00 -m ff:ff:ff:ff:ff:00`; and
+runs a witness `tcpdump`. Equivalent manual bridge invocation:
+
+```sh
+sudo ./vwifi-phys-bridge /run/vwifi/foo.sock wlx00c0cab57e6f \
+     -c 11 -b 02:11:22:33:44:00 -m ff:ff:ff:ff:ff:00 -r 3 -v
+```
+
+### `vwifi-phys-bridge` flags that matter here
+
+| Flag | Purpose |
+|------|---------|
+| `-b <bssid>` | relevance-filter match address (the range base) |
+| `-m <mask>`  | relevance-filter mask — forward the whole `…:00..FF` set, not one BSSID |
+| `-r <n>`     | inject each critical frame N times (beacons/probe-resps excluded); use 2–3 on a lossy channel |
+| `-c <chan>`  | channel (must match the AP + AR9271 + MT7921U) |
+
+The bridge already: injects `NO_ACK` (no 15× self-retransmit storm); drops
+control frames and foreign beacons from the medium; suppresses echoes of its own
+injections; auto-raises the capture MTU; and **self-heals** if the mt76 radio
+flaps (reopens the socket instead of exiting).
 
 ---
 
-## 9. Constraints and risks
+## 6. Verifying each stage
 
-- **Single channel** for all phone-joinable APs (the accepted trade for one radio).
-- Phone's air link is **11n/legacy** (advertise HT-off on joinable APs to match).
-- **Downlink losses are not retransmitted** (the vwifi driver fakes the VM's TX
-  status) — rely on good signal and EAPOL/DHCP/TCP retries. A later refinement
-  could feed the phone's real downlink ACKs back into the medium to make VM
-  TX-status truthful.
-- **Block-Ack/RTS/CTS must stay off** on joinable APs — `ieee80211n=0` +
-  `wmm_enabled=0` guarantees this.
-- The **ackmon firmware/driver hook is the real engineering** and must be
-  validated on actual AR9271 silicon (USB HTC concurrency of monitor + inject +
-  ACK is the make-or-break check).
+```sh
+# AR9271 is in AP opmode with the two decoy vifs (=> mask covers the VM range):
+iw dev | awk '/Interface/{i=$2} /addr/{print i, $2}'
+
+# The AR9271 is ACKing the STA's uplink (witness on the MT7921U, co-channel).
+# Note real STAs randomize their MAC — grab it from the AP's assoc-resp target:
+tshark -r witness.pcap -Y 'wlan.fc.type_subtype==0x1d && wlan.ra==<STA_MAC>' | wc -l   # > 0
+
+# On the VM AP: STA associated, data flowing, NOT dropping:
+iw dev phy0-ap0 station dump | grep -E 'Station|authorized|rx packets|rx drop misc'
+#   rx packets climbing + rx drop misc flat  ==  crypto path healthy
+```
+
+Signs of each historical failure mode, for future debugging:
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| STA retransmits uplink forever, handshake stalls, 0 ACKs to STA | AR9271 in monitor (no ACK) | AP-opmode decoys (§2) |
+| Downlink frames appear ~15× with retry flag | injecting without NO_ACK | (built in) |
+| 4-way sometimes "wrong key", sometimes completes | handshake frame loss | `-r 3`, separate radios |
+| WPA2 associates, 4-way completes, **no data / no DHCP**, `rx drop misc` climbs | VM ath9k hw-crypto not real | `nohwcrypt=1` (§4) |
+| `reason=3/4 locally_generated`, periodic reconnects | beacon/keepalive loss (co-location, congestion) | separate radios, clean channel |
+| Bridge exits: "raw socket read error: Network is down" | mt76 USB reset | self-heal (built in) |
 
 ---
 
-## 10. Status of the pieces
+## 7. Constraints and remaining rough edges
 
-| Piece | State |
-|---|---|
-| vwifi medium: channel match incl. mixed-width / wide channels | done |
-| vwifi medium: physical-link physics exemption (`physical` hello flag) | done |
-| vwifi-phys-bridge: single-channel multi-BSSID relay | works as-is |
-| OpenWRT hostapd profiles (legacy, no-BA, prefix BSSIDs) | `examples/hostapd/` |
-| ackmon source analysis (ACK = address-match, driver-only) | done — `ackmon/` |
-| AR9271 ackmon `ath9k_htc` patch | **draft, untested** — `ackmon/` |
-| Monitor-ACK feasibility test | **run first** — `ackmon/README.md` |
-| Firmware fallback (`open-ath9k-htc-firmware`) | only if the test fails |
+- **Single channel** for all phone-joinable APs (one radio pair). Pick the
+  quietest channel you can — congestion directly causes the periodic reconnects.
+- Joinable APs must be **legacy / no Block-Ack / no RTS-CTS** (`ieee80211n=0`,
+  `wmm_enabled=0`, `htmode=NONE`). APs that only serve *virtual* clients can stay
+  HT/VHT/HE at any width.
+- **Downlink losses aren't retransmitted at L2** (NO_ACK injection); rely on
+  `-r`, a clean channel, and upper-layer retries.
+- **mt76 flaps** under sustained load; the bridge now self-heals, but fewer flaps
+  = fewer blips (separate the radios, lower `-r`, a powered USB port/hub).
+- The two radios are **co-located transmitters** — physical separation is the
+  single best lever for the periodic beacon-loss reconnects.
+
+---
+
+## 8. Component map
+
+| Piece | Where | Role |
+|---|---|---|
+| `vwifi-medium` | host | the hub / medium |
+| `vwifi_host.c` | host kernel module | a host-side virtual radio on the medium (also had a `SW_CRYPTO_CONTROL` crypto bug, now fixed) |
+| emulated `ath9k` | in each VM | the VM's radio — needs `nohwcrypt=1` |
+| `vwifi-phys-bridge` | host | capture/inject relay between real air and the medium (MT7921U) |
+| AR9271 + hostapd decoys | host | the SIFS ACK for the VM BSSID range |
+| `scripts/lab-bringup.sh` | host | one-command bring-up |

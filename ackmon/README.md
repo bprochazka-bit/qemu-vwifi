@@ -1,3 +1,14 @@
+> **SUPERSEDED — kept for the record.** Hardware testing settled the open
+> question below: the AR9271 firmware does **not** ACK in `HTC_M_MONITOR`
+> opmode, even with the MAC/BSSID-mask programmed (verified with a co-channel
+> witness — zero ACKs to the station). A driver patch that only overrides
+> `AR_STA_ID`/`bssidmask` on a *monitor* vif therefore does not help. The
+> working solution runs the AR9271 in **AP opmode** (decoy hostapd BSSes whose
+> `bssidmask` spans the VM BSSID range) on one radio and does capture/injection
+> on a **second** radio — see
+> [`../docs/ar9271-phys-bridge-lab.md`](../docs/ar9271-phys-bridge-lab.md).
+> This directory documents the monitor-ACK route that was tried and ruled out.
+
 # ackmon — single-radio hardware-ACK for the AR9271 physical bridge
 
 `ackmon` lets one AR9271 (ath9k_htc) **hardware-ACK uplink frames addressed to a
