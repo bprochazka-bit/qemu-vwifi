@@ -63,6 +63,12 @@ static int forward_all;   /* -A: disable the relevance filter (sniff mode) */
 static uint8_t filter_bssid[6];
 static int have_filter_bssid;
 
+/* -m <mask>: relevance-filter address mask (1=care, 0=don't-care), mirroring
+ * the hardware bssidmask. Lets one bridge forward a whole prefix-aligned set
+ * of lab BSSIDs (e.g. 02:11:22:33:44:00..FF with mask ff:ff:ff:ff:ff:00)
+ * instead of a single exact address. Defaults to all-ones == exact match. */
+static uint8_t filter_mask[6] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
+
 /* Raise the interface MTU this high at startup so a full-size downlink
  * frame (radiotap + 802.11 header + 1500-byte payload, ~1540 bytes) can
  * be injected without EMSGSIZE ("Message too long"). */
@@ -571,11 +577,14 @@ static int open_raw_socket(const char *iface)
             memcpy(own_mac, ifr.ifr_hwaddr.sa_data, 6);
             const uint8_t *k = have_filter_bssid ? filter_bssid : own_mac;
             fprintf(stderr, "bridge: interface MAC %02x:%02x:%02x:%02x:%02x:%02x;"
-                    " relevance filter %s (match %02x:%02x:%02x:%02x:%02x:%02x)\n",
+                    " relevance filter %s (match %02x:%02x:%02x:%02x:%02x:%02x"
+                    " mask %02x:%02x:%02x:%02x:%02x:%02x)\n",
                     own_mac[0], own_mac[1], own_mac[2],
                     own_mac[3], own_mac[4], own_mac[5],
                     forward_all ? "OFF (-A)" : "on",
-                    k[0], k[1], k[2], k[3], k[4], k[5]);
+                    k[0], k[1], k[2], k[3], k[4], k[5],
+                    filter_mask[0], filter_mask[1], filter_mask[2],
+                    filter_mask[3], filter_mask[4], filter_mask[5]);
         } else {
             fprintf(stderr, "bridge: SIOCGIFHWADDR: %s "
                     "(relevance filter disabled)\n", strerror(errno));
@@ -964,7 +973,14 @@ static void handle_phys_data(void)
         const uint8_t *ra = frame + 4;
         const uint8_t *key = have_filter_bssid ? filter_bssid : own_mac;
         int is_group = (ra[0] & 0x01);
-        if (!is_group && memcmp(ra, key, 6) != 0)
+        int match = 1;
+        for (int i = 0; i < 6; i++) {
+            if ((ra[i] & filter_mask[i]) != (key[i] & filter_mask[i])) {
+                match = 0;
+                break;
+            }
+        }
+        if (!is_group && !match)
             return;
     }
 
@@ -1121,6 +1137,10 @@ static void usage(const char *prog)
         "  -b <bssid>       Relevance-filter on this BSSID instead of the\n"
         "                   interface MAC (two-radio setup: dedicated ACK radio\n"
         "                   holds MAC=BSSID, this radio does capture/inject)\n"
+        "  -m <mask>        Relevance-filter address mask (1=care, 0=don't-care,\n"
+        "                   default ff:ff:ff:ff:ff:ff). Forward a prefix-aligned\n"
+        "                   BSSID set, e.g. -b 02:11:22:33:44:00 -m ff:ff:ff:ff:ff:00\n"
+        "                   forwards 02:11:22:33:44:00..FF\n"
         "  -A               Forward ALL captured frames (disable the relevance\n"
         "                   filter; only for sniffing -- floods the hub on a\n"
         "                   busy channel)\n"
@@ -1151,7 +1171,7 @@ int main(int argc, char *argv[])
     /* Reset getopt to start scanning from argv[3] */
     optind = 3;
 
-    while ((opt = getopt(argc, argv, "c:w:s:n:b:Avh")) != -1) {
+    while ((opt = getopt(argc, argv, "c:w:s:n:b:m:Avh")) != -1) {
         switch (opt) {
         case 'b': {
             unsigned int m[6];
@@ -1163,6 +1183,17 @@ int main(int argc, char *argv[])
             for (int i = 0; i < 6; i++)
                 filter_bssid[i] = (uint8_t)m[i];
             have_filter_bssid = 1;
+            break;
+        }
+        case 'm': {
+            unsigned int m[6];
+            if (sscanf(optarg, "%x:%x:%x:%x:%x:%x",
+                       &m[0], &m[1], &m[2], &m[3], &m[4], &m[5]) != 6) {
+                fprintf(stderr, "bridge: bad -m mask: %s\n", optarg);
+                return 1;
+            }
+            for (int i = 0; i < 6; i++)
+                filter_mask[i] = (uint8_t)m[i];
             break;
         }
         case 'c':
