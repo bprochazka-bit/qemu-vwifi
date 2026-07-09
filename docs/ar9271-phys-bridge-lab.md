@@ -297,21 +297,34 @@ Signs of each historical failure mode, for future debugging:
   mt76. So the legacy radiotap RATE is a no-op here and the on-air rate sits at
   the ~1 Mbps basic rate. `capture` prints the on-air rate parsed from the RX
   radiotap to confirm this directly on the radio the bridge injects on.
-- **The remaining lever worth trying: HT MCS injection.** mt76 has historically
-  honored the radiotap **MCS** field even when it ignores the legacy RATE.
-  `vwifi-linkbench inject -M <mcs>` builds an HT (TX_FLAGS+MCS) radiotap instead
-  of a legacy rate (MCS0=6.5 … MCS7=65 Mbps @20 MHz). If a co-channel `capture`
-  shows the frames going out as HT and inject throughput jumps well above 1 Mbps,
-  the fix is to inject HT from `vwifi-phys-bridge` (a phone can receive HT frames
-  regardless of the AP being legacy — the PHY rate is independent of the MAC
-  frame). If MCS injection *also* stays ~1 Mbps, the conclusion is architectural:
-  mt76 monitor injection can't be rate-controlled, so high downlink throughput
-  needs a different inject path (e.g. an ath9k radio, which does honor injected
-  rates) or a real AP/mesh vif rather than monitor injection.
+- **VERDICT (ground-truth confirmed): mt76 monitor injection sends everything at
+  1 Mbps, ignoring both legacy RATE and HT MCS.** Injecting `-M 7` (MCS7) on the
+  MT7921U and capturing on an independent witness radio shows
+  `on-air rate : 1 Mbps` — the driver discards the MCS request and even downshifts
+  to a *legacy* 1 Mbps frame. Legacy `-R 6`/`-R 24`/`-M 7` are all identical
+  ~1 Mbps. `-Q`/`-B` do nothing (not a queuing problem) and air loss is 0 %. So
+  the ~1 Mbps downlink ceiling (~0.5 Mbps TCP) is an **mt76 driver limitation on
+  the inject path**, not our code — `vwifi-phys-bridge` builds the radiotap rate
+  correctly; mt76 ignores it. (An injecting radio's *self-capture* echoes the
+  requested rate, e.g. a witness on the same radio once showed 6 Mbps — always
+  confirm the rate on a *separate* radio.)
+- **The fix is a different inject radio.** ath9k honors injected legacy/MCS rates.
+  Confirm before changing hardware — put the AR9271 (or any ath9k) in monitor and
+  inject while a second radio witnesses the rate:
+  ```sh
+  sudo ./scripts/mon-setup.sh <ath9k-iface> 11
+  sudo ./scripts/mon-setup.sh <witness-iface> 11
+  sudo ./vwifi-linkbench capture <witness-iface> -t 8 &
+  sudo ./vwifi-linkbench inject  <ath9k-iface> -R 24 -s 1500 -t 6   # then -M 7
+  ```
+  If the witness shows 24 Mbps / HT, the bridge's capture+inject radio should be
+  an **ath9k in monitor** (capture rate is irrelevant; only the inject rate is).
+  Role split then needs two ath9k-class radios — one AP-opmode for the SIFS ACK,
+  one monitor for capture/inject — since AP+monitor can't share one radio.
 - **Probes** (`vwifi-linkbench inject`): `-s a,b,c` sweeps size (flat fps ⇒
   fps/per-frame-bound; constant Mbps ⇒ byte/rate-bound); `-M <mcs>` HT injection;
-  `-Q` = qdisc bypass; `-B <bytes>` = `SO_SNDBUF`; `-N` = non-blocking. `-Q`/`-B`
-  are already ruled out (it is not a queuing problem).
+  `-Q` = qdisc bypass; `-B <bytes>` = `SO_SNDBUF`; `-N` = non-blocking. `capture`
+  prints the ground-truth on-air rate. `-Q`/`-B`/`-M` are all ruled out on mt76.
 - **Downlink loss still isn't retransmitted at L2** (NO_ACK), whether the loss is
   in the air or in the driver's monitor TX queue (`ENOBUFS`). Characterize which
   before tuning further (§7.5).
