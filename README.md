@@ -359,7 +359,7 @@ The following registers are explicitly handled in Phase 1:
 | AR_KEYTABLE | 0x8800–0x97FF | ✓ | ✓ | Hardware key cache (CCMP offload) |
 | All others | * | ✓ | ✓ | Shadow register + UNHANDLED warning |
 
-## Hardware Crypto (WPA2 / CCMP)
+## Hardware Crypto (WPA2 / WPA3 / CCMP)
 
 Real ath9k hardware offloads CCMP (AES-CCM) to an on-chip crypto engine
 driven by the key cache, and advertises that capability to mac80211.  Because
@@ -411,6 +411,31 @@ a wrong key is rejected at ~2⁻⁶⁴, so this is both robust and faithful to t
 "hardware found the key" behaviour the driver expects.  Pairwise and group
 (GTK) keys are handled identically.
 
+### WPA3-Personal (SAE) and Protected Management Frames
+
+WPA3-Personal reuses the **same CCMP-128 data cipher** as WPA2, so its data
+path needs no new engine.  The two things that make a connection "WPA3" sit
+either off the device or in a path the engine already covers:
+
+- **SAE** (the PSK replacement) is an authentication handshake run entirely in
+  userspace (`hostapd` / `wpa_supplicant`) over unprotected Authentication
+  management frames, exactly like the WPA2 4-way EAPOL handshake already is.
+  The device just forwards those management frames over the medium; it never
+  interprets them.
+- **PMF / 802.11w** is mandatory for WPA3.  *Individually-addressed* robust
+  management frames (protected Action, Deauth, Disassoc, SA-Query) are
+  encrypted with the pairwise CCMP key and ride the **same** offload as data
+  frames — the CCM nonce/AAD construction differs only in the Management bit
+  and subtype masking (§12.5.3), which the engine handles.  *Group-addressed*
+  robust management frames use BIP (AES-CMAC) with the IGTK; ath9k does not
+  offload BIP, so mac80211 performs it in software and the device is not
+  involved.
+
+As a result WPA3-Personal associates and passes traffic on the unmodified
+`ath9k` driver with no capability changes — the CCMP engine is the whole data
+plane, and PMF is covered by the engine's management-frame path plus
+mac80211's software BIP.
+
 ### Scope and verification
 
 The AES-CCM implementation lives in `src/vwifi_ath9k_crypto.h` and follows
@@ -418,10 +443,14 @@ IEEE 802.11-2016 §12.5.3 / RFC 3610 (M = 8, L = 2), reusing the `AES_KEY` API
 shared by QEMU's `crypto/aes.h` and OpenSSL.  Run `make test-crypto` to build
 and execute `tests/test_ccmp.c`, which verifies the CCM core against OpenSSL's
 `EVP_aes_128_ccm` over 2000 random vectors, plus MPDU round-trip, forgery
-rejection, and the full key-cache TX→RX data path.
+rejection, the **protected-management-frame (PMF) path** — its nonce/AAD
+checked against an independent 802.11 reference and its ciphertext/MIC against
+OpenSSL — and the full key-cache TX→RX data path.
 
-Only CCMP (WPA2 / WPA3-personal data) is emulated; TKIP and WEP keys are
-stored but not decrypted, so those ciphers are unsupported.
+Supported: **WPA2-Personal and WPA3-Personal (CCMP-128), including PMF.**
+TKIP and WEP keys are stored but not decrypted, so those ciphers remain
+unsupported; WPA3-Enterprise 192-bit (GCMP-256 / BIP-GMAC-256) would need a
+separate AES-GCM engine and is out of scope.
 
 ## EEPROM Image
 

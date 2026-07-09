@@ -1235,6 +1235,12 @@ static void vwifi_ath9k_inject_rx_frame(VwifiAth9kState *s,
      * we cannot decrypt (unknown/absent key, or non-CCMP cipher such as
      * TKIP/WEP which we do not emulate), we flag a decrypt error so the frame
      * is dropped rather than delivered as garbage.
+     *
+     * This path is frame-type agnostic: it keys off the Protected bit, so
+     * individually-addressed protected management frames (802.11w / PMF, which
+     * WPA3 requires) decrypt through the same CCM engine as data frames.
+     * Group-addressed robust management frames use BIP (not the Protected bit)
+     * and are verified by mac80211 in software, so they pass through untouched.
      */
     uint8_t rx_decbuf[ATH9K_MAX_FRAME_SIZE];
     uint8_t rx_keyix = 0;

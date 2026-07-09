@@ -211,7 +211,125 @@ static void test_mic_rejection(void)
     printf("  %s\n", (fails>base) ? "FAILED" : "OK (all forgeries rejected)");
 }
 
-/* ---- [4] Key-cache layout + full device data-path simulation ---- */
+/* ---- [4] PMF / protected management frames (WPA3 requires 802.11w) ---- *
+ *
+ * WPA3 mandates Protected Management Frames.  Individually-addressed robust
+ * management frames (e.g. protected Action / Deauth) are encrypted with the
+ * pairwise CCMP key and flow through the very same hardware-crypto offload as
+ * data frames -- only the CCM nonce and AAD differ (802.11-2016 §12.5.3):
+ *   - nonce flags octet carries the Management bit (0x10),
+ *   - the AAD keeps the frame subtype bits (they are masked out for data).
+ * The engine handles this in its is_mgmt branch; this test exercises that
+ * branch, which the data-frame vectors above never touch.
+ */
+
+/* Build a protected robust Action management frame + CCMP header. */
+static int build_mgmt_frame(uint8_t *f, int payload_len, int keyid)
+{
+    uint16_t fc = 0x00D0;               /* type 0 (mgmt), subtype 13 (Action) */
+    int i, off = 24;                    /* mgmt header is always 24 bytes     */
+    fc |= 0x4000;                       /* Protected                          */
+    f[0] = fc & 0xff; f[1] = (fc >> 8) & 0xff;
+    f[2] = 0; f[3] = 0;                 /* duration                           */
+    for (i = 0; i < 6; i++) f[4 + i]  = 0x10 + i;   /* A1 (DA)               */
+    for (i = 0; i < 6; i++) f[10 + i] = 0x20 + i;   /* A2 (SA)               */
+    for (i = 0; i < 6; i++) f[16 + i] = 0x30 + i;   /* A3 (BSSID)            */
+    f[22] = 0x70; f[23] = 0x0a;         /* seq ctrl (frag 0, seq 0xA7)       */
+    /* CCMP header: PN0 PN1 rsvd keyid PN2 PN3 PN4 PN5 */
+    f[off+0] = 0xaa; f[off+1] = 0xbb; f[off+2] = 0x00;
+    f[off+3] = (uint8_t)(0x20 | (keyid << 6));      /* ExtIV=1               */
+    f[off+4] = 0xcc; f[off+5] = 0xdd; f[off+6] = 0xee; f[off+7] = 0xff;
+    off += 8;
+    for (i = 0; i < payload_len; i++) f[off + i] = (uint8_t)(0x11 * (i & 0xf));
+    return off + payload_len;
+}
+
+/* Independent 802.11 reference for a *management* frame's CCM nonce + AAD,
+ * derived straight from the spec (not from vwifi_ccmp_build), so a bug in the
+ * engine's is_mgmt branch cannot hide behind a shared code path. */
+static int ref_mgmt_nonce_aad(const uint8_t *f, uint8_t nonce[13], uint8_t aad[30])
+{
+    const uint8_t *a1 = f + 4, *a2 = f + 10, *a3 = f + 16, *ccmp = f + 24;
+    uint16_t fc = f[0] | (f[1] << 8);
+    uint16_t mask_fc = (fc & ~0x3800) | 0x4000;   /* mgmt: keep subtype bits */
+    int p = 0;
+
+    nonce[0] = 0x10;                              /* Management bit, TID 0    */
+    memcpy(nonce + 1, a2, 6);
+    nonce[7]  = ccmp[7]; nonce[8]  = ccmp[6]; nonce[9]  = ccmp[5];
+    nonce[10] = ccmp[4]; nonce[11] = ccmp[1]; nonce[12] = ccmp[0];
+
+    aad[p++] = mask_fc & 0xff;
+    aad[p++] = (mask_fc >> 8) & 0xff;
+    memcpy(aad + p, a1, 6); p += 6;
+    memcpy(aad + p, a2, 6); p += 6;
+    memcpy(aad + p, a3, 6); p += 6;
+    aad[p++] = f[22] & 0x0f;                      /* SC: keep frag, mask seq  */
+    aad[p++] = 0;
+    return p;                                     /* == 22 for a 3-addr mgmt  */
+}
+
+static void test_mgmt_pmf(void)
+{
+    int base = fails, len, i;
+    uint8_t key[16];
+    printf("[4] PMF: protected management frames (WPA3 802.11w)\n");
+    for (i = 0; i < 16; i++) key[i] = 0x5a ^ (i * 11);
+
+    for (len = 0; len <= 128; len++) {
+        uint8_t f[512], orig[512], ref_nonce[13], ref_aad[30];
+        uint8_t got_nonce[13], got_aad[30];
+        int flen = build_mgmt_frame(f, len, 1);
+        int ref_alen, got_alen, flen_enc = flen;
+        uint8_t ct_a[512], tag_a[8], ct_b[512], tag_b[8];
+
+        /* (a) engine's nonce/AAD for this mgmt frame must equal the spec ref. */
+        ref_alen = ref_mgmt_nonce_aad(f, ref_nonce, ref_aad);
+        got_alen = vwifi_ccmp_build(f, flen, 24, got_nonce, got_aad);
+        if (got_alen != ref_alen ||
+            memcmp(got_nonce, ref_nonce, 13) ||
+            memcmp(got_aad, ref_aad, ref_alen)) {
+            printf("  mgmt nonce/AAD mismatch len=%d (got_alen=%d ref=%d)\n",
+                   len, got_alen, ref_alen);
+            hexdump("got nonce", got_nonce, 13); hexdump("ref nonce", ref_nonce, 13);
+            hexdump("got aad", got_aad, got_alen > 0 ? got_alen : 0);
+            hexdump("ref aad", ref_aad, ref_alen);
+            fails++; return;
+        }
+
+        /* (b) the CCM core over that nonce/AAD must match OpenSSL. */
+        my_ccm(key, ref_nonce, ref_aad, ref_alen, f + 32, len, ct_a, tag_a);
+        ossl_ccm(key, ref_nonce, ref_aad, ref_alen, f + 32, len, ct_b, tag_b);
+        if (memcmp(ct_a, ct_b, len) || memcmp(tag_a, tag_b, 8)) {
+            printf("  mgmt CCM != OpenSSL len=%d\n", len); fails++; return;
+        }
+
+        /* (c) full offload round-trip: encrypt@TX -> decrypt@RX recovers it. */
+        memcpy(orig, f, flen);
+        if (vwifi_ccmp_encrypt(key, f, &flen_enc, sizeof(f)) != 0 ||
+            flen_enc != flen + 8) {
+            printf("  mgmt encrypt failed len=%d\n", len); fails++; return;
+        }
+        if (vwifi_ccmp_decrypt(key, f, flen_enc) != 0 ||
+            memcmp(f, orig, flen) != 0) {
+            printf("  mgmt round-trip failed len=%d\n", len); fails++; return;
+        }
+    }
+
+    /* (d) a forged (bit-flipped) protected mgmt frame must be rejected. */
+    {
+        uint8_t f[512]; int flen = build_mgmt_frame(f, 40, 0), flen_enc = flen;
+        vwifi_ccmp_encrypt(key, f, &flen_enc, sizeof(f));
+        f[24 + 8 + 3] ^= 0x01;                    /* flip a ciphertext bit    */
+        if (vwifi_ccmp_decrypt(key, f, flen_enc) == 0) {
+            printf("  forged mgmt frame accepted!\n"); fails++;
+        }
+    }
+    printf("  %s\n", (fails > base) ? "FAILED"
+           : "OK (mgmt nonce/AAD == spec; CCM == OpenSSL; round-trip; forgery rejected)");
+}
+
+/* ---- [5] Key-cache layout + full device data-path simulation ---- */
 
 static uint32_t le32(const uint8_t *p){return p[0]|(p[1]<<8)|(p[2]<<16)|((uint32_t)p[3]<<24);}
 static uint32_t le16(const uint8_t *p){return p[0]|(p[1]<<8);}
@@ -248,7 +366,7 @@ static void test_keycache_and_datapath(void)
     int base = fails, i;
     static uint32_t regs[16384];
     uint8_t pairwise[16], group[16], got[16];
-    printf("[4] Key-cache layout + device data-path (encrypt@TX -> decrypt@RX)\n");
+    printf("[5] Key-cache layout + device data-path (encrypt@TX -> decrypt@RX)\n");
 
     for (i = 0; i < 16; i++) { pairwise[i] = 0xA0 + i; group[i] = 0x5C ^ (i * 3); }
 
@@ -294,6 +412,7 @@ int main(void)
     test_core_vs_openssl();
     test_roundtrip();
     test_mic_rejection();
+    test_mgmt_pmf();
     test_keycache_and_datapath();
     printf("\n%s\n", fails ? "*** TESTS FAILED ***" : "*** ALL TESTS PASSED ***");
     return fails ? 1 : 0;
