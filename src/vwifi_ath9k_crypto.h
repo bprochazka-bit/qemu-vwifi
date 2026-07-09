@@ -15,7 +15,12 @@
  *
  * The implementation follows IEEE 802.11-2016 §12.5.3 (CCMP) and the CCM
  * mode of RFC 3610 (M = 8, L = 2).  The nonce/AAD construction mirrors the
- * mac80211 reference (net/mac80211/aes_ccm.c, ccmp_special_blocks()).
+ * mac80211 reference (net/mac80211/aes_ccm.c, ccmp_special_blocks()) and
+ * handles both data frames and *protected management frames* (802.11w / PMF,
+ * required by WPA3): the is_mgmt path sets the Management bit in the nonce and
+ * keeps the frame subtype bits in the AAD.  WPA3-Personal therefore needs no
+ * new engine — its data cipher is this same CCMP-128, and its PMF unicast
+ * management frames run through this same transform.
  *
  * The only primitive required is the AES-128 forward block cipher.  The
  * caller supplies it through the AES_KEY / AES_set_encrypt_key() / AES_encrypt()
