@@ -356,10 +356,10 @@ The following registers are explicitly handled in Phase 1:
 | AR_WA | 0x4004 | ✓ | ✓ | Workaround register, AR9285 default |
 | AR_STA_ID0/1 | 0x8000/4 | ✓ | ✓ | Station MAC, shadow |
 | AR_PM_STATE | 0x4008 | ✓ | — | Reports awake |
-| AR_KEYTABLE | 0x8800–0x97FF | ✓ | ✓ | Hardware key cache (CCMP / WEP offload) |
+| AR_KEYTABLE | 0x8800–0x97FF | ✓ | ✓ | Hardware key cache (CCMP / TKIP / WEP offload) |
 | All others | * | ✓ | ✓ | Shadow register + UNHANDLED warning |
 
-## Hardware Crypto (WPA2 / WPA3 / CCMP / WEP)
+## Hardware Crypto (WPA2 / WPA3 / CCMP / TKIP / WEP)
 
 Real ath9k hardware offloads CCMP (AES-CCM) to an on-chip crypto engine
 driven by the key cache, and advertises that capability to mac80211.  Because
@@ -445,9 +445,9 @@ so, like CCMP, an unemulated engine drops every WEP frame.  The engine lives in
 `src/vwifi_ath9k_wep.h` and performs the §12.3.2 transform:
 `RC4(IV ‖ key)` over `plaintext ‖ CRC-32(plaintext)`.
 
-- **Cipher discrimination**: CCMP/TKIP set the *ExtIV* bit in the IV header (an
-  8-octet header); WEP does not (4-octet header).  On RX the device inspects
-  that bit to route a protected frame to the WEP or the CCM path.
+- **Cipher discrimination**: CCMP and TKIP set the *ExtIV* bit in the IV header
+  (an 8-octet header); WEP does not (4-octet header).  On RX the device inspects
+  that bit to route a protected frame to the WEP path or the extended-IV path.
 - **Key length** comes from the slot's key type (5 / 13 / 16 octets), read back
   through the same `key0..key4` split the CCM path uses.  Unused slots read as
   `AR_KEYTABLE_TYPE_CLR`, so a genuinely empty slot is rejected even though
@@ -459,6 +459,31 @@ so, like CCMP, an unemulated engine drops every WEP frame.  The engine lives in
 
 WEP is cryptographically broken and offered only for legacy interoperability
 and driver testing; use WPA2/WPA3 for anything real.
+
+### TKIP (per-packet key mixing + RC4 + CRC-32 ICV)
+
+TKIP (WPA-Personal / WPA-TKIP) offloads only its *cipher* half to the engine.
+ath9k sets `IEEE80211_KEY_FLAG_GENERATE_MMIC`, so **mac80211 computes and
+verifies the 8-octet Michael MIC in software**; the hardware derives the
+per-packet RC4 key, runs RC4, and appends the CRC-32 ICV.  The engine
+(`src/vwifi_ath9k_tkip.h`) therefore does mixing + RC4 + ICV and treats the
+Michael MIC as opaque payload — a much smaller surface than full TKIP.
+
+- **Key mixing**: TKIP phase 1 (TK + transmitter address + `IV32`) and phase 2
+  (+ `IV16`) produce the 16-octet RC4 key, per §12.5.2.3.  This S-box mixing is
+  the one genuinely new primitive; it is verified against the published
+  IEEE 802.11i key-mixing test vectors.
+- **Temporal key**: only the 128-bit TK lives in the main key-cache slot (same
+  `key0..key4` split as CCM); the companion "MIC key" slot the driver programs
+  is never read, because Michael is done in software.
+- **RX cipher selection**: CCMP and TKIP share the ExtIV header, so for an
+  extended-IV frame the device tries CCM first (64-bit MIC) and then TKIP
+  (32-bit ICV).  A network programs only one pairwise cipher, so at most one set
+  of slots is populated and the MIC/ICV check picks the right key.
+- **RC4 / CRC-32** are shared with the WEP engine.
+
+TKIP is deprecated (and disallowed on 802.11n rates); it is provided for
+legacy-AP interop and testing only.
 
 ### Scope and verification
 
@@ -476,10 +501,13 @@ against the published keystream vectors, CRC-32 against `zlib` and the canonical
 check value, WEP-40/104/128 MPDU round-trip, ICV forgery rejection, the
 per-type key-cache reconstruction, and ExtIV discrimination.
 
-Supported: **WPA2-Personal and WPA3-Personal (CCMP-128, incl. PMF), and WEP-40 /
-104 / 128.**  TKIP keys are stored but not decrypted, so TKIP remains
-unsupported; WPA3-Enterprise 192-bit (GCMP-256 / BIP-GMAC-256) would need a
-separate AES-GCM engine and is out of scope.
+The TKIP engine's suite (`make test-tkip`, `tests/test_tkip.c`) checks phase 1 +
+phase 2 mixing against the published IEEE 802.11i key-mixing test vectors, plus
+MPDU round-trip, ICV forgery rejection, and the TKIP key-cache TX→RX data path.
+
+Supported: **WPA2-Personal and WPA3-Personal (CCMP-128, incl. PMF), WPA-Personal
+(TKIP), and WEP-40 / 104 / 128.**  WPA3-Enterprise 192-bit (GCMP-256 /
+BIP-GMAC-256) would need a separate AES-GCM engine and is out of scope.
 
 ## EEPROM Image
 

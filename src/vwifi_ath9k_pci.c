@@ -31,6 +31,7 @@
 #include "vwifi_ath9k_dma.h"
 #include "vwifi_ath9k_crypto.h"
 #include "vwifi_ath9k_wep.h"
+#include "vwifi_ath9k_tkip.h"
 #include "vwifi.h"
 
 #include <sys/socket.h>
@@ -569,6 +570,27 @@ static int vwifi_ath9k_keycache_wep(VwifiAth9kState *s, unsigned slot,
 }
 
 /*
+ * Reconstruct the 128-bit TKIP temporal key stored in cache entry `slot`.
+ * Returns false if the slot is not a valid TKIP entry.  Only the temporal key
+ * (the cipher key) lives in the main slot, laid out with the same key0..key4
+ * split as CCM; the Michael MIC keys the driver programs into the companion
+ * slot are not read here because Michael is done in software by mac80211.
+ */
+static bool vwifi_ath9k_keycache_tkip(VwifiAth9kState *s, unsigned slot,
+                                      uint8_t key[16])
+{
+    if (slot >= AR_KEY_CACHE_SIZE) {
+        return false;
+    }
+    if ((vwifi_ath9k_reg_read_raw(s, AR_KEYTABLE_TYPE(slot)) &
+         AR_KEYTABLE_TYPE_MASK) != AR_KEYTABLE_TYPE_TKIP) {
+        return false;
+    }
+    vwifi_ath9k_keycache_material(s, slot, key);
+    return true;
+}
+
+/*
  * Decrypt a received CCMP MPDU.  On real hardware the MAC performs an
  * associative key-cache lookup (by transmitter address / key id); here we
  * try each populated CCM key and accept the one whose MIC verifies.  Because
@@ -621,6 +643,33 @@ static bool vwifi_ath9k_rx_decrypt_wep(VwifiAth9kState *s, const uint8_t *src,
         }
         memcpy(dst, src, len);
         if (vwifi_wep_decrypt(key, keylen, dst, len) == 0) {
+            *out_keyix = (uint8_t)slot;
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * Decrypt a received TKIP MPDU.  Like WEP, TKIP has only a 32-bit ICV (the
+ * Michael MIC is verified later, in software, by mac80211), so we try each
+ * populated TKIP slot and accept the temporal key whose ICV verifies.  The
+ * per-packet RC4 key is mixed from the TK, the frame's transmitter address
+ * (A2) and the TSC in the TKIP header, all read inside vwifi_tkip_decrypt().
+ */
+static bool vwifi_ath9k_rx_decrypt_tkip(VwifiAth9kState *s, const uint8_t *src,
+                                        uint8_t *dst, int len, uint8_t *out_keyix)
+{
+    unsigned slot;
+
+    for (slot = 0; slot < AR_KEY_CACHE_SIZE; slot++) {
+        uint8_t tk[16];
+
+        if (!vwifi_ath9k_keycache_tkip(s, slot, tk)) {
+            continue;
+        }
+        memcpy(dst, src, len);
+        if (vwifi_tkip_decrypt(tk, dst, len) == 0) {
             *out_keyix = (uint8_t)slot;
             return true;
         }
@@ -884,6 +933,28 @@ static void vwifi_ath9k_process_tx_queue(VwifiAth9kState *s, int qnum)
                         }
                     } else {
                         vwifi_ath9k_warn("TX: no WEP key at cache slot %u",
+                                    keyix);
+                    }
+                } else if ((ds_ctl0 & AR_DestIdxValid) &&
+                           encr_type == AR_ENCR_TYPE_TKIP &&
+                           vwifi_dot11_protected(frame_buf, send_len)) {
+                    unsigned keyix = (ds_ctl1 & AR_DestIdx) >> AR_DestIdx_S;
+                    uint8_t tk[16];
+
+                    if (vwifi_ath9k_keycache_tkip(s, keyix, tk)) {
+                        int enc_len = send_len;
+                        if (vwifi_tkip_encrypt(tk, frame_buf, &enc_len,
+                                               (int)sizeof(frame_buf)) == 0) {
+                            vwifi_ath9k_trace("TX TKIP encrypt keyix=%u "
+                                        "%u -> %d bytes", keyix, send_len,
+                                        enc_len);
+                            send_len = enc_len;
+                        } else {
+                            vwifi_ath9k_warn("TX TKIP encrypt failed "
+                                        "(keyix=%u len=%u)", keyix, send_len);
+                        }
+                    } else {
+                        vwifi_ath9k_warn("TX: no TKIP key at cache slot %u",
                                     keyix);
                     }
                 }
@@ -1324,10 +1395,12 @@ static void vwifi_ath9k_inject_rx_frame(VwifiAth9kState *s,
      * TKIP), we flag a decrypt error so the frame is dropped rather than
      * delivered as garbage.
      *
-     * The cipher is inferred from the IV header: CCMP/TKIP set the ExtIV bit
-     * (8-octet header) while WEP does not (4-octet header).  We emulate CCMP
-     * (ExtIV) and WEP; a TKIP frame (ExtIV set) fails CCM decryption and is
-     * dropped.
+     * The cipher is inferred from the IV header and, for the extended-IV
+     * ciphers, from which key verifies: CCMP and TKIP both set the ExtIV bit
+     * (8-octet header) while WEP does not (4-octet header).  For an ExtIV frame
+     * we try CCM first (64-bit MIC) and then TKIP (32-bit ICV); a network only
+     * ever programs one pairwise cipher, so at most one set of slots is
+     * populated and the MIC/ICV check selects the right key.
      *
      * This path is frame-type agnostic: it keys off the Protected bit, so
      * individually-addressed protected management frames (802.11w / PMF, which
@@ -1337,18 +1410,26 @@ static void vwifi_ath9k_inject_rx_frame(VwifiAth9kState *s,
      */
     uint8_t rx_decbuf[ATH9K_MAX_FRAME_SIZE];
     uint8_t rx_keyix = 0;
+    const char *rx_cipher = "WEP";
     bool    rx_decrypted = false;
     bool    rx_decrypt_err = false;
     if (vwifi_dot11_protected(frame, frame_len)) {
         int rx_hdrlen = vwifi_wep_hdrlen(frame, frame_len);
         bool ext_iv = vwifi_wep_is_extiv(frame, frame_len, rx_hdrlen);
-        bool ok;
+        bool ok = false;
 
         if (frame_len > (int)sizeof(rx_decbuf)) {
             ok = false;
         } else if (ext_iv) {
-            ok = vwifi_ath9k_rx_decrypt(s, frame, rx_decbuf, frame_len,
-                                        &rx_keyix);
+            if (vwifi_ath9k_rx_decrypt(s, frame, rx_decbuf, frame_len,
+                                       &rx_keyix)) {
+                ok = true;
+                rx_cipher = "CCMP";
+            } else if (vwifi_ath9k_rx_decrypt_tkip(s, frame, rx_decbuf,
+                                                   frame_len, &rx_keyix)) {
+                ok = true;
+                rx_cipher = "TKIP";
+            }
         } else {
             ok = vwifi_ath9k_rx_decrypt_wep(s, frame, rx_decbuf, frame_len,
                                             &rx_keyix);
@@ -1358,11 +1439,11 @@ static void vwifi_ath9k_inject_rx_frame(VwifiAth9kState *s,
             frame = rx_decbuf;
             rx_decrypted = true;
             vwifi_ath9k_trace("RX %s decrypt ok keyix=%u len=%u",
-                        ext_iv ? "CCMP" : "WEP", rx_keyix, frame_len);
+                        rx_cipher, rx_keyix, frame_len);
         } else {
             rx_decrypt_err = true;
             vwifi_ath9k_warn("RX %s decrypt failed (len=%u) — dropping",
-                        ext_iv ? "CCMP" : "WEP", frame_len);
+                        ext_iv ? "CCMP/TKIP" : "WEP", frame_len);
         }
     }
 
@@ -2208,7 +2289,7 @@ static void vwifi_ath9k_mmio_write(void *opaque, hwaddr addr, uint64_t val64,
         /* Hardware key cache (WEP/TKIP/CCMP offload).
          * The driver programs keys here via ath_hw_set_keycache_entry();
          * we shadow the writes in regs[] and read the key material back at
-         * TX/RX time to perform CCMP or WEP.  Stored silently (no UNHANDLED). */
+         * TX/RX to perform CCMP, TKIP or WEP.  Stored silently (no UNHANDLED). */
         if (addr >= AR_KEYTABLE_0 && addr < AR_KEYTABLE_END) {
             vwifi_ath9k_reg_write_raw(s, addr, val);
             break;
