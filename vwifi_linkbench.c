@@ -240,11 +240,28 @@ static int do_inject(const char *iface, double mbps, int size, double secs,
         (unsigned long long)enobufs, (unsigned long long)eagain,
         (unsigned long long)err,
         offered ? 100.0 * (offered - ok) / offered : 0.0);
-    if (enobufs > ok / 20)
+    /* A real over-the-air TX tops out in the low thousands of fps even for
+     * tiny frames; sustaining tens of thousands with a blocking socket means
+     * write() never hit the hardware — the frames are being discarded at the
+     * driver because the interface is not actually on a channel / not really
+     * transmitting. This is the classic "forgot to set the channel" setup bug. */
+    if (fps > 50000.0)
+        fprintf(stderr,
+        "  WARNING: %.0f fps / %.0f Mbps is impossible over the air — these\n"
+        "        frames are NOT reaching the radio. The interface is up but not\n"
+        "        transmitting (no channel set, or not really in monitor mode).\n"
+        "        Fix it first:  sudo ./scripts/mon-setup.sh %s <channel>\n",
+        fps, mbps_air, iface);
+    else if (enobufs > ok / 20)
         fprintf(stderr,
         "  NOTE: heavy ENOBUFS => the monitor TX queue is the ceiling; the\n"
         "        driver is dropping injects, not the air. This is the silent\n"
         "        downlink loss the bridge sees under load.\n");
+    else
+        fprintf(stderr,
+        "  (sustained %.0f fps = %.1f ms/frame; if far below the air rate,\n"
+        "        the driver's monitor TX-completion rate is the ceiling.)\n",
+        fps, fps > 0 ? 1000.0 / fps : 0.0);
     return 0;
 }
 
@@ -356,6 +373,9 @@ static void usage(const char *p)
         "          fps/Mbps and driver drops (ENOBUFS = TX queue is the cap).\n"
         "capture — count frames on a monitor iface; with an injector on a\n"
         "          second radio, also report air loss from the VWLB seq stream.\n"
+        "\n"
+        "Set the interface up FIRST (monitor mode + channel), both radios on the\n"
+        "same channel:  sudo ./scripts/mon-setup.sh <iface> <channel>\n"
         "\n"
         "  -R <mbps>  inject rate: 1,2,5.5,6,9,11,12,18,24,36,48,54 (default 6)\n"
         "  -s <bytes> 802.11 frame size incl header (default 1500, max %d)\n"

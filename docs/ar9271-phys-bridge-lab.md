@@ -280,6 +280,14 @@ Signs of each historical failure mode, for future debugging:
   stayed ~0.5 Mbps from 6 through 36 Mbps on-air. That rules the air PHY rate
   *out* as the current binding constraint and points at a frames-per-second cap
   in the relay (see §7.5).
+- **Measured bottleneck: the MT7921U's monitor-mode inject completes only ~60–80
+  frames/s.** `vwifi-linkbench inject` on the MT7921U with a *blocking* socket
+  sustains ~80 fps of 1500 B frames (~1 Mbps) with **zero** ENOBUFS — i.e. the
+  driver/firmware TX-completion rate, not queue overflow, backpressures each
+  `write()` to ~12 ms. This is the wall behind the ~0.5 Mbps download; rate (`-R`)
+  can't move it. Next probes: fps-bound vs byte-bound (sweep `-s`), whether `-N`
+  turns the block into ENOBUFS, and whether another radio / mt76 version injects
+  faster.
 - **Downlink loss still isn't retransmitted at L2** (NO_ACK), whether the loss is
   in the air or in the driver's monitor TX queue (`ENOBUFS`). Characterize which
   before tuning further (§7.5).
@@ -316,16 +324,29 @@ Read it like this:
 **`vwifi-linkbench` — an iperf for the PHY relay.** Measures each leg's raw
 ceiling directly:
 
+Set each radio up first — **monitor mode on a channel**, and both radios of a
+pair on the *same* channel. `scripts/mon-setup.sh` does this and verifies it
+(it hard-fails if the channel didn't take — the #1 mistake, which otherwise
+leaves the radio "up" but off-frequency so injects vanish into a void and
+linkbench prints an impossible multi-Gbps rate):
+
 ```sh
-# Inject ceiling of the bridge's radio (tear the lab down first so nothing
-# else drives it). Sweep -R; watch accepted fps/Mbps and the ENOBUFS %:
+sudo ./scripts/mon-setup.sh wlx00c0cab57e6f 11      # sink radio
+sudo ./scripts/mon-setup.sh wlx90de80152b9e 11      # source radio (same channel!)
+
+# Inject ceiling of one radio (tear the lab down first so nothing else drives
+# it). Sweep -R and frame size; watch accepted fps/Mbps and the ENOBUFS %:
 sudo ./vwifi-linkbench inject wlx00c0cab57e6f -R 6 -s 1500 -t 10 -v
 
 # Full air path + loss, two monitor radios on the same channel:
-sudo ./vwifi-linkbench capture <radio-A> -t 12 &     # sink
-sudo ./vwifi-linkbench inject  <radio-B> -R 6 -t 10   # source
+sudo ./vwifi-linkbench capture wlx00c0cab57e6f -t 12 &     # sink
+sudo ./vwifi-linkbench inject  wlx90de80152b9e -R 6 -t 10   # source
 # capture prints air-loss % from the injector's VWLB sequence stream.
 ```
+
+A blocking inject that sustains an impossibly high fps (tens of thousands+) means
+the frames are **not reaching the radio** — the interface isn't on a channel or
+isn't really in monitor mode. Re-run `mon-setup.sh` before trusting any number.
 
 If `linkbench inject` sustains, say, 400+ fps at 6 Mbps with near-zero ENOBUFS,
 the inject path is not the cap and the problem is air loss or upstream offer; if
