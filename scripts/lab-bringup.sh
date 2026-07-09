@@ -57,7 +57,6 @@ REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 BRIDGE_BIN="${BRIDGE_BIN:-$REPO_DIR/vwifi-phys-bridge}"
 
 RUN_DIR="/run/vwifi-lab"
-HOSTAPD_CONF="$RUN_DIR/hostapd-ack.conf"
 WITNESS_PCAP="${WITNESS_PCAP:-/tmp/lab-witness.pcap}"
 PHONE_MAC="${PHONE_MAC:-}"                     # optional: for the ACK check
 
@@ -71,9 +70,10 @@ need_root() { [ "$(id -u)" = 0 ] || die "run with sudo"; }
 teardown() {
     say "Tearing down..."
     pkill -f "vwifi-phys-bridge .*$MT_IF" 2>/dev/null || true
-    pkill -f "hostapd .*$HOSTAPD_CONF"    2>/dev/null || true
+    pkill -f "hostapd .*$RUN_DIR/hostapd" 2>/dev/null || true
     pkill -f "tcpdump -i $MT_IF"          2>/dev/null || true
     sleep 1
+    iw dev lab-decoy-b del 2>/dev/null || true
     ip link set "$AR9271_IF" down 2>/dev/null || true
     ip link set "$MT_IF" down 2>/dev/null || true
     say "Down. (radios left in monitor/down; re-run to bring up again)"
@@ -101,65 +101,83 @@ say "Releasing $AR9271_IF from NetworkManager/wpa_supplicant (if present)"
 nmcli device set "$AR9271_IF" managed no 2>/dev/null || true
 pkill -f "wpa_supplicant.*$AR9271_IF" 2>/dev/null || true
 teardown_quiet() { pkill -f "vwifi-phys-bridge .*$MT_IF" 2>/dev/null || true
-                   pkill -f "hostapd .*$HOSTAPD_CONF" 2>/dev/null || true
-                   pkill -f "tcpdump -i $MT_IF" 2>/dev/null || true; }
+                   pkill -f "hostapd .*$RUN_DIR/hostapd" 2>/dev/null || true
+                   pkill -f "tcpdump -i $MT_IF" 2>/dev/null || true
+                   iw dev lab-decoy-b del 2>/dev/null || true; }
 teardown_quiet
 sleep 1
 
 # ----------------------------------------------------------------------------
-# 1. AR9271 -> two-BSS hostapd (AP opmode + bssidmask that covers the VM range)
+# 1. AR9271 -> AP opmode on two vifs (bssidmask covers the VM BSSID range)
+#
+# Both decoy APs must come up at the EXACT configured BSSIDs so the driver's
+# auto-computed bssidmask spans the VM range. ath9k_htc advertises a single
+# hardware address, so hostapd's own `bss=` interface creation gets a RANDOM
+# MAC from mac80211 (breaks the mask). A direct `ip link set address` on a
+# pre-created vif IS honored, and hostapd started with `interface=` ADOPTS an
+# existing netdev without recreating it -- so we pre-create each vif, pin its
+# MAC, and run a dedicated single-BSS hostapd on each via interface=.
 # ----------------------------------------------------------------------------
+DECOY_B_IF="lab-decoy-b"
+
 say "Configuring AR9271 ($AR9271_IF): decoy APs $BSSID_LO / $BSSID_HI on ch $CHANNEL"
+PHY=$(iw dev "$AR9271_IF" info | awk '/wiphy/{print "phy"$2}')
+[ -n "$PHY" ] || die "could not determine phy for $AR9271_IF"
+
+# Primary vif -> BSSID_LO (existing netdev; MAC set while down).
 ip link set "$AR9271_IF" down
-# First BSS uses the interface MAC; pin it to the low decoy BSSID.
 iw dev "$AR9271_IF" set type managed 2>/dev/null || true
 ip link set "$AR9271_IF" address "$BSSID_LO"
 
-cat > "$HOSTAPD_CONF" <<EOF
-# Decoy/ACK APs on the AR9271. hostapd OWNS only these two BSSIDs; their sole
-# lab purpose is to put the chip in AP opmode and make the auto-computed
-# bssidmask span $BSSID_LO..$BSSID_HI so the PCU hardware-ACKs the VM BSSIDs.
-# Legacy (no HT / no WMM) => simple per-frame ACK, no Block-Ack / RTS-CTS.
-interface=$AR9271_IF
+# Second vif -> BSSID_HI, pre-created with an explicit (honored) MAC.
+iw dev "$DECOY_B_IF" del 2>/dev/null || true
+iw phy "$PHY" interface add "$DECOY_B_IF" type __ap
+ip link set "$DECOY_B_IF" down 2>/dev/null || true
+ip link set "$DECOY_B_IF" address "$BSSID_HI"
+got=$(cat "/sys/class/net/$DECOY_B_IF/address" 2>/dev/null || echo "")
+[ "$got" = "$BSSID_HI" ] || die "could not pin $DECOY_B_IF to $BSSID_HI (got '$got') -- \
+driver will not accept this address; try a different BSSID_HI"
+
+# One single-BSS hostapd per vif. interface= adopts the pre-set netdev.
+#   Legacy (no HT / no WMM) => simple per-frame ACK, no Block-Ack / RTS-CTS.
+#   beacon_int high => low on-air duty cycle, less desense of the co-located
+#   MT7921U. These APs exist only to hold AP opmode + widen the bssidmask; they
+#   also double as survey-able "wrong" decoy APs.
+write_hostapd_conf() {   # $1=iface $2=ssid $3=bssid $4=conffile
+    cat > "$4" <<EOF
+interface=$1
 driver=nl80211
 hw_mode=g
 channel=$CHANNEL
 ieee80211n=0
 wmm_enabled=0
 ap_isolate=1
-# Beacon slowly: these APs exist only to hold AP opmode (for the ACK) and to be
-# survey-able decoys. A low beacon rate cuts the AR9271's on-air duty cycle so
-# it does not desense the co-located MT7921U mid-injection. ~1.02s interval.
 beacon_int=1000
-
-ssid=$SSID_LO
-bssid=$BSSID_LO
-
-bss=lab-decoy-b
-ssid=$SSID_HI
-bssid=$BSSID_HI
+ssid=$2
+bssid=$3
 EOF
+}
+write_hostapd_conf "$AR9271_IF"  "$SSID_LO" "$BSSID_LO" "$RUN_DIR/hostapd-a.conf"
+write_hostapd_conf "$DECOY_B_IF" "$SSID_HI" "$BSSID_HI" "$RUN_DIR/hostapd-b.conf"
 
-say "Starting hostapd (2 BSS)"
-hostapd -B -P "$RUN_DIR/hostapd.pid" "$HOSTAPD_CONF" \
-    || die "hostapd failed to start — check 'hostapd $HOSTAPD_CONF' output"
+say "Starting hostapd A ($BSSID_LO on $AR9271_IF)"
+hostapd -B -P "$RUN_DIR/hostapd-a.pid" "$RUN_DIR/hostapd-a.conf" \
+    || die "hostapd A failed -- check 'hostapd $RUN_DIR/hostapd-a.conf'"
+say "Starting hostapd B ($BSSID_HI on $DECOY_B_IF)"
+hostapd -B -P "$RUN_DIR/hostapd-b.pid" "$RUN_DIR/hostapd-b.conf" \
+    || die "hostapd B failed -- check 'hostapd $RUN_DIR/hostapd-b.conf'"
 sleep 2
 
-# Verify both AP vifs came up at the intended addresses. The driver derives the
-# hardware bssidmask from the two vif MACs; if hostapd/mac80211 could not honor
-# the second BSSID it silently assigns a RANDOM MAC, which produces a mask that
-# does NOT cover the VM BSSIDs -> the AR9271 never ACKs the STA and association
-# fails. Hard-fail here instead of running broken.
+# Hard-fail if either vif is not at its configured BSSID: a wrong MAC means the
+# bssidmask does not cover the VM BSSIDs and the AR9271 never ACKs the STA.
 say "AR9271 vif addresses (expect $BSSID_LO and $BSSID_HI):"
 iw dev | awk '/Interface/{i=$2} /addr/{print "    "i"  "$2}' \
-    | grep -Ei "${AR9271_IF}|lab-decoy-b" || true
-
-decoy_b_mac=$(cat /sys/class/net/lab-decoy-b/address 2>/dev/null || echo "")
-if [ "$decoy_b_mac" != "$BSSID_HI" ]; then
-    warn "decoy B MAC is '$decoy_b_mac', expected '$BSSID_HI'."
-    warn "The driver rejected the BSSID spread and randomised it -> the bssidmask"
-    warn "will NOT cover the VM BSSIDs and the STA will not be ACKed."
-    warn "Narrow the span (e.g. BSSID_HI=02:11:22:33:44:03) or check hostapd's log."
+    | grep -Ei "${AR9271_IF}|${DECOY_B_IF}" || true
+a_mac=$(cat "/sys/class/net/$AR9271_IF/address" 2>/dev/null || echo "")
+b_mac=$(cat "/sys/class/net/$DECOY_B_IF/address" 2>/dev/null || echo "")
+[ "$a_mac" = "$BSSID_LO" ] || die "primary vif MAC is '$a_mac', expected '$BSSID_LO'"
+if [ "$b_mac" != "$BSSID_HI" ]; then
+    warn "decoy B MAC is '$b_mac', expected '$BSSID_HI' -- hostapd recreated the vif."
     die "aborting: decoy BSSID did not stick"
 fi
 say "=> both decoy vifs correct; bssidmask $FILTER_MASK covers $FILTER_BASE..$BSSID_HI"
