@@ -117,10 +117,22 @@ static struct {
     uint16_t freq_hi;           /* highest 20MHz channel in BW range */
 } chan_cfg;
 
-/* Statistics */
-static unsigned int stats_hub_to_phys;
-static unsigned int stats_phys_to_hub;
-static unsigned int stats_echoes;
+/* Statistics. Cumulative since start; the periodic reporter (-S) prints
+ * per-interval deltas so you can see live fps/throughput and, crucially,
+ * whether injects are being dropped by the driver's monitor TX queue
+ * (EAGAIN/ENOBUFS) -- an otherwise-silent downlink loss. */
+static uint64_t stats_hub_to_phys;      /* frames injected OK (per source frame) */
+static uint64_t stats_phys_to_hub;      /* frames forwarded to the hub */
+static uint64_t stats_echoes;           /* own injects suppressed on capture */
+static uint64_t stats_hp_bytes;         /* bytes injected (hub->phys, on-air) */
+static uint64_t stats_ph_bytes;         /* bytes forwarded (phys->hub) */
+static uint64_t stats_inject_writes;    /* write() calls incl. -r copies */
+static uint64_t stats_drop_enobufs;     /* injects dropped: driver TX queue full */
+static uint64_t stats_drop_eagain;      /* injects dropped: socket would block */
+static uint64_t stats_drop_err;         /* injects dropped: other write() error */
+
+static int stats_interval;              /* -S <sec>: periodic report (0 = off) */
+static volatile sig_atomic_t stats_dump_now;  /* set by SIGUSR1 */
 
 /* ================================================================
  *  Signal handler
@@ -130,6 +142,61 @@ static void sig_handler(int sig)
 {
     (void)sig;
     g_running = 0;
+}
+
+static void sigusr1_handler(int sig)
+{
+    (void)sig;
+    stats_dump_now = 1;
+}
+
+/* Print a one-line throughput report: per-interval deltas plus cumulative
+ * totals. Called on the -S timer and on SIGUSR1. `elapsed_ms` is the wall
+ * time since the previous report (0 => print cumulative only, no rates). */
+static void stats_report(double elapsed_ms)
+{
+    static uint64_t p_hp, p_ph, p_hpb, p_phb, p_deno, p_deag, p_derr, p_echo;
+
+    uint64_t d_hp   = stats_hub_to_phys   - p_hp;
+    uint64_t d_ph   = stats_phys_to_hub   - p_ph;
+    uint64_t d_hpb  = stats_hp_bytes      - p_hpb;
+    uint64_t d_phb  = stats_ph_bytes      - p_phb;
+    uint64_t d_deno = stats_drop_enobufs  - p_deno;
+    uint64_t d_deag = stats_drop_eagain   - p_deag;
+    uint64_t d_derr = stats_drop_err      - p_derr;
+    uint64_t d_echo = stats_echoes        - p_echo;
+
+    if (elapsed_ms > 0) {
+        double s = elapsed_ms / 1000.0;
+        fprintf(stderr,
+            "bridge: stats %.1fs | hub->phys %.0f fps %.2f Mbps "
+            "drop(enobufs=%llu eagain=%llu err=%llu) | "
+            "phys->hub %.0f fps %.2f Mbps | echoes %llu\n",
+            s,
+            d_hp / s, (d_hpb * 8.0) / (s * 1e6),
+            (unsigned long long)d_deno, (unsigned long long)d_deag,
+            (unsigned long long)d_derr,
+            d_ph / s, (d_phb * 8.0) / (s * 1e6),
+            (unsigned long long)d_echo);
+    } else {
+        fprintf(stderr,
+            "bridge: stats (cumulative) | hub->phys %llu frames %llu bytes "
+            "drop(enobufs=%llu eagain=%llu err=%llu) | phys->hub %llu frames "
+            "%llu bytes | echoes %llu\n",
+            (unsigned long long)stats_hub_to_phys,
+            (unsigned long long)stats_hp_bytes,
+            (unsigned long long)stats_drop_enobufs,
+            (unsigned long long)stats_drop_eagain,
+            (unsigned long long)stats_drop_err,
+            (unsigned long long)stats_phys_to_hub,
+            (unsigned long long)stats_ph_bytes,
+            (unsigned long long)stats_echoes);
+    }
+
+    p_hp = stats_hub_to_phys; p_ph = stats_phys_to_hub;
+    p_hpb = stats_hp_bytes;   p_phb = stats_ph_bytes;
+    p_deno = stats_drop_enobufs; p_deag = stats_drop_eagain;
+    p_derr = stats_drop_err;  p_echo = stats_echoes;
 }
 
 /* ================================================================
@@ -985,25 +1052,43 @@ static void process_hub_message(const uint8_t *payload, uint32_t payload_len)
             copies = 1;
     }
 
+    int any_ok = 0;
     for (int c = 0; c < copies; c++) {
         /* Mark copies 2+ as retransmissions so the receiver's duplicate
          * filter drops them when an earlier copy already arrived. */
         if (c == 1)
             inject_buf[INJECT_RADIOTAP_LEN + 1] |= 0x08;  /* FC retry bit */
 
+        stats_inject_writes++;
         n = write(raw_fd, inject_buf, INJECT_RADIOTAP_LEN + frame_len);
         if (n < 0) {
+            /* ENOBUFS/EAGAIN = the driver's monitor TX queue is full: the
+             * frame is dropped on the floor with no L2 retransmit. Count it
+             * (this is the silent downlink loss that caps throughput on a
+             * fast offered load) rather than swallowing it. */
+            if (errno == ENOBUFS) {
+                stats_drop_enobufs++;
+                continue;  /* a later copy may still get a queue slot */
+            }
+            if (errno == EAGAIN) {
+                stats_drop_eagain++;
+                continue;
+            }
+            stats_drop_err++;
             if (errno == EMSGSIZE)
                 fprintf(stderr, "bridge: inject write: Message too long "
                         "(frame=%u, need MTU >= %zu; raise it or clamp MSS)\n",
                         frame_len, INJECT_RADIOTAP_LEN + frame_len);
-            else if (errno != EAGAIN && errno != ENOBUFS)
+            else
                 fprintf(stderr, "bridge: inject write: %s\n", strerror(errno));
-            return;
+            break;  /* EMSGSIZE/hard errors fail every copy identically */
         }
+        any_ok = 1;
+        stats_hp_bytes += frame_len;
     }
 
-    stats_hub_to_phys++;
+    if (any_ok)
+        stats_hub_to_phys++;
     if (verbose)
         fprintf(stderr, "bridge: hub->phys: injected %u bytes x%d (ch=%u)\n",
                 frame_len, copies, msg_chan_freq);
@@ -1205,6 +1290,7 @@ static void handle_phys_data(void)
     }
 
     stats_phys_to_hub++;
+    stats_ph_bytes += frame_len;
     if (verbose)
         fprintf(stderr,
             "bridge: phys->hub: forwarded %zu bytes "
@@ -1295,6 +1381,10 @@ static void usage(const char *prog)
         "                   path sends at ~1 Mbps and caps downlink throughput.\n"
         "                   No rate fallback on NO_ACK inject -- too high a rate\n"
         "                   for the link just raises loss; sweep 24-36 first.\n"
+        "  -S <sec>         Print a periodic throughput report every <sec>s:\n"
+        "                   per-direction fps/Mbps and inject drop counters\n"
+        "                   (enobufs/eagain = silent downlink loss). SIGUSR1\n"
+        "                   dumps on demand. 0 = off (default).\n"
         "  -A               Forward ALL captured frames (disable the relevance\n"
         "                   filter; only for sniffing -- floods the hub on a\n"
         "                   busy channel)\n"
@@ -1325,7 +1415,7 @@ int main(int argc, char *argv[])
     /* Reset getopt to start scanning from argv[3] */
     optind = 3;
 
-    while ((opt = getopt(argc, argv, "c:w:s:n:b:m:r:R:Avh")) != -1) {
+    while ((opt = getopt(argc, argv, "c:w:s:n:b:m:r:R:S:Avh")) != -1) {
         switch (opt) {
         case 'b': {
             unsigned int m[6];
@@ -1389,6 +1479,13 @@ int main(int argc, char *argv[])
             inject_rate_rt = rt;
             break;
         }
+        case 'S':
+            stats_interval = atoi(optarg);
+            if (stats_interval < 0) {
+                fprintf(stderr, "bridge: -S must be >= 0: %s\n", optarg);
+                return 1;
+            }
+            break;
         case 'A':
             forward_all = 1;
             break;
@@ -1418,6 +1515,7 @@ int main(int argc, char *argv[])
     signal(SIGINT,  sig_handler);
     signal(SIGTERM, sig_handler);
     signal(SIGPIPE, SIG_IGN);
+    signal(SIGUSR1, sigusr1_handler);   /* dump stats on demand */
 
     fprintf(stderr, "bridge: hub=%s iface=%s channel=%d bw=%s node=%s\n",
             hub_path, ifname, channel_num, bw_str, node_id);
@@ -1470,9 +1568,27 @@ int main(int argc, char *argv[])
     /* Main poll loop */
     {
         struct pollfd pfds[2];
+        struct timespec last_report;
         pfds[1].fd = hub_fd;   pfds[1].events = POLLIN;
+        clock_gettime(CLOCK_MONOTONIC, &last_report);
 
         while (g_running) {
+            /* Periodic (-S) or on-demand (SIGUSR1) throughput report. */
+            if (stats_interval || stats_dump_now) {
+                struct timespec now;
+                clock_gettime(CLOCK_MONOTONIC, &now);
+                double ms = (now.tv_sec - last_report.tv_sec) * 1000.0
+                          + (now.tv_nsec - last_report.tv_nsec) / 1e6;
+                if (stats_dump_now) {
+                    stats_report(ms);
+                    stats_dump_now = 0;
+                    last_report = now;
+                } else if (ms >= stats_interval * 1000.0) {
+                    stats_report(ms);
+                    last_report = now;
+                }
+            }
+
             /* A capture-interface flap (mt76 USB reset) is recoverable: reopen
              * the raw socket rather than tearing the whole bridge down. */
             if (raw_needs_reopen) {
@@ -1515,10 +1631,8 @@ int main(int argc, char *argv[])
     }
 
     /* Normal shutdown (reached after main loop exits) */
-    fprintf(stderr,
-        "bridge: shutting down -- hub->phys: %u frames, phys->hub: %u frames, "
-        "echoes suppressed: %u\n",
-        stats_hub_to_phys, stats_phys_to_hub, stats_echoes);
+    fprintf(stderr, "bridge: shutting down\n");
+    stats_report(0);
 
 out:
     if (hub_fd >= 0) close(hub_fd);

@@ -212,6 +212,7 @@ sudo ./vwifi-phys-bridge /run/vwifi/foo.sock wlx00c0cab57e6f \
 | `-m <mask>`  | relevance-filter mask — forward the whole `…:00..03` set, not one BSSID |
 | `-r <n>`     | inject each critical frame N times (beacons/probe-resps excluded); use 2–3 on a lossy channel |
 | `-R <mbps>`  | over-air downlink rate (`1,2,5.5,6,9,11,12,18,24,36,48,54`, or `0`=auto/echo the VM's rate, floored at 6 Mbps). **Without a rate the mt76 monitor path injects at ~1 Mbps and caps downlink throughput.** No rate fallback on NO_ACK inject, so too high a rate for the link just raises loss — sweep 24–36 first. `INJECT_RATE=<mbps>` in `lab-bringup.sh`. |
+| `-S <sec>`   | print a periodic throughput report: per-direction fps/Mbps and, crucially, inject drop counters (`enobufs`/`eagain` = frames the driver's monitor TX queue rejected — otherwise-silent downlink loss). `SIGUSR1` dumps on demand. |
 | `-c <chan>`  | channel (must match the AP + AR9271 + MT7921U) |
 
 The bridge already: injects `NO_ACK` (no 15× self-retransmit storm); drops
@@ -272,19 +273,64 @@ Signs of each historical failure mode, for future debugging:
   downlink and reads far lower than the upload. Measured example: phone upload
   5.3 Mbps vs download 0.39 Mbps, unloaded latency 14 ms (the relay itself is
   fast) but 241 ms loaded (downlink bufferbloat behind a slow inject queue).
-- **Downlink inject rate is the #1 lever** (fixed). The injector now advertises a
-  radiotap RATE; previously it sent no rate and mt76 fell back to ~1 Mbps. Use
-  `-R`/`INJECT_RATE` to pin a legacy rate (sweep 24–36 Mbps) and raise the
-  downlink ceiling. Because NO_ACK injection has no rate fallback, the right
-  value is empirical — too high for the link SNR just trades throughput for loss.
-- **Downlink loss still isn't retransmitted at L2** (NO_ACK). After raising the
-  rate, the remaining downlink cap is air loss on the co-located channel: rely on
-  `-r`, separated radios, and a quieter channel; upper layers do the recovery.
-- **Remaining throughput levers**: a quieter channel, physically separated radios,
-  `INJECT_COPIES` tuning, and whether the VM beacon/rate control delivers more of
-  its frames to air. The thin ~600 ms over-air beacon cadence still drives the
-  periodic beacon-loss reconnects that stall traffic (a stability, not peak-rate,
-  limit).
+- **The injected downlink now carries a radiotap RATE** (was absent → mt76 fell
+  back to ~1 Mbps). Set it with `-R`/`INJECT_RATE`; NO_ACK injection has no rate
+  fallback, so too high a rate for the link just trades throughput for loss.
+  **But raising the rate alone did not lift the observed ceiling** — download
+  stayed ~0.5 Mbps from 6 through 36 Mbps on-air. That rules the air PHY rate
+  *out* as the current binding constraint and points at a frames-per-second cap
+  in the relay (see §7.5).
+- **Downlink loss still isn't retransmitted at L2** (NO_ACK), whether the loss is
+  in the air or in the driver's monitor TX queue (`ENOBUFS`). Characterize which
+  before tuning further (§7.5).
+- **Remaining throughput levers**: the inject-queue ceiling (§7.5), a quieter
+  channel, physically separated radios, and `INJECT_COPIES`. The thin ~600 ms
+  over-air beacon cadence still drives the periodic beacon-loss reconnects that
+  stall traffic (a stability, not peak-rate, limit).
+
+## 7.5 Characterizing throughput (isolating the bottleneck)
+
+When end-to-end download is low but the on-air rate is fine, the cap is
+frames-per-second somewhere in the relay, not bits-per-second on air. Two
+instruments isolate it without TCP/VM/phone in the path:
+
+**Live bridge counters (`-S`).** Run the bridge with `-S 2` (or `INJECT_RATE=…`
+plus edit the script, or send `SIGUSR1`) to get a per-2s readout:
+
+```
+bridge: stats 2.0s | hub->phys 431 fps 5.03 Mbps drop(enobufs=812 eagain=0 err=0) \
+        | phys->hub 88 fps 0.9 Mbps | echoes 431
+```
+
+Read it like this:
+- **`drop(enobufs=…)` climbing** → the mt76 monitor TX queue is the ceiling; the
+  driver is silently discarding injects (this loss is invisible to any
+  speedtest). Lever: fewer copies (`-r 1`), a powered USB port, a different mt76
+  queue/driver setting, or pacing the injector.
+- **`hub->phys fps` low with ~0 drops** → the bridge isn't being *offered* more
+  frames; the bottleneck is upstream (VM rate control / medium), not the air.
+- **high inject fps + drops ~0 but download still low** → the loss is in the air
+  (single-shot NO_ACK on the co-located channel): separate the radios, quieter
+  channel.
+
+**`vwifi-linkbench` — an iperf for the PHY relay.** Measures each leg's raw
+ceiling directly:
+
+```sh
+# Inject ceiling of the bridge's radio (tear the lab down first so nothing
+# else drives it). Sweep -R; watch accepted fps/Mbps and the ENOBUFS %:
+sudo ./vwifi-linkbench inject wlx00c0cab57e6f -R 6 -s 1500 -t 10 -v
+
+# Full air path + loss, two monitor radios on the same channel:
+sudo ./vwifi-linkbench capture <radio-A> -t 12 &     # sink
+sudo ./vwifi-linkbench inject  <radio-B> -R 6 -t 10   # source
+# capture prints air-loss % from the injector's VWLB sequence stream.
+```
+
+If `linkbench inject` sustains, say, 400+ fps at 6 Mbps with near-zero ENOBUFS,
+the inject path is not the cap and the problem is air loss or upstream offer; if
+it plateaus at ~40–80 fps with heavy ENOBUFS, the monitor TX queue is the wall
+and rate tuning can't help until that's addressed.
 
 ---
 
@@ -296,5 +342,6 @@ Signs of each historical failure mode, for future debugging:
 | `vwifi_host.c` | host kernel module | a host-side virtual radio on the medium (also had a `SW_CRYPTO_CONTROL` crypto bug, now fixed) |
 | emulated `ath9k` | in each VM | the VM's radio — needs `nohwcrypt=1` |
 | `vwifi-phys-bridge` | host | capture/inject relay between real air and the medium (MT7921U) |
+| `vwifi-linkbench` | host | iperf-style inject/capture microbenchmark for the PHY relay (§7.5) |
 | AR9271 + hostapd decoys | host | the SIFS ACK for the VM BSSID range |
 | `scripts/lab-bringup.sh` | host | one-command bring-up |
