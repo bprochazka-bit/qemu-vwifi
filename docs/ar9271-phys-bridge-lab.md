@@ -280,14 +280,24 @@ Signs of each historical failure mode, for future debugging:
   stayed ~0.5 Mbps from 6 through 36 Mbps on-air. That rules the air PHY rate
   *out* as the current binding constraint and points at a frames-per-second cap
   in the relay (see §7.5).
-- **Measured bottleneck: the MT7921U's monitor-mode inject completes only ~60–80
-  frames/s.** `vwifi-linkbench inject` on the MT7921U with a *blocking* socket
-  sustains ~80 fps of 1500 B frames (~1 Mbps) with **zero** ENOBUFS — i.e. the
-  driver/firmware TX-completion rate, not queue overflow, backpressures each
-  `write()` to ~12 ms. This is the wall behind the ~0.5 Mbps download; rate (`-R`)
-  can't move it. Next probes: fps-bound vs byte-bound (sweep `-s`), whether `-N`
-  turns the block into ENOBUFS, and whether another radio / mt76 version injects
-  faster.
+- **Measured bottleneck: mt76 monitor-mode injection completes only ~80–92
+  frames/s — on *both* radios.** `vwifi-linkbench inject` with a *blocking*
+  socket sustains ~80–92 fps of 1500 B frames (~1 Mbps) with **zero** ENOBUFS,
+  and a co-channel `capture` confirms **0 % air loss** at that rate (the channel
+  is nearly idle). So the wall is the driver/firmware TX-completion rate
+  (~11 ms/frame vs ~2 ms of actual air time), it is **not** specific to one
+  radio, and it is **not** air loss — swapping which mt76 radio injects will not
+  help. Rate (`-R`) can't move it either. The ~11 ms ≈ a 100 Hz timer tick,
+  which suggests the frame is paced in the TX path (qdisc / mac80211 software
+  queue / TX-status batched on a tick) rather than at the PHY.
+- **Probing the ~90 fps wall** (`vwifi-linkbench inject`): `-s 200,700,1500`
+  sweeps frame size (flat fps ⇒ fps-bound/per-frame latency; rising fps ⇒
+  byte-bound); `-Q` sets `PACKET_QDISC_BYPASS` (skips the netdev qdisc); `-B
+  <bytes>` enlarges `SO_SNDBUF` (tests TX-completion batching); `-N` turns the
+  block into visible ENOBUFS. If `-Q` or `-B` lifts the rate, port the winning
+  socket option into `vwifi-phys-bridge`'s inject socket. If nothing moves it,
+  the cap is in mt76 monitor injection itself and the fix is architectural
+  (a different inject path/driver, or not single-frame monitor injection).
 - **Downlink loss still isn't retransmitted at L2** (NO_ACK), whether the loss is
   in the air or in the driver's monitor TX queue (`ENOBUFS`). Characterize which
   before tuning further (§7.5).

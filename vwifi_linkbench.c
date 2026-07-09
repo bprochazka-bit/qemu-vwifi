@@ -142,7 +142,8 @@ static int open_mon(const char *iface, int for_tx)
 /* ---- inject mode ------------------------------------------------------- */
 
 static int do_inject(const char *iface, double mbps, int size, double secs,
-                     long pps, int nonblock, int verbose)
+                     long pps, int nonblock, int qdisc_bypass, int sndbuf,
+                     int verbose)
 {
     int rt = mbps_to_rt(mbps);
     if (rt < 0) {
@@ -157,6 +158,25 @@ static int do_inject(const char *iface, double mbps, int size, double secs,
     if (fd < 0) return 1;
     if (nonblock)
         fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+
+    /* -Q: hand frames straight to the driver's ndo_start_xmit, skipping the
+     * netdev qdisc. If the ~10 ms/frame injection pacing lives in the qdisc
+     * layer (fq_codel/AQL waking per timer tick), this bypasses it. */
+#ifndef PACKET_QDISC_BYPASS
+#define PACKET_QDISC_BYPASS 20
+#endif
+    if (qdisc_bypass) {
+        int one = 1;
+        if (setsockopt(fd, SOL_PACKET, PACKET_QDISC_BYPASS,
+                       &one, sizeof(one)) < 0)
+            perror("linkbench: PACKET_QDISC_BYPASS (continuing without)");
+    }
+    /* -B: enlarge the socket send buffer so more frames can queue while the
+     * driver drains TX completions — tests whether the block is TX-status
+     * batching rather than a hard per-frame rate. */
+    if (sndbuf > 0 &&
+        setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf)) < 0)
+        perror("linkbench: SO_SNDBUF (continuing)");
 
     /* Build radiotap (RATE + NO_ACK) + 802.11 data header once; only the
      * sequence number in the payload changes per frame. */
@@ -184,8 +204,10 @@ static int do_inject(const char *iface, double mbps, int size, double secs,
     signal(SIGTERM, on_sig);
 
     fprintf(stderr, "linkbench: inject %s: rate=%.1f Mbps size=%dB dur=%.0fs "
-            "%s%s\n", iface, mbps, size, secs,
-            pps ? "paced " : "max-rate ", nonblock ? "nonblock" : "blocking");
+            "%s%s%s%s\n", iface, mbps, size, secs,
+            pps ? "paced " : "max-rate ", nonblock ? "nonblock" : "blocking",
+            qdisc_bypass ? " qdisc-bypass" : "",
+            sndbuf ? " sndbuf-set" : "");
     if (pps) fprintf(stderr, "linkbench: target %ld pps\n", pps);
 
     uint64_t offered = 0, ok = 0, enobufs = 0, eagain = 0, err = 0;
@@ -366,7 +388,8 @@ static void usage(const char *p)
 {
     fprintf(stderr,
         "Usage:\n"
-        "  %s inject  <iface> [-R mbps] [-s bytes] [-t secs] [-p pps] [-N] [-v]\n"
+        "  %s inject  <iface> [-R mbps] [-s bytes[,bytes...]] [-t secs]\n"
+        "             [-p pps] [-N] [-Q] [-B bytes] [-v]\n"
         "  %s capture <iface> [-t secs] [-v]\n"
         "\n"
         "inject  — blast VWLB frames out a monitor iface; report accepted\n"
@@ -378,11 +401,16 @@ static void usage(const char *p)
         "same channel:  sudo ./scripts/mon-setup.sh <iface> <channel>\n"
         "\n"
         "  -R <mbps>  inject rate: 1,2,5.5,6,9,11,12,18,24,36,48,54 (default 6)\n"
-        "  -s <bytes> 802.11 frame size incl header (default 1500, max %d)\n"
-        "  -t <secs>  duration (default 5)\n"
+        "  -s <bytes> 802.11 frame size incl header (default 1500, max %d).\n"
+        "             A comma list (e.g. 200,700,1500) sweeps each size in turn:\n"
+        "             flat fps across sizes = fps-bound; rising fps = byte-bound.\n"
+        "  -t <secs>  duration, per size (default 5)\n"
         "  -p <pps>   inject: pace to this many frames/s (default 0 = max rate)\n"
         "  -N         inject: non-blocking socket (surface ENOBUFS at max offer\n"
         "             instead of letting write() apply backpressure)\n"
+        "  -Q         inject: PACKET_QDISC_BYPASS (skip the netdev qdisc — test\n"
+        "             whether the per-frame pacing lives there)\n"
+        "  -B <bytes> inject: SO_SNDBUF size (test TX-completion batching)\n"
         "  -v         per-second progress\n",
         p, p, LB_MAX_SIZE);
 }
@@ -394,23 +422,38 @@ int main(int argc, char *argv[])
     const char *iface = argv[2];
 
     double mbps = 6.0, secs = 5.0;
-    int size = 1500, nonblock = 0, verbose = 0;
+    int nonblock = 0, verbose = 0, qdisc_bypass = 0, sndbuf = 0;
     long pps = 0;
+    const char *size_list = "1500";   /* -s accepts a comma list to sweep */
 
     for (int i = 3; i < argc; i++) {
         if (!strcmp(argv[i], "-R") && i + 1 < argc)      mbps = atof(argv[++i]);
-        else if (!strcmp(argv[i], "-s") && i + 1 < argc) size = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-s") && i + 1 < argc) size_list = argv[++i];
         else if (!strcmp(argv[i], "-t") && i + 1 < argc) secs = atof(argv[++i]);
         else if (!strcmp(argv[i], "-p") && i + 1 < argc) pps  = atol(argv[++i]);
+        else if (!strcmp(argv[i], "-B") && i + 1 < argc) sndbuf = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-N"))                 nonblock = 1;
+        else if (!strcmp(argv[i], "-Q"))                 qdisc_bypass = 1;
         else if (!strcmp(argv[i], "-v"))                 verbose = 1;
         else { fprintf(stderr, "linkbench: unknown arg: %s\n", argv[i]);
                usage(argv[0]); return 1; }
     }
     if (secs <= 0) secs = 5.0;
 
-    if (!strcmp(mode, "inject"))
-        return do_inject(iface, mbps, size, secs, pps, nonblock, verbose);
+    if (!strcmp(mode, "inject")) {
+        /* -s may be a comma list (e.g. 200,700,1500): run each in turn so a
+         * single command shows whether the ceiling is fps-bound (fps ~flat
+         * across sizes) or byte-bound (fps rises as size falls). */
+        int rc = 0;
+        char list[256];
+        snprintf(list, sizeof(list), "%s", size_list);
+        for (char *tok = strtok(list, ","); tok; tok = strtok(NULL, ",")) {
+            int size = atoi(tok);
+            rc |= do_inject(iface, mbps, size, secs, pps, nonblock,
+                            qdisc_bypass, sndbuf, verbose);
+        }
+        return rc;
+    }
     if (!strcmp(mode, "capture"))
         return do_capture(iface, secs, verbose);
 
