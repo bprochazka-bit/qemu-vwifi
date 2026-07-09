@@ -5,10 +5,10 @@
 #
 # Architecture (see docs/ar9271-phys-bridge-lab.md):
 #
-#   AR9271  (ath9k_htc)  2 hostapd BSS at ...:44:00 and ...:44:FF, channel 11
+#   AR9271  (ath9k_htc)  2 hostapd BSS at ...:44:00 and ...:44:03, channel 11
 #                        -> chip is in AP opmode, so the PCU hardware-ACKs any
 #                           frame matching the auto-computed bssidmask
-#                           ff:ff:ff:ff:ff:00, i.e. 02:11:22:33:44:00..FF.
+#                           ff:ff:ff:ff:ff:fc, i.e. 02:11:22:33:44:00..03.
 #                        -> hostapd only OWNS :00 and :FF (decoy "wrong" APs),
 #                           so it never answers management for the VM BSSIDs;
 #                           it just supplies the SIFS ACK for the whole range.
@@ -37,13 +37,16 @@ MT_IF="${MT_IF:-mon0}"                       # MT7921U: capture + inject radio
 CHANNEL="${CHANNEL:-11}"                      # single lab channel
 HUB_SOCK="${HUB_SOCK:-/run/vwifi/foo.sock}"   # vwifi hub socket
 
-# BSSID plan. The two DECOY BSSIDs owned by the host sit at the extremes of the
-# range so the driver's auto-mask spans the whole last byte. VM APs live in
-# between (02:11:22:33:44:01 .. :FE) and are ACKed via that mask.
+# BSSID plan. Two DECOY BSSIDs owned by the host bound the range so the driver's
+# auto-mask spans it. Keep the span SMALL: mac80211/ath9k reject a full-byte
+# spread (:00 vs :FF) and fall back to a random MAC on the 2nd vif, which breaks
+# the mask. :00 + :03 gives a standard 4-BSSID mask (ff:ff:ff:ff:ff:fc) covering
+# :00..:03; the VM APs live at :01/:02 (ACKed via the mask, not owned by the host).
+# Need more VMs? Use :00 + :07 (mask ...:f8, covers :00..:07, VMs :01..:06).
 BSSID_LO="02:11:22:33:44:00"                  # host decoy A (mask low end)
-BSSID_HI="02:11:22:33:44:FF"                  # host decoy B (mask high end)
+BSSID_HI="02:11:22:33:44:03"                  # host decoy B (mask high end)
 FILTER_BASE="02:11:22:33:44:00"               # bridge relevance-filter base
-FILTER_MASK="ff:ff:ff:ff:ff:00"               # -> forwards ...:44:00..FF
+FILTER_MASK="ff:ff:ff:ff:ff:fc"               # -> forwards ...:44:00..03
 
 SSID_LO="Lab-Decoy-A"
 SSID_HI="Lab-Decoy-B"
@@ -115,7 +118,7 @@ ip link set "$AR9271_IF" address "$BSSID_LO"
 cat > "$HOSTAPD_CONF" <<EOF
 # Decoy/ACK APs on the AR9271. hostapd OWNS only these two BSSIDs; their sole
 # lab purpose is to put the chip in AP opmode and make the auto-computed
-# bssidmask span 02:11:22:33:44:00..FF so the PCU hardware-ACKs the VM BSSIDs.
+# bssidmask span $BSSID_LO..$BSSID_HI so the PCU hardware-ACKs the VM BSSIDs.
 # Legacy (no HT / no WMM) => simple per-frame ACK, no Block-Ack / RTS-CTS.
 interface=$AR9271_IF
 driver=nl80211
@@ -142,13 +145,24 @@ hostapd -B -P "$RUN_DIR/hostapd.pid" "$HOSTAPD_CONF" \
     || die "hostapd failed to start — check 'hostapd $HOSTAPD_CONF' output"
 sleep 2
 
-# Verify both AP vifs exist at the extremes. The driver derives the hardware
-# bssidmask from these two addresses: :00 XOR :FF = ...:FF => mask ...:ff:00,
-# which covers the entire 02:11:22:33:44:xx range.
+# Verify both AP vifs came up at the intended addresses. The driver derives the
+# hardware bssidmask from the two vif MACs; if hostapd/mac80211 could not honor
+# the second BSSID it silently assigns a RANDOM MAC, which produces a mask that
+# does NOT cover the VM BSSIDs -> the AR9271 never ACKs the STA and association
+# fails. Hard-fail here instead of running broken.
 say "AR9271 vif addresses (expect $BSSID_LO and $BSSID_HI):"
 iw dev | awk '/Interface/{i=$2} /addr/{print "    "i"  "$2}' \
     | grep -Ei "${AR9271_IF}|lab-decoy-b" || true
-say "=> hardware bssidmask spans ff:ff:ff:ff:ff:00 (ACKs 02:11:22:33:44:00..FF)"
+
+decoy_b_mac=$(cat /sys/class/net/lab-decoy-b/address 2>/dev/null || echo "")
+if [ "$decoy_b_mac" != "$BSSID_HI" ]; then
+    warn "decoy B MAC is '$decoy_b_mac', expected '$BSSID_HI'."
+    warn "The driver rejected the BSSID spread and randomised it -> the bssidmask"
+    warn "will NOT cover the VM BSSIDs and the STA will not be ACKed."
+    warn "Narrow the span (e.g. BSSID_HI=02:11:22:33:44:03) or check hostapd's log."
+    die "aborting: decoy BSSID did not stick"
+fi
+say "=> both decoy vifs correct; bssidmask $FILTER_MASK covers $FILTER_BASE..$BSSID_HI"
 
 # ----------------------------------------------------------------------------
 # 2. MT7921U -> monitor on the same channel (capture + inject + witness)
@@ -185,7 +199,7 @@ cat <<EOF
 
 $(say "LAB IS UP on channel $CHANNEL")
 
-  AR9271  : hostapd 2-BSS ($BSSID_LO / $BSSID_HI)  -> ACK for ...:44:00..FF
+  AR9271  : hostapd 2-BSS ($BSSID_LO / $BSSID_HI)  -> ACK for $FILTER_BASE..$BSSID_HI
   MT7921U : monitor + bridge on $MT_IF             -> capture/inject to the hub
   witness : $WITNESS_PCAP    bridge log: $RUN_DIR/bridge.log
 
