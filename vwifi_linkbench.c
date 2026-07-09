@@ -143,7 +143,7 @@ static int open_mon(const char *iface, int for_tx)
 
 static int do_inject(const char *iface, double mbps, int size, double secs,
                      long pps, int nonblock, int qdisc_bypass, int sndbuf,
-                     int mcs, int verbose)
+                     int mcs, int noack, int verbose)
 {
     int rt = 0;
     if (mcs >= 0) {
@@ -194,13 +194,18 @@ static int do_inject(const char *iface, double mbps, int size, double secs,
      *            honoring MCS, so this is the lever that may actually raise
      *            the on-air rate above ~1 Mbps. MCS i @ 20 MHz long-GI:
      *            0→6.5, 1→13, ... 7→65 Mbps. */
+    /* tx_flags low byte: NO_ACK (0x08) normally; -A clears it to test whether
+     * the NO_ACK flag is what makes the driver drop to the 1 Mbps basic rate.
+     * Without NO_ACK the injecting radio expects an ACK it can't hear and will
+     * retransmit — capture shows that as a >1x duplication factor. */
+    uint8_t txf = noack ? 0x08 : 0x00;
     uint8_t buf[16 + LB_MAX_SIZE];
     int rtlen;
     if (mcs >= 0) {
         uint8_t rtap[13] = {
             0x00, 0x00, 0x0d, 0x00,      /* version, pad, len=13 */
             0x00, 0x80, 0x08, 0x00,      /* present = TX_FLAGS(15) | MCS(19) */
-            0x08, 0x00,                  /* [8]  tx_flags = NO_ACK */
+            txf,  0x00,                  /* [8]  tx_flags */
             0x02, 0x00, (uint8_t)mcs     /* [10] mcs: known=idx, flags=0, index */
         };
         memcpy(buf, rtap, sizeof rtap);
@@ -210,7 +215,7 @@ static int do_inject(const char *iface, double mbps, int size, double secs,
             0x00, 0x00, 0x0c, 0x00,      /* version, pad, len=12 */
             0x04, 0x80, 0x00, 0x00,      /* present = RATE(2) | TX_FLAGS(15) */
             (uint8_t)rt, 0x00,           /* rate, pad */
-            0x08, 0x00                   /* tx_flags = NO_ACK */
+            txf,  0x00                   /* tx_flags */
         };
         memcpy(buf, rtap, sizeof rtap);
         rtlen = sizeof rtap;
@@ -234,10 +239,11 @@ static int do_inject(const char *iface, double mbps, int size, double secs,
     if (mcs >= 0) snprintf(ratestr, sizeof ratestr, "MCS%d (HT)", mcs);
     else          snprintf(ratestr, sizeof ratestr, "%.1f Mbps", mbps);
     fprintf(stderr, "linkbench: inject %s: rate=%s size=%dB dur=%.0fs "
-            "%s%s%s%s\n", iface, ratestr, size, secs,
+            "%s%s%s%s%s\n", iface, ratestr, size, secs,
             pps ? "paced " : "max-rate ", nonblock ? "nonblock" : "blocking",
             qdisc_bypass ? " qdisc-bypass" : "",
-            sndbuf ? " sndbuf-set" : "");
+            sndbuf ? " sndbuf-set" : "",
+            noack ? " NO_ACK" : " ACK-expected");
     if (pps) fprintf(stderr, "linkbench: target %ld pps\n", pps);
 
     uint64_t offered = 0, ok = 0, enobufs = 0, eagain = 0, err = 0;
@@ -440,18 +446,25 @@ static int do_capture(const char *iface, double secs, int verbose)
         (unsigned long long)bench, bench / dur, bench_bytes * 8.0 / (dur * 1e6));
     if (have_seq) {
         uint64_t span = (uint64_t)(seq_max - seq_min) + 1;
-        /* bench can exceed span if the injector restarted its sequence during
-         * the window (e.g. two injectors, or an old build that reset seq per
-         * -s size) — clamp instead of underflowing the unsigned subtraction. */
-        double loss = (span > bench) ? 100.0 * (span - bench) / span : 0.0;
+        /* bench > span means each frame was received more than once: the
+         * injecting radio retransmitted it (NO_ACK not honored) — report the
+         * duplication factor. Otherwise report air loss. Clamp either way so
+         * the unsigned subtraction never underflows. */
         fprintf(stderr,
-        "  seq span    : %llu..%llu (%llu sent by injector in window)\n"
-        "  air loss    : %.1f%%  (received %llu of %llu)%s\n",
+        "  seq span    : %llu..%llu (%llu unique sent in window)\n",
         (unsigned long long)seq_min, (unsigned long long)seq_max,
-        (unsigned long long)span, loss,
-        (unsigned long long)bench, (unsigned long long)span,
-        bench > span ? "  [received > span: seq restarted / duplicate injector]"
-                     : "");
+        (unsigned long long)span);
+        if (bench > span)
+            fprintf(stderr,
+        "  duplication : %.1fx  (received %llu for %llu unique — injector is\n"
+        "                retransmitting; radio not honoring NO_ACK)\n",
+            (double)bench / (double)span,
+            (unsigned long long)bench, (unsigned long long)span);
+        else
+            fprintf(stderr,
+        "  air loss    : %.1f%%  (received %llu of %llu)\n",
+            100.0 * (span - bench) / span,
+            (unsigned long long)bench, (unsigned long long)span);
 
         /* On-air rate the injected frames ACTUALLY went out at — settles
          * whether the radio honored the injected -R or fell back to a basic
@@ -502,6 +515,9 @@ static void usage(const char *p)
         "  -p <pps>   inject: pace to this many frames/s (default 0 = max rate)\n"
         "  -N         inject: non-blocking socket (surface ENOBUFS at max offer\n"
         "             instead of letting write() apply backpressure)\n"
+        "  -A         inject: DON'T set NO_ACK (expects an ACK, will retransmit)\n"
+        "             — tests whether NO_ACK is what forces the 1 Mbps basic rate;\n"
+        "             capture shows a >1x duplication factor from the retransmits\n"
         "  -Q         inject: PACKET_QDISC_BYPASS (skip the netdev qdisc — test\n"
         "             whether the per-frame pacing lives there)\n"
         "  -B <bytes> inject: SO_SNDBUF size (test TX-completion batching)\n"
@@ -517,6 +533,7 @@ int main(int argc, char *argv[])
 
     double mbps = 6.0, secs = 5.0;
     int nonblock = 0, verbose = 0, qdisc_bypass = 0, sndbuf = 0, mcs = -1;
+    int noack = 1;
     long pps = 0;
     const char *size_list = "1500";   /* -s accepts a comma list to sweep */
 
@@ -529,6 +546,7 @@ int main(int argc, char *argv[])
         else if (!strcmp(argv[i], "-B") && i + 1 < argc) sndbuf = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-N"))                 nonblock = 1;
         else if (!strcmp(argv[i], "-Q"))                 qdisc_bypass = 1;
+        else if (!strcmp(argv[i], "-A"))                 noack = 0;
         else if (!strcmp(argv[i], "-v"))                 verbose = 1;
         else { fprintf(stderr, "linkbench: unknown arg: %s\n", argv[i]);
                usage(argv[0]); return 1; }
@@ -545,7 +563,7 @@ int main(int argc, char *argv[])
         for (char *tok = strtok(list, ","); tok; tok = strtok(NULL, ",")) {
             int size = atoi(tok);
             rc |= do_inject(iface, mbps, size, secs, pps, nonblock,
-                            qdisc_bypass, sndbuf, mcs, verbose);
+                            qdisc_bypass, sndbuf, mcs, noack, verbose);
         }
         return rc;
     }
