@@ -1171,7 +1171,18 @@ static int __init vwifi_init(void)
     ieee80211_hw_set(hw, SUPPORTS_PS);
     ieee80211_hw_set(hw, HOST_BROADCAST_PS_BUFFERING);
     ieee80211_hw_set(hw, RX_INCLUDES_FCS);
-    ieee80211_hw_set(hw, SW_CRYPTO_CONTROL);
+    /*
+     * Do NOT set IEEE80211_HW_SW_CRYPTO_CONTROL. Despite the name, that flag
+     * does not enable software crypto -- it tells mac80211 "the driver
+     * controls crypto, so do not fall back to software unless set_key()
+     * returns 1". This is a purely virtual radio: it has no crypto hardware
+     * and no set_key() op, so with that flag set mac80211 refuses to perform
+     * software CCMP/GCMP/BIP and every encrypted data frame is dropped
+     * (WPA2 associates -- EAPOL is done in userspace -- but no data flows,
+     * showing up as climbing "rx drop misc" on the peer). Leaving the flag
+     * unset lets mac80211 do CCMP/GCMP/BIP in software, which is what a
+     * virtual radio wants; open networks were unaffected either way.
+     */
 
     hw->queues = 4;  /* AC_VO, AC_VI, AC_BE, AC_BK */
 

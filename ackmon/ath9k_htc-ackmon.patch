@@ -1,0 +1,112 @@
+ath9k_htc: ackmon — hardware-ACK a fixed BSSID set on a monitor vif
+
+DRAFT / UNTESTED — build and validate on real AR9271 hardware.
+
+Rationale
+=========
+The AR9271 PCU ACKs a received unicast frame when its RA matches the device
+address under the BSSID mask:
+
+    (RA & bssidmask) == (macaddr & bssidmask)
+
+`macaddr` is propagated to the target as the monitor vif's `myaddr`
+(AR_STA_ID); `bssidmask` is programmed by ath_hw_setbssidmask() (AR_BSSMSK).
+Nothing in ath9k ever sets AR_DIAG_ACK_DIS, so ACK is *not* disabled in
+monitor mode — it simply never fires because no frame is addressed to the
+sniffer's MAC.
+
+ackmon overrides macaddr=<base> and bssidmask=<mask> for a single monitor
+vif so the chip hardware-ACKs every BSSID in the masked set, while the vif
+still captures and injects raw. No AP/hostapd runs locally; the real APs
+live on the vwifi medium and remain the literal APs. Only the SIFS ACK is
+provided locally — Auth/Assoc/EAPOL are relayed to the VMs.
+
+Use a dedicated lab adapter running ONLY a monitor vif. Choose prefix-aligned
+BSSIDs so the mask is tight, e.g. base 02:11:22:33:44:00, mask ff:ff:ff:ff:ff:fc
+covers 02:11:22:33:44:00..03.
+
+Apply against drivers/net/wireless/ath/ath9k/htc_drv_main.c. Line numbers are
+approximate; the two insertion points are (1) just after the module includes /
+top-of-file statics, and (2) inside ath9k_htc_set_mac_bssid_mask(), immediately
+before the ath_hw_setbssidmask(common) call.
+
+---
+--- a/drivers/net/wireless/ath/ath9k/htc_drv_main.c
++++ b/drivers/net/wireless/ath/ath9k/htc_drv_main.c
+@@ (top of file, after the existing #includes)
++/* ----------------------------------------------------------------------
++ * ackmon: hardware-ACK a configured BSSID set on a monitor vif (lab use).
++ * See ackmon/README.md in the qemu-vwifi tree.
++ * ---------------------------------------------------------------------- */
++static bool ackmon;
++module_param(ackmon, bool, 0644);
++MODULE_PARM_DESC(ackmon, "ACK a fixed BSSID set on a monitor vif (lab use)");
++
++static char *ackmon_base = "02:11:22:33:44:00";
++module_param(ackmon_base, charp, 0644);
++MODULE_PARM_DESC(ackmon_base, "ackmon: RA-match base MAC (the BSSID prefix)");
++
++static char *ackmon_mask = "ff:ff:ff:ff:ff:fc";
++module_param(ackmon_mask, charp, 0644);
++MODULE_PARM_DESC(ackmon_mask, "ackmon: address mask (1=care, 0=don't-care)");
++
+@@ static void ath9k_htc_set_mac_bssid_mask(struct ath9k_htc_priv *priv,
+ 	memcpy(common->bssidmask, iter_data.mask, ETH_ALEN);
+
+ 	if (iter_data.hw_macaddr)
+ 		memcpy(common->macaddr, iter_data.hw_macaddr, ETH_ALEN);
+
++	if (ackmon) {
++		u8 base[ETH_ALEN], mask[ETH_ALEN];
++
++		if (!mac_pton(ackmon_base, base) || !mac_pton(ackmon_mask, mask)) {
++			ath_err(common,
++				"ackmon: bad base/mask MAC ('%s'/'%s')\n",
++				ackmon_base, ackmon_mask);
++		} else {
++			/*
++			 * The RA-match base becomes the device MAC; the mask
++			 * widens it so the PCU ACKs the whole BSSID set. The
++			 * monitor vif carries common->macaddr to the target as
++			 * hvif.myaddr, so AR_STA_ID follows automatically the
++			 * next time the monitor interface is (re)registered.
++			 */
++			memcpy(common->macaddr, base, ETH_ALEN);
++			memcpy(common->bssidmask, mask, ETH_ALEN);
++			ath_dbg(common, CONFIG,
++				"ackmon: macaddr=%pM bssidmask=%pM\n",
++				common->macaddr, common->bssidmask);
++		}
++	}
++
+ 	ath_hw_setbssidmask(common);
+ }
+---
+
+Load + bring-up
+===============
+    sudo modprobe -r ath9k_htc
+    sudo modprobe ath9k_htc ackmon=1 \
+         ackmon_base=02:11:22:33:44:00 ackmon_mask=ff:ff:ff:ff:ff:fc
+
+    sudo ip link set wlxc01c300da281 down
+    sudo iw dev wlxc01c300da281 set type monitor
+    sudo ip link set wlxc01c300da281 up           # monitor registered AFTER
+    sudo iw dev wlxc01c300da281 set channel 6      # ackmon override is in place
+
+Verify the override reached the chip:
+    dmesg | grep ackmon          # macaddr/bssidmask line
+
+Known-open items to confirm on hardware (the reason this is a DRAFT)
+===================================================================
+1. myaddr propagation: AR_STA_ID must end up = base. set_mac_bssid_mask runs
+   on config/bss-info changes; confirm the monitor vif's myaddr is (re)sent to
+   the target after the override. If not, toggle the monitor vif (down/up) once
+   more after channel set, or move the override into the monitor-add path
+   (__ath9k_htc_add_monitor_interface, where hvif.myaddr = common->macaddr).
+2. The decisive risk: does the AR9271 firmware ACK in HTC_M_MONITOR opmode at
+   all? Validate with the injection test in ackmon/README.md BEFORE relying on
+   it. If the firmware suppresses monitor ACK regardless of AR_STA_ID, fall
+   back to patching open-ath9k-htc-firmware.
+3. This override is global while enabled — use a dedicated adapter with only a
+   monitor vif up.

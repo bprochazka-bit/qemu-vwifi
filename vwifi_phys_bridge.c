@@ -30,6 +30,7 @@
 #include <stdint.h>
 #include <time.h>
 #include <net/if.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <arpa/inet.h>
@@ -47,6 +48,45 @@ static volatile sig_atomic_t g_running = 1;
 /* File descriptors */
 static int hub_fd = -1;
 static int raw_fd = -1;
+
+/* Our interface MAC (== the AP BSSID when bridging a single AP). Used by
+ * the phys->hub relevance filter so a busy channel's ambient traffic
+ * isn't dumped wholesale into the medium (which floods the hub and can
+ * crash the USB radio firmware). */
+static uint8_t own_mac[6];
+static int forward_all;   /* -A: disable the relevance filter (sniff mode) */
+
+/* -b <bssid>: address the relevance filter matches on, instead of the
+ * interface MAC. Needed for the two-radio setup where a dedicated ACK
+ * radio holds MAC == BSSID and a *separate* radio runs this bridge for
+ * capture/injection (its MAC is not the BSSID). */
+static uint8_t filter_bssid[6];
+static int have_filter_bssid;
+
+/* -m <mask>: relevance-filter address mask (1=care, 0=don't-care), mirroring
+ * the hardware bssidmask. Lets one bridge forward a whole prefix-aligned set
+ * of lab BSSIDs (e.g. 02:11:22:33:44:00..FF with mask ff:ff:ff:ff:ff:00)
+ * instead of a single exact address. Defaults to all-ones == exact match. */
+static uint8_t filter_mask[6] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
+
+/* -r <n>: inject each critical downlink frame N times (default 1). Injected
+ * frames are NO_ACK single-shot with no hardware retransmit (the injector can
+ * never hear "its" ACK -- the frame's source is the VM BSSID, not this radio),
+ * so on a congested/co-located channel a single collision drops a handshake
+ * frame with only slow ~1s EAPOL recovery. Sending 2-3 copies (retry bit set
+ * on copies 2+) trades a little airtime for a much better 4-way / assoc
+ * completion rate. Only association-critical frames are duplicated: management
+ * and the unprotected EAPOL handshake. Beacons/probe-responses (periodic) and
+ * encrypted user data are always injected once -- the latter because upper
+ * layers already retransmit and injected copies are not reliably de-duplicated
+ * by the receiver, so they would surface as application-level dupes (ping
+ * "DUP!"). */
+static int inject_copies = 1;
+
+/* Raise the interface MTU this high at startup so a full-size downlink
+ * frame (radiotap + 802.11 header + 1500-byte payload, ~1540 bytes) can
+ * be injected without EMSGSIZE ("Message too long"). */
+#define INJECT_MTU  2400
 
 /* CLI configuration */
 static const char *hub_path;
@@ -342,6 +382,17 @@ static uint64_t now_ms(void)
     return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
 }
 
+/* True if (addr & mask) == (key & mask) -- the same match the hardware
+ * bssidmask uses. Lets the relevance filter accept a prefix-aligned set. */
+static int addr_in_range(const uint8_t *addr, const uint8_t *key,
+                         const uint8_t *mask)
+{
+    for (int i = 0; i < 6; i++)
+        if ((addr[i] & mask[i]) != (key[i] & mask[i]))
+            return 0;
+    return 1;
+}
+
 /*
  * Record a frame hash before injection (hub->phys path).
  * Called just before writing to the raw socket so we can
@@ -434,16 +485,20 @@ static int connect_hub(const char *path)
 
 /*
  * Send the hello/registration message to the hub.
- * Format: [uint32_t len (net order)][uint32_t HELLO_MAGIC][node_id\0]
+ * Format: [uint32_t len (net order)][uint32_t HELLO_MAGIC][node_id\0][flags]
+ *
+ * The trailing flags byte announces this peer as a physical radio so the
+ * hub exempts its links from the simulated propagation model -- real RF
+ * is the only thing that should drop or attenuate these frames.
  */
 static int send_hello(int fd, const char *id)
 {
     size_t id_len = strlen(id) + 1;  /* include null terminator */
-    uint32_t payload_len = 4 + id_len;
+    uint32_t payload_len = 4 + id_len + 1;  /* + flags byte */
     uint32_t len_be = htonl(payload_len);
     uint32_t magic = HELLO_MAGIC;
 
-    uint8_t buf[4 + 4 + 64];
+    uint8_t buf[4 + 4 + 64 + 1];
     if (4 + payload_len > sizeof(buf)) {
         fprintf(stderr, "bridge: node_id too long\n");
         return -1;
@@ -452,6 +507,7 @@ static int send_hello(int fd, const char *id)
     memcpy(buf, &len_be, 4);
     memcpy(buf + 4, &magic, 4);
     memcpy(buf + 8, id, id_len);
+    buf[8 + id_len] = VWIFI_HELLO_FLAG_PHYSICAL;
 
     if (write_all(fd, buf, 4 + payload_len) < 0) {
         fprintf(stderr, "bridge: send_hello: %s\n", strerror(errno));
@@ -537,7 +593,89 @@ static int open_raw_socket(const char *iface)
         return -1;
     }
 
+    /* Read our own MAC (== the AP BSSID) for the relevance filter. */
+    {
+        struct ifreq ifr;
+        memset(&ifr, 0, sizeof(ifr));
+        strncpy(ifr.ifr_name, iface, IFNAMSIZ - 1);
+        if (ioctl(fd, SIOCGIFHWADDR, &ifr) == 0) {
+            memcpy(own_mac, ifr.ifr_hwaddr.sa_data, 6);
+            const uint8_t *k = have_filter_bssid ? filter_bssid : own_mac;
+            fprintf(stderr, "bridge: interface MAC %02x:%02x:%02x:%02x:%02x:%02x;"
+                    " relevance filter %s (match %02x:%02x:%02x:%02x:%02x:%02x"
+                    " mask %02x:%02x:%02x:%02x:%02x:%02x)\n",
+                    own_mac[0], own_mac[1], own_mac[2],
+                    own_mac[3], own_mac[4], own_mac[5],
+                    forward_all ? "OFF (-A)" : "on",
+                    k[0], k[1], k[2], k[3], k[4], k[5],
+                    filter_mask[0], filter_mask[1], filter_mask[2],
+                    filter_mask[3], filter_mask[4], filter_mask[5]);
+        } else {
+            fprintf(stderr, "bridge: SIOCGIFHWADDR: %s "
+                    "(relevance filter disabled)\n", strerror(errno));
+            forward_all = 1;
+        }
+    }
+
+    /* Raise the MTU so full-size downlink frames can be injected. Drivers
+     * cap this differently (ath9k_htc rejects 2400), so probe a descending
+     * list and keep the highest the driver accepts. Best effort: if none
+     * take, warn -- the operator can clamp MSS on the AP instead. */
+    {
+        static const int mtu_try[] = { INJECT_MTU, 2304, 2048, 1800, 1600 };
+        int set_mtu = 0;
+        for (size_t i = 0; i < sizeof(mtu_try) / sizeof(mtu_try[0]); i++) {
+            struct ifreq ifr;
+            memset(&ifr, 0, sizeof(ifr));
+            strncpy(ifr.ifr_name, iface, IFNAMSIZ - 1);
+            ifr.ifr_mtu = mtu_try[i];
+            if (ioctl(fd, SIOCSIFMTU, &ifr) == 0) {
+                set_mtu = mtu_try[i];
+                break;
+            }
+        }
+        if (set_mtu)
+            fprintf(stderr, "bridge: %s MTU set to %d\n", iface, set_mtu);
+        else
+            fprintf(stderr, "bridge: could not raise %s MTU (driver cap): %s "
+                    "-- large downlink frames will fail; clamp MSS on the AP "
+                    "(e.g. lower br-lan MTU to 1400)\n",
+                    iface, strerror(errno));
+    }
+
     return fd;
+}
+
+/* Set when the capture interface flaps (e.g. an mt76 USB reset produces
+ * ENETDOWN on read). The main loop reopens the raw socket instead of exiting,
+ * so a momentary radio reset is a self-healing blip rather than a full outage
+ * that needs a manual restart. */
+static int raw_needs_reopen;
+
+/* Close and reopen the raw capture socket, retrying with backoff until the
+ * interface comes back up (or shutdown is requested). Updates the global
+ * raw_fd; the main loop rebinds its pollfd to it each iteration. */
+static void reopen_raw_socket(void)
+{
+    if (raw_fd >= 0) {
+        close(raw_fd);
+        raw_fd = -1;
+    }
+    fprintf(stderr, "bridge: capture interface %s down -- reopening...\n", ifname);
+    int backoff_ms = 200;
+    while (g_running) {
+        int fd = open_raw_socket(ifname);
+        if (fd >= 0) {
+            raw_fd = fd;
+            fprintf(stderr, "bridge: %s recovered\n", ifname);
+            return;
+        }
+        struct timespec ts = { backoff_ms / 1000,
+                               (long)(backoff_ms % 1000) * 1000000L };
+        nanosleep(&ts, NULL);
+        if (backoff_ms < 2000)
+            backoff_ms *= 2;
+    }
 }
 
 /* ================================================================
@@ -687,13 +825,34 @@ static size_t parse_radiotap(const uint8_t *buf, size_t len,
  *  over the air via the monitor-mode interface.
  * ================================================================ */
 
-/* Minimal radiotap header for injection: 8 bytes, no fields */
-static const uint8_t inject_radiotap[8] = {
+/*
+ * Radiotap header for injection.
+ *
+ * We MUST advertise IEEE80211_RADIOTAP_TX_FLAGS with the NO_ACK bit set.
+ * Without it, mac80211 treats an injected frame as an ordinary transmit that
+ * expects a hardware ACK, and when the injecting radio does not hear one it
+ * retransmits the frame up to the driver's retry limit (~15x). For a virtual
+ * AP whose real ACKs are produced by a *different* logical entity (the phone
+ * ACKs the downlink in the air; the AR9271 ACKs the uplink), those hardware
+ * retransmits are pure self-inflicted airtime: each downlink EAPOL/data frame
+ * hits the air ~15 times with the retry flag set, saturating the SIFS window
+ * that the station's uplink ACK needs and stalling the 4-way handshake.
+ *
+ * NO_ACK => inject exactly once, do not wait for an ACK, do not retransmit.
+ * The medium is the retransmit authority; the air is a single-shot relay.
+ *
+ *   present = 1 << 15 (IEEE80211_RADIOTAP_TX_FLAGS)   = 0x00008000
+ *   tx_flags = 0x0008 (IEEE80211_RADIOTAP_F_TX_NOACK)
+ */
+#define RADIOTAP_TX_FLAG_NOACK 0x0008
+static const uint8_t inject_radiotap[] = {
     0x00,                   /* version */
     0x00,                   /* pad */
-    0x08, 0x00,             /* length = 8 (LE) */
-    0x00, 0x00, 0x00, 0x00  /* present = 0 */
+    0x0a, 0x00,             /* length = 10 (LE) */
+    0x00, 0x80, 0x00, 0x00, /* present = TX_FLAGS (bit 15) */
+    0x08, 0x00              /* tx_flags = NO_ACK (LE) */
 };
+#define INJECT_RADIOTAP_LEN (sizeof(inject_radiotap))
 
 /*
  * Process a single hub message (payload after the 4-byte length prefix).
@@ -705,7 +864,7 @@ static void process_hub_message(const uint8_t *payload, uint32_t payload_len)
     const uint8_t *frame;
     uint16_t frame_len;
     uint16_t msg_chan_freq;
-    uint8_t inject_buf[8 + VWIFI_MAX_FRAME_SIZE];
+    uint8_t inject_buf[INJECT_RADIOTAP_LEN + VWIFI_MAX_FRAME_SIZE];
     ssize_t n;
 
     /* Need at least a v1 header */
@@ -761,20 +920,52 @@ static void process_hub_message(const uint8_t *payload, uint32_t payload_len)
     echo_record(frame, frame_len);
 
     /* Build injection buffer: radiotap header + 802.11 frame */
-    memcpy(inject_buf, inject_radiotap, 8);
-    memcpy(inject_buf + 8, frame, frame_len);
+    memcpy(inject_buf, inject_radiotap, INJECT_RADIOTAP_LEN);
+    memcpy(inject_buf + INJECT_RADIOTAP_LEN, frame, frame_len);
 
-    n = write(raw_fd, inject_buf, 8 + frame_len);
-    if (n < 0) {
-        if (errno != EAGAIN && errno != ENOBUFS)
-            fprintf(stderr, "bridge: inject write: %s\n", strerror(errno));
-        return;
+    /* Redundant injection is only for the one-shot, association-critical
+     * frames that have no L2 retransmit and whose loss stalls the connection:
+     * management (auth/assoc/deauth/disassoc) and the unprotected EAPOL
+     * handshake (data frames sent before the key is installed). Everything
+     * else is injected once:
+     *   - beacons / probe responses: periodic, one loss is harmless;
+     *   - encrypted user data (Protected bit set): duplicating it delivers
+     *     duplicates all the way to the application (ping "DUP!", etc.) --
+     *     the receiver's dup filter does not reliably drop injected copies --
+     *     and TCP/ARP/DHCP already retransmit on their own. */
+    int copies = inject_copies;
+    {
+        int ftype       = (frame[0] >> 2) & 0x3;   /* 0=mgmt,1=ctrl,2=data */
+        int fsub        = (frame[0] >> 4) & 0xf;
+        int protected_f = frame[1] & 0x40;         /* FC Protected bit */
+        if (ftype == 0 && (fsub == 8 || fsub == 5))   /* beacon / probe-resp */
+            copies = 1;
+        else if (ftype == 2 && protected_f)           /* encrypted user data */
+            copies = 1;
+    }
+
+    for (int c = 0; c < copies; c++) {
+        /* Mark copies 2+ as retransmissions so the receiver's duplicate
+         * filter drops them when an earlier copy already arrived. */
+        if (c == 1)
+            inject_buf[INJECT_RADIOTAP_LEN + 1] |= 0x08;  /* FC retry bit */
+
+        n = write(raw_fd, inject_buf, INJECT_RADIOTAP_LEN + frame_len);
+        if (n < 0) {
+            if (errno == EMSGSIZE)
+                fprintf(stderr, "bridge: inject write: Message too long "
+                        "(frame=%u, need MTU >= %zu; raise it or clamp MSS)\n",
+                        frame_len, INJECT_RADIOTAP_LEN + frame_len);
+            else if (errno != EAGAIN && errno != ENOBUFS)
+                fprintf(stderr, "bridge: inject write: %s\n", strerror(errno));
+            return;
+        }
     }
 
     stats_hub_to_phys++;
     if (verbose)
-        fprintf(stderr, "bridge: hub->phys: injected %u bytes (ch=%u)\n",
-                frame_len, msg_chan_freq);
+        fprintf(stderr, "bridge: hub->phys: injected %u bytes x%d (ch=%u)\n",
+                frame_len, copies, msg_chan_freq);
 }
 
 /* ================================================================
@@ -824,9 +1015,11 @@ static void handle_phys_data(void)
     if (nread <= 0) {
         if (nread < 0 && (errno == EAGAIN || errno == EINTR))
             return;
-        fprintf(stderr, "bridge: raw socket read error: %s\n",
+        /* ENETDOWN and friends: the capture radio flapped (mt76 USB reset).
+         * Recover by reopening the socket rather than exiting. */
+        fprintf(stderr, "bridge: raw socket read error: %s -- recovering\n",
                 strerror(errno));
-        g_running = 0;
+        raw_needs_reopen = 1;
         return;
     }
 
@@ -856,6 +1049,43 @@ static void handle_phys_data(void)
     /* Oversized frame check */
     if (frame_len > VWIFI_MAX_FRAME_SIZE)
         return;
+
+    /* Relevance filter: on a busy channel the radio hears tens of thousands
+     * of unrelated frames; forwarding them all floods the hub, loads the
+     * bridge, and can crash the USB firmware. Keep only frames that belong to
+     * our lab BSSID set. Disable with -A to forward everything.
+     *
+     *  - Control frames (ACK/RTS/CTS/BlockAck): never forwarded. They are
+     *    PHY-local and meaningless in the medium.
+     *  - Unicast: Addr1 (RA, offset 4) must be in our BSSID range.
+     *  - Group-addressed: forward probe requests (discovery) and any frame
+     *    whose BSSID (Addr3, offset 16) is in our range; drop foreign beacons
+     *    and neighbours' broadcasts -- the bulk of the ambient flood. A
+     *    client's broadcast uplink (DHCP/ARP) is toDS with RA == BSSID, so it
+     *    is unicast-at-L2 and already covered by the RA test above. */
+    if (!forward_all) {
+        int ftype = (frame[0] >> 2) & 0x3;   /* 0=mgmt,1=ctrl,2=data */
+        int fsub  = (frame[0] >> 4) & 0xf;
+
+        if (ftype == 1)                      /* control frame */
+            return;
+
+        const uint8_t *ra = frame + 4;
+        const uint8_t *key = have_filter_bssid ? filter_bssid : own_mac;
+        int is_group = (ra[0] & 0x01);
+
+        if (!is_group) {
+            if (!addr_in_range(ra, key, filter_mask))
+                return;
+        } else {
+            int is_probe_req = (ftype == 0 && fsub == 4);
+            const uint8_t *bssid = frame + 16;   /* Addr3 (mgmt: == BSSID) */
+            int have_bssid = (frame_len >= 24);
+            if (!is_probe_req &&
+                !(have_bssid && addr_in_range(bssid, key, filter_mask)))
+                return;
+        }
+    }
 
     /* Echo check — drop frames we injected */
     if (echo_check(frame, frame_len)) {
@@ -1007,6 +1237,20 @@ static void usage(const char *prog)
         "                   HT20, HT40+, HT40-, VHT80, VHT160, VHT80+80\n"
         "  -s <center2_mhz> Secondary 80MHz center freq (VHT80+80 only)\n"
         "  -n <node_id>     Node ID for hub registration (default: phys-<ifname>)\n"
+        "  -b <bssid>       Relevance-filter on this BSSID instead of the\n"
+        "                   interface MAC (two-radio setup: dedicated ACK radio\n"
+        "                   holds MAC=BSSID, this radio does capture/inject)\n"
+        "  -m <mask>        Relevance-filter address mask (1=care, 0=don't-care,\n"
+        "                   default ff:ff:ff:ff:ff:ff). Forward a prefix-aligned\n"
+        "                   BSSID set, e.g. -b 02:11:22:33:44:00 -m ff:ff:ff:ff:ff:00\n"
+        "                   forwards 02:11:22:33:44:00..FF\n"
+        "  -r <n>           Inject each critical downlink frame N times (default\n"
+        "                   1; try 2-3 on a lossy/congested channel). Only\n"
+        "                   management + EAPOL are duplicated; beacons and\n"
+        "                   encrypted data are always injected once.\n"
+        "  -A               Forward ALL captured frames (disable the relevance\n"
+        "                   filter; only for sniffing -- floods the hub on a\n"
+        "                   busy channel)\n"
         "  -v               Verbose logging\n"
         "  -h               This help\n"
         "\n"
@@ -1034,8 +1278,31 @@ int main(int argc, char *argv[])
     /* Reset getopt to start scanning from argv[3] */
     optind = 3;
 
-    while ((opt = getopt(argc, argv, "c:w:s:n:vh")) != -1) {
+    while ((opt = getopt(argc, argv, "c:w:s:n:b:m:r:Avh")) != -1) {
         switch (opt) {
+        case 'b': {
+            unsigned int m[6];
+            if (sscanf(optarg, "%x:%x:%x:%x:%x:%x",
+                       &m[0], &m[1], &m[2], &m[3], &m[4], &m[5]) != 6) {
+                fprintf(stderr, "bridge: bad -b BSSID: %s\n", optarg);
+                return 1;
+            }
+            for (int i = 0; i < 6; i++)
+                filter_bssid[i] = (uint8_t)m[i];
+            have_filter_bssid = 1;
+            break;
+        }
+        case 'm': {
+            unsigned int m[6];
+            if (sscanf(optarg, "%x:%x:%x:%x:%x:%x",
+                       &m[0], &m[1], &m[2], &m[3], &m[4], &m[5]) != 6) {
+                fprintf(stderr, "bridge: bad -m mask: %s\n", optarg);
+                return 1;
+            }
+            for (int i = 0; i < 6; i++)
+                filter_mask[i] = (uint8_t)m[i];
+            break;
+        }
         case 'c':
             channel_num = atoi(optarg);
             if (channel_num <= 0) {
@@ -1051,6 +1318,16 @@ int main(int argc, char *argv[])
             break;
         case 'n':
             snprintf(node_id, sizeof(node_id), "%s", optarg);
+            break;
+        case 'r':
+            inject_copies = atoi(optarg);
+            if (inject_copies < 1 || inject_copies > 8) {
+                fprintf(stderr, "bridge: -r must be 1..8: %s\n", optarg);
+                return 1;
+            }
+            break;
+        case 'A':
+            forward_all = 1;
             break;
         case 'v':
             verbose = 1;
@@ -1124,10 +1401,19 @@ int main(int argc, char *argv[])
     /* Main poll loop */
     {
         struct pollfd pfds[2];
-        pfds[0].fd = raw_fd;   pfds[0].events = POLLIN;
         pfds[1].fd = hub_fd;   pfds[1].events = POLLIN;
 
         while (g_running) {
+            /* A capture-interface flap (mt76 USB reset) is recoverable: reopen
+             * the raw socket rather than tearing the whole bridge down. */
+            if (raw_needs_reopen) {
+                reopen_raw_socket();
+                raw_needs_reopen = 0;
+                if (!g_running)
+                    break;
+            }
+
+            pfds[0].fd = raw_fd;   pfds[0].events = POLLIN;
             pfds[0].revents = 0;
             pfds[1].revents = 0;
 
@@ -1138,8 +1424,6 @@ int main(int argc, char *argv[])
                 perror("bridge: poll");
                 break;
             }
-            if (nready == 0)
-                continue;
 
             /* Hub -> physical */
             if (pfds[1].revents & POLLIN)
@@ -1149,12 +1433,15 @@ int main(int argc, char *argv[])
             if (pfds[0].revents & POLLIN)
                 handle_phys_data();
 
+            /* Capture interface error (flap): reopen on the next iteration. */
+            if (pfds[0].revents & (POLLERR | POLLHUP | POLLNVAL))
+                raw_needs_reopen = 1;
+
             /* Hub disconnect is fatal */
             if (pfds[1].revents & (POLLERR | POLLHUP)) {
                 fprintf(stderr, "bridge: hub connection lost\n");
                 break;
             }
-            /* Raw socket errors are transient (interface flap) — ignore */
         }
     }
 

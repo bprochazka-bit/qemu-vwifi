@@ -203,12 +203,22 @@ sudo tcpdump -i wlan0 -e -n
 ## Bridging in a real radio (optional)
 
 `vwifi-phys-bridge` connects a physical WiFi interface in monitor
-mode to the medium, so an external device can associate with a
-virtual AP running inside a QEMU VM.
+mode to the medium, making the virtual APs/clients **observable** over
+the air (and real traffic injectable into the sim).
 
 ```bash
 sudo ./vwifi-phys-bridge /tmp/vwifi.sock wlx90de801c625f -c 6 -v
 ```
+
+> **Association caveat.** Plain monitor mode lets a real device *see*
+> the virtual APs but **not reliably *join* one**: an 802.11 STA needs
+> its frames ACKed within SIFS (~10–16 µs), which only a real radio's
+> MAC hardware can do — a software relay is ~1000× too slow. To let an
+> unmodifiable real station (e.g. an Android phone) actually associate
+> to a virtual OpenWRT AP using a single radio, see
+> [`docs/ar9271-phys-bridge-lab.md`](docs/ar9271-phys-bridge-lab.md),
+> which keeps the VM as the literal AP and adds a hardware-ACK hook on
+> an AR9271 (open firmware).
 
 Options:
 
@@ -312,9 +322,17 @@ The MAC must be unique on the medium.
    `/dev/vwifi`, and `write()`s it to the hub's Unix socket.
 6. The hub looks up each peer's last known channel and fans the
    frame out only to peers whose channel matches (including HT40
-   bond_freq and VHT80+ center_freq disambiguation). A per-link
-   SNR model decides per-frame whether to drop based on the
-   sender's rate code and the receiver's link SNR.
+   bond_freq and VHT80+ center_freq disambiguation; the HT40 bond
+   pair is only enforced when both peers declare one, so a narrow
+   station still hears a bonded AP on the shared primary). A
+   per-link SNR model decides per-frame whether to drop based on
+   the sender's rate code and the receiver's link SNR. Links that
+   touch a **physical radio** (the phys bridge, which registers
+   with the `physical` hello flag) are exempt from this model:
+   real-world RF is the channel, so the hub never adds simulated
+   loss or rewrites their RSSI. Inter-hub TCP **bridges** are
+   multi-channel trunks and are likewise never channel-filtered;
+   the downstream hub filters per-receiver.
 7. Each QEMU vwifi-virt device injects the frame into the guest's
    RX path.
 
