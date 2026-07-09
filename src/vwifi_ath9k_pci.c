@@ -30,6 +30,7 @@
 #include "vwifi_ath9k_eeprom.h"
 #include "vwifi_ath9k_dma.h"
 #include "vwifi_ath9k_crypto.h"
+#include "vwifi_ath9k_wep.h"
 #include "vwifi.h"
 
 #include <sys/socket.h>
@@ -500,23 +501,15 @@ static void vwifi_ath9k_send_rate(VwifiAth9kState *s, const uint8_t *frame,
  * ------------------------------------------------------------------- */
 
 /*
- * Reconstruct the 128-bit CCMP key stored in cache entry `slot`.
- * Returns false if the slot is not a valid CCM (AES-CCM) entry.  The key
- * material layout matches ath_hw_set_keycache_entry(): key0..key4 split as
- * 4/2/4/2/4 little-endian octets.
+ * Reconstruct the 16 octets of key material stored in cache entry `slot`.
+ * The layout matches ath_hw_set_keycache_entry(): key0..key4 split as
+ * 4/2/4/2/4 little-endian octets.  This is cipher-independent; the caller
+ * checks the slot's key type and uses as many octets as that cipher needs.
  */
-static bool vwifi_ath9k_keycache_ccm(VwifiAth9kState *s, unsigned slot,
-                                     uint8_t key[16])
+static void vwifi_ath9k_keycache_material(VwifiAth9kState *s, unsigned slot,
+                                          uint8_t key[16])
 {
     uint32_t k0, k1, k2, k3, k4;
-
-    if (slot >= AR_KEY_CACHE_SIZE) {
-        return false;
-    }
-    if ((vwifi_ath9k_reg_read_raw(s, AR_KEYTABLE_TYPE(slot)) &
-         AR_KEYTABLE_TYPE_MASK) != AR_KEYTABLE_TYPE_CCM) {
-        return false;
-    }
 
     k0 = vwifi_ath9k_reg_read_raw(s, AR_KEYTABLE_KEY0(slot));
     k1 = vwifi_ath9k_reg_read_raw(s, AR_KEYTABLE_KEY1(slot)) & 0xffff;
@@ -529,7 +522,50 @@ static bool vwifi_ath9k_keycache_ccm(VwifiAth9kState *s, unsigned slot,
     key[6]  = k2;       key[7]  = k2 >> 8;  key[8]  = k2 >> 16; key[9]  = k2 >> 24;
     key[10] = k3;       key[11] = k3 >> 8;
     key[12] = k4;       key[13] = k4 >> 8;  key[14] = k4 >> 16; key[15] = k4 >> 24;
+}
+
+/*
+ * Reconstruct the 128-bit CCMP key stored in cache entry `slot`.
+ * Returns false if the slot is not a valid CCM (AES-CCM) entry.
+ */
+static bool vwifi_ath9k_keycache_ccm(VwifiAth9kState *s, unsigned slot,
+                                     uint8_t key[16])
+{
+    if (slot >= AR_KEY_CACHE_SIZE) {
+        return false;
+    }
+    if ((vwifi_ath9k_reg_read_raw(s, AR_KEYTABLE_TYPE(slot)) &
+         AR_KEYTABLE_TYPE_MASK) != AR_KEYTABLE_TYPE_CCM) {
+        return false;
+    }
+    vwifi_ath9k_keycache_material(s, slot, key);
     return true;
+}
+
+/*
+ * Reconstruct the WEP key stored in cache entry `slot`.  Returns the key
+ * length in octets (5 = WEP-40, 13 = WEP-104, 16 = WEP-128) or 0 if the slot
+ * does not hold a WEP key.  Unused slots read as AR_KEYTABLE_TYPE_CLR (the
+ * driver resets every entry to CLR during init), so a genuinely empty slot is
+ * rejected here even though WEP-40 happens to be key type 0.
+ */
+static int vwifi_ath9k_keycache_wep(VwifiAth9kState *s, unsigned slot,
+                                    uint8_t key[16])
+{
+    int keylen;
+
+    if (slot >= AR_KEY_CACHE_SIZE) {
+        return 0;
+    }
+    switch (vwifi_ath9k_reg_read_raw(s, AR_KEYTABLE_TYPE(slot)) &
+            AR_KEYTABLE_TYPE_MASK) {
+    case AR_KEYTABLE_TYPE_40:  keylen = 5;  break;
+    case AR_KEYTABLE_TYPE_104: keylen = 13; break;
+    case AR_KEYTABLE_TYPE_128: keylen = 16; break;
+    default:                   return 0;
+    }
+    vwifi_ath9k_keycache_material(s, slot, key);
+    return keylen;
 }
 
 /*
@@ -557,6 +593,34 @@ static bool vwifi_ath9k_rx_decrypt(VwifiAth9kState *s, const uint8_t *src,
         }
         memcpy(dst, src, len);
         if (vwifi_ccmp_decrypt(key, dst, len) == 0) {
+            *out_keyix = (uint8_t)slot;
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * Decrypt a received WEP MPDU.  WEP carries no cryptographic MIC, only a
+ * 32-bit ICV, and the KeyID in the IV header only selects one of the (few)
+ * default keys — so, as with CCM, we try each populated WEP slot and accept
+ * the one whose ICV verifies.  In practice at most four WEP keys are ever
+ * programmed, so the 2^-32 per-slot false-accept rate is negligible.
+ */
+static bool vwifi_ath9k_rx_decrypt_wep(VwifiAth9kState *s, const uint8_t *src,
+                                       uint8_t *dst, int len, uint8_t *out_keyix)
+{
+    unsigned slot;
+
+    for (slot = 0; slot < AR_KEY_CACHE_SIZE; slot++) {
+        uint8_t key[16];
+        int keylen = vwifi_ath9k_keycache_wep(s, slot, key);
+
+        if (keylen == 0) {
+            continue;
+        }
+        memcpy(dst, src, len);
+        if (vwifi_wep_decrypt(key, keylen, dst, len) == 0) {
             *out_keyix = (uint8_t)slot;
             return true;
         }
@@ -769,12 +833,13 @@ static void vwifi_ath9k_process_tx_queue(VwifiAth9kState *s, int qnum)
 
                 /*
                  * Hardware crypto offload: if the driver flagged this frame
-                 * for encryption (valid key-cache index + AES/CCM encr type)
-                 * and it carries the Protected bit, run CCMP the way the
-                 * AR9285 crypto engine would — encrypt the payload in place
-                 * and append the 8-byte MIC.  mac80211 has already inserted
-                 * the CCMP header (IV/PN) because ath9k advertises
-                 * IEEE80211_KEY_FLAG_GENERATE_IV.
+                 * for encryption (valid key-cache index + an encr type) and it
+                 * carries the Protected bit, run the transform the AR9285
+                 * crypto engine would — encrypt the payload in place and append
+                 * the cipher's trailer.  mac80211 has already inserted the IV
+                 * header (CCMP header for AES, 4-byte WEP IV for WEP) because
+                 * ath9k advertises IEEE80211_KEY_FLAG_GENERATE_IV; the driver's
+                 * frame_len already reserves the trailer (MIC / ICV).
                  */
                 if ((ds_ctl0 & AR_DestIdxValid) &&
                     encr_type == AR_ENCR_TYPE_AES &&
@@ -796,6 +861,29 @@ static void vwifi_ath9k_process_tx_queue(VwifiAth9kState *s, int qnum)
                         }
                     } else {
                         vwifi_ath9k_warn("TX: no CCM key at cache slot %u",
+                                    keyix);
+                    }
+                } else if ((ds_ctl0 & AR_DestIdxValid) &&
+                           encr_type == AR_ENCR_TYPE_WEP &&
+                           vwifi_dot11_protected(frame_buf, send_len)) {
+                    unsigned keyix = (ds_ctl1 & AR_DestIdx) >> AR_DestIdx_S;
+                    uint8_t key[16];
+                    int keylen = vwifi_ath9k_keycache_wep(s, keyix, key);
+
+                    if (keylen > 0) {
+                        int enc_len = send_len;
+                        if (vwifi_wep_encrypt(key, keylen, frame_buf, &enc_len,
+                                              (int)sizeof(frame_buf)) == 0) {
+                            vwifi_ath9k_trace("TX WEP encrypt keyix=%u "
+                                        "%u -> %d bytes", keyix, send_len,
+                                        enc_len);
+                            send_len = enc_len;
+                        } else {
+                            vwifi_ath9k_warn("TX WEP encrypt failed "
+                                        "(keyix=%u len=%u)", keyix, send_len);
+                        }
+                    } else {
+                        vwifi_ath9k_warn("TX: no WEP key at cache slot %u",
                                     keyix);
                     }
                 }
@@ -1227,14 +1315,19 @@ static void vwifi_ath9k_inject_rx_frame(VwifiAth9kState *s,
 
     /*
      * Hardware crypto offload (RX): if the frame carries the Protected bit,
-     * decrypt it with a matching CCM key from the key cache before DMAing it
-     * to the driver, exactly as the AR9285 crypto engine would.  mac80211
-     * relies on this: ath9k_cmn_rx_skb_postprocess() sets RX_FLAG_DECRYPTED
-     * only when the RX status reports a valid key index and no decrypt error,
-     * after which mac80211 strips the CCMP header and the trailing MIC.  If
-     * we cannot decrypt (unknown/absent key, or non-CCMP cipher such as
-     * TKIP/WEP which we do not emulate), we flag a decrypt error so the frame
-     * is dropped rather than delivered as garbage.
+     * decrypt it with a matching key from the key cache before DMAing it to
+     * the driver, exactly as the AR9285 crypto engine would.  mac80211 relies
+     * on this: ath9k_cmn_rx_skb_postprocess() sets RX_FLAG_DECRYPTED only when
+     * the RX status reports a valid key index and no decrypt error, after
+     * which mac80211 strips the IV header and the trailing MIC/ICV.  If we
+     * cannot decrypt (unknown/absent key, or an unsupported cipher such as
+     * TKIP), we flag a decrypt error so the frame is dropped rather than
+     * delivered as garbage.
+     *
+     * The cipher is inferred from the IV header: CCMP/TKIP set the ExtIV bit
+     * (8-octet header) while WEP does not (4-octet header).  We emulate CCMP
+     * (ExtIV) and WEP; a TKIP frame (ExtIV set) fails CCM decryption and is
+     * dropped.
      *
      * This path is frame-type agnostic: it keys off the Protected bit, so
      * individually-addressed protected management frames (802.11w / PMF, which
@@ -1247,17 +1340,29 @@ static void vwifi_ath9k_inject_rx_frame(VwifiAth9kState *s,
     bool    rx_decrypted = false;
     bool    rx_decrypt_err = false;
     if (vwifi_dot11_protected(frame, frame_len)) {
-        if (frame_len <= (int)sizeof(rx_decbuf) &&
-            vwifi_ath9k_rx_decrypt(s, frame, rx_decbuf, frame_len,
-                                   &rx_keyix)) {
+        int rx_hdrlen = vwifi_wep_hdrlen(frame, frame_len);
+        bool ext_iv = vwifi_wep_is_extiv(frame, frame_len, rx_hdrlen);
+        bool ok;
+
+        if (frame_len > (int)sizeof(rx_decbuf)) {
+            ok = false;
+        } else if (ext_iv) {
+            ok = vwifi_ath9k_rx_decrypt(s, frame, rx_decbuf, frame_len,
+                                        &rx_keyix);
+        } else {
+            ok = vwifi_ath9k_rx_decrypt_wep(s, frame, rx_decbuf, frame_len,
+                                            &rx_keyix);
+        }
+
+        if (ok) {
             frame = rx_decbuf;
             rx_decrypted = true;
-            vwifi_ath9k_trace("RX CCMP decrypt ok keyix=%u len=%u",
-                        rx_keyix, frame_len);
+            vwifi_ath9k_trace("RX %s decrypt ok keyix=%u len=%u",
+                        ext_iv ? "CCMP" : "WEP", rx_keyix, frame_len);
         } else {
             rx_decrypt_err = true;
-            vwifi_ath9k_warn("RX CCMP decrypt failed (len=%u) — dropping",
-                        frame_len);
+            vwifi_ath9k_warn("RX %s decrypt failed (len=%u) — dropping",
+                        ext_iv ? "CCMP" : "WEP", frame_len);
         }
     }
 
@@ -2103,7 +2208,7 @@ static void vwifi_ath9k_mmio_write(void *opaque, hwaddr addr, uint64_t val64,
         /* Hardware key cache (WEP/TKIP/CCMP offload).
          * The driver programs keys here via ath_hw_set_keycache_entry();
          * we shadow the writes in regs[] and read the key material back at
-         * TX/RX time to perform CCMP.  Stored silently (no UNHANDLED spam). */
+         * TX/RX time to perform CCMP or WEP.  Stored silently (no UNHANDLED). */
         if (addr >= AR_KEYTABLE_0 && addr < AR_KEYTABLE_END) {
             vwifi_ath9k_reg_write_raw(s, addr, val);
             break;

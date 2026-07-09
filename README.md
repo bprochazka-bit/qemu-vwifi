@@ -356,10 +356,10 @@ The following registers are explicitly handled in Phase 1:
 | AR_WA | 0x4004 | ✓ | ✓ | Workaround register, AR9285 default |
 | AR_STA_ID0/1 | 0x8000/4 | ✓ | ✓ | Station MAC, shadow |
 | AR_PM_STATE | 0x4008 | ✓ | — | Reports awake |
-| AR_KEYTABLE | 0x8800–0x97FF | ✓ | ✓ | Hardware key cache (CCMP offload) |
+| AR_KEYTABLE | 0x8800–0x97FF | ✓ | ✓ | Hardware key cache (CCMP / WEP offload) |
 | All others | * | ✓ | ✓ | Shadow register + UNHANDLED warning |
 
-## Hardware Crypto (WPA2 / WPA3 / CCMP)
+## Hardware Crypto (WPA2 / WPA3 / CCMP / WEP)
 
 Real ath9k hardware offloads CCMP (AES-CCM) to an on-chip crypto engine
 driven by the key cache, and advertises that capability to mac80211.  Because
@@ -436,6 +436,30 @@ As a result WPA3-Personal associates and passes traffic on the unmodified
 plane, and PMF is covered by the engine's management-frame path plus
 mac80211's software BIP.
 
+### WEP (RC4 + CRC-32)
+
+WEP is offloaded to the same key cache: the driver programs the WEP key into a
+slot (key type 40 / 104 / 128), mac80211 inserts the 4-octet IV header
+(`IEEE80211_KEY_FLAG_GENERATE_IV`), and the hardware appends the 4-octet ICV —
+so, like CCMP, an unemulated engine drops every WEP frame.  The engine lives in
+`src/vwifi_ath9k_wep.h` and performs the §12.3.2 transform:
+`RC4(IV ‖ key)` over `plaintext ‖ CRC-32(plaintext)`.
+
+- **Cipher discrimination**: CCMP/TKIP set the *ExtIV* bit in the IV header (an
+  8-octet header); WEP does not (4-octet header).  On RX the device inspects
+  that bit to route a protected frame to the WEP or the CCM path.
+- **Key length** comes from the slot's key type (5 / 13 / 16 octets), read back
+  through the same `key0..key4` split the CCM path uses.  Unused slots read as
+  `AR_KEYTABLE_TYPE_CLR`, so a genuinely empty slot is rejected even though
+  WEP-40 is key type 0.
+- **RX key selection**: WEP has no cryptographic MIC, only a 32-bit ICV, so the
+  device tries each populated WEP slot and accepts the one whose ICV verifies.
+  In practice ≤ 4 WEP keys are ever programmed, making the 2⁻³² per-slot
+  false-accept rate negligible.
+
+WEP is cryptographically broken and offered only for legacy interoperability
+and driver testing; use WPA2/WPA3 for anything real.
+
 ### Scope and verification
 
 The AES-CCM implementation lives in `src/vwifi_ath9k_crypto.h` and follows
@@ -447,8 +471,13 @@ rejection, the **protected-management-frame (PMF) path** — its nonce/AAD
 checked against an independent 802.11 reference and its ciphertext/MIC against
 OpenSSL — and the full key-cache TX→RX data path.
 
-Supported: **WPA2-Personal and WPA3-Personal (CCMP-128), including PMF.**
-TKIP and WEP keys are stored but not decrypted, so those ciphers remain
+The WEP engine has its own suite (`make test-wep`, `tests/test_wep.c`): RC4
+against the published keystream vectors, CRC-32 against `zlib` and the canonical
+check value, WEP-40/104/128 MPDU round-trip, ICV forgery rejection, the
+per-type key-cache reconstruction, and ExtIV discrimination.
+
+Supported: **WPA2-Personal and WPA3-Personal (CCMP-128, incl. PMF), and WEP-40 /
+104 / 128.**  TKIP keys are stored but not decrypted, so TKIP remains
 unsupported; WPA3-Enterprise 192-bit (GCMP-256 / BIP-GMAC-256) would need a
 separate AES-GCM engine and is out of scope.
 

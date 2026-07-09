@@ -134,6 +134,14 @@ test-crypto:
 		-o tests/test_ccmp tests/test_ccmp.c -lcrypto
 	./tests/test_ccmp
 
+.PHONY: test-wep
+test-wep:
+	@echo "=== Building and running WEP crypto unit test ==="
+	@command -v cc >/dev/null 2>&1 || { echo "cc not found"; exit 1; }
+	cc -O2 -Wall -Isrc \
+		-o tests/test_wep tests/test_wep.c -lz
+	./tests/test_wep
+
 # ---- Static analysis (optional, requires cppcheck) ----------------
 
 .PHONY: lint
