@@ -211,6 +211,7 @@ sudo ./vwifi-phys-bridge /run/vwifi/foo.sock wlx00c0cab57e6f \
 | `-b <bssid>` | relevance-filter match address (the range base) |
 | `-m <mask>`  | relevance-filter mask — forward the whole `…:00..03` set, not one BSSID |
 | `-r <n>`     | inject each critical frame N times (beacons/probe-resps excluded); use 2–3 on a lossy channel |
+| `-R <mbps>`  | over-air downlink rate (`1,2,5.5,6,9,11,12,18,24,36,48,54`, or `0`=auto/echo the VM's rate, floored at 6 Mbps). **Without a rate the mt76 monitor path injects at ~1 Mbps and caps downlink throughput.** No rate fallback on NO_ACK inject, so too high a rate for the link just raises loss — sweep 24–36 first. `INJECT_RATE=<mbps>` in `lab-bringup.sh`. |
 | `-c <chan>`  | channel (must match the AP + AR9271 + MT7921U) |
 
 The bridge already: injects `NO_ACK` (no 15× self-retransmit storm); drops
@@ -246,6 +247,7 @@ Signs of each historical failure mode, for future debugging:
 | WPA2 associates, 4-way completes, **no data / no DHCP**, `rx drop misc` climbs | VM ath9k hw-crypto not real | `nohwcrypt=1` (§4) |
 | ping shows `DUP!`, each downlink 2–3× | `-r` duplicating encrypted data | (built in: only mgmt/EAPOL duplicated) |
 | `reason=3/4 locally_generated`, periodic reconnects | beacon/keepalive loss (co-location, congestion) | separate radios, clean channel |
+| download ≪ upload (e.g. 0.4 vs 5 Mbps), witness shows downlink at ~1 Mbps | injector sent no radiotap rate → mt76 monitor default | set `-R`/`INJECT_RATE` (§5); auto now floors at 6 Mbps |
 | Bridge exits: "raw socket read error: Network is down" | mt76 USB reset | self-heal (built in) |
 
 ---
@@ -263,12 +265,26 @@ Signs of each historical failure mode, for future debugging:
   = fewer blips (separate the radios, lower `-r`, a powered USB port/hub).
 - The two radios are **co-located transmitters** — physical separation is the
   single best lever for the periodic beacon-loss reconnects.
-- **Throughput is not yet tuned** (open follow-up). The path works and is mostly
-  stable, but bandwidth is limited by: single-shot NO_ACK downlink (no L2
-  retransmit), the thin ~600 ms over-air beacon cadence, the shared/legacy 6–54
-  Mbps rates, and the medium→bridge→air relay latency. Levers to explore next:
-  a quieter channel, separated radios, `INJECT_COPIES` tuning, and whether the
-  VM beacon/rate control can be made to deliver more of its frames to air.
+- **Throughput asymmetry is expected**: uplink is hardware-ACKed by the AR9271
+  (the STA does normal rate-control + L2 retransmit), so it runs near link speed;
+  downlink is injected single-shot NO_ACK with no L2 retransmit, so a
+  *download*-heavy test (speedtest, web browsing) rides entirely on the weak
+  downlink and reads far lower than the upload. Measured example: phone upload
+  5.3 Mbps vs download 0.39 Mbps, unloaded latency 14 ms (the relay itself is
+  fast) but 241 ms loaded (downlink bufferbloat behind a slow inject queue).
+- **Downlink inject rate is the #1 lever** (fixed). The injector now advertises a
+  radiotap RATE; previously it sent no rate and mt76 fell back to ~1 Mbps. Use
+  `-R`/`INJECT_RATE` to pin a legacy rate (sweep 24–36 Mbps) and raise the
+  downlink ceiling. Because NO_ACK injection has no rate fallback, the right
+  value is empirical — too high for the link SNR just trades throughput for loss.
+- **Downlink loss still isn't retransmitted at L2** (NO_ACK). After raising the
+  rate, the remaining downlink cap is air loss on the co-located channel: rely on
+  `-r`, separated radios, and a quieter channel; upper layers do the recovery.
+- **Remaining throughput levers**: a quieter channel, physically separated radios,
+  `INJECT_COPIES` tuning, and whether the VM beacon/rate control delivers more of
+  its frames to air. The thin ~600 ms over-air beacon cadence still drives the
+  periodic beacon-loss reconnects that stall traffic (a stability, not peak-rate,
+  limit).
 
 ---
 

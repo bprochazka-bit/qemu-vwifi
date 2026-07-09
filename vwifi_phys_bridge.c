@@ -83,6 +83,15 @@ static uint8_t filter_mask[6] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
  * "DUP!"). */
 static int inject_copies = 1;
 
+/* -R <mbps>: fixed injected-downlink rate, in radiotap 500 kbps units.
+ * 0 (default) = "auto": reproduce the rate the VM chose (the medium header's
+ * rate_code), floored at 6 Mbps. Without a rate in the radiotap header the
+ * mt76 monitor path transmits at the band's lowest basic rate (~1 Mbps in
+ * 2.4 GHz), which caps downlink throughput hard. Note there is no rate
+ * fallback on NO_ACK injection, so a fixed rate too high for the link SNR
+ * just raises loss -- sweep to find the desense wall (24-36 Mbps is typical). */
+static int inject_rate_rt;   /* 0 = auto/echo medium rate_code */
+
 /* Raise the interface MTU this high at startup so a full-size downlink
  * frame (radiotap + 802.11 header + 1500-byte payload, ~1540 bytes) can
  * be injected without EMSGSIZE ("Message too long"). */
@@ -311,11 +320,10 @@ static int compute_channel_config(void)
 
 /* Radiotap uses 500 kbps units; the vwifi medium protocol uses the
  * legacy PLCP rate codes from vwifi.h. This table maps between the
- * two for the receive path (radiotap -> medium). The reverse
- * direction (medium -> radiotap) is currently unused: the injection
- * path builds a fixed-rate radiotap header rather than echoing the
- * incoming rate. If/when we want to honor per-frame rates on the
- * inject side, add the reverse helper back. */
+ * two in both directions: the receive path (radiotap -> medium) via
+ * rt_rate_to_code(), and the injection path (medium -> radiotap) via
+ * code_to_rt_rate(), which lets the downlink honor the rate the VM
+ * actually chose instead of the mt76 monitor default (~1 Mbps). */
 static const struct {
     uint8_t rt_rate;        /* radiotap 500kbps units */
     uint8_t code;           /* medium PLCP rate code */
@@ -343,6 +351,20 @@ static uint8_t rt_rate_to_code(uint8_t rt)
             return rate_map[i].code;
     }
     return VWIFI_DEFAULT_RATE;  /* 6 Mbps OFDM */
+}
+
+/* Convert a vwifi medium rate code to a radiotap rate (500 kbps units).
+ * Used on the inject path to reproduce the VM's chosen TX rate over the
+ * air. Falls back to 6 Mbps OFDM (rt 12) for an unknown/zero code so the
+ * downlink never drops to the ~1 Mbps monitor default. */
+#define INJECT_RATE_FLOOR_RT 12   /* 6 Mbps OFDM */
+static uint8_t code_to_rt_rate(uint8_t code)
+{
+    for (size_t i = 0; i < NUM_RATES; i++) {
+        if (rate_map[i].code == code)
+            return rate_map[i].rt_rate;
+    }
+    return INJECT_RATE_FLOOR_RT;
 }
 
 /* ================================================================
@@ -841,16 +863,28 @@ static size_t parse_radiotap(const uint8_t *buf, size_t len,
  * NO_ACK => inject exactly once, do not wait for an ACK, do not retransmit.
  * The medium is the retransmit authority; the air is a single-shot relay.
  *
- *   present = 1 << 15 (IEEE80211_RADIOTAP_TX_FLAGS)   = 0x00008000
+ * We also advertise IEEE80211_RADIOTAP_RATE (bit 2) so the downlink goes out
+ * at a chosen legacy rate instead of the mt76 monitor default (~1 Mbps in
+ * 2.4 GHz). The rate byte is patched per frame (see process_hub_message):
+ * either the -R fixed value or the VM's own rate echoed from the medium header.
+ * Radiotap fields are laid out in present-bit order with natural alignment:
+ * RATE (u8, bit 2) at offset 8, then a pad byte to 2-align TX_FLAGS (u16,
+ * bit 15) at offset 10.
+ *
+ *   present  = (1 << 2) | (1 << 15)                   = 0x00008004
+ *   rate     = <patched, 500 kbps units>
  *   tx_flags = 0x0008 (IEEE80211_RADIOTAP_F_TX_NOACK)
  */
 #define RADIOTAP_TX_FLAG_NOACK 0x0008
+#define INJECT_RATE_OFFSET     8    /* index of the rate byte in the header */
 static const uint8_t inject_radiotap[] = {
     0x00,                   /* version */
     0x00,                   /* pad */
-    0x0a, 0x00,             /* length = 10 (LE) */
-    0x00, 0x80, 0x00, 0x00, /* present = TX_FLAGS (bit 15) */
-    0x08, 0x00              /* tx_flags = NO_ACK (LE) */
+    0x0c, 0x00,             /* length = 12 (LE) */
+    0x04, 0x80, 0x00, 0x00, /* present = RATE (bit 2) | TX_FLAGS (bit 15) */
+    0x00,                   /* [8]  rate (500 kbps units) -- patched per frame */
+    0x00,                   /* [9]  pad: 2-align tx_flags */
+    0x08, 0x00              /* [10] tx_flags = NO_ACK (LE) */
 };
 #define INJECT_RADIOTAP_LEN (sizeof(inject_radiotap))
 
@@ -922,6 +956,13 @@ static void process_hub_message(const uint8_t *payload, uint32_t payload_len)
     /* Build injection buffer: radiotap header + 802.11 frame */
     memcpy(inject_buf, inject_radiotap, INJECT_RADIOTAP_LEN);
     memcpy(inject_buf + INJECT_RADIOTAP_LEN, frame, frame_len);
+
+    /* Set the over-air TX rate. -R pins a fixed rate; otherwise reproduce the
+     * rate the VM chose (medium header rate_code), floored at 6 Mbps. Either
+     * way we never fall back to the mt76 ~1 Mbps monitor default. */
+    inject_buf[INJECT_RATE_OFFSET] = inject_rate_rt
+                                   ? (uint8_t)inject_rate_rt
+                                   : code_to_rt_rate(hdr->rate_code);
 
     /* Redundant injection is only for the one-shot, association-critical
      * frames that have no L2 retransmit and whose loss stalls the connection:
@@ -1248,6 +1289,12 @@ static void usage(const char *prog)
         "                   1; try 2-3 on a lossy/congested channel). Only\n"
         "                   management + EAPOL are duplicated; beacons and\n"
         "                   encrypted data are always injected once.\n"
+        "  -R <mbps>        Over-air downlink TX rate: 1,2,5.5,6,9,11,12,18,24,\n"
+        "                   36,48,54, or 0=auto (default; echo the VM's rate,\n"
+        "                   floored at 6 Mbps). Without this the mt76 monitor\n"
+        "                   path sends at ~1 Mbps and caps downlink throughput.\n"
+        "                   No rate fallback on NO_ACK inject -- too high a rate\n"
+        "                   for the link just raises loss; sweep 24-36 first.\n"
         "  -A               Forward ALL captured frames (disable the relevance\n"
         "                   filter; only for sniffing -- floods the hub on a\n"
         "                   busy channel)\n"
@@ -1278,7 +1325,7 @@ int main(int argc, char *argv[])
     /* Reset getopt to start scanning from argv[3] */
     optind = 3;
 
-    while ((opt = getopt(argc, argv, "c:w:s:n:b:m:r:Avh")) != -1) {
+    while ((opt = getopt(argc, argv, "c:w:s:n:b:m:r:R:Avh")) != -1) {
         switch (opt) {
         case 'b': {
             unsigned int m[6];
@@ -1326,6 +1373,22 @@ int main(int argc, char *argv[])
                 return 1;
             }
             break;
+        case 'R': {
+            /* Legacy rate in Mbps -> radiotap 500 kbps units. 0 = auto. */
+            int rt = (int)(atof(optarg) * 2 + 0.5);
+            int ok = (rt == 0);
+            for (size_t i = 0; i < NUM_RATES && !ok; i++)
+                if (rate_map[i].rt_rate == rt)
+                    ok = 1;
+            if (!ok) {
+                fprintf(stderr, "bridge: -R must be a legacy rate in Mbps "
+                        "(1,2,5.5,6,9,11,12,18,24,36,48,54) or 0=auto: %s\n",
+                        optarg);
+                return 1;
+            }
+            inject_rate_rt = rt;
+            break;
+        }
         case 'A':
             forward_all = 1;
             break;
@@ -1358,6 +1421,12 @@ int main(int argc, char *argv[])
 
     fprintf(stderr, "bridge: hub=%s iface=%s channel=%d bw=%s node=%s\n",
             hub_path, ifname, channel_num, bw_str, node_id);
+    if (inject_rate_rt)
+        fprintf(stderr, "bridge: inject rate=%.1f Mbps (fixed) copies=%d\n",
+                inject_rate_rt / 2.0, inject_copies);
+    else
+        fprintf(stderr, "bridge: inject rate=auto (echo VM rate, >=6 Mbps) "
+                "copies=%d\n", inject_copies);
 
     /* Compute channel/bandwidth configuration */
     if (compute_channel_config() < 0)

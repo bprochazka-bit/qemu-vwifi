@@ -200,9 +200,11 @@ tcpdump -i "$MT_IF" -w "$WITNESS_PCAP" -U >/dev/null 2>&1 &
 sleep 1
 
 INJECT_COPIES="${INJECT_COPIES:-3}"   # redundant injection for the lossy channel
-say "Starting bridge on $MT_IF (forwarding $FILTER_BASE / $FILTER_MASK, -r $INJECT_COPIES)"
+INJECT_RATE="${INJECT_RATE:-0}"       # over-air downlink rate in Mbps (0=auto/echo VM;
+                                      # sweep 24/36 to raise downlink throughput)
+say "Starting bridge on $MT_IF (forwarding $FILTER_BASE / $FILTER_MASK, -r $INJECT_COPIES, -R $INJECT_RATE)"
 "$BRIDGE_BIN" "$HUB_SOCK" "$MT_IF" -c "$CHANNEL" \
-    -b "$FILTER_BASE" -m "$FILTER_MASK" -r "$INJECT_COPIES" -v \
+    -b "$FILTER_BASE" -m "$FILTER_MASK" -r "$INJECT_COPIES" -R "$INJECT_RATE" -v \
     > "$RUN_DIR/bridge.log" 2>&1 &
 sleep 1
 
