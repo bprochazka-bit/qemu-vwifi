@@ -24,10 +24,12 @@
 #include "qemu/timer.h"
 #include "qemu/main-loop.h"
 #include "qom/object.h"
+#include "crypto/aes.h"
 
 #include "vwifi_ath9k_regs.h"
 #include "vwifi_ath9k_eeprom.h"
 #include "vwifi_ath9k_dma.h"
+#include "vwifi_ath9k_crypto.h"
 #include "vwifi.h"
 
 #include <sys/socket.h>
@@ -488,6 +490,80 @@ static void vwifi_ath9k_send_rate(VwifiAth9kState *s, const uint8_t *frame,
                 frame_len, s->tx_frames_to_medium);
 }
 
+/* -------------------------------------------------------------------
+ *  Hardware crypto offload (CCMP / AES-CCM)
+ *
+ *  Real ath9k programs keys into the on-chip key cache and the MAC does
+ *  CCMP on the data path.  We shadow the key cache in regs[] (the driver's
+ *  MMIO writes land there like any other register) and perform the same
+ *  AES-CCM transform in software here.  See vwifi_ath9k_crypto.h.
+ * ------------------------------------------------------------------- */
+
+/*
+ * Reconstruct the 128-bit CCMP key stored in cache entry `slot`.
+ * Returns false if the slot is not a valid CCM (AES-CCM) entry.  The key
+ * material layout matches ath_hw_set_keycache_entry(): key0..key4 split as
+ * 4/2/4/2/4 little-endian octets.
+ */
+static bool vwifi_ath9k_keycache_ccm(VwifiAth9kState *s, unsigned slot,
+                                     uint8_t key[16])
+{
+    uint32_t k0, k1, k2, k3, k4;
+
+    if (slot >= AR_KEY_CACHE_SIZE) {
+        return false;
+    }
+    if ((vwifi_ath9k_reg_read_raw(s, AR_KEYTABLE_TYPE(slot)) &
+         AR_KEYTABLE_TYPE_MASK) != AR_KEYTABLE_TYPE_CCM) {
+        return false;
+    }
+
+    k0 = vwifi_ath9k_reg_read_raw(s, AR_KEYTABLE_KEY0(slot));
+    k1 = vwifi_ath9k_reg_read_raw(s, AR_KEYTABLE_KEY1(slot)) & 0xffff;
+    k2 = vwifi_ath9k_reg_read_raw(s, AR_KEYTABLE_KEY2(slot));
+    k3 = vwifi_ath9k_reg_read_raw(s, AR_KEYTABLE_KEY3(slot)) & 0xffff;
+    k4 = vwifi_ath9k_reg_read_raw(s, AR_KEYTABLE_KEY4(slot));
+
+    key[0]  = k0;       key[1]  = k0 >> 8;  key[2]  = k0 >> 16; key[3]  = k0 >> 24;
+    key[4]  = k1;       key[5]  = k1 >> 8;
+    key[6]  = k2;       key[7]  = k2 >> 8;  key[8]  = k2 >> 16; key[9]  = k2 >> 24;
+    key[10] = k3;       key[11] = k3 >> 8;
+    key[12] = k4;       key[13] = k4 >> 8;  key[14] = k4 >> 16; key[15] = k4 >> 24;
+    return true;
+}
+
+/*
+ * Decrypt a received CCMP MPDU.  On real hardware the MAC performs an
+ * associative key-cache lookup (by transmitter address / key id); here we
+ * try each populated CCM key and accept the one whose MIC verifies.  Because
+ * the CCMP MIC is a cryptographic tag, a wrong key is rejected with
+ * overwhelming probability, so this is both robust and faithful to the
+ * "hardware picked the right key" behaviour the driver expects.
+ *
+ * `src` is the encrypted frame; on success the decrypted frame is written to
+ * `dst` (same length) and the matching key-cache slot is returned via
+ * `*out_keyix`.  Returns false if no key decrypts the frame.
+ */
+static bool vwifi_ath9k_rx_decrypt(VwifiAth9kState *s, const uint8_t *src,
+                                   uint8_t *dst, int len, uint8_t *out_keyix)
+{
+    unsigned slot;
+
+    for (slot = 0; slot < AR_KEY_CACHE_SIZE; slot++) {
+        uint8_t key[16];
+
+        if (!vwifi_ath9k_keycache_ccm(s, slot, key)) {
+            continue;
+        }
+        memcpy(dst, src, len);
+        if (vwifi_ccmp_decrypt(key, dst, len) == 0) {
+            *out_keyix = (uint8_t)slot;
+            return true;
+        }
+    }
+    return false;
+}
+
 static void vwifi_ath9k_process_tx_queue(VwifiAth9kState *s, int qnum)
 {
     uint32_t desc_addr = s->tx_queues[qnum].txdp;
@@ -577,7 +653,8 @@ static void vwifi_ath9k_process_tx_queue(VwifiAth9kState *s, int qnum)
          */
         if (ds_data != 0 && frame_len > 0 &&
             frame_len <= ATH9K_MAX_FRAME_SIZE) {
-            uint8_t frame_buf[ATH9K_MAX_FRAME_SIZE];
+            /* +MIC headroom so CCMP encryption can append the 8-byte MIC */
+            uint8_t frame_buf[ATH9K_MAX_FRAME_SIZE + VWIFI_CCMP_MIC_LEN];
             uint16_t gathered = 0;
             uint16_t seg_len;
             uint32_t seg_desc = desc_addr;
@@ -597,6 +674,18 @@ static void vwifi_ath9k_process_tx_queue(VwifiAth9kState *s, int qnum)
                 if (tx_rate == 0) {
                     tx_rate = VWIFI_DEFAULT_RATE;
                 }
+            }
+
+            /* Read TX encryption type from descriptor ctl6 (AR_EncrType).
+             * The driver sets this + the key-cache index (AR_DestIdx) when
+             * it wants the hardware crypto engine to encrypt the frame. */
+            uint32_t ds_ctl6 = 0;
+            uint8_t  encr_type = AR_ENCR_TYPE_CLEAR;
+            if (pci_dma_read(&s->parent_obj,
+                             desc_addr + DESC_OFF_TX_CTL6,
+                             &ds_ctl6, 4) == 0) {
+                ds_ctl6 = le32_to_cpu(ds_ctl6);
+                encr_type = (ds_ctl6 & AR_EncrType) >> AR_EncrType_S;
             }
 
             /* Gather segments using buf_len (actual DMA data) */
@@ -677,12 +766,51 @@ static void vwifi_ath9k_process_tx_queue(VwifiAth9kState *s, int qnum)
                         send_len = gathered - padsize;
                     }
                 }
+
+                /*
+                 * Hardware crypto offload: if the driver flagged this frame
+                 * for encryption (valid key-cache index + AES/CCM encr type)
+                 * and it carries the Protected bit, run CCMP the way the
+                 * AR9285 crypto engine would — encrypt the payload in place
+                 * and append the 8-byte MIC.  mac80211 has already inserted
+                 * the CCMP header (IV/PN) because ath9k advertises
+                 * IEEE80211_KEY_FLAG_GENERATE_IV.
+                 */
+                if ((ds_ctl0 & AR_DestIdxValid) &&
+                    encr_type == AR_ENCR_TYPE_AES &&
+                    vwifi_dot11_protected(frame_buf, send_len)) {
+                    unsigned keyix = (ds_ctl1 & AR_DestIdx) >> AR_DestIdx_S;
+                    uint8_t key[16];
+
+                    if (vwifi_ath9k_keycache_ccm(s, keyix, key)) {
+                        int enc_len = send_len;
+                        if (vwifi_ccmp_encrypt(key, frame_buf, &enc_len,
+                                               (int)sizeof(frame_buf)) == 0) {
+                            vwifi_ath9k_trace("TX CCMP encrypt keyix=%u "
+                                        "%u -> %d bytes", keyix, send_len,
+                                        enc_len);
+                            send_len = enc_len;
+                        } else {
+                            vwifi_ath9k_warn("TX CCMP encrypt failed "
+                                        "(keyix=%u len=%u)", keyix, send_len);
+                        }
+                    } else {
+                        vwifi_ath9k_warn("TX: no CCM key at cache slot %u",
+                                    keyix);
+                    }
+                }
+
                 /*
                  * Use frame_len - FCS_LEN as the authoritative OTA
                  * frame size.  buf_len (used for DMA gathering) may
                  * include extra alignment bytes beyond the real frame.
                  * Sending those extra bytes corrupts trailing IEs and
                  * causes mac80211 to flag the beacon as corrupt.
+                 *
+                 * For an encrypted frame the driver's frame_len already
+                 * accounts for the appended MIC (bf_frmlen includes
+                 * IEEE80211_CCMP_MIC_LEN), so ota_len == send_len here and
+                 * the cap below leaves the ciphertext + MIC intact.
                  */
                 uint16_t ota_len = frame_len > 4 ? frame_len - 4 : 0;
                 if (ota_len > 0 && ota_len < send_len) {
@@ -1098,6 +1226,36 @@ static void vwifi_ath9k_inject_rx_frame(VwifiAth9kState *s,
     }
 
     /*
+     * Hardware crypto offload (RX): if the frame carries the Protected bit,
+     * decrypt it with a matching CCM key from the key cache before DMAing it
+     * to the driver, exactly as the AR9285 crypto engine would.  mac80211
+     * relies on this: ath9k_cmn_rx_skb_postprocess() sets RX_FLAG_DECRYPTED
+     * only when the RX status reports a valid key index and no decrypt error,
+     * after which mac80211 strips the CCMP header and the trailing MIC.  If
+     * we cannot decrypt (unknown/absent key, or non-CCMP cipher such as
+     * TKIP/WEP which we do not emulate), we flag a decrypt error so the frame
+     * is dropped rather than delivered as garbage.
+     */
+    uint8_t rx_decbuf[ATH9K_MAX_FRAME_SIZE];
+    uint8_t rx_keyix = 0;
+    bool    rx_decrypted = false;
+    bool    rx_decrypt_err = false;
+    if (vwifi_dot11_protected(frame, frame_len)) {
+        if (frame_len <= (int)sizeof(rx_decbuf) &&
+            vwifi_ath9k_rx_decrypt(s, frame, rx_decbuf, frame_len,
+                                   &rx_keyix)) {
+            frame = rx_decbuf;
+            rx_decrypted = true;
+            vwifi_ath9k_trace("RX CCMP decrypt ok keyix=%u len=%u",
+                        rx_keyix, frame_len);
+        } else {
+            rx_decrypt_err = true;
+            vwifi_ath9k_warn("RX CCMP decrypt failed (len=%u) — dropping",
+                        frame_len);
+        }
+    }
+
+    /*
      * Re-insert the 802.11 header alignment padding the guest's ath9k
      * driver expects on RX -- the mirror image of the TX padding strip.
      *
@@ -1177,8 +1335,22 @@ static void vwifi_ath9k_inject_rx_frame(VwifiAth9kState *s,
 
     /* status5: EVM data (zero is fine) */
 
-    /* status8: RxDone + RxFrameOK */
-    rx_status[8] = cpu_to_le32(AR_RxDone | AR_RxFrameOK);
+    /*
+     * status8: RxDone + RxFrameOK, plus hardware-crypto key status.
+     *  - Decrypted OK: report a valid key index so the driver marks the
+     *    frame RX_FLAG_DECRYPTED and mac80211 skips software crypto.
+     *  - Decrypt failed: report AR_DecryptCRCErr so the driver drops it.
+     */
+    {
+        uint32_t s8 = AR_RxDone | AR_RxFrameOK;
+        if (rx_decrypted) {
+            s8 |= AR_RxKeyIdxValid |
+                  (((uint32_t)rx_keyix << AR_KeyIdx_S) & AR_KeyIdx);
+        } else if (rx_decrypt_err) {
+            s8 |= AR_DecryptCRCErr;
+        }
+        rx_status[8] = cpu_to_le32(s8);
+    }
 
     pci_dma_write(&s->parent_obj, desc_addr + DESC_OFF_RX_STATUS0,
                   rx_status, sizeof(rx_status));
@@ -1581,6 +1753,11 @@ static uint64_t vwifi_ath9k_mmio_read(void *opaque, hwaddr addr, unsigned size)
             val = vwifi_ath9k_reg_read_raw(s, addr);
             break;
         }
+        /* Hardware key cache – shadow storage, read back silently */
+        if (addr >= AR_KEYTABLE_0 && addr < AR_KEYTABLE_END) {
+            val = vwifi_ath9k_reg_read_raw(s, addr);
+            break;
+        }
         /* PHY register space */
         if (addr >= AR_PHY_BASE && addr < ATH9K_MMIO_SIZE) {
             val = vwifi_ath9k_reg_read_raw(s, addr);
@@ -1914,6 +2091,14 @@ static void vwifi_ath9k_mmio_write(void *opaque, hwaddr addr, uint64_t val64,
             in_range(addr, AR_D0_CHNTIME, AR_NUM_DCU) ||
             in_range(addr, AR_D0_MISC, AR_NUM_DCU) ||
             in_range(addr, AR_D0_SEQNUM, AR_NUM_DCU)) {
+            vwifi_ath9k_reg_write_raw(s, addr, val);
+            break;
+        }
+        /* Hardware key cache (WEP/TKIP/CCMP offload).
+         * The driver programs keys here via ath_hw_set_keycache_entry();
+         * we shadow the writes in regs[] and read the key material back at
+         * TX/RX time to perform CCMP.  Stored silently (no UNHANDLED spam). */
+        if (addr >= AR_KEYTABLE_0 && addr < AR_KEYTABLE_END) {
             vwifi_ath9k_reg_write_raw(s, addr, val);
             break;
         }
