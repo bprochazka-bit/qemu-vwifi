@@ -280,24 +280,28 @@ Signs of each historical failure mode, for future debugging:
   stayed ~0.5 Mbps from 6 through 36 Mbps on-air. That rules the air PHY rate
   *out* as the current binding constraint and points at a frames-per-second cap
   in the relay (see §7.5).
-- **Measured bottleneck: mt76 monitor-mode injection completes only ~80–92
-  frames/s — on *both* radios.** `vwifi-linkbench inject` with a *blocking*
-  socket sustains ~80–92 fps of 1500 B frames (~1 Mbps) with **zero** ENOBUFS,
-  and a co-channel `capture` confirms **0 % air loss** at that rate (the channel
-  is nearly idle). So the wall is the driver/firmware TX-completion rate
-  (~11 ms/frame vs ~2 ms of actual air time), it is **not** specific to one
-  radio, and it is **not** air loss — swapping which mt76 radio injects will not
-  help. Rate (`-R`) can't move it either. The ~11 ms ≈ a 100 Hz timer tick,
-  which suggests the frame is paced in the TX path (qdisc / mac80211 software
-  queue / TX-status batched on a tick) rather than at the PHY.
-- **Probing the ~90 fps wall** (`vwifi-linkbench inject`): `-s 200,700,1500`
-  sweeps frame size (flat fps ⇒ fps-bound/per-frame latency; rising fps ⇒
-  byte-bound); `-Q` sets `PACKET_QDISC_BYPASS` (skips the netdev qdisc); `-B
-  <bytes>` enlarges `SO_SNDBUF` (tests TX-completion batching); `-N` turns the
-  block into visible ENOBUFS. If `-Q` or `-B` lifts the rate, port the winning
-  socket option into `vwifi-phys-bridge`'s inject socket. If nothing moves it,
-  the cap is in mt76 monitor injection itself and the fix is architectural
-  (a different inject path/driver, or not single-frame monitor injection).
+- **Measured bottleneck: injected downlink throughput is byte-bound at ~1 Mbps,
+  not fps-bound.** A `-s 200,700,1500` sweep shows per-frame time scaling
+  *linearly* with size (~7 µs/byte + ~0.75 ms fixed) and throughput pinned at
+  ~0.7–1.0 Mbps across all sizes — the signature of frames actually leaving at a
+  ~1 Mbps PHY rate, i.e. the injected radiotap `RATE` being **ignored / falling
+  back to a basic rate**. `PACKET_QDISC_BYPASS` (`-Q`) and a bigger `SO_SNDBUF`
+  (`-B`) do **not** help — correctly, since it is not a queuing/pacing problem —
+  and a co-channel `capture` shows **0 % air loss**. (This overturns the earlier
+  "~100 Hz tick pacing" guess.) Note radios differ: the witness once showed the
+  MT7921U honoring 6 Mbps, while the second radio here appears to inject at
+  ~1 Mbps — measure the *actual* rate per radio with `capture` before concluding.
+- **`capture` reports the on-air rate** of the VWLB frames (parsed from the RX
+  radiotap), which settles whether a given radio honors the injected `-R` or
+  falls back to a basic rate. Run the size sweep and a rate-reporting capture on
+  the radio the bridge actually injects on (the MT7921U), not just any monitor
+  radio.
+- **Probes** (`vwifi-linkbench inject`): `-s a,b,c` sweeps size (flat fps ⇒
+  fps/per-frame-bound; constant Mbps ⇒ byte/rate-bound); `-Q` = qdisc bypass;
+  `-B <bytes>` = `SO_SNDBUF`; `-N` = non-blocking (surface ENOBUFS). If the
+  radio ignores the injected rate, the fix is to make it honor a higher legacy
+  rate (driver/firmware, or a different inject path) — raising the *rate*, since
+  the throughput is rate-bound, is what scales it, not queue tuning.
 - **Downlink loss still isn't retransmitted at L2** (NO_ACK), whether the loss is
   in the air or in the driver's monitor TX queue (`ENOBUFS`). Characterize which
   before tuning further (§7.5).

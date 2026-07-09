@@ -312,6 +312,39 @@ static int find_magic(const uint8_t *buf, int len, uint32_t *seq)
     return 0;
 }
 
+/* Extract the legacy on-air rate (radiotap RATE, 500 kbps units) from a
+ * captured frame, or -1 if absent (HT/VHT/HE frames carry MCS instead of a
+ * legacy rate). Walks the present bitmap and the fields preceding bit 2
+ * (RATE), honoring radiotap alignment. This tells us the rate the frame
+ * *actually* went out at — i.e. whether the injected -R was honored. */
+static int rt_rate_500k(const uint8_t *buf, int len)
+{
+    if (len < 8) return -1;
+    int rtlen = buf[2] | (buf[3] << 8);
+    if (rtlen < 8 || rtlen > len) return -1;
+
+    uint32_t present;
+    memcpy(&present, buf + 4, 4);
+
+    /* Skip any chained extended present words (bit 31). Field data starts
+     * after the last present word. */
+    int off = 8;
+    for (uint32_t p = present; p & (1u << 31); ) {
+        if (off + 4 > rtlen) return -1;
+        memcpy(&p, buf + off, 4);
+        off += 4;
+    }
+
+    int cur = off;                                  /* alignment is vs buf[0] */
+    if (present & (1u << 0)) { cur = (cur + 7) & ~7; cur += 8; }  /* TSFT   */
+    if (present & (1u << 1)) { cur += 1; }                        /* Flags  */
+    if (present & (1u << 2)) {                                    /* Rate   */
+        if (cur + 1 > rtlen) return -1;
+        return buf[cur];
+    }
+    return -1;   /* no legacy RATE field present */
+}
+
 static int do_capture(const char *iface, double secs, int verbose)
 {
     int fd = open_mon(iface, 0);
@@ -326,6 +359,8 @@ static int do_capture(const char *iface, double secs, int verbose)
     uint64_t all = 0, all_bytes = 0, bench = 0, bench_bytes = 0;
     int have_seq = 0;
     uint32_t seq_min = 0, seq_max = 0;
+    uint64_t rate_hist[256] = { 0 };   /* VWLB frames by on-air rate (500k) */
+    uint64_t rate_ht = 0;              /* VWLB frames with no legacy rate (HT/VHT) */
     double t0 = now_ms(), tend = t0 + secs * 1000.0;
     double last_log = t0;
     uint64_t last_bench = 0;
@@ -348,6 +383,8 @@ static int do_capture(const char *iface, double secs, int verbose)
             bench++; bench_bytes += n;
             if (!have_seq) { seq_min = seq_max = seq; have_seq = 1; }
             else { if (seq < seq_min) seq_min = seq; if (seq > seq_max) seq_max = seq; }
+            int r = rt_rate_500k(buf, (int)n);
+            if (r >= 0) rate_hist[r & 0xff]++; else rate_ht++;
         }
         double t = now_ms();
         if (verbose && t - last_log >= 1000.0) {
@@ -377,6 +414,22 @@ static int do_capture(const char *iface, double secs, int verbose)
         (unsigned long long)seq_min, (unsigned long long)seq_max,
         (unsigned long long)span, loss,
         (unsigned long long)bench, (unsigned long long)span);
+
+        /* On-air rate the injected frames ACTUALLY went out at — settles
+         * whether the radio honored the injected -R or fell back to a basic
+         * rate. */
+        fprintf(stderr, "  on-air rate :");
+        int shown = 0;
+        for (int r = 0; r < 256; r++)
+            if (rate_hist[r]) {
+                fprintf(stderr, " %g Mbps=%llu", r / 2.0,
+                        (unsigned long long)rate_hist[r]);
+                shown++;
+            }
+        if (rate_ht) fprintf(stderr, " HT/VHT(no-legacy-rate)=%llu",
+                             (unsigned long long)rate_ht);
+        if (!shown && !rate_ht) fprintf(stderr, " (radiotap had no rate field)");
+        fprintf(stderr, "\n");
     } else {
         fprintf(stderr, "  (no VWLB frames seen — is an injector running on "
                 "the same channel?)\n");
