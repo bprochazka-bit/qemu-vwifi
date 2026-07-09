@@ -63,12 +63,32 @@ Measured facts on the AR9271 (`ath9k_htc`, USB):
   `(RA & bssidmask) == (macaddr & bssidmask)` — **including BSSIDs no vif owns**,
   because the mask is a bitmask, not a list.
 
-So: run **two decoy hostapd BSSes on the AR9271** at the extremes of the BSSID
-range (e.g. `02:11:22:33:44:00` and `…:FF`). The driver derives
-`bssidmask = ff:ff:ff:ff:ff:00`, and the chip hardware-ACKs the whole
-`02:11:22:33:44:00..FF` range. The VM APs live at `…:01..FE`; the AR9271 ACKs
-their uplink even though hostapd only *owns* `…:00`/`…:FF`. Those two decoys
-double as the survey "wrong APs."
+So: run **two decoy hostapd BSSes on the AR9271** that bound the BSSID range,
+e.g. `02:11:22:33:44:00` and `02:11:22:33:44:03`. The driver derives
+`bssidmask = ff:ff:ff:ff:ff:fc`, and the chip hardware-ACKs the whole
+`02:11:22:33:44:00..03` range. The VM APs live at `…:01`/`…:02`; the AR9271 ACKs
+their uplink even though hostapd only *owns* `…:00`/`…:03`. Those two decoys
+double as the survey "wrong APs." (Need more VMs? Widen to `…:00`/`…:07`
+→ mask `…:f8`, covering `…:00..07`, VMs at `…:01..06`.)
+
+### Getting the second decoy's MAC to stick (ath9k_htc gotcha)
+
+`ath9k_htc` advertises a **single hardware address**, so mac80211 cannot give a
+second AP vif a *controlled* MAC on its own — hostapd's `bss=<iface>` interface
+creation gets a **random** locally-administered MAC, whatever BSSID you
+configure. A random second MAC yields a `bssidmask` that does **not** cover the
+VM BSSIDs, and the AR9271 silently never ACKs the STA (the failure looks like
+"associates, completes the 4-way on retransmits, then drops" — the STA
+retransmits ~80 % of its uplink). Two facts make it work:
+
+- a **direct `ip link set <iface> address …`** on a pre-created `__ap` vif *is*
+  honored (mac80211 validates rather than randomizes), and
+- **`hostapd interface=<iface>`** *adopts* an existing netdev without recreating
+  it, whereas `bss=` recreates (and re-randomizes).
+
+So pre-create the second vif with `iw`, pin its MAC, and run a **separate
+single-BSS hostapd per vif** with `interface=` (never `bss=`). `scripts/lab-bringup.sh`
+does this and **hard-fails** if either MAC doesn't land on its configured BSSID.
 
 Capture + injection run on a **second** radio (the MT7921U, `mt76`) in monitor
 mode, since the AR9271 can't do AP+monitor.
@@ -76,18 +96,20 @@ mode, since the AR9271 can't do AP+monitor.
 ### BSSID mask math
 
 The mask is `~(XOR of the AP-vif addresses)`; a bit is "don't-care" (ACK-matched)
-only where the addresses differ. To span the whole last byte you need two vifs
-that differ in all 8 low bits:
+only where the addresses differ. The two decoys bound the range:
 
 ```
-02:11:22:33:44:00  XOR  02:11:22:33:44:FF  = 00:00:00:00:00:FF
-  -> mask ff:ff:ff:ff:ff:00  -> ACKs 02:11:22:33:44:00 .. :FF  (256 BSSIDs)
+02:11:22:33:44:00  XOR  02:11:22:33:44:03  = 00:00:00:00:00:03
+  -> mask ff:ff:ff:ff:ff:fc  -> ACKs 02:11:22:33:44:00 .. :03  (4 BSSIDs)
 ```
 
-Keep the fixed prefix a locally-administered address (`02:…`) you own, and make
-the mask no wider than your BSSID pool — every don't-care bit widens the set of
-addresses the card will ACK, and if it ever overlaps a real neighbour's MAC the
-card will ACK traffic that isn't yours.
+In principle `:00`/`:FF` would span all 256, but **ath9k_htc will not accept a
+spread that wide** (see the gotcha above — it randomizes the second vif). Keep
+the span small and standard (`…:fc` for 4, `…:f8` for 8). Keep the fixed prefix
+a locally-administered address (`02:…`) you own, and make the mask no wider than
+your BSSID pool — every don't-care bit widens the set of addresses the card will
+ACK, and if it ever overlaps a real neighbour's MAC the card will ACK traffic
+that isn't yours.
 
 ---
 
@@ -95,16 +117,16 @@ card will ACK traffic that isn't yours.
 
 ```
   OpenWRT VM1  hostapd  bssid 02:11:22:33:44:01  ┐  the REAL, joinable APs
-  OpenWRT VM2  hostapd  bssid 02:11:22:33:44:02  ├─ ch 11, legacy, WPA2-PSK
-  OpenWRT VM3  hostapd  bssid 02:11:22:33:44:03  ┘  (ath9k, nohwcrypt=1)
+  OpenWRT VM2  hostapd  bssid 02:11:22:33:44:02  ┘─ ch 11, legacy, WPA2-PSK
+        │                                            (ath9k, nohwcrypt=1)
         │  vwifi medium (hub)
         ▼
    vwifi-phys-bridge on MT7921U (mt76), ch 11, monitor:
-        capture STA uplink -> hub;  inject VM downlink (NO_ACK, -r 3)
-        relevance filter -b 02:11:22:33:44:00 -m ff:ff:ff:ff:ff:00
+        capture STA uplink -> hub;  inject VM downlink (NO_ACK, -r)
+        relevance filter -b 02:11:22:33:44:00 -m ff:ff:ff:ff:ff:fc
         │
-   AR9271 (ath9k_htc), ch 11: two decoy hostapd BSSes at :00 and :FF
-        -> AP opmode; hardware-ACKs the STA's uplink to :01..:FE  ◄─┐ ACK (SIFS)
+   AR9271 (ath9k_htc), ch 11: two decoy hostapds (interface=) at :00 and :03
+        -> AP opmode; hardware-ACKs the STA's uplink to :01/:02  ◄──┐ ACK (SIFS)
                                                                      │
   Real STA ))) sees the SSIDs on ch 11, joins one, associates ──────┘
 ```
@@ -137,10 +159,11 @@ Set this on **every** VM that does crypto (each AP and any VM client). After a
 reboot the `.conf` makes it stick. Note: OpenWRT's `/etc/modules.d/` is only a
 list of modules to load — module *options* must go in `/etc/modprobe.d/*.conf`.
 
-**AP profile.** Same channel, assigned BSSID in `…:01..FE`, legacy (non-HT, no
-WMM) so every data frame uses a simple per-frame ACK — no Block-Ack or RTS/CTS
-(those are additional SIFS responses the bridge doesn't generate). Attach it to a
-network that has a DHCP server (`network='lan'`).
+**AP profile.** Same channel, assigned BSSID inside the ACK mask but not owned
+by a decoy (`…:01`/`…:02` for the `…:fc` mask), legacy (non-HT, no WMM) so every
+data frame uses a simple per-frame ACK — no Block-Ack or RTS/CTS (those are
+additional SIFS responses the bridge doesn't generate). Attach it to a network
+that has a DHCP server (`network='lan'`).
 
 ```sh
 uci set wireless.radio0.channel='11'
@@ -168,14 +191,17 @@ sudo AR9271_IF=wlxc01c300da281 MT_IF=wlx00c0cab57e6f ./scripts/lab-bringup.sh
 sudo ./scripts/lab-bringup.sh stop     # tear down
 ```
 
-It: sets the AR9271 to the low decoy BSSID and starts a 2-BSS hostapd (`:00`,
-`:FF`, ch 11, legacy, slow beacons); puts the MT7921U in monitor on ch 11; starts
-`vwifi-phys-bridge` with `-r 3 -b 02:11:22:33:44:00 -m ff:ff:ff:ff:ff:00`; and
-runs a witness `tcpdump`. Equivalent manual bridge invocation:
+It: pins the AR9271 primary vif to `:00` and pre-creates a second vif at `:03`,
+then runs a separate single-BSS hostapd on each via `interface=` (ch 11, legacy,
+slow beacons) and **hard-fails** if either MAC didn't stick; puts the MT7921U in
+monitor on ch 11; starts `vwifi-phys-bridge` with
+`-r 3 -b 02:11:22:33:44:00 -m ff:ff:ff:ff:ff:fc`; and runs a witness `tcpdump`.
+Override injection redundancy with `INJECT_COPIES=N`. Equivalent manual bridge
+invocation:
 
 ```sh
 sudo ./vwifi-phys-bridge /run/vwifi/foo.sock wlx00c0cab57e6f \
-     -c 11 -b 02:11:22:33:44:00 -m ff:ff:ff:ff:ff:00 -r 3 -v
+     -c 11 -b 02:11:22:33:44:00 -m ff:ff:ff:ff:ff:fc -r 3 -v
 ```
 
 ### `vwifi-phys-bridge` flags that matter here
@@ -183,7 +209,7 @@ sudo ./vwifi-phys-bridge /run/vwifi/foo.sock wlx00c0cab57e6f \
 | Flag | Purpose |
 |------|---------|
 | `-b <bssid>` | relevance-filter match address (the range base) |
-| `-m <mask>`  | relevance-filter mask — forward the whole `…:00..FF` set, not one BSSID |
+| `-m <mask>`  | relevance-filter mask — forward the whole `…:00..03` set, not one BSSID |
 | `-r <n>`     | inject each critical frame N times (beacons/probe-resps excluded); use 2–3 on a lossy channel |
 | `-c <chan>`  | channel (must match the AP + AR9271 + MT7921U) |
 
@@ -214,9 +240,11 @@ Signs of each historical failure mode, for future debugging:
 | Symptom | Cause | Fix |
 |---|---|---|
 | STA retransmits uplink forever, handshake stalls, 0 ACKs to STA | AR9271 in monitor (no ACK) | AP-opmode decoys (§2) |
+| STA completes 4-way (on retransmits) then drops; decoy vif has a **random** MAC | 2nd decoy BSSID didn't stick → mask doesn't cover the VM | pre-create vif + `interface=` hostapd (§2); script hard-fails on this |
 | Downlink frames appear ~15× with retry flag | injecting without NO_ACK | (built in) |
 | 4-way sometimes "wrong key", sometimes completes | handshake frame loss | `-r 3`, separate radios |
 | WPA2 associates, 4-way completes, **no data / no DHCP**, `rx drop misc` climbs | VM ath9k hw-crypto not real | `nohwcrypt=1` (§4) |
+| ping shows `DUP!`, each downlink 2–3× | `-r` duplicating encrypted data | (built in: only mgmt/EAPOL duplicated) |
 | `reason=3/4 locally_generated`, periodic reconnects | beacon/keepalive loss (co-location, congestion) | separate radios, clean channel |
 | Bridge exits: "raw socket read error: Network is down" | mt76 USB reset | self-heal (built in) |
 
@@ -235,6 +263,12 @@ Signs of each historical failure mode, for future debugging:
   = fewer blips (separate the radios, lower `-r`, a powered USB port/hub).
 - The two radios are **co-located transmitters** — physical separation is the
   single best lever for the periodic beacon-loss reconnects.
+- **Throughput is not yet tuned** (open follow-up). The path works and is mostly
+  stable, but bandwidth is limited by: single-shot NO_ACK downlink (no L2
+  retransmit), the thin ~600 ms over-air beacon cadence, the shared/legacy 6–54
+  Mbps rates, and the medium→bridge→air relay latency. Levers to explore next:
+  a quieter channel, separated radios, `INJECT_COPIES` tuning, and whether the
+  VM beacon/rate control can be made to deliver more of its frames to air.
 
 ---
 
