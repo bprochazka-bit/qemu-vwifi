@@ -291,17 +291,27 @@ Signs of each historical failure mode, for future debugging:
   "~100 Hz tick pacing" guess.) Note radios differ: the witness once showed the
   MT7921U honoring 6 Mbps, while the second radio here appears to inject at
   ~1 Mbps — measure the *actual* rate per radio with `capture` before concluding.
-- **`capture` reports the on-air rate** of the VWLB frames (parsed from the RX
-  radiotap), which settles whether a given radio honors the injected `-R` or
-  falls back to a basic rate. Run the size sweep and a rate-reporting capture on
-  the radio the bridge actually injects on (the MT7921U), not just any monitor
-  radio.
+- **Confirmed: mt76 ignores the legacy injection rate on *both* radios.** The
+  size sweep is identical whether injecting at `-R 6` or `-R 24` (~0.7/0.9/1.0
+  Mbps at 200/700/1500 B), on the MT7921U (the bridge's radio) and the second
+  mt76. So the legacy radiotap RATE is a no-op here and the on-air rate sits at
+  the ~1 Mbps basic rate. `capture` prints the on-air rate parsed from the RX
+  radiotap to confirm this directly on the radio the bridge injects on.
+- **The remaining lever worth trying: HT MCS injection.** mt76 has historically
+  honored the radiotap **MCS** field even when it ignores the legacy RATE.
+  `vwifi-linkbench inject -M <mcs>` builds an HT (TX_FLAGS+MCS) radiotap instead
+  of a legacy rate (MCS0=6.5 … MCS7=65 Mbps @20 MHz). If a co-channel `capture`
+  shows the frames going out as HT and inject throughput jumps well above 1 Mbps,
+  the fix is to inject HT from `vwifi-phys-bridge` (a phone can receive HT frames
+  regardless of the AP being legacy — the PHY rate is independent of the MAC
+  frame). If MCS injection *also* stays ~1 Mbps, the conclusion is architectural:
+  mt76 monitor injection can't be rate-controlled, so high downlink throughput
+  needs a different inject path (e.g. an ath9k radio, which does honor injected
+  rates) or a real AP/mesh vif rather than monitor injection.
 - **Probes** (`vwifi-linkbench inject`): `-s a,b,c` sweeps size (flat fps ⇒
-  fps/per-frame-bound; constant Mbps ⇒ byte/rate-bound); `-Q` = qdisc bypass;
-  `-B <bytes>` = `SO_SNDBUF`; `-N` = non-blocking (surface ENOBUFS). If the
-  radio ignores the injected rate, the fix is to make it honor a higher legacy
-  rate (driver/firmware, or a different inject path) — raising the *rate*, since
-  the throughput is rate-bound, is what scales it, not queue tuning.
+  fps/per-frame-bound; constant Mbps ⇒ byte/rate-bound); `-M <mcs>` HT injection;
+  `-Q` = qdisc bypass; `-B <bytes>` = `SO_SNDBUF`; `-N` = non-blocking. `-Q`/`-B`
+  are already ruled out (it is not a queuing problem).
 - **Downlink loss still isn't retransmitted at L2** (NO_ACK), whether the loss is
   in the air or in the driver's monitor TX queue (`ENOBUFS`). Characterize which
   before tuning further (§7.5).

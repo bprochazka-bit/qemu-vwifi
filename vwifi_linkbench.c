@@ -143,13 +143,21 @@ static int open_mon(const char *iface, int for_tx)
 
 static int do_inject(const char *iface, double mbps, int size, double secs,
                      long pps, int nonblock, int qdisc_bypass, int sndbuf,
-                     int verbose)
+                     int mcs, int verbose)
 {
-    int rt = mbps_to_rt(mbps);
-    if (rt < 0) {
-        fprintf(stderr, "linkbench: bad -R %.1f (use 1,2,5.5,6,9,11,12,18,24,"
-                "36,48,54)\n", mbps);
-        return 1;
+    int rt = 0;
+    if (mcs >= 0) {
+        if (mcs > 31) {
+            fprintf(stderr, "linkbench: bad -M %d (HT MCS 0..31)\n", mcs);
+            return 1;
+        }
+    } else {
+        rt = mbps_to_rt(mbps);
+        if (rt < 0) {
+            fprintf(stderr, "linkbench: bad -R %.1f (use 1,2,5.5,6,9,11,12,18,"
+                    "24,36,48,54)\n", mbps);
+            return 1;
+        }
     }
     if (size < LB_MIN_SIZE) size = LB_MIN_SIZE;
     if (size > LB_MAX_SIZE) size = LB_MAX_SIZE;
@@ -178,17 +186,36 @@ static int do_inject(const char *iface, double mbps, int size, double secs,
         setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf)) < 0)
         perror("linkbench: SO_SNDBUF (continuing)");
 
-    /* Build radiotap (RATE + NO_ACK) + 802.11 data header once; only the
-     * sequence number in the payload changes per frame. */
-    uint8_t buf[12 + LB_MAX_SIZE];
-    uint8_t rtap[12] = {
-        0x00, 0x00, 0x0c, 0x00,          /* version, pad, len=12 */
-        0x04, 0x80, 0x00, 0x00,          /* present = RATE(2) | TX_FLAGS(15) */
-        (uint8_t)rt, 0x00,               /* rate, pad */
-        0x08, 0x00                       /* tx_flags = NO_ACK */
-    };
-    memcpy(buf, rtap, 12);
-    uint8_t *f = buf + 12;               /* 802.11 frame */
+    /* Build the radiotap header once; only the payload sequence number
+     * changes per frame. Two variants:
+     *   legacy — RATE (bit 2) + TX_FLAGS (bit 15), rate in 500 kbps units.
+     *   HT MCS — TX_FLAGS (bit 15) + MCS (bit 19). mt76 has historically
+     *            ignored the legacy RATE on monitor injection while still
+     *            honoring MCS, so this is the lever that may actually raise
+     *            the on-air rate above ~1 Mbps. MCS i @ 20 MHz long-GI:
+     *            0→6.5, 1→13, ... 7→65 Mbps. */
+    uint8_t buf[16 + LB_MAX_SIZE];
+    int rtlen;
+    if (mcs >= 0) {
+        uint8_t rtap[13] = {
+            0x00, 0x00, 0x0d, 0x00,      /* version, pad, len=13 */
+            0x00, 0x80, 0x08, 0x00,      /* present = TX_FLAGS(15) | MCS(19) */
+            0x08, 0x00,                  /* [8]  tx_flags = NO_ACK */
+            0x02, 0x00, (uint8_t)mcs     /* [10] mcs: known=idx, flags=0, index */
+        };
+        memcpy(buf, rtap, sizeof rtap);
+        rtlen = sizeof rtap;
+    } else {
+        uint8_t rtap[12] = {
+            0x00, 0x00, 0x0c, 0x00,      /* version, pad, len=12 */
+            0x04, 0x80, 0x00, 0x00,      /* present = RATE(2) | TX_FLAGS(15) */
+            (uint8_t)rt, 0x00,           /* rate, pad */
+            0x08, 0x00                   /* tx_flags = NO_ACK */
+        };
+        memcpy(buf, rtap, sizeof rtap);
+        rtlen = sizeof rtap;
+    }
+    uint8_t *f = buf + rtlen;             /* 802.11 frame */
     memset(f, 0, size);
     f[0] = 0x08; f[1] = 0x02;            /* data, FromDS (AP->STA) */
     /* addr1 = DA (dummy STA), addr2 = BSSID/SA, addr3 = SA */
@@ -198,20 +225,26 @@ static int do_inject(const char *iface, double mbps, int size, double secs,
     memcpy(f + 10, bssid, 6);
     memcpy(f + 16, bssid, 6);
     memcpy(f + LB_PAYLOAD_OFF, LB_MAGIC, 4);
-    int total = 12 + size;
+    int total = rtlen + size;
 
     signal(SIGINT, on_sig);
     signal(SIGTERM, on_sig);
 
-    fprintf(stderr, "linkbench: inject %s: rate=%.1f Mbps size=%dB dur=%.0fs "
-            "%s%s%s%s\n", iface, mbps, size, secs,
+    char ratestr[32];
+    if (mcs >= 0) snprintf(ratestr, sizeof ratestr, "MCS%d (HT)", mcs);
+    else          snprintf(ratestr, sizeof ratestr, "%.1f Mbps", mbps);
+    fprintf(stderr, "linkbench: inject %s: rate=%s size=%dB dur=%.0fs "
+            "%s%s%s%s\n", iface, ratestr, size, secs,
             pps ? "paced " : "max-rate ", nonblock ? "nonblock" : "blocking",
             qdisc_bypass ? " qdisc-bypass" : "",
             sndbuf ? " sndbuf-set" : "");
     if (pps) fprintf(stderr, "linkbench: target %ld pps\n", pps);
 
     uint64_t offered = 0, ok = 0, enobufs = 0, eagain = 0, err = 0;
-    uint32_t seq = 0;
+    /* Sequence numbers stay monotonic ACROSS a -s sweep (do_inject is called
+     * once per size). Resetting per call would make a single capture see
+     * seq restart at 0 and mis-compute loss. */
+    static uint32_t seq = 0;
     double t0 = now_ms(), tend = t0 + secs * 1000.0, tnext = t0;
     double interval_ms = pps ? 1000.0 / (double)pps : 0.0;
     double last_log = t0;
@@ -407,13 +440,18 @@ static int do_capture(const char *iface, double secs, int verbose)
         (unsigned long long)bench, bench / dur, bench_bytes * 8.0 / (dur * 1e6));
     if (have_seq) {
         uint64_t span = (uint64_t)(seq_max - seq_min) + 1;
-        double loss = span ? 100.0 * (span - bench) / span : 0.0;
+        /* bench can exceed span if the injector restarted its sequence during
+         * the window (e.g. two injectors, or an old build that reset seq per
+         * -s size) — clamp instead of underflowing the unsigned subtraction. */
+        double loss = (span > bench) ? 100.0 * (span - bench) / span : 0.0;
         fprintf(stderr,
         "  seq span    : %llu..%llu (%llu sent by injector in window)\n"
-        "  air loss    : %.1f%%  (received %llu of %llu)\n",
+        "  air loss    : %.1f%%  (received %llu of %llu)%s\n",
         (unsigned long long)seq_min, (unsigned long long)seq_max,
         (unsigned long long)span, loss,
-        (unsigned long long)bench, (unsigned long long)span);
+        (unsigned long long)bench, (unsigned long long)span,
+        bench > span ? "  [received > span: seq restarted / duplicate injector]"
+                     : "");
 
         /* On-air rate the injected frames ACTUALLY went out at — settles
          * whether the radio honored the injected -R or fell back to a basic
@@ -441,7 +479,7 @@ static void usage(const char *p)
 {
     fprintf(stderr,
         "Usage:\n"
-        "  %s inject  <iface> [-R mbps] [-s bytes[,bytes...]] [-t secs]\n"
+        "  %s inject  <iface> [-R mbps | -M mcs] [-s bytes[,bytes...]] [-t secs]\n"
         "             [-p pps] [-N] [-Q] [-B bytes] [-v]\n"
         "  %s capture <iface> [-t secs] [-v]\n"
         "\n"
@@ -453,7 +491,10 @@ static void usage(const char *p)
         "Set the interface up FIRST (monitor mode + channel), both radios on the\n"
         "same channel:  sudo ./scripts/mon-setup.sh <iface> <channel>\n"
         "\n"
-        "  -R <mbps>  inject rate: 1,2,5.5,6,9,11,12,18,24,36,48,54 (default 6)\n"
+        "  -R <mbps>  legacy inject rate: 1,2,5.5,6,9,11,12,18,24,36,48,54 (def 6)\n"
+        "  -M <mcs>   HT MCS inject (0-31) instead of a legacy rate. mt76 may\n"
+        "             honor MCS injection even when it ignores -R; MCS0=6.5..\n"
+        "             MCS7=65 Mbps @20MHz. capture shows HT for these frames.\n"
         "  -s <bytes> 802.11 frame size incl header (default 1500, max %d).\n"
         "             A comma list (e.g. 200,700,1500) sweeps each size in turn:\n"
         "             flat fps across sizes = fps-bound; rising fps = byte-bound.\n"
@@ -475,12 +516,13 @@ int main(int argc, char *argv[])
     const char *iface = argv[2];
 
     double mbps = 6.0, secs = 5.0;
-    int nonblock = 0, verbose = 0, qdisc_bypass = 0, sndbuf = 0;
+    int nonblock = 0, verbose = 0, qdisc_bypass = 0, sndbuf = 0, mcs = -1;
     long pps = 0;
     const char *size_list = "1500";   /* -s accepts a comma list to sweep */
 
     for (int i = 3; i < argc; i++) {
         if (!strcmp(argv[i], "-R") && i + 1 < argc)      mbps = atof(argv[++i]);
+        else if (!strcmp(argv[i], "-M") && i + 1 < argc) mcs  = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-s") && i + 1 < argc) size_list = argv[++i];
         else if (!strcmp(argv[i], "-t") && i + 1 < argc) secs = atof(argv[++i]);
         else if (!strcmp(argv[i], "-p") && i + 1 < argc) pps  = atol(argv[++i]);
@@ -503,7 +545,7 @@ int main(int argc, char *argv[])
         for (char *tok = strtok(list, ","); tok; tok = strtok(NULL, ",")) {
             int size = atoi(tok);
             rc |= do_inject(iface, mbps, size, secs, pps, nonblock,
-                            qdisc_bypass, sndbuf, verbose);
+                            qdisc_bypass, sndbuf, mcs, verbose);
         }
         return rc;
     }
