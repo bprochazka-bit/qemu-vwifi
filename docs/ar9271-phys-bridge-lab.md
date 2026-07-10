@@ -211,7 +211,9 @@ sudo ./vwifi-phys-bridge /run/vwifi/foo.sock wlx00c0cab57e6f \
 | `-b <bssid>` | relevance-filter match address (the range base) |
 | `-m <mask>`  | relevance-filter mask — forward the whole `…:00..03` set, not one BSSID |
 | `-r <n>`     | inject each critical frame N times (beacons/probe-resps excluded); use 2–3 on a lossy channel |
-| `-R <mbps>`  | over-air downlink rate (`1,2,5.5,6,9,11,12,18,24,36,48,54`, or `0`=auto/echo the VM's rate, floored at 6 Mbps). **Without a rate the mt76 monitor path injects at ~1 Mbps and caps downlink throughput.** No rate fallback on NO_ACK inject, so too high a rate for the link just raises loss — sweep 24–36 first. `INJECT_RATE=<mbps>` in `lab-bringup.sh`. |
+| `-R <mbps>`  | legacy over-air rate (`1,2,…,54`, or `0`=auto/echo the VM's rate). **mt76/ath9k_htc ignore this and always inject at ~1 Mbps** — use `-M`/`-L` on a Realtek. `INJECT_RATE=` in `lab-bringup.sh`. |
+| `-M <mcs>`   | inject at **HT MCS** `0..31` (Realtek rtl88xxau honors it → real rates, MCS7=65 Mbps; pick a moderate MCS like 4 for robustness). Overrides `-R`. `INJECT_MCS=` in `lab-bringup.sh`. |
+| `-L`         | inject **rate-less** (no rate field; driver picks). On a Realtek with `rtw_monitor_disable_1m=1` → HT-MCS7/VHT-MCS9. `INJECT_RATELESS=1` in `lab-bringup.sh`. |
 | `-S <sec>`   | print a periodic throughput report: per-direction fps/Mbps and, crucially, inject drop counters (`enobufs`/`eagain` = frames the driver's monitor TX queue rejected — otherwise-silent downlink loss). `SIGUSR1` dumps on demand. |
 | `-c <chan>`  | channel (must match the AP + AR9271 + MT7921U) |
 
@@ -337,6 +339,20 @@ Signs of each historical failure mode, for future debugging:
   above 1 Mbps, the fix is to make the bridge's **capture+inject radio the
   Realtek** (capture rate is irrelevant; only inject matters), keeping the AR9271
   as the AP-opmode SIFS ACK.
+- **CONFIRMED + IMPLEMENTED.** On an RTL8812AU (aircrack-ng driver): rate-less
+  inject → **VHT-MCS8, 37 Mbps** (3110 fps); `-M 7` → HT-MCS7, 37.7 Mbps;
+  `-R 24` → 30 Mbps — all witnessed, all ~37× the mt76 ceiling. The bridge now
+  supports `-M <mcs>` (HT MCS) and `-L` (rate-less); `lab-bringup.sh` takes
+  `INJECT_MCS=` / `INJECT_RATELESS=1`. **Deployment:** point the bridge's radio
+  (`MT_IF`) at the Realtek and pick a rate, e.g.:
+  ```sh
+  sudo AR9271_IF=<ar9271> MT_IF=<realtek> INJECT_MCS=4 ./scripts/lab-bringup.sh
+  ```
+  Start at a **moderate MCS (≈4, 39 Mbps)** and raise it while watching the phone:
+  the rate-less VHT-MCS8 is aggressive (a witness saw ~57 % frame loss, though
+  much of that is the mt76 *witness* not keeping up with 3110 fps, not true air
+  loss). A lower MCS trades peak rate for delivery on the co-located channel;
+  `-r`/separated radios/quiet channel still apply since NO_ACK has no L2 retransmit.
 - **Probes** (`vwifi-linkbench inject`): `-R 0` rate-less (driver default);
   `-M <mcs>` HT; `-R <mbps>` legacy; `-s a,b,c` size sweep; `-A` drop NO_ACK;
   `-Q`/`-B` qdisc/sndbuf. `capture` decodes the ground-truth on-air rate

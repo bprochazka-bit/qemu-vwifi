@@ -92,6 +92,15 @@ static int inject_copies = 1;
  * just raises loss -- sweep to find the desense wall (24-36 Mbps is typical). */
 static int inject_rate_rt;   /* 0 = auto/echo medium rate_code */
 
+/* Injection rate mode (mt76/ath9k_htc ignore the requested rate and always
+ * transmit at ~1 Mbps; a Realtek rtl88xxau honors these):
+ *   inject_mcs >= 0  : -M, inject HT MCS <n> (TX_FLAGS + MCS radiotap)
+ *   inject_rateless  : -R 0, inject with NO rate field so the driver picks
+ *                      (rtl88xxau w/ rtw_monitor_disable_1m=1 => HT-MCS7/VHT-MCS9)
+ *   otherwise        : legacy RATE (inject_rate_rt or the echoed medium rate) */
+static int inject_mcs = -1;
+static int inject_rateless;
+
 /* Raise the interface MTU this high at startup so a full-size downlink
  * frame (radiotap + 802.11 header + 1500-byte payload, ~1540 bytes) can
  * be injected without EMSGSIZE ("Message too long"). */
@@ -930,30 +939,52 @@ static size_t parse_radiotap(const uint8_t *buf, size_t len,
  * NO_ACK => inject exactly once, do not wait for an ACK, do not retransmit.
  * The medium is the retransmit authority; the air is a single-shot relay.
  *
- * We also advertise IEEE80211_RADIOTAP_RATE (bit 2) so the downlink goes out
- * at a chosen legacy rate instead of the mt76 monitor default (~1 Mbps in
- * 2.4 GHz). The rate byte is patched per frame (see process_hub_message):
- * either the -R fixed value or the VM's own rate echoed from the medium header.
- * Radiotap fields are laid out in present-bit order with natural alignment:
- * RATE (u8, bit 2) at offset 8, then a pad byte to 2-align TX_FLAGS (u16,
- * bit 15) at offset 10.
+ * The rate is set per the injection mode (see inject_mcs/inject_rateless):
+ * legacy RATE (bit 2), HT MCS (bit 19), or rate-less (no rate field, driver
+ * picks). All three keep TX_FLAGS=NO_ACK. build_inject_rtap() writes the right
+ * header for the mode and returns its length.
  *
- *   present  = (1 << 2) | (1 << 15)                   = 0x00008004
- *   rate     = <patched, 500 kbps units>
+ *   present  = (1<<2)|(1<<15)=0x8004 legacy | (1<<15)|(1<<19)=0x88000 HT |
+ *              (1<<15)=0x8000 rate-less
  *   tx_flags = 0x0008 (IEEE80211_RADIOTAP_F_TX_NOACK)
  */
 #define RADIOTAP_TX_FLAG_NOACK 0x0008
-#define INJECT_RATE_OFFSET     8    /* index of the rate byte in the header */
-static const uint8_t inject_radiotap[] = {
-    0x00,                   /* version */
-    0x00,                   /* pad */
-    0x0c, 0x00,             /* length = 12 (LE) */
-    0x04, 0x80, 0x00, 0x00, /* present = RATE (bit 2) | TX_FLAGS (bit 15) */
-    0x00,                   /* [8]  rate (500 kbps units) -- patched per frame */
-    0x00,                   /* [9]  pad: 2-align tx_flags */
-    0x08, 0x00              /* [10] tx_flags = NO_ACK (LE) */
-};
-#define INJECT_RADIOTAP_LEN (sizeof(inject_radiotap))
+#define INJECT_MAX_RTAP        13   /* largest header (HT MCS variant) */
+
+/* Build the injection radiotap header into buf; return its byte length. */
+static int build_inject_rtap(uint8_t *buf, uint8_t medium_rate_code)
+{
+    if (inject_mcs >= 0) {                 /* HT MCS: TX_FLAGS(15) + MCS(19) */
+        static const uint8_t h[13] = {
+            0x00, 0x00, 0x0d, 0x00,        /* version, pad, len=13 */
+            0x00, 0x80, 0x08, 0x00,        /* present = TX_FLAGS | MCS */
+            0x08, 0x00,                    /* [8]  tx_flags = NO_ACK */
+            0x02, 0x00, 0x00               /* [10] mcs: known=idx, flags, index */
+        };
+        memcpy(buf, h, 13);
+        buf[12] = (uint8_t)inject_mcs;
+        return 13;
+    }
+    if (inject_rateless) {                 /* no rate field: driver picks */
+        static const uint8_t h[10] = {
+            0x00, 0x00, 0x0a, 0x00,        /* version, pad, len=10 */
+            0x00, 0x80, 0x00, 0x00,        /* present = TX_FLAGS only */
+            0x08, 0x00                     /* [8] tx_flags = NO_ACK */
+        };
+        memcpy(buf, h, 10);
+        return 10;
+    }
+    static const uint8_t h[12] = {         /* legacy RATE(2) + TX_FLAGS(15) */
+        0x00, 0x00, 0x0c, 0x00,            /* version, pad, len=12 */
+        0x04, 0x80, 0x00, 0x00,            /* present = RATE | TX_FLAGS */
+        0x00, 0x00,                        /* [8] rate (patched), [9] pad */
+        0x08, 0x00                         /* [10] tx_flags = NO_ACK */
+    };
+    memcpy(buf, h, 12);
+    buf[8] = inject_rate_rt ? (uint8_t)inject_rate_rt
+                            : code_to_rt_rate(medium_rate_code);
+    return 12;
+}
 
 /*
  * Process a single hub message (payload after the 4-byte length prefix).
@@ -965,7 +996,8 @@ static void process_hub_message(const uint8_t *payload, uint32_t payload_len)
     const uint8_t *frame;
     uint16_t frame_len;
     uint16_t msg_chan_freq;
-    uint8_t inject_buf[INJECT_RADIOTAP_LEN + VWIFI_MAX_FRAME_SIZE];
+    uint8_t inject_buf[INJECT_MAX_RTAP + VWIFI_MAX_FRAME_SIZE];
+    int rtap_len;
     ssize_t n;
 
     /* Need at least a v1 header */
@@ -1020,16 +1052,9 @@ static void process_hub_message(const uint8_t *payload, uint32_t payload_len)
     /* Record echo hash before injection */
     echo_record(frame, frame_len);
 
-    /* Build injection buffer: radiotap header + 802.11 frame */
-    memcpy(inject_buf, inject_radiotap, INJECT_RADIOTAP_LEN);
-    memcpy(inject_buf + INJECT_RADIOTAP_LEN, frame, frame_len);
-
-    /* Set the over-air TX rate. -R pins a fixed rate; otherwise reproduce the
-     * rate the VM chose (medium header rate_code), floored at 6 Mbps. Either
-     * way we never fall back to the mt76 ~1 Mbps monitor default. */
-    inject_buf[INJECT_RATE_OFFSET] = inject_rate_rt
-                                   ? (uint8_t)inject_rate_rt
-                                   : code_to_rt_rate(hdr->rate_code);
+    /* Build injection buffer: radiotap header (per injection mode) + frame. */
+    rtap_len = build_inject_rtap(inject_buf, hdr->rate_code);
+    memcpy(inject_buf + rtap_len, frame, frame_len);
 
     /* Redundant injection is only for the one-shot, association-critical
      * frames that have no L2 retransmit and whose loss stalls the connection:
@@ -1057,10 +1082,10 @@ static void process_hub_message(const uint8_t *payload, uint32_t payload_len)
         /* Mark copies 2+ as retransmissions so the receiver's duplicate
          * filter drops them when an earlier copy already arrived. */
         if (c == 1)
-            inject_buf[INJECT_RADIOTAP_LEN + 1] |= 0x08;  /* FC retry bit */
+            inject_buf[rtap_len + 1] |= 0x08;  /* FC retry bit */
 
         stats_inject_writes++;
-        n = write(raw_fd, inject_buf, INJECT_RADIOTAP_LEN + frame_len);
+        n = write(raw_fd, inject_buf, rtap_len + frame_len);
         if (n < 0) {
             /* ENOBUFS/EAGAIN = the driver's monitor TX queue is full: the
              * frame is dropped on the floor with no L2 retransmit. Count it
@@ -1077,8 +1102,8 @@ static void process_hub_message(const uint8_t *payload, uint32_t payload_len)
             stats_drop_err++;
             if (errno == EMSGSIZE)
                 fprintf(stderr, "bridge: inject write: Message too long "
-                        "(frame=%u, need MTU >= %zu; raise it or clamp MSS)\n",
-                        frame_len, INJECT_RADIOTAP_LEN + frame_len);
+                        "(frame=%u, need MTU >= %d; raise it or clamp MSS)\n",
+                        frame_len, rtap_len + frame_len);
             else
                 fprintf(stderr, "bridge: inject write: %s\n", strerror(errno));
             break;  /* EMSGSIZE/hard errors fail every copy identically */
@@ -1375,12 +1400,15 @@ static void usage(const char *prog)
         "                   1; try 2-3 on a lossy/congested channel). Only\n"
         "                   management + EAPOL are duplicated; beacons and\n"
         "                   encrypted data are always injected once.\n"
-        "  -R <mbps>        Over-air downlink TX rate: 1,2,5.5,6,9,11,12,18,24,\n"
-        "                   36,48,54, or 0=auto (default; echo the VM's rate,\n"
-        "                   floored at 6 Mbps). Without this the mt76 monitor\n"
-        "                   path sends at ~1 Mbps and caps downlink throughput.\n"
-        "                   No rate fallback on NO_ACK inject -- too high a rate\n"
-        "                   for the link just raises loss; sweep 24-36 first.\n"
+        "  -R <mbps>        Legacy over-air downlink rate: 1,2,5.5,6,9,11,12,18,\n"
+        "                   24,36,48,54, or 0=auto (default; echo the VM's rate).\n"
+        "                   NOTE: mt76/ath9k_htc IGNORE this and always inject at\n"
+        "                   ~1 Mbps -- use -M/-L on a Realtek rtl88xxau instead.\n"
+        "  -M <mcs>         Inject at HT MCS <0..31> (TX_FLAGS+MCS radiotap). On a\n"
+        "                   Realtek rtl88xxau this gives real rates (MCS7=65Mbps);\n"
+        "                   pick a moderate MCS (e.g. 4) for robustness. Overrides -R.\n"
+        "  -L               Inject rate-less (no rate field; driver picks). On a\n"
+        "                   rtl88xxau w/ rtw_monitor_disable_1m=1 => HT-MCS7/VHT-MCS9.\n"
         "  -S <sec>         Print a periodic throughput report every <sec>s:\n"
         "                   per-direction fps/Mbps and inject drop counters\n"
         "                   (enobufs/eagain = silent downlink loss). SIGUSR1\n"
@@ -1415,7 +1443,7 @@ int main(int argc, char *argv[])
     /* Reset getopt to start scanning from argv[3] */
     optind = 3;
 
-    while ((opt = getopt(argc, argv, "c:w:s:n:b:m:r:R:S:Avh")) != -1) {
+    while ((opt = getopt(argc, argv, "c:w:s:n:b:m:r:R:M:S:LAvh")) != -1) {
         switch (opt) {
         case 'b': {
             unsigned int m[6];
@@ -1479,6 +1507,17 @@ int main(int argc, char *argv[])
             inject_rate_rt = rt;
             break;
         }
+        case 'M':
+            inject_mcs = atoi(optarg);
+            if (inject_mcs < 0 || inject_mcs > 31) {
+                fprintf(stderr, "bridge: -M must be an HT MCS 0..31: %s\n",
+                        optarg);
+                return 1;
+            }
+            break;
+        case 'L':
+            inject_rateless = 1;
+            break;
         case 'S':
             stats_interval = atoi(optarg);
             if (stats_interval < 0) {
@@ -1519,11 +1558,17 @@ int main(int argc, char *argv[])
 
     fprintf(stderr, "bridge: hub=%s iface=%s channel=%d bw=%s node=%s\n",
             hub_path, ifname, channel_num, bw_str, node_id);
-    if (inject_rate_rt)
-        fprintf(stderr, "bridge: inject rate=%.1f Mbps (fixed) copies=%d\n",
+    if (inject_mcs >= 0)
+        fprintf(stderr, "bridge: inject HT MCS%d copies=%d\n",
+                inject_mcs, inject_copies);
+    else if (inject_rateless)
+        fprintf(stderr, "bridge: inject rate-less (driver default) copies=%d\n",
+                inject_copies);
+    else if (inject_rate_rt)
+        fprintf(stderr, "bridge: inject rate=%.1f Mbps (fixed legacy) copies=%d\n",
                 inject_rate_rt / 2.0, inject_copies);
     else
-        fprintf(stderr, "bridge: inject rate=auto (echo VM rate, >=6 Mbps) "
+        fprintf(stderr, "bridge: inject rate=auto (echo VM legacy rate) "
                 "copies=%d\n", inject_copies);
 
     /* Compute channel/bandwidth configuration */
