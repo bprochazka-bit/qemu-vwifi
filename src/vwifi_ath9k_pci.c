@@ -29,6 +29,7 @@
 #include "vwifi_ath9k_regs.h"
 #include "vwifi_ath9k_eeprom.h"
 #include "vwifi_ath9k_dma.h"
+#include "vwifi_ath9k_ampdu.h"
 #include "vwifi_ath9k_crypto.h"
 #include "vwifi_ath9k_wep.h"
 #include "vwifi_ath9k_tkip.h"
@@ -684,6 +685,18 @@ static void vwifi_ath9k_process_tx_queue(VwifiAth9kState *s, int qnum)
     uint16_t frame_len, buf_len;
     int count = 0;
 
+    /*
+     * A-MPDU (802.11n) aggregation state, accumulated across the
+     * contiguous run of AR_IsAggr subframe descriptors that make up one
+     * aggregate.  We record each subframe's sequence number as it is sent
+     * and, on the last subframe (AR_IsAggr without AR_MoreAggr), synthesize
+     * the immediate Block-Ack that the peer would have returned.  agg_n == 0
+     * for every legacy (non-aggregated) frame, so this leaves the legacy
+     * TX path unchanged.
+     */
+    uint16_t agg_seqnos[VWIFI_ATH9K_MAX_AGGR];
+    int      agg_n = 0;
+
     if (desc_addr == 0) {
         return;
     }
@@ -854,6 +867,18 @@ static void vwifi_ath9k_process_tx_queue(VwifiAth9kState *s, int qnum)
 
             if (gathered > 0) {
                 /*
+                 * A-MPDU: record this subframe's 802.11 sequence number
+                 * for the Block-Ack bitmap we write on the last subframe.
+                 * The Sequence Control field is in the (unencrypted,
+                 * unpadded-prefix) header, so reading it here — before the
+                 * crypto/padding transforms below — is safe.
+                 */
+                if ((ds_ctl1 & AR_IsAggr) && agg_n < VWIFI_ATH9K_MAX_AGGR) {
+                    agg_seqnos[agg_n++] =
+                        vwifi_ath9k_frame_seqno(frame_buf, gathered);
+                }
+
+                /*
                  * Strip padding inserted by the driver.
                  * Padding = (hdrlen & 3) bytes after the 802.11 header.
                  * hdrlen is determined from the Frame Control field.
@@ -1023,7 +1048,49 @@ static void vwifi_ath9k_process_tx_queue(VwifiAth9kState *s, int qnum)
 
             /* status0: per-chain TX RSSI for the received ACK
              *   AR_TxRSSIAnt00[7:0] = chain 0 RSSI */
-            uint32_t txs0 = cpu_to_le32((uint32_t)ack_rssi & 0xFF);
+            uint32_t s0 = (uint32_t)ack_rssi & 0xFF;
+
+            /* status9: AR_TxDone (driver polls this for completion) */
+            uint32_t s9 = AR_TxDone;
+
+            /*
+             * A-MPDU Block-Ack completion.  On the aggregate's last
+             * subframe (AR_IsAggr set, AR_MoreAggr clear) report the
+             * immediate BlockAck the peer would have returned: set
+             * AR_TxBaStatus in status0, the per-subframe ACK bitmap in
+             * status3/4, and the BA window start in AR_SeqNum (status9).
+             * ath_tx_complete_aggr() reads exactly these from this
+             * (bf_lastbf) descriptor; the intermediate subframes' status
+             * words are never consulted, so they keep the plain
+             * AR_TxDone/AR_FrmXmitOK written above/below.
+             */
+            if ((ds_ctl1 & AR_IsAggr) && !(ds_ctl1 & AR_MoreAggr) &&
+                agg_n > 0) {
+                uint16_t seq_st;
+                uint32_t ba_low, ba_high;
+
+                vwifi_ath9k_ba_bitmap(agg_seqnos, agg_n,
+                                      &seq_st, &ba_low, &ba_high);
+
+                s0 |= AR_TxBaStatus;
+                s9 |= ((uint32_t)seq_st << AR_SeqNum_S) & AR_SeqNum;
+
+                uint32_t txs3 = cpu_to_le32(ba_low);
+                uint32_t txs4 = cpu_to_le32(ba_high);
+                pci_dma_write(&s->parent_obj,
+                              desc_addr + DESC_OFF_TX_STATUS3,
+                              &txs3, 4);
+                pci_dma_write(&s->parent_obj,
+                              desc_addr + DESC_OFF_TX_STATUS4,
+                              &txs4, 4);
+
+                vwifi_ath9k_trace("TX A-MPDU complete: %d subframes, "
+                            "seq_st=%u ba=%08x%08x", agg_n, seq_st,
+                            ba_high, ba_low);
+                agg_n = 0;  /* aggregate finished; ready for the next one */
+            }
+
+            uint32_t txs0 = cpu_to_le32(s0);
 
             /* status1: frame status + rate info
              *   AR_FrmXmitOK (bit 0) = 1 (ACK received)
@@ -1038,8 +1105,7 @@ static void vwifi_ath9k_process_tx_queue(VwifiAth9kState *s, int qnum)
                 ((uint32_t)ack_rssi & 0xFF) |
                 ((uint32_t)ack_rssi << AR_TxRSSICombined_S));
 
-            /* status9: AR_TxDone (driver polls this for completion) */
-            uint32_t txs9 = cpu_to_le32(AR_TxDone);
+            uint32_t txs9 = cpu_to_le32(s9);
 
             pci_dma_write(&s->parent_obj,
                           desc_addr + DESC_OFF_TX_STATUS0,
@@ -1048,7 +1114,7 @@ static void vwifi_ath9k_process_tx_queue(VwifiAth9kState *s, int qnum)
                           desc_addr + DESC_OFF_TX_STATUS1,
                           &txs1, 4);
             pci_dma_write(&s->parent_obj,
-                          desc_addr + 0x4C, /* TX_STATUS5 */
+                          desc_addr + DESC_OFF_TX_STATUS5,
                           &txs5, 4);
             pci_dma_write(&s->parent_obj,
                           desc_addr + DESC_OFF_TX_STATUS9,
@@ -1324,7 +1390,15 @@ static inline bool in_range(hwaddr addr, uint32_t base, uint32_t count)
  *  When a frame arrives from the medium (another VM), inject it into
  *  the RX DMA path the same way beacons are injected.
  * ------------------------------------------------------------------- */
-static void vwifi_ath9k_inject_rx_frame(VwifiAth9kState *s,
+/*
+ * Inject one received frame into the RX descriptor ring.  Returns true if a
+ * frame was written into a descriptor (the caller batches these and raises a
+ * single RXOK once the whole burst is drained — see vwifi_ath9k_fd_read).
+ * Returns false when nothing was injected (RX disabled, ring empty/RXEOL, or
+ * a DMA error); RXEOL is still raised inline as it is an error condition, not
+ * a normal completion.
+ */
+static bool vwifi_ath9k_inject_rx_frame(VwifiAth9kState *s,
                                   const struct vwifi_frame_hdr *hdr,
                                   const uint8_t *frame, uint16_t frame_len)
 {
@@ -1334,7 +1408,7 @@ static void vwifi_ath9k_inject_rx_frame(VwifiAth9kState *s,
     uint16_t rx_len;  /* length reported in RX status (includes FCS) */
 
     if (!s->rx_enabled || s->rxdp == 0) {
-        return;
+        return false;
     }
 
     desc_addr = s->rxdp;
@@ -1348,7 +1422,7 @@ static void vwifi_ath9k_inject_rx_frame(VwifiAth9kState *s,
     if (s->rxdp_ring_empty) {
         if (pci_dma_read(&s->parent_obj, desc_addr + DESC_OFF_LINK,
                          &ds_link, 4) != 0) {
-            return;
+            return false;
         }
         ds_link = le32_to_cpu(ds_link);
         if (ds_link != 0) {
@@ -1364,7 +1438,7 @@ static void vwifi_ath9k_inject_rx_frame(VwifiAth9kState *s,
             vwifi_ath9k_raise_irq(s, AR_ISR_RXEOL);
             s->rx_enabled = false;
             s->rxdp_ring_empty = false;
-            return;
+            return false;
         }
     }
 
@@ -1375,13 +1449,13 @@ static void vwifi_ath9k_inject_rx_frame(VwifiAth9kState *s,
                      &ds_data, 4) != 0 ||
         pci_dma_read(&s->parent_obj, desc_addr + DESC_OFF_CTL1,
                      &ds_ctl1, 4) != 0) {
-        return;
+        return false;
     }
 
     ds_link = le32_to_cpu(ds_link);
     ds_data = le32_to_cpu(ds_data);
     if (ds_data == 0) {
-        return;
+        return false;
     }
 
     /*
@@ -1576,14 +1650,16 @@ static void vwifi_ath9k_inject_rx_frame(VwifiAth9kState *s,
         vwifi_ath9k_trace("RX ring end at 0x%08x — deferring RXEOL", desc_addr);
     }
 
-    vwifi_ath9k_raise_irq(s, AR_ISR_RXOK);
+    return true;
 }
 
 /*
  * Process a complete medium message (after length prefix has been stripped).
  * Validates the header and injects the frame into the RX path.
  */
-static void vwifi_ath9k_process_msg(VwifiAth9kState *s,
+/* Returns true if the frame was injected into the RX ring (so the caller can
+ * coalesce the RXOK interrupt across a whole drained burst). */
+static bool vwifi_ath9k_process_msg(VwifiAth9kState *s,
                                      const uint8_t *msg, uint32_t msg_len)
 {
     struct vwifi_frame_hdr hdr;
@@ -1593,7 +1669,7 @@ static void vwifi_ath9k_process_msg(VwifiAth9kState *s,
     /* Accept v1 (28 bytes) or v2 (40 bytes) headers */
     if (msg_len < VWIFI_HDR_SIZE_MIN) {
         vwifi_ath9k_warn("MEDIUM RX: message too short (%u bytes)", msg_len);
-        return;
+        return false;
     }
 
     /* Peek at version to determine header size */
@@ -1602,7 +1678,7 @@ static void vwifi_ath9k_process_msg(VwifiAth9kState *s,
 
     if (hdr.magic != VWIFI_MAGIC) {
         vwifi_ath9k_warn("MEDIUM RX: bad magic 0x%08x", hdr.magic);
-        return;
+        return false;
     }
     if (hdr.version == 1) {
         hdr_size = VWIFI_HDR_SIZE_V1;
@@ -1615,21 +1691,21 @@ static void vwifi_ath9k_process_msg(VwifiAth9kState *s,
         }
     } else {
         vwifi_ath9k_warn("MEDIUM RX: unknown version %u", hdr.version);
-        return;
+        return false;
     }
     if (hdr.frame_len == 0 || hdr.frame_len > VWIFI_MAX_FRAME_SIZE) {
         vwifi_ath9k_warn("MEDIUM RX: bad frame_len %u", hdr.frame_len);
-        return;
+        return false;
     }
     if (msg_len < hdr_size + hdr.frame_len) {
         vwifi_ath9k_warn("MEDIUM RX: truncated (msg=%u, need=%u)",
                    msg_len, hdr_size + hdr.frame_len);
-        return;
+        return false;
     }
 
     /* Don't inject our own frames back (the hub broadcasts to all) */
     if (memcmp(hdr.tx_mac, s->our_mac, 6) == 0) {
-        return;
+        return false;
     }
 
     frame = msg + hdr_size;
@@ -1655,10 +1731,10 @@ static void vwifi_ath9k_process_msg(VwifiAth9kState *s,
      * perfectly valid during that time.
      */
     if (!s->rx_enabled || s->rxdp == 0) {
-        return;
+        return false;
     }
 
-    vwifi_ath9k_inject_rx_frame(s, &hdr, frame, hdr.frame_len);
+    return vwifi_ath9k_inject_rx_frame(s, &hdr, frame, hdr.frame_len);
 }
 
 /* -------------------------------------------------------------------
@@ -1700,7 +1776,15 @@ static void vwifi_ath9k_fd_read(void *opaque)
     }
     s->medium_rxbuf_used += (uint32_t)n;
 
-    /* Process complete messages */
+    /*
+     * Drain every complete message this read produced, then raise a single
+     * RXOK for the whole burst.  The ath9k RX tasklet drains the descriptor
+     * ring until it hits a descriptor without AR_RxDone, so one interrupt
+     * per burst is equivalent to one-per-frame for delivery but far cheaper
+     * — and it is exactly how an A-MPDU's de-aggregated subframes complete
+     * on real hardware (one RXOK for the aggregate, not one per MPDU).
+     */
+    bool any_rx = false;
     while (s->medium_rxbuf_used >= 4) {
         memcpy(&net_len, s->medium_rxbuf, 4);
         msg_len = ntohl(net_len);
@@ -1709,6 +1793,9 @@ static void vwifi_ath9k_fd_read(void *opaque)
             vwifi_ath9k_error("MEDIUM RX: absurd msg_len %u, resetting buffer",
                         msg_len);
             s->medium_rxbuf_used = 0;
+            if (any_rx) {
+                vwifi_ath9k_raise_irq(s, AR_ISR_RXOK);
+            }
             return;
         }
 
@@ -1716,7 +1803,9 @@ static void vwifi_ath9k_fd_read(void *opaque)
             break;
         }
 
-        vwifi_ath9k_process_msg(s, s->medium_rxbuf + 4, msg_len);
+        if (vwifi_ath9k_process_msg(s, s->medium_rxbuf + 4, msg_len)) {
+            any_rx = true;
+        }
 
         consumed = 4 + msg_len;
         if (consumed < s->medium_rxbuf_used) {
@@ -1724,6 +1813,10 @@ static void vwifi_ath9k_fd_read(void *opaque)
                     s->medium_rxbuf_used - consumed);
         }
         s->medium_rxbuf_used -= consumed;
+    }
+
+    if (any_rx) {
+        vwifi_ath9k_raise_irq(s, AR_ISR_RXOK);
     }
 }
 
