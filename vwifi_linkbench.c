@@ -441,6 +441,16 @@ static int do_capture(const char *iface, double secs, int verbose)
     struct timeval tv = { 0, 200000 };
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
+    /* Enlarge the capture buffer so a fast injector doesn't overflow it — the
+     * point is to measure *air* loss, not our own capture drops. The kernel
+     * still tells us via PACKET_STATISTICS how many it dropped buffer-full. */
+    int rcvbuf = 16 * 1024 * 1024;
+    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+    /* Reset the drop counter to a known baseline (PACKET_STATISTICS is
+     * read-and-clear). */
+    { struct tpacket_stats z; socklen_t zl = sizeof(z);
+      getsockopt(fd, SOL_PACKET, PACKET_STATISTICS, &z, &zl); }
+
     while (!g_stop && now_ms() < tend) {
         ssize_t n = recv(fd, buf, sizeof(buf), 0);
         if (n < 0) {
@@ -472,15 +482,27 @@ static int do_capture(const char *iface, double secs, int verbose)
         }
     }
     double dur = (now_ms() - t0) / 1000.0;
+
+    /* Kernel-side capture drops (buffer-full). If this is high, missing frames
+     * are OUR capture loss, not air loss — the distinction the 50% artifact
+     * hinges on. */
+    struct tpacket_stats pstats = { 0, 0 };
+    socklen_t pl = sizeof(pstats);
+    getsockopt(fd, SOL_PACKET, PACKET_STATISTICS, &pstats, &pl);
     close(fd);
 
     fprintf(stderr,
         "\nlinkbench: CAPTURE RESULT (%.2fs)\n"
         "  all frames  : %llu  (%.0f fps, %.2f Mbps captured)\n"
-        "  VWLB frames : %llu  (%.0f fps, %.2f Mbps)\n",
+        "  VWLB frames : %llu  (%.0f fps, %.2f Mbps)\n"
+        "  capture drop: %u frames dropped by the kernel (buffer full) %s\n",
         dur,
         (unsigned long long)all, all / dur, all_bytes * 8.0 / (dur * 1e6),
-        (unsigned long long)bench, bench / dur, bench_bytes * 8.0 / (dur * 1e6));
+        (unsigned long long)bench, bench / dur, bench_bytes * 8.0 / (dur * 1e6),
+        pstats.tp_drops,
+        pstats.tp_drops > pstats.tp_packets / 20
+            ? "<-- HIGH: missing frames are capture-side, NOT air loss"
+            : "(low: missing frames are real air loss)");
     if (have_seq) {
         uint64_t span = (uint64_t)(seq_max - seq_min) + 1;
         /* bench > span means each frame was received more than once: the
