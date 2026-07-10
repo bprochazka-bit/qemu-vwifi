@@ -308,23 +308,39 @@ Signs of each historical failure mode, for future debugging:
   correctly; mt76 ignores it. (An injecting radio's *self-capture* echoes the
   requested rate, e.g. a witness on the same radio once showed 6 Mbps — always
   confirm the rate on a *separate* radio.)
-- **The fix is a different inject radio.** ath9k honors injected legacy/MCS rates.
-  Confirm before changing hardware — put the AR9271 (or any ath9k) in monitor and
-  inject while a second radio witnesses the rate:
+- **ath9k_htc (AR9271) is *not* the fix — it is worse.** Injecting on the AR9271
+  in monitor also comes out at **1 Mbps** on the witness, and it *ignores NO_ACK*
+  so it retransmits each frame ~10–15× (11 fps, 89 ms/frame). Clearing NO_ACK on
+  mt76 (`-A`) likewise stays 1 Mbps (with a ~15× duplication) — so NO_ACK is not
+  the cause either. Both of the on-hand radios are hard-capped at 1 Mbps for
+  monitor injection.
+- **The fix is a Realtek rtl88xxau (RTL8812AU/8814AU) with the aircrack-ng
+  driver.** Unlike mt76/ath9k_htc, it can inject above 1 Mbps. Set the module
+  options (then reload the driver so they take — auto-load on insert misses them):
+  ```
+  # /etc/modprobe.d/88XXau.conf
+  options 88XXau rtw_monitor_disable_1m=1 rtw_monitor_retransmit=0
+  ```
+  `rtw_monitor_disable_1m=1` makes a **rate-less** inject default to HT-MCS7 /
+  VHT-MCS9 instead of the 1 Mbps floor; `rtw_monitor_retransmit=0` keeps
+  single-shot (NO_ACK honored per-frame via the radiotap TX_FLAGS bit). Test with
+  a **rate-less** inject (`-R 0` = no rate field) and read the decoded MCS on the
+  witness:
   ```sh
-  sudo ./scripts/mon-setup.sh <ath9k-iface> 11
+  sudo ./scripts/mon-setup.sh <rtl-iface> 11
   sudo ./scripts/mon-setup.sh <witness-iface> 11
   sudo ./vwifi-linkbench capture <witness-iface> -t 8 &
-  sudo ./vwifi-linkbench inject  <ath9k-iface> -R 24 -s 1500 -t 6   # then -M 7
+  sudo ./vwifi-linkbench inject  <rtl-iface> -R 0 -s 1500 -t 6      # rate-less
+  # also try -M 7 (explicit HT) and -R 24 (explicit legacy)
   ```
-  If the witness shows 24 Mbps / HT, the bridge's capture+inject radio should be
-  an **ath9k in monitor** (capture rate is irrelevant; only the inject rate is).
-  Role split then needs two ath9k-class radios — one AP-opmode for the SIFS ACK,
-  one monitor for capture/inject — since AP+monitor can't share one radio.
-- **Probes** (`vwifi-linkbench inject`): `-s a,b,c` sweeps size (flat fps ⇒
-  fps/per-frame-bound; constant Mbps ⇒ byte/rate-bound); `-M <mcs>` HT injection;
-  `-Q` = qdisc bypass; `-B <bytes>` = `SO_SNDBUF`; `-N` = non-blocking. `capture`
-  prints the ground-truth on-air rate. `-Q`/`-B`/`-M` are all ruled out on mt76.
+  If the witness shows `HT-MCS7` / `VHT-MCS9` and inject throughput jumps well
+  above 1 Mbps, the fix is to make the bridge's **capture+inject radio the
+  Realtek** (capture rate is irrelevant; only inject matters), keeping the AR9271
+  as the AP-opmode SIFS ACK.
+- **Probes** (`vwifi-linkbench inject`): `-R 0` rate-less (driver default);
+  `-M <mcs>` HT; `-R <mbps>` legacy; `-s a,b,c` size sweep; `-A` drop NO_ACK;
+  `-Q`/`-B` qdisc/sndbuf. `capture` decodes the ground-truth on-air rate
+  (legacy Mbps, HT-MCS, or VHT-MCS). On mt76/ath9k_htc every variant is 1 Mbps.
 - **Downlink loss still isn't retransmitted at L2** (NO_ACK), whether the loss is
   in the air or in the driver's monitor TX queue (`ENOBUFS`). Characterize which
   before tuning further (§7.5).

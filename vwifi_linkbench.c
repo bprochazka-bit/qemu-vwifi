@@ -146,16 +146,23 @@ static int do_inject(const char *iface, double mbps, int size, double secs,
                      int mcs, int noack, int verbose)
 {
     int rt = 0;
+    int rateless = 0;
     if (mcs >= 0) {
         if (mcs > 31) {
             fprintf(stderr, "linkbench: bad -M %d (HT MCS 0..31)\n", mcs);
             return 1;
         }
+    } else if (mbps == 0) {
+        /* -R 0: inject with NO rate/MCS radiotap field at all — let the driver
+         * pick. On mt76/ath9k_htc that means the 1 Mbps floor; on the Realtek
+         * rtl88xxau with rtw_monitor_disable_1m=1 a rate-less inject defaults
+         * to HT-MCS7/VHT-MCS9, which is the whole point of this mode. */
+        rateless = 1;
     } else {
         rt = mbps_to_rt(mbps);
         if (rt < 0) {
-            fprintf(stderr, "linkbench: bad -R %.1f (use 1,2,5.5,6,9,11,12,18,"
-                    "24,36,48,54)\n", mbps);
+            fprintf(stderr, "linkbench: bad -R %.1f (use 0=driver-default, or "
+                    "1,2,5.5,6,9,11,12,18,24,36,48,54)\n", mbps);
             return 1;
         }
     }
@@ -201,7 +208,15 @@ static int do_inject(const char *iface, double mbps, int size, double secs,
     uint8_t txf = noack ? 0x08 : 0x00;
     uint8_t buf[16 + LB_MAX_SIZE];
     int rtlen;
-    if (mcs >= 0) {
+    if (rateless) {
+        uint8_t rtap[10] = {
+            0x00, 0x00, 0x0a, 0x00,      /* version, pad, len=10 */
+            0x00, 0x80, 0x00, 0x00,      /* present = TX_FLAGS(15) only */
+            txf,  0x00                   /* [8] tx_flags (no rate/MCS field) */
+        };
+        memcpy(buf, rtap, sizeof rtap);
+        rtlen = sizeof rtap;
+    } else if (mcs >= 0) {
         uint8_t rtap[13] = {
             0x00, 0x00, 0x0d, 0x00,      /* version, pad, len=13 */
             0x00, 0x80, 0x08, 0x00,      /* present = TX_FLAGS(15) | MCS(19) */
@@ -235,9 +250,10 @@ static int do_inject(const char *iface, double mbps, int size, double secs,
     signal(SIGINT, on_sig);
     signal(SIGTERM, on_sig);
 
-    char ratestr[32];
-    if (mcs >= 0) snprintf(ratestr, sizeof ratestr, "MCS%d (HT)", mcs);
-    else          snprintf(ratestr, sizeof ratestr, "%.1f Mbps", mbps);
+    char ratestr[40];
+    if (rateless)      snprintf(ratestr, sizeof ratestr, "rate-less (driver default)");
+    else if (mcs >= 0) snprintf(ratestr, sizeof ratestr, "MCS%d (HT)", mcs);
+    else               snprintf(ratestr, sizeof ratestr, "%.1f Mbps", mbps);
     fprintf(stderr, "linkbench: inject %s: rate=%s size=%dB dur=%.0fs "
             "%s%s%s%s%s\n", iface, ratestr, size, secs,
             pps ? "paced " : "max-rate ", nonblock ? "nonblock" : "blocking",
@@ -351,37 +367,52 @@ static int find_magic(const uint8_t *buf, int len, uint32_t *seq)
     return 0;
 }
 
-/* Extract the legacy on-air rate (radiotap RATE, 500 kbps units) from a
- * captured frame, or -1 if absent (HT/VHT/HE frames carry MCS instead of a
- * legacy rate). Walks the present bitmap and the fields preceding bit 2
- * (RATE), honoring radiotap alignment. This tells us the rate the frame
- * *actually* went out at — i.e. whether the injected -R was honored. */
-static int rt_rate_500k(const uint8_t *buf, int len)
+/* Decode the on-air rate of a captured frame from its RX radiotap. Fills:
+ *   legacy_500k : legacy RATE in 500 kbps units, or -1 if absent
+ *   ht_mcs      : HT MCS index (0-31), or -1
+ *   vht_mcs     : VHT MCS index (0-9), or -1
+ * A frame carries exactly one of these. This tells us the rate the frame
+ * *actually* went out at — e.g. whether a Realtek rate-less inject came out
+ * as HT-MCS7/VHT-MCS9 or fell back to 1 Mbps like mt76.
+ *
+ * Walks the present bitmap honoring each field's radiotap size/alignment
+ * (alignment is measured from the start of the radiotap header). */
+struct rt_rate { int legacy_500k, ht_mcs, vht_mcs; };
+
+static void rt_parse(const uint8_t *buf, int len, struct rt_rate *out)
 {
-    if (len < 8) return -1;
+    out->legacy_500k = out->ht_mcs = out->vht_mcs = -1;
+    if (len < 8) return;
     int rtlen = buf[2] | (buf[3] << 8);
-    if (rtlen < 8 || rtlen > len) return -1;
+    if (rtlen < 8 || rtlen > len) return;
 
     uint32_t present;
     memcpy(&present, buf + 4, 4);
 
-    /* Skip any chained extended present words (bit 31). Field data starts
-     * after the last present word. */
+    /* Field data starts after all chained extended-present words (bit 31). */
     int off = 8;
     for (uint32_t p = present; p & (1u << 31); ) {
-        if (off + 4 > rtlen) return -1;
+        if (off + 4 > rtlen) return;
         memcpy(&p, buf + off, 4);
         off += 4;
     }
 
-    int cur = off;                                  /* alignment is vs buf[0] */
-    if (present & (1u << 0)) { cur = (cur + 7) & ~7; cur += 8; }  /* TSFT   */
-    if (present & (1u << 1)) { cur += 1; }                        /* Flags  */
-    if (present & (1u << 2)) {                                    /* Rate   */
-        if (cur + 1 > rtlen) return -1;
-        return buf[cur];
+    /* {size, align} for radiotap bits 0..21 (the ones before/at VHT). */
+    static const struct { uint8_t size, align; } F[] = {
+        {8,8},{1,1},{1,1},{4,2},{2,2},{1,1},{1,1},{2,2},   /* 0..7  */
+        {2,2},{2,2},{1,1},{1,1},{1,1},{1,1},{2,2},{2,2},   /* 8..15 */
+        {1,1},{1,1},{8,4},{3,1},{8,4},{12,2}               /* 16..21 */
+    };
+    int cur = off;                                  /* absolute, vs buf[0] */
+    for (int bit = 0; bit <= 21; bit++) {
+        if (!(present & (1u << bit))) continue;
+        cur = (cur + F[bit].align - 1) & ~(F[bit].align - 1);
+        if (cur + F[bit].size > rtlen) return;      /* truncated */
+        if (bit == 2)  out->legacy_500k = buf[cur];
+        if (bit == 19) out->ht_mcs = buf[cur + 2];  /* known, flags, index */
+        if (bit == 21) out->vht_mcs = (buf[cur + 4] >> 4) & 0x0f; /* user0 MCS */
+        cur += F[bit].size;
     }
-    return -1;   /* no legacy RATE field present */
 }
 
 static int do_capture(const char *iface, double secs, int verbose)
@@ -398,8 +429,10 @@ static int do_capture(const char *iface, double secs, int verbose)
     uint64_t all = 0, all_bytes = 0, bench = 0, bench_bytes = 0;
     int have_seq = 0;
     uint32_t seq_min = 0, seq_max = 0;
-    uint64_t rate_hist[256] = { 0 };   /* VWLB frames by on-air rate (500k) */
-    uint64_t rate_ht = 0;              /* VWLB frames with no legacy rate (HT/VHT) */
+    uint64_t rate_hist[256] = { 0 };   /* VWLB frames by legacy rate (500k) */
+    uint64_t ht_hist[32] = { 0 };      /* VWLB frames by HT MCS index */
+    uint64_t vht_hist[16] = { 0 };     /* VWLB frames by VHT MCS index */
+    uint64_t rate_unknown = 0;         /* VWLB frames with no decodable rate */
     double t0 = now_ms(), tend = t0 + secs * 1000.0;
     double last_log = t0;
     uint64_t last_bench = 0;
@@ -422,8 +455,12 @@ static int do_capture(const char *iface, double secs, int verbose)
             bench++; bench_bytes += n;
             if (!have_seq) { seq_min = seq_max = seq; have_seq = 1; }
             else { if (seq < seq_min) seq_min = seq; if (seq > seq_max) seq_max = seq; }
-            int r = rt_rate_500k(buf, (int)n);
-            if (r >= 0) rate_hist[r & 0xff]++; else rate_ht++;
+            struct rt_rate rr;
+            rt_parse(buf, (int)n, &rr);
+            if (rr.legacy_500k >= 0)   rate_hist[rr.legacy_500k & 0xff]++;
+            else if (rr.vht_mcs >= 0)  vht_hist[rr.vht_mcs & 0x0f]++;
+            else if (rr.ht_mcs >= 0)   ht_hist[rr.ht_mcs & 0x1f]++;
+            else                       rate_unknown++;
         }
         double t = now_ms();
         if (verbose && t - last_log >= 1000.0) {
@@ -467,8 +504,8 @@ static int do_capture(const char *iface, double secs, int verbose)
             (unsigned long long)bench, (unsigned long long)span);
 
         /* On-air rate the injected frames ACTUALLY went out at — settles
-         * whether the radio honored the injected -R or fell back to a basic
-         * rate. */
+         * whether the radio honored the requested rate or fell back to a basic
+         * rate. HT MCS0-7 @20MHz LGI = 6.5..65 Mbps; VHT-MCS9 @20MHz = 86.7. */
         fprintf(stderr, "  on-air rate :");
         int shown = 0;
         for (int r = 0; r < 256; r++)
@@ -477,9 +514,23 @@ static int do_capture(const char *iface, double secs, int verbose)
                         (unsigned long long)rate_hist[r]);
                 shown++;
             }
-        if (rate_ht) fprintf(stderr, " HT/VHT(no-legacy-rate)=%llu",
-                             (unsigned long long)rate_ht);
-        if (!shown && !rate_ht) fprintf(stderr, " (radiotap had no rate field)");
+        for (int m = 0; m < 32; m++)
+            if (ht_hist[m]) {
+                fprintf(stderr, " HT-MCS%d=%llu", m,
+                        (unsigned long long)ht_hist[m]);
+                shown++;
+            }
+        for (int m = 0; m < 16; m++)
+            if (vht_hist[m]) {
+                fprintf(stderr, " VHT-MCS%d=%llu", m,
+                        (unsigned long long)vht_hist[m]);
+                shown++;
+            }
+        if (rate_unknown)
+            fprintf(stderr, " unknown(no-rate-field)=%llu",
+                    (unsigned long long)rate_unknown);
+        if (!shown && !rate_unknown)
+            fprintf(stderr, " (radiotap had no rate field)");
         fprintf(stderr, "\n");
     } else {
         fprintf(stderr, "  (no VWLB frames seen — is an injector running on "
@@ -504,10 +555,13 @@ static void usage(const char *p)
         "Set the interface up FIRST (monitor mode + channel), both radios on the\n"
         "same channel:  sudo ./scripts/mon-setup.sh <iface> <channel>\n"
         "\n"
-        "  -R <mbps>  legacy inject rate: 1,2,5.5,6,9,11,12,18,24,36,48,54 (def 6)\n"
+        "  -R <mbps>  legacy inject rate: 1,2,5.5,6,9,11,12,18,24,36,48,54 (def 6),\n"
+        "             or 0 = rate-less (no rate field; let the driver pick — a\n"
+        "             Realtek rtl88xxau with rtw_monitor_disable_1m=1 then uses\n"
+        "             HT-MCS7/VHT-MCS9 instead of the 1 Mbps floor).\n"
         "  -M <mcs>   HT MCS inject (0-31) instead of a legacy rate. mt76 may\n"
         "             honor MCS injection even when it ignores -R; MCS0=6.5..\n"
-        "             MCS7=65 Mbps @20MHz. capture shows HT for these frames.\n"
+        "             MCS7=65 Mbps @20MHz. capture decodes the on-air MCS.\n"
         "  -s <bytes> 802.11 frame size incl header (default 1500, max %d).\n"
         "             A comma list (e.g. 200,700,1500) sweeps each size in turn:\n"
         "             flat fps across sizes = fps-bound; rising fps = byte-bound.\n"
