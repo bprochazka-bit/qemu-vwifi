@@ -138,7 +138,8 @@ static struct {
 static uint64_t stats_hub_to_phys;      /* frames injected OK (per source frame) */
 static uint64_t stats_phys_to_hub;      /* frames forwarded to the hub */
 static uint64_t stats_echoes;           /* own injects suppressed on capture */
-static uint64_t stats_hp_bytes;         /* bytes injected (hub->phys, on-air) */
+static uint64_t stats_hp_bytes;         /* hub->phys GOODPUT bytes (unique frames) */
+static uint64_t stats_hp_air_bytes;     /* hub->phys ON-AIR bytes (incl -r/-D copies) */
 static uint64_t stats_ph_bytes;         /* bytes forwarded (phys->hub) */
 static uint64_t stats_inject_writes;    /* write() calls incl. -r copies */
 static uint64_t stats_drop_enobufs;     /* injects dropped: driver TX queue full */
@@ -169,11 +170,12 @@ static void sigusr1_handler(int sig)
  * time since the previous report (0 => print cumulative only, no rates). */
 static void stats_report(double elapsed_ms)
 {
-    static uint64_t p_hp, p_ph, p_hpb, p_phb, p_deno, p_deag, p_derr, p_echo;
+    static uint64_t p_hp, p_ph, p_hpb, p_hpab, p_phb, p_deno, p_deag, p_derr, p_echo;
 
     uint64_t d_hp   = stats_hub_to_phys   - p_hp;
     uint64_t d_ph   = stats_phys_to_hub   - p_ph;
     uint64_t d_hpb  = stats_hp_bytes      - p_hpb;
+    uint64_t d_hpab = stats_hp_air_bytes  - p_hpab;
     uint64_t d_phb  = stats_ph_bytes      - p_phb;
     uint64_t d_deno = stats_drop_enobufs  - p_deno;
     uint64_t d_deag = stats_drop_eagain   - p_deag;
@@ -182,12 +184,18 @@ static void stats_report(double elapsed_ms)
 
     if (elapsed_ms > 0) {
         double s = elapsed_ms / 1000.0;
+        double good = (d_hpb * 8.0) / (s * 1e6);
+        double air  = (d_hpab * 8.0) / (s * 1e6);
+        char airbuf[32] = "";
+        /* Only show the on-air figure when copies make it differ from goodput. */
+        if (d_hpab > d_hpb)
+            snprintf(airbuf, sizeof airbuf, " (air %.2f)", air);
         fprintf(stderr,
-            "bridge: stats %.1fs | hub->phys %.0f fps %.2f Mbps "
+            "bridge: stats %.1fs | hub->phys %.0f fps %.2f Mbps%s "
             "drop(enobufs=%llu eagain=%llu err=%llu) | "
             "phys->hub %.0f fps %.2f Mbps | echoes %llu\n",
             s,
-            d_hp / s, (d_hpb * 8.0) / (s * 1e6),
+            d_hp / s, good, airbuf,
             (unsigned long long)d_deno, (unsigned long long)d_deag,
             (unsigned long long)d_derr,
             d_ph / s, (d_phb * 8.0) / (s * 1e6),
@@ -208,7 +216,7 @@ static void stats_report(double elapsed_ms)
     }
 
     p_hp = stats_hub_to_phys; p_ph = stats_phys_to_hub;
-    p_hpb = stats_hp_bytes;   p_phb = stats_ph_bytes;
+    p_hpb = stats_hp_bytes;   p_hpab = stats_hp_air_bytes; p_phb = stats_ph_bytes;
     p_deno = stats_drop_enobufs; p_deag = stats_drop_eagain;
     p_derr = stats_drop_err;  p_echo = stats_echoes;
 }
@@ -1112,11 +1120,13 @@ static void process_hub_message(const uint8_t *payload, uint32_t payload_len)
             break;  /* EMSGSIZE/hard errors fail every copy identically */
         }
         any_ok = 1;
-        stats_hp_bytes += frame_len;
+        stats_hp_air_bytes += frame_len;   /* on-air bytes: counts every copy */
     }
 
-    if (any_ok)
+    if (any_ok) {
         stats_hub_to_phys++;
+        stats_hp_bytes += frame_len;        /* goodput: unique frame, counted once */
+    }
     if (verbose)
         fprintf(stderr, "bridge: hub->phys: injected %u bytes x%d (ch=%u)\n",
                 frame_len, copies, msg_chan_freq);
