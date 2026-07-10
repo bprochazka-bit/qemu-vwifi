@@ -215,9 +215,14 @@ elif [ "$INJECT_RATELESS" = 1 ]; then
 else
     RATE_ARGS="-R $INJECT_RATE";     RATE_DESC="-R $INJECT_RATE"
 fi
-say "Starting bridge on $MT_IF (forwarding $FILTER_BASE / $FILTER_MASK, -r $INJECT_COPIES, $RATE_DESC)"
+# STATS_INTERVAL=<sec> adds -S: the bridge logs per-direction fps/Mbps + inject
+# drop counters every <sec>s to the bridge log — read it during a phone test to
+# see whether downlink (hub->phys) or uplink (phys->hub) is the throughput limit.
+STATS_INTERVAL="${STATS_INTERVAL:-0}"
+STATS_ARGS=""; [ "$STATS_INTERVAL" != 0 ] && STATS_ARGS="-S $STATS_INTERVAL"
+say "Starting bridge on $MT_IF (forwarding $FILTER_BASE / $FILTER_MASK, -r $INJECT_COPIES, $RATE_DESC $STATS_ARGS)"
 "$BRIDGE_BIN" "$HUB_SOCK" "$MT_IF" -c "$CHANNEL" \
-    -b "$FILTER_BASE" -m "$FILTER_MASK" -r "$INJECT_COPIES" $RATE_ARGS -v \
+    -b "$FILTER_BASE" -m "$FILTER_MASK" -r "$INJECT_COPIES" $RATE_ARGS $STATS_ARGS -v \
     > "$RUN_DIR/bridge.log" 2>&1 &
 sleep 1
 
