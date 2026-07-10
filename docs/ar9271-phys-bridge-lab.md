@@ -214,6 +214,8 @@ sudo ./vwifi-phys-bridge /run/vwifi/foo.sock wlx00c0cab57e6f \
 | `-R <mbps>`  | legacy over-air rate (`1,2,…,54`, or `0`=auto/echo the VM's rate). **mt76/ath9k_htc ignore this and always inject at ~1 Mbps** — use `-M`/`-L` on a Realtek. `INJECT_RATE=` in `lab-bringup.sh`. |
 | `-M <mcs>`   | inject at **HT MCS** `0..31` (Realtek rtl88xxau honors it → real rates, MCS7=65 Mbps; pick a moderate MCS like 4 for robustness). Overrides `-R`. `INJECT_MCS=` in `lab-bringup.sh`. |
 | `-L`         | inject **rate-less** (no rate field; driver picks). On a Realtek with `rtw_monitor_disable_1m=1` → HT-MCS7/VHT-MCS9. `INJECT_RATELESS=1` in `lab-bringup.sh`. |
+| `-D <n>`     | inject each **encrypted data** frame `n` times (1..4, default 1). On a fast radio with airtime to spare, 2–3 masks the single-shot NO_ACK downlink's air loss from TCP → goodput climbs toward the PHY rate. `INJECT_DATA_COPIES=` in `lab-bringup.sh`. |
+| `-S <sec>`   | periodic per-direction fps/Mbps + inject-drop report (`STATS_INTERVAL=`). Read it during a phone test to see if downlink (`hub->phys`) or uplink (`phys->hub`) is the limit. |
 | `-S <sec>`   | print a periodic throughput report: per-direction fps/Mbps and, crucially, inject drop counters (`enobufs`/`eagain` = frames the driver's monitor TX queue rejected — otherwise-silent downlink loss). `SIGUSR1` dumps on demand. |
 | `-c <chan>`  | channel (must match the AP + AR9271 + MT7921U) |
 
@@ -349,10 +351,23 @@ Signs of each historical failure mode, for future debugging:
   sudo AR9271_IF=<ar9271> MT_IF=<realtek> INJECT_MCS=4 ./scripts/lab-bringup.sh
   ```
   Start at a **moderate MCS (≈4, 39 Mbps)** and raise it while watching the phone:
-  the rate-less VHT-MCS8 is aggressive (a witness saw ~57 % frame loss, though
-  much of that is the mt76 *witness* not keeping up with 3110 fps, not true air
-  loss). A lower MCS trades peak rate for delivery on the co-located channel;
-  `-r`/separated radios/quiet channel still apply since NO_ACK has no L2 retransmit.
+  the rate-less VHT-MCS8 is aggressive. A lower MCS trades peak rate for delivery
+  on the co-located channel; `-r`/separated radios/quiet channel still apply
+  since NO_ACK has no L2 retransmit.
+- **Downlink air loss is NOT the deployment limit (proven).** Paced witness
+  captures (kernel `PACKET_STATISTICS` drops = 0) show **MCS4 1.8% / MCS7 1.2%**
+  air loss; the earlier "~57 %" was the mt76 witness overflowing at 3110 fps, not
+  air. (MCS0 showed 70 % — that is PHY *overdrive*, offering 12 Mbps into a
+  6.5 Mbps rate, not SNR loss; avoid MCS0.) Bridge `-S` on the deployed path:
+  `hub->phys` ~6–8 Mbps injected, 0 drops; `phys->hub` ~10 Mbps on upload — ~25×
+  the original 0.28 Mbps, and the relay is not the cap. The remaining limit is
+  TCP over the ~2 % single-shot-NO_ACK downlink (7 Mbps @ 15 ms RTT ⇒ ~1.3 %
+  loss, matching the witnessed 1.8 %).
+- **To push toward the PHY rate: `-D 2` (`INJECT_DATA_COPIES=2`).** Duplicating
+  each data frame turns ~2 % loss into ~0.04 %, so TCP stops backing off. Cheap on
+  a fast radio (7 Mbps of data in a 39 Mbps MCS4 pipe leaves ample airtime);
+  copies carry the retry bit and TCP dedups regardless, so no correctness risk.
+  Raise `-D` while watching `hub->phys` Mbps and the phone.
 - **Probes** (`vwifi-linkbench inject`): `-R 0` rate-less (driver default);
   `-M <mcs>` HT; `-R <mbps>` legacy; `-s a,b,c` size sweep; `-A` drop NO_ACK;
   `-Q`/`-B` qdisc/sndbuf. `capture` decodes the ground-truth on-air rate

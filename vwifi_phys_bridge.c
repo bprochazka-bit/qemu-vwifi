@@ -83,6 +83,11 @@ static uint8_t filter_mask[6] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
  * "DUP!"). */
 static int inject_copies = 1;
 
+/* -D <n>: how many times to inject each *encrypted data* frame (default 1 =
+ * single-shot). >1 masks the NO_ACK downlink's air loss from TCP at the cost
+ * of airtime -- only worth it on a fast inject radio (Realtek) with headroom. */
+static int data_copies = 1;
+
 /* -R <mbps>: fixed injected-downlink rate, in radiotap 500 kbps units.
  * 0 (default) = "auto": reproduce the rate the VM chose (the medium header's
  * rate_code), floored at 6 Mbps. Without a rate in the radiotap header the
@@ -1056,16 +1061,14 @@ static void process_hub_message(const uint8_t *payload, uint32_t payload_len)
     rtap_len = build_inject_rtap(inject_buf, hdr->rate_code);
     memcpy(inject_buf + rtap_len, frame, frame_len);
 
-    /* Redundant injection is only for the one-shot, association-critical
-     * frames that have no L2 retransmit and whose loss stalls the connection:
-     * management (auth/assoc/deauth/disassoc) and the unprotected EAPOL
-     * handshake (data frames sent before the key is installed). Everything
-     * else is injected once:
-     *   - beacons / probe responses: periodic, one loss is harmless;
-     *   - encrypted user data (Protected bit set): duplicating it delivers
-     *     duplicates all the way to the application (ping "DUP!", etc.) --
-     *     the receiver's dup filter does not reliably drop injected copies --
-     *     and TCP/ARP/DHCP already retransmit on their own. */
+    /* Redundant injection combats the single-shot NO_ACK downlink (no L2
+     * retransmit): association-critical frames (mgmt + unprotected EAPOL) use
+     * -r copies. Encrypted user data defaults to single-shot, but -D raises it:
+     * on a fast radio (Realtek) there is ample airtime, and duplicating each
+     * data frame turns a ~2% air loss into ~0.04%, so TCP stops treating loss
+     * as congestion and ramps toward the PHY rate. Copies 2+ carry the retry
+     * bit so a compliant STA drops the duplicate; even if it doesn't, TCP
+     * discards the duplicate segment (no correctness impact, only airtime). */
     int copies = inject_copies;
     {
         int ftype       = (frame[0] >> 2) & 0x3;   /* 0=mgmt,1=ctrl,2=data */
@@ -1074,7 +1077,7 @@ static void process_hub_message(const uint8_t *payload, uint32_t payload_len)
         if (ftype == 0 && (fsub == 8 || fsub == 5))   /* beacon / probe-resp */
             copies = 1;
         else if (ftype == 2 && protected_f)           /* encrypted user data */
-            copies = 1;
+            copies = data_copies;
     }
 
     int any_ok = 0;
@@ -1409,6 +1412,11 @@ static void usage(const char *prog)
         "                   pick a moderate MCS (e.g. 4) for robustness. Overrides -R.\n"
         "  -L               Inject rate-less (no rate field; driver picks). On a\n"
         "                   rtl88xxau w/ rtw_monitor_disable_1m=1 => HT-MCS7/VHT-MCS9.\n"
+        "  -D <n>           Inject each encrypted DATA frame <n> times (1..4,\n"
+        "                   default 1). On a fast radio with airtime to spare,\n"
+        "                   2-3 masks the NO_ACK downlink's air loss from TCP and\n"
+        "                   lifts goodput toward the PHY rate (copies carry the\n"
+        "                   retry bit; TCP dedups regardless).\n"
         "  -S <sec>         Print a periodic throughput report every <sec>s:\n"
         "                   per-direction fps/Mbps and inject drop counters\n"
         "                   (enobufs/eagain = silent downlink loss). SIGUSR1\n"
@@ -1443,7 +1451,7 @@ int main(int argc, char *argv[])
     /* Reset getopt to start scanning from argv[3] */
     optind = 3;
 
-    while ((opt = getopt(argc, argv, "c:w:s:n:b:m:r:R:M:S:LAvh")) != -1) {
+    while ((opt = getopt(argc, argv, "c:w:s:n:b:m:r:R:M:D:S:LAvh")) != -1) {
         switch (opt) {
         case 'b': {
             unsigned int m[6];
@@ -1518,6 +1526,13 @@ int main(int argc, char *argv[])
         case 'L':
             inject_rateless = 1;
             break;
+        case 'D':
+            data_copies = atoi(optarg);
+            if (data_copies < 1 || data_copies > 4) {
+                fprintf(stderr, "bridge: -D must be 1..4: %s\n", optarg);
+                return 1;
+            }
+            break;
         case 'S':
             stats_interval = atoi(optarg);
             if (stats_interval < 0) {
@@ -1559,17 +1574,17 @@ int main(int argc, char *argv[])
     fprintf(stderr, "bridge: hub=%s iface=%s channel=%d bw=%s node=%s\n",
             hub_path, ifname, channel_num, bw_str, node_id);
     if (inject_mcs >= 0)
-        fprintf(stderr, "bridge: inject HT MCS%d copies=%d\n",
-                inject_mcs, inject_copies);
+        fprintf(stderr, "bridge: inject HT MCS%d copies=%d data-copies=%d\n",
+                inject_mcs, inject_copies, data_copies);
     else if (inject_rateless)
-        fprintf(stderr, "bridge: inject rate-less (driver default) copies=%d\n",
-                inject_copies);
+        fprintf(stderr, "bridge: inject rate-less (driver default) copies=%d "
+                "data-copies=%d\n", inject_copies, data_copies);
     else if (inject_rate_rt)
-        fprintf(stderr, "bridge: inject rate=%.1f Mbps (fixed legacy) copies=%d\n",
-                inject_rate_rt / 2.0, inject_copies);
+        fprintf(stderr, "bridge: inject rate=%.1f Mbps (fixed legacy) copies=%d "
+                "data-copies=%d\n", inject_rate_rt / 2.0, inject_copies, data_copies);
     else
         fprintf(stderr, "bridge: inject rate=auto (echo VM legacy rate) "
-                "copies=%d\n", inject_copies);
+                "copies=%d data-copies=%d\n", inject_copies, data_copies);
 
     /* Compute channel/bandwidth configuration */
     if (compute_channel_config() < 0)

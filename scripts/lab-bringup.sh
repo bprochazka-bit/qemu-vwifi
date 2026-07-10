@@ -220,9 +220,13 @@ fi
 # see whether downlink (hub->phys) or uplink (phys->hub) is the throughput limit.
 STATS_INTERVAL="${STATS_INTERVAL:-0}"
 STATS_ARGS=""; [ "$STATS_INTERVAL" != 0 ] && STATS_ARGS="-S $STATS_INTERVAL"
-say "Starting bridge on $MT_IF (forwarding $FILTER_BASE / $FILTER_MASK, -r $INJECT_COPIES, $RATE_DESC $STATS_ARGS)"
+# INJECT_DATA_COPIES=<n> (-D): inject each encrypted data frame n times to mask
+# the NO_ACK downlink's air loss from TCP (only on a fast radio with headroom).
+INJECT_DATA_COPIES="${INJECT_DATA_COPIES:-1}"
+DATA_ARGS=""; [ "$INJECT_DATA_COPIES" != 1 ] && DATA_ARGS="-D $INJECT_DATA_COPIES"
+say "Starting bridge on $MT_IF (forwarding $FILTER_BASE / $FILTER_MASK, -r $INJECT_COPIES, $RATE_DESC $DATA_ARGS $STATS_ARGS)"
 "$BRIDGE_BIN" "$HUB_SOCK" "$MT_IF" -c "$CHANNEL" \
-    -b "$FILTER_BASE" -m "$FILTER_MASK" -r "$INJECT_COPIES" $RATE_ARGS $STATS_ARGS -v \
+    -b "$FILTER_BASE" -m "$FILTER_MASK" -r "$INJECT_COPIES" $RATE_ARGS $DATA_ARGS $STATS_ARGS -v \
     > "$RUN_DIR/bridge.log" 2>&1 &
 sleep 1
 
