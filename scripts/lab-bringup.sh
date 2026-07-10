@@ -200,9 +200,33 @@ tcpdump -i "$MT_IF" -w "$WITNESS_PCAP" -U >/dev/null 2>&1 &
 sleep 1
 
 INJECT_COPIES="${INJECT_COPIES:-3}"   # redundant injection for the lossy channel
-say "Starting bridge on $MT_IF (forwarding $FILTER_BASE / $FILTER_MASK, -r $INJECT_COPIES)"
+# Injection rate mode. mt76/ath9k_htc IGNORE the rate and always inject at
+# ~1 Mbps; a Realtek rtl88xxau honors it. Choose ONE:
+#   INJECT_MCS=<n>    -> -M <n>  (HT MCS on a Realtek; e.g. 4 for robustness)
+#   INJECT_RATELESS=1 -> -L      (rate-less; Realtek driver default MCS)
+#   INJECT_RATE=<m>   -> -R <m>  (legacy Mbps; 0=auto/echo VM, the default)
+INJECT_MCS="${INJECT_MCS:-}"
+INJECT_RATELESS="${INJECT_RATELESS:-0}"
+INJECT_RATE="${INJECT_RATE:-0}"
+if [ -n "$INJECT_MCS" ]; then
+    RATE_ARGS="-M $INJECT_MCS";      RATE_DESC="-M $INJECT_MCS"
+elif [ "$INJECT_RATELESS" = 1 ]; then
+    RATE_ARGS="-L";                  RATE_DESC="-L (rate-less)"
+else
+    RATE_ARGS="-R $INJECT_RATE";     RATE_DESC="-R $INJECT_RATE"
+fi
+# STATS_INTERVAL=<sec> adds -S: the bridge logs per-direction fps/Mbps + inject
+# drop counters every <sec>s to the bridge log — read it during a phone test to
+# see whether downlink (hub->phys) or uplink (phys->hub) is the throughput limit.
+STATS_INTERVAL="${STATS_INTERVAL:-0}"
+STATS_ARGS=""; [ "$STATS_INTERVAL" != 0 ] && STATS_ARGS="-S $STATS_INTERVAL"
+# INJECT_DATA_COPIES=<n> (-D): inject each encrypted data frame n times to mask
+# the NO_ACK downlink's air loss from TCP (only on a fast radio with headroom).
+INJECT_DATA_COPIES="${INJECT_DATA_COPIES:-1}"
+DATA_ARGS=""; [ "$INJECT_DATA_COPIES" != 1 ] && DATA_ARGS="-D $INJECT_DATA_COPIES"
+say "Starting bridge on $MT_IF (forwarding $FILTER_BASE / $FILTER_MASK, -r $INJECT_COPIES, $RATE_DESC $DATA_ARGS $STATS_ARGS)"
 "$BRIDGE_BIN" "$HUB_SOCK" "$MT_IF" -c "$CHANNEL" \
-    -b "$FILTER_BASE" -m "$FILTER_MASK" -r "$INJECT_COPIES" -v \
+    -b "$FILTER_BASE" -m "$FILTER_MASK" -r "$INJECT_COPIES" $RATE_ARGS $DATA_ARGS $STATS_ARGS -v \
     > "$RUN_DIR/bridge.log" 2>&1 &
 sleep 1
 

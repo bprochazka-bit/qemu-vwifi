@@ -11,6 +11,11 @@ Status: **validated end to end** — VM client, Linux laptop, and an Android pho
 all associate with WPA2-PSK, complete the 4-way handshake, get a DHCP lease, and
 pass traffic.
 
+Sections 0–6 are about making association/data *work at all*. **Throughput** is a
+separate axis, covered in §7: the four blockers below get you connected, but the
+downlink rate is capped by *which radio injects* — mt76/ath9k_htc are stuck at
+1 Mbps, an RTL8812AU reaches tens of Mbps (measured 0.28 → ~7 Mbps end to end).
+
 ---
 
 ## 0. TL;DR — the four things that had to be true
@@ -211,6 +216,12 @@ sudo ./vwifi-phys-bridge /run/vwifi/foo.sock wlx00c0cab57e6f \
 | `-b <bssid>` | relevance-filter match address (the range base) |
 | `-m <mask>`  | relevance-filter mask — forward the whole `…:00..03` set, not one BSSID |
 | `-r <n>`     | inject each critical frame N times (beacons/probe-resps excluded); use 2–3 on a lossy channel |
+| `-R <mbps>`  | legacy over-air rate (`1,2,…,54`, or `0`=auto/echo the VM's rate). **mt76/ath9k_htc ignore this and always inject at ~1 Mbps** — use `-M`/`-L` on a Realtek. `INJECT_RATE=` in `lab-bringup.sh`. |
+| `-M <mcs>`   | inject at **HT MCS** `0..31` (Realtek rtl88xxau honors it → real rates, MCS7=65 Mbps; pick a moderate MCS like 4 for robustness). Overrides `-R`. `INJECT_MCS=` in `lab-bringup.sh`. |
+| `-L`         | inject **rate-less** (no rate field; driver picks). On a Realtek with `rtw_monitor_disable_1m=1` → HT-MCS7/VHT-MCS9. `INJECT_RATELESS=1` in `lab-bringup.sh`. |
+| `-D <n>`     | inject each **encrypted data** frame `n` times (1..4, default 1). On a fast radio with airtime to spare, 2–3 masks the single-shot NO_ACK downlink's air loss from TCP → goodput climbs toward the PHY rate. `INJECT_DATA_COPIES=` in `lab-bringup.sh`. |
+| `-S <sec>`   | periodic per-direction fps/Mbps + inject-drop report (`STATS_INTERVAL=`). Read it during a phone test to see if downlink (`hub->phys`) or uplink (`phys->hub`) is the limit. |
+| `-S <sec>`   | print a periodic throughput report: per-direction fps/Mbps and, crucially, inject drop counters (`enobufs`/`eagain` = frames the driver's monitor TX queue rejected — otherwise-silent downlink loss). `SIGUSR1` dumps on demand. |
 | `-c <chan>`  | channel (must match the AP + AR9271 + MT7921U) |
 
 The bridge already: injects `NO_ACK` (no 15× self-retransmit storm); drops
@@ -246,29 +257,161 @@ Signs of each historical failure mode, for future debugging:
 | WPA2 associates, 4-way completes, **no data / no DHCP**, `rx drop misc` climbs | VM ath9k hw-crypto not real | `nohwcrypt=1` (§4) |
 | ping shows `DUP!`, each downlink 2–3× | `-r` duplicating encrypted data | (built in: only mgmt/EAPOL duplicated) |
 | `reason=3/4 locally_generated`, periodic reconnects | beacon/keepalive loss (co-location, congestion) | separate radios, clean channel |
+| download ≪ upload (e.g. 0.4 vs 5 Mbps), witness shows downlink at ~1 Mbps | injector sent no radiotap rate → mt76 monitor default | set `-R`/`INJECT_RATE` (§5); auto now floors at 6 Mbps |
 | Bridge exits: "raw socket read error: Network is down" | mt76 USB reset | self-heal (built in) |
 
 ---
 
-## 7. Constraints and remaining rough edges
+## 7. Throughput and constraints
 
-- **Single channel** for all phone-joinable APs (one radio pair). Pick the
-  quietest channel you can — congestion directly causes the periodic reconnects.
+Association works on any of the radios; **throughput does not** — it is gated by
+which radio injects the downlink. This section covers that (7.1), the standing
+constraints (7.2), and how to measure where a given setup is limited (7.3).
+
+## 7.1 Downlink throughput — the inject radio is everything
+
+The uplink is fine by construction: the AR9271 hardware-ACKs it and the STA does
+normal rate control + L2 retransmit, so it runs near link speed. **The downlink
+is the whole story** — it is injected single-shot (NO_ACK, no L2 retransmit), so
+a download-heavy test (speedtest, browsing) rides entirely on it, and its ceiling
+is set by **what rate the inject radio actually transmits at.**
+
+**The rate you request in radiotap is not necessarily what goes on air — and it
+is driver-specific.** Measured, ground-truth (witnessed on a *separate* radio;
+an injecting radio's self-capture only echoes the *requested* rate):
+
+| Inject radio | Honors requested rate? | On-air result |
+|---|---|---|
+| **MT7921U** (`mt76`) | No — ignores legacy RATE *and* HT MCS | pinned to **1 Mbps** |
+| **AR9271** (`ath9k_htc`) | No, *and* ignores NO_ACK (retransmits ~10–15×) | **1 Mbps**, ~11 fps |
+| **RTL8812AU** (`rtl88xxau`, aircrack-ng) | **Yes** — legacy, HT MCS, and rate-less | up to **VHT-MCS8 / ~37 Mbps** |
+
+So on mt76/ath9k_htc the downlink is hard-capped at ~1 Mbps (~0.5 Mbps TCP) no
+matter what `-R`/`-M`/`-L` you pass — not a bug in the bridge (it builds the
+radiotap correctly), a driver limitation. **Use a Realtek RTL8812AU/8814AU as the
+bridge's capture+inject radio** (capture rate is irrelevant; only inject matters),
+keeping the AR9271 as the AP-opmode SIFS-ACK radio.
+
+### Realtek setup
+
+```
+# /etc/modprobe.d/88XXau.conf   — then reload the driver so options take
+# (auto-load on insert misses modprobe.d): modprobe -r 88XXau && modprobe 88XXau
+options 88XXau rtw_monitor_disable_1m=1 rtw_monitor_retransmit=0
+```
+
+`rtw_monitor_disable_1m=1` lifts the 1 Mbps floor (a rate-less inject then
+defaults to HT-MCS7/VHT-MCS9); `rtw_monitor_retransmit=0` keeps single-shot so
+per-frame NO_ACK is honored. Confirm the on-air rate before deploying (§7.3).
+
+### Deploy + tune
+
+```sh
+sudo AR9271_IF=<ar9271> MT_IF=<realtek> INJECT_MCS=4 ./scripts/lab-bringup.sh
+```
+
+- **`INJECT_MCS=<n>`** (`-M`): fixed HT MCS — the recommended mode (deterministic,
+  tunable). Start at a **moderate MCS 4** (39 Mbps PHY) and raise while watching
+  the phone; higher MCS = more peak rate but needs better SNR on the co-located
+  channel. `INJECT_RATELESS=1`/`-L` uses the driver default (VHT-MCS8 — fast but
+  aggressive); legacy `-R <mbps>` also works. (Only relevant to synthetic
+  `linkbench` at a *fixed* offered rate: offering more than the PHY can carry
+  silently drops the excess — e.g. 1000 fps × 1500 B = 12 Mbps into MCS0's
+  6.5 Mbps loses ~half. TCP self-limits, so this doesn't bite in deployment.)
+- **`INJECT_DATA_COPIES=<n>`** (`-D`): inject each data frame `n`× to mask air
+  loss from TCP. **Only helps on a genuinely lossy link** — at MCS4 the air loss
+  is ~2 %, which is *not* the binding constraint, so `-D 2` there just doubles
+  airtime for no goodput gain (measured). Leave at 1 unless a loss test (§7.3)
+  shows real loss.
+- **`INJECT_COPIES=<n>`** (`-r`): duplicate association-critical mgmt/EAPOL frames
+  (2–3 on a lossy channel) — for reliable *association*, not steady-state rate.
+
+### Measured result
+
+0.28 Mbps → **~7 Mbps download (~25×)** at MCS4. The relay is not the cap (bridge
+`-S` shows 0 drops; capture does ~10 Mbps on upload; air loss ~2 %). The residual
+limit is **TCP over the single-shot downlink plus periodic full-connection
+stalls** (beacon-loss reconnects — the `0.0×` intervals where *both* directions
+collapse together in the `-S` log), and bufferbloat (loaded RTT ~240 ms). Those
+are stability/environmental issues: the standing levers are **physically separate
+the two radios**, a **quieter channel**, and (future work) redundant beacon
+injection. Raising MCS or `-D` will not move them.
+
+## 7.2 Other constraints
+
+- **Single channel** for all phone-joinable APs (one radio pair) — congestion
+  directly causes the periodic reconnects, so pick the quietest channel you can.
 - Joinable APs must be **legacy / no Block-Ack / no RTS-CTS** (`ieee80211n=0`,
-  `wmm_enabled=0`, `htmode=NONE`). APs that only serve *virtual* clients can stay
-  HT/VHT/HE at any width.
-- **Downlink losses aren't retransmitted at L2** (NO_ACK injection); rely on
-  `-r`, a clean channel, and upper-layer retries.
-- **mt76 flaps** under sustained load; the bridge now self-heals, but fewer flaps
-  = fewer blips (separate the radios, lower `-r`, a powered USB port/hub).
-- The two radios are **co-located transmitters** — physical separation is the
-  single best lever for the periodic beacon-loss reconnects.
-- **Throughput is not yet tuned** (open follow-up). The path works and is mostly
-  stable, but bandwidth is limited by: single-shot NO_ACK downlink (no L2
-  retransmit), the thin ~600 ms over-air beacon cadence, the shared/legacy 6–54
-  Mbps rates, and the medium→bridge→air relay latency. Levers to explore next:
-  a quieter channel, separated radios, `INJECT_COPIES` tuning, and whether the
-  VM beacon/rate control can be made to deliver more of its frames to air.
+  `wmm_enabled=0`, `htmode=NONE`); those extras are additional SIFS responses the
+  bridge doesn't generate. APs serving only *virtual* clients can stay HT/VHT/HE.
+- **Downlink loss isn't retransmitted at L2** (NO_ACK); rely on a clean channel,
+  separated radios, and upper-layer retries.
+- **USB radios flap** under sustained load; the bridge self-heals (reopens the
+  socket), but a powered hub / separate ports / lower `-r` mean fewer blips.
+- The radios are **co-located transmitters** — physical separation is the single
+  best lever for the periodic beacon-loss reconnects.
+
+## 7.3 Characterizing throughput (isolating the bottleneck)
+
+To find where a setup is limited, isolate each leg. Two instruments do it — one
+on the live path, one synthetic without TCP/VM/phone.
+
+**Live bridge counters (`STATS_INTERVAL=2` / `-S 2`, or send `SIGUSR1`).** During
+a phone speedtest, `tail -f /run/vwifi-lab/bridge.log | grep stats`:
+
+```
+bridge: stats 2.0s | hub->phys 330 fps 7.52 Mbps (air 15.0) drop(enobufs=0 eagain=0 err=0) | phys->hub 231 fps 0.25 Mbps | echoes 0
+```
+
+`hub->phys` Mbps is downlink **goodput** (matches the client); `(air N)` appears
+only when `-r`/`-D` copies make on-air bytes exceed it. `phys->hub` is the uplink
+(TCP ACKs on download; data on upload). Read it:
+- **`drop(enobufs=…)` climbing** → the inject radio's TX queue is the ceiling
+  (silent loss, invisible to a speedtest). Lever: fewer copies, pacing, better USB.
+- **`hub->phys` Mbps low, ~0 drops** → the bridge isn't being *offered* more; the
+  limit is upstream (VM rate control / medium), not the air.
+- **high `hub->phys`, ~0 drops, phone still slow** → downlink air loss (quantify
+  with linkbench below) or TCP/RTT.
+- **both directions periodically collapse to `~0` together** → a full-connection
+  stall (beacon-loss reconnect); a stability problem, not rate. Separate radios,
+  quieter channel.
+
+**`vwifi-linkbench` — an iperf for the PHY relay.** Measures each leg's raw
+ceiling directly, and — the crux of the whole throughput story — reports the
+**ground-truth on-air rate** (`capture` decodes legacy Mbps / HT-MCS / VHT-MCS
+from the RX radiotap) and **kernel capture drops** (`PACKET_STATISTICS`, so you
+can tell real air loss from the witness overflowing):
+
+Set each radio up first — **monitor mode on a channel**, and both radios of a
+pair on the *same* channel. `scripts/mon-setup.sh` does this and verifies it
+(it hard-fails if the channel didn't take — the #1 mistake, which otherwise
+leaves the radio "up" but off-frequency so injects vanish into a void and
+linkbench prints an impossible multi-Gbps rate):
+
+```sh
+sudo ./scripts/mon-setup.sh wlx00c0cab57e6f 11      # sink radio
+sudo ./scripts/mon-setup.sh wlx90de80152b9e 11      # source radio (same channel!)
+
+# Does this radio honor the injected rate? Inject on it, witness on the other.
+# (mt76/ath9k_htc => 1 Mbps; RTL8812AU => the MCS you asked for.)
+sudo ./vwifi-linkbench capture <witness> -t 10 &
+sudo ./vwifi-linkbench inject  <radio>   -M 4 -s 1500 -t 8 -p 1000
+
+# Air-loss vs MCS at a realistic paced rate (capture drop must read ~0 to trust
+# the loss figure): sweep -M 0,4,7. Note a rate offered above the PHY rate shows
+# as "loss" that is really overdrive (e.g. 1000fps*1500B=12Mbps into MCS0's 6.5).
+```
+
+`inject` probes: `-M <mcs>` HT · `-R <mbps>` legacy · `-R 0`/`-L` rate-less ·
+`-s a,b,c` size sweep · `-p <pps>` pace · `-A` drop NO_ACK · `-Q`/`-B` qdisc/sndbuf.
+A blocking inject that sustains an impossibly high fps (tens of thousands+) means
+the frames are **not reaching the radio** — the interface isn't on a channel or
+isn't really in monitor mode. Re-run `mon-setup.sh` before trusting any number.
+
+If `linkbench inject` sustains, say, 400+ fps at 6 Mbps with near-zero ENOBUFS,
+the inject path is not the cap and the problem is air loss or upstream offer; if
+it plateaus at ~40–80 fps with heavy ENOBUFS, the monitor TX queue is the wall
+and rate tuning can't help until that's addressed.
 
 ---
 
@@ -279,6 +422,8 @@ Signs of each historical failure mode, for future debugging:
 | `vwifi-medium` | host | the hub / medium |
 | `vwifi_host.c` | host kernel module | a host-side virtual radio on the medium (also had a `SW_CRYPTO_CONTROL` crypto bug, now fixed) |
 | emulated `ath9k` | in each VM | the VM's radio — needs `nohwcrypt=1` |
-| `vwifi-phys-bridge` | host | capture/inject relay between real air and the medium (MT7921U) |
+| `vwifi-phys-bridge` | host | capture/inject relay between real air and the medium (best: RTL8812AU inject radio) |
+| `vwifi-linkbench` | host | iperf-style inject/capture microbenchmark + on-air rate / air-loss measurement for the PHY relay (§7.3) |
 | AR9271 + hostapd decoys | host | the SIFS ACK for the VM BSSID range |
-| `scripts/lab-bringup.sh` | host | one-command bring-up |
+| `scripts/lab-bringup.sh` | host | one-command bring-up (`INJECT_MCS=`, `INJECT_DATA_COPIES=`, `STATS_INTERVAL=`, …) |
+| `scripts/mon-setup.sh` | host | put a radio in monitor mode on a channel and verify it took (§7.3) |

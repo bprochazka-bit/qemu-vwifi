@@ -83,6 +83,29 @@ static uint8_t filter_mask[6] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
  * "DUP!"). */
 static int inject_copies = 1;
 
+/* -D <n>: how many times to inject each *encrypted data* frame (default 1 =
+ * single-shot). >1 masks the NO_ACK downlink's air loss from TCP at the cost
+ * of airtime -- only worth it on a fast inject radio (Realtek) with headroom. */
+static int data_copies = 1;
+
+/* -R <mbps>: fixed injected-downlink rate, in radiotap 500 kbps units.
+ * 0 (default) = "auto": reproduce the rate the VM chose (the medium header's
+ * rate_code), floored at 6 Mbps. Without a rate in the radiotap header the
+ * mt76 monitor path transmits at the band's lowest basic rate (~1 Mbps in
+ * 2.4 GHz), which caps downlink throughput hard. Note there is no rate
+ * fallback on NO_ACK injection, so a fixed rate too high for the link SNR
+ * just raises loss -- sweep to find the desense wall (24-36 Mbps is typical). */
+static int inject_rate_rt;   /* 0 = auto/echo medium rate_code */
+
+/* Injection rate mode (mt76/ath9k_htc ignore the requested rate and always
+ * transmit at ~1 Mbps; a Realtek rtl88xxau honors these):
+ *   inject_mcs >= 0  : -M, inject HT MCS <n> (TX_FLAGS + MCS radiotap)
+ *   inject_rateless  : -R 0, inject with NO rate field so the driver picks
+ *                      (rtl88xxau w/ rtw_monitor_disable_1m=1 => HT-MCS7/VHT-MCS9)
+ *   otherwise        : legacy RATE (inject_rate_rt or the echoed medium rate) */
+static int inject_mcs = -1;
+static int inject_rateless;
+
 /* Raise the interface MTU this high at startup so a full-size downlink
  * frame (radiotap + 802.11 header + 1500-byte payload, ~1540 bytes) can
  * be injected without EMSGSIZE ("Message too long"). */
@@ -108,10 +131,23 @@ static struct {
     uint16_t freq_hi;           /* highest 20MHz channel in BW range */
 } chan_cfg;
 
-/* Statistics */
-static unsigned int stats_hub_to_phys;
-static unsigned int stats_phys_to_hub;
-static unsigned int stats_echoes;
+/* Statistics. Cumulative since start; the periodic reporter (-S) prints
+ * per-interval deltas so you can see live fps/throughput and, crucially,
+ * whether injects are being dropped by the driver's monitor TX queue
+ * (EAGAIN/ENOBUFS) -- an otherwise-silent downlink loss. */
+static uint64_t stats_hub_to_phys;      /* frames injected OK (per source frame) */
+static uint64_t stats_phys_to_hub;      /* frames forwarded to the hub */
+static uint64_t stats_echoes;           /* own injects suppressed on capture */
+static uint64_t stats_hp_bytes;         /* hub->phys GOODPUT bytes (unique frames) */
+static uint64_t stats_hp_air_bytes;     /* hub->phys ON-AIR bytes (incl -r/-D copies) */
+static uint64_t stats_ph_bytes;         /* bytes forwarded (phys->hub) */
+static uint64_t stats_inject_writes;    /* write() calls incl. -r copies */
+static uint64_t stats_drop_enobufs;     /* injects dropped: driver TX queue full */
+static uint64_t stats_drop_eagain;      /* injects dropped: socket would block */
+static uint64_t stats_drop_err;         /* injects dropped: other write() error */
+
+static int stats_interval;              /* -S <sec>: periodic report (0 = off) */
+static volatile sig_atomic_t stats_dump_now;  /* set by SIGUSR1 */
 
 /* ================================================================
  *  Signal handler
@@ -121,6 +157,68 @@ static void sig_handler(int sig)
 {
     (void)sig;
     g_running = 0;
+}
+
+static void sigusr1_handler(int sig)
+{
+    (void)sig;
+    stats_dump_now = 1;
+}
+
+/* Print a one-line throughput report: per-interval deltas plus cumulative
+ * totals. Called on the -S timer and on SIGUSR1. `elapsed_ms` is the wall
+ * time since the previous report (0 => print cumulative only, no rates). */
+static void stats_report(double elapsed_ms)
+{
+    static uint64_t p_hp, p_ph, p_hpb, p_hpab, p_phb, p_deno, p_deag, p_derr, p_echo;
+
+    uint64_t d_hp   = stats_hub_to_phys   - p_hp;
+    uint64_t d_ph   = stats_phys_to_hub   - p_ph;
+    uint64_t d_hpb  = stats_hp_bytes      - p_hpb;
+    uint64_t d_hpab = stats_hp_air_bytes  - p_hpab;
+    uint64_t d_phb  = stats_ph_bytes      - p_phb;
+    uint64_t d_deno = stats_drop_enobufs  - p_deno;
+    uint64_t d_deag = stats_drop_eagain   - p_deag;
+    uint64_t d_derr = stats_drop_err      - p_derr;
+    uint64_t d_echo = stats_echoes        - p_echo;
+
+    if (elapsed_ms > 0) {
+        double s = elapsed_ms / 1000.0;
+        double good = (d_hpb * 8.0) / (s * 1e6);
+        double air  = (d_hpab * 8.0) / (s * 1e6);
+        char airbuf[32] = "";
+        /* Only show the on-air figure when copies make it differ from goodput. */
+        if (d_hpab > d_hpb)
+            snprintf(airbuf, sizeof airbuf, " (air %.2f)", air);
+        fprintf(stderr,
+            "bridge: stats %.1fs | hub->phys %.0f fps %.2f Mbps%s "
+            "drop(enobufs=%llu eagain=%llu err=%llu) | "
+            "phys->hub %.0f fps %.2f Mbps | echoes %llu\n",
+            s,
+            d_hp / s, good, airbuf,
+            (unsigned long long)d_deno, (unsigned long long)d_deag,
+            (unsigned long long)d_derr,
+            d_ph / s, (d_phb * 8.0) / (s * 1e6),
+            (unsigned long long)d_echo);
+    } else {
+        fprintf(stderr,
+            "bridge: stats (cumulative) | hub->phys %llu frames %llu bytes "
+            "drop(enobufs=%llu eagain=%llu err=%llu) | phys->hub %llu frames "
+            "%llu bytes | echoes %llu\n",
+            (unsigned long long)stats_hub_to_phys,
+            (unsigned long long)stats_hp_bytes,
+            (unsigned long long)stats_drop_enobufs,
+            (unsigned long long)stats_drop_eagain,
+            (unsigned long long)stats_drop_err,
+            (unsigned long long)stats_phys_to_hub,
+            (unsigned long long)stats_ph_bytes,
+            (unsigned long long)stats_echoes);
+    }
+
+    p_hp = stats_hub_to_phys; p_ph = stats_phys_to_hub;
+    p_hpb = stats_hp_bytes;   p_hpab = stats_hp_air_bytes; p_phb = stats_ph_bytes;
+    p_deno = stats_drop_enobufs; p_deag = stats_drop_eagain;
+    p_derr = stats_drop_err;  p_echo = stats_echoes;
 }
 
 /* ================================================================
@@ -311,11 +409,10 @@ static int compute_channel_config(void)
 
 /* Radiotap uses 500 kbps units; the vwifi medium protocol uses the
  * legacy PLCP rate codes from vwifi.h. This table maps between the
- * two for the receive path (radiotap -> medium). The reverse
- * direction (medium -> radiotap) is currently unused: the injection
- * path builds a fixed-rate radiotap header rather than echoing the
- * incoming rate. If/when we want to honor per-frame rates on the
- * inject side, add the reverse helper back. */
+ * two in both directions: the receive path (radiotap -> medium) via
+ * rt_rate_to_code(), and the injection path (medium -> radiotap) via
+ * code_to_rt_rate(), which lets the downlink honor the rate the VM
+ * actually chose instead of the mt76 monitor default (~1 Mbps). */
 static const struct {
     uint8_t rt_rate;        /* radiotap 500kbps units */
     uint8_t code;           /* medium PLCP rate code */
@@ -343,6 +440,20 @@ static uint8_t rt_rate_to_code(uint8_t rt)
             return rate_map[i].code;
     }
     return VWIFI_DEFAULT_RATE;  /* 6 Mbps OFDM */
+}
+
+/* Convert a vwifi medium rate code to a radiotap rate (500 kbps units).
+ * Used on the inject path to reproduce the VM's chosen TX rate over the
+ * air. Falls back to 6 Mbps OFDM (rt 12) for an unknown/zero code so the
+ * downlink never drops to the ~1 Mbps monitor default. */
+#define INJECT_RATE_FLOOR_RT 12   /* 6 Mbps OFDM */
+static uint8_t code_to_rt_rate(uint8_t code)
+{
+    for (size_t i = 0; i < NUM_RATES; i++) {
+        if (rate_map[i].code == code)
+            return rate_map[i].rt_rate;
+    }
+    return INJECT_RATE_FLOOR_RT;
 }
 
 /* ================================================================
@@ -841,18 +952,52 @@ static size_t parse_radiotap(const uint8_t *buf, size_t len,
  * NO_ACK => inject exactly once, do not wait for an ACK, do not retransmit.
  * The medium is the retransmit authority; the air is a single-shot relay.
  *
- *   present = 1 << 15 (IEEE80211_RADIOTAP_TX_FLAGS)   = 0x00008000
+ * The rate is set per the injection mode (see inject_mcs/inject_rateless):
+ * legacy RATE (bit 2), HT MCS (bit 19), or rate-less (no rate field, driver
+ * picks). All three keep TX_FLAGS=NO_ACK. build_inject_rtap() writes the right
+ * header for the mode and returns its length.
+ *
+ *   present  = (1<<2)|(1<<15)=0x8004 legacy | (1<<15)|(1<<19)=0x88000 HT |
+ *              (1<<15)=0x8000 rate-less
  *   tx_flags = 0x0008 (IEEE80211_RADIOTAP_F_TX_NOACK)
  */
 #define RADIOTAP_TX_FLAG_NOACK 0x0008
-static const uint8_t inject_radiotap[] = {
-    0x00,                   /* version */
-    0x00,                   /* pad */
-    0x0a, 0x00,             /* length = 10 (LE) */
-    0x00, 0x80, 0x00, 0x00, /* present = TX_FLAGS (bit 15) */
-    0x08, 0x00              /* tx_flags = NO_ACK (LE) */
-};
-#define INJECT_RADIOTAP_LEN (sizeof(inject_radiotap))
+#define INJECT_MAX_RTAP        13   /* largest header (HT MCS variant) */
+
+/* Build the injection radiotap header into buf; return its byte length. */
+static int build_inject_rtap(uint8_t *buf, uint8_t medium_rate_code)
+{
+    if (inject_mcs >= 0) {                 /* HT MCS: TX_FLAGS(15) + MCS(19) */
+        static const uint8_t h[13] = {
+            0x00, 0x00, 0x0d, 0x00,        /* version, pad, len=13 */
+            0x00, 0x80, 0x08, 0x00,        /* present = TX_FLAGS | MCS */
+            0x08, 0x00,                    /* [8]  tx_flags = NO_ACK */
+            0x02, 0x00, 0x00               /* [10] mcs: known=idx, flags, index */
+        };
+        memcpy(buf, h, 13);
+        buf[12] = (uint8_t)inject_mcs;
+        return 13;
+    }
+    if (inject_rateless) {                 /* no rate field: driver picks */
+        static const uint8_t h[10] = {
+            0x00, 0x00, 0x0a, 0x00,        /* version, pad, len=10 */
+            0x00, 0x80, 0x00, 0x00,        /* present = TX_FLAGS only */
+            0x08, 0x00                     /* [8] tx_flags = NO_ACK */
+        };
+        memcpy(buf, h, 10);
+        return 10;
+    }
+    static const uint8_t h[12] = {         /* legacy RATE(2) + TX_FLAGS(15) */
+        0x00, 0x00, 0x0c, 0x00,            /* version, pad, len=12 */
+        0x04, 0x80, 0x00, 0x00,            /* present = RATE | TX_FLAGS */
+        0x00, 0x00,                        /* [8] rate (patched), [9] pad */
+        0x08, 0x00                         /* [10] tx_flags = NO_ACK */
+    };
+    memcpy(buf, h, 12);
+    buf[8] = inject_rate_rt ? (uint8_t)inject_rate_rt
+                            : code_to_rt_rate(medium_rate_code);
+    return 12;
+}
 
 /*
  * Process a single hub message (payload after the 4-byte length prefix).
@@ -864,7 +1009,8 @@ static void process_hub_message(const uint8_t *payload, uint32_t payload_len)
     const uint8_t *frame;
     uint16_t frame_len;
     uint16_t msg_chan_freq;
-    uint8_t inject_buf[INJECT_RADIOTAP_LEN + VWIFI_MAX_FRAME_SIZE];
+    uint8_t inject_buf[INJECT_MAX_RTAP + VWIFI_MAX_FRAME_SIZE];
+    int rtap_len;
     ssize_t n;
 
     /* Need at least a v1 header */
@@ -919,20 +1065,18 @@ static void process_hub_message(const uint8_t *payload, uint32_t payload_len)
     /* Record echo hash before injection */
     echo_record(frame, frame_len);
 
-    /* Build injection buffer: radiotap header + 802.11 frame */
-    memcpy(inject_buf, inject_radiotap, INJECT_RADIOTAP_LEN);
-    memcpy(inject_buf + INJECT_RADIOTAP_LEN, frame, frame_len);
+    /* Build injection buffer: radiotap header (per injection mode) + frame. */
+    rtap_len = build_inject_rtap(inject_buf, hdr->rate_code);
+    memcpy(inject_buf + rtap_len, frame, frame_len);
 
-    /* Redundant injection is only for the one-shot, association-critical
-     * frames that have no L2 retransmit and whose loss stalls the connection:
-     * management (auth/assoc/deauth/disassoc) and the unprotected EAPOL
-     * handshake (data frames sent before the key is installed). Everything
-     * else is injected once:
-     *   - beacons / probe responses: periodic, one loss is harmless;
-     *   - encrypted user data (Protected bit set): duplicating it delivers
-     *     duplicates all the way to the application (ping "DUP!", etc.) --
-     *     the receiver's dup filter does not reliably drop injected copies --
-     *     and TCP/ARP/DHCP already retransmit on their own. */
+    /* Redundant injection combats the single-shot NO_ACK downlink (no L2
+     * retransmit): association-critical frames (mgmt + unprotected EAPOL) use
+     * -r copies. Encrypted user data defaults to single-shot, but -D raises it:
+     * on a fast radio (Realtek) there is ample airtime, and duplicating each
+     * data frame turns a ~2% air loss into ~0.04%, so TCP stops treating loss
+     * as congestion and ramps toward the PHY rate. Copies 2+ carry the retry
+     * bit so a compliant STA drops the duplicate; even if it doesn't, TCP
+     * discards the duplicate segment (no correctness impact, only airtime). */
     int copies = inject_copies;
     {
         int ftype       = (frame[0] >> 2) & 0x3;   /* 0=mgmt,1=ctrl,2=data */
@@ -941,28 +1085,48 @@ static void process_hub_message(const uint8_t *payload, uint32_t payload_len)
         if (ftype == 0 && (fsub == 8 || fsub == 5))   /* beacon / probe-resp */
             copies = 1;
         else if (ftype == 2 && protected_f)           /* encrypted user data */
-            copies = 1;
+            copies = data_copies;
     }
 
+    int any_ok = 0;
     for (int c = 0; c < copies; c++) {
         /* Mark copies 2+ as retransmissions so the receiver's duplicate
          * filter drops them when an earlier copy already arrived. */
         if (c == 1)
-            inject_buf[INJECT_RADIOTAP_LEN + 1] |= 0x08;  /* FC retry bit */
+            inject_buf[rtap_len + 1] |= 0x08;  /* FC retry bit */
 
-        n = write(raw_fd, inject_buf, INJECT_RADIOTAP_LEN + frame_len);
+        stats_inject_writes++;
+        n = write(raw_fd, inject_buf, rtap_len + frame_len);
         if (n < 0) {
+            /* ENOBUFS/EAGAIN = the driver's monitor TX queue is full: the
+             * frame is dropped on the floor with no L2 retransmit. Count it
+             * (this is the silent downlink loss that caps throughput on a
+             * fast offered load) rather than swallowing it. */
+            if (errno == ENOBUFS) {
+                stats_drop_enobufs++;
+                continue;  /* a later copy may still get a queue slot */
+            }
+            if (errno == EAGAIN) {
+                stats_drop_eagain++;
+                continue;
+            }
+            stats_drop_err++;
             if (errno == EMSGSIZE)
                 fprintf(stderr, "bridge: inject write: Message too long "
-                        "(frame=%u, need MTU >= %zu; raise it or clamp MSS)\n",
-                        frame_len, INJECT_RADIOTAP_LEN + frame_len);
-            else if (errno != EAGAIN && errno != ENOBUFS)
+                        "(frame=%u, need MTU >= %d; raise it or clamp MSS)\n",
+                        frame_len, rtap_len + frame_len);
+            else
                 fprintf(stderr, "bridge: inject write: %s\n", strerror(errno));
-            return;
+            break;  /* EMSGSIZE/hard errors fail every copy identically */
         }
+        any_ok = 1;
+        stats_hp_air_bytes += frame_len;   /* on-air bytes: counts every copy */
     }
 
-    stats_hub_to_phys++;
+    if (any_ok) {
+        stats_hub_to_phys++;
+        stats_hp_bytes += frame_len;        /* goodput: unique frame, counted once */
+    }
     if (verbose)
         fprintf(stderr, "bridge: hub->phys: injected %u bytes x%d (ch=%u)\n",
                 frame_len, copies, msg_chan_freq);
@@ -1164,6 +1328,7 @@ static void handle_phys_data(void)
     }
 
     stats_phys_to_hub++;
+    stats_ph_bytes += frame_len;
     if (verbose)
         fprintf(stderr,
             "bridge: phys->hub: forwarded %zu bytes "
@@ -1248,6 +1413,24 @@ static void usage(const char *prog)
         "                   1; try 2-3 on a lossy/congested channel). Only\n"
         "                   management + EAPOL are duplicated; beacons and\n"
         "                   encrypted data are always injected once.\n"
+        "  -R <mbps>        Legacy over-air downlink rate: 1,2,5.5,6,9,11,12,18,\n"
+        "                   24,36,48,54, or 0=auto (default; echo the VM's rate).\n"
+        "                   NOTE: mt76/ath9k_htc IGNORE this and always inject at\n"
+        "                   ~1 Mbps -- use -M/-L on a Realtek rtl88xxau instead.\n"
+        "  -M <mcs>         Inject at HT MCS <0..31> (TX_FLAGS+MCS radiotap). On a\n"
+        "                   Realtek rtl88xxau this gives real rates (MCS7=65Mbps);\n"
+        "                   pick a moderate MCS (e.g. 4) for robustness. Overrides -R.\n"
+        "  -L               Inject rate-less (no rate field; driver picks). On a\n"
+        "                   rtl88xxau w/ rtw_monitor_disable_1m=1 => HT-MCS7/VHT-MCS9.\n"
+        "  -D <n>           Inject each encrypted DATA frame <n> times (1..4,\n"
+        "                   default 1). On a fast radio with airtime to spare,\n"
+        "                   2-3 masks the NO_ACK downlink's air loss from TCP and\n"
+        "                   lifts goodput toward the PHY rate (copies carry the\n"
+        "                   retry bit; TCP dedups regardless).\n"
+        "  -S <sec>         Print a periodic throughput report every <sec>s:\n"
+        "                   per-direction fps/Mbps and inject drop counters\n"
+        "                   (enobufs/eagain = silent downlink loss). SIGUSR1\n"
+        "                   dumps on demand. 0 = off (default).\n"
         "  -A               Forward ALL captured frames (disable the relevance\n"
         "                   filter; only for sniffing -- floods the hub on a\n"
         "                   busy channel)\n"
@@ -1278,7 +1461,7 @@ int main(int argc, char *argv[])
     /* Reset getopt to start scanning from argv[3] */
     optind = 3;
 
-    while ((opt = getopt(argc, argv, "c:w:s:n:b:m:r:Avh")) != -1) {
+    while ((opt = getopt(argc, argv, "c:w:s:n:b:m:r:R:M:D:S:LAvh")) != -1) {
         switch (opt) {
         case 'b': {
             unsigned int m[6];
@@ -1326,6 +1509,47 @@ int main(int argc, char *argv[])
                 return 1;
             }
             break;
+        case 'R': {
+            /* Legacy rate in Mbps -> radiotap 500 kbps units. 0 = auto. */
+            int rt = (int)(atof(optarg) * 2 + 0.5);
+            int ok = (rt == 0);
+            for (size_t i = 0; i < NUM_RATES && !ok; i++)
+                if (rate_map[i].rt_rate == rt)
+                    ok = 1;
+            if (!ok) {
+                fprintf(stderr, "bridge: -R must be a legacy rate in Mbps "
+                        "(1,2,5.5,6,9,11,12,18,24,36,48,54) or 0=auto: %s\n",
+                        optarg);
+                return 1;
+            }
+            inject_rate_rt = rt;
+            break;
+        }
+        case 'M':
+            inject_mcs = atoi(optarg);
+            if (inject_mcs < 0 || inject_mcs > 31) {
+                fprintf(stderr, "bridge: -M must be an HT MCS 0..31: %s\n",
+                        optarg);
+                return 1;
+            }
+            break;
+        case 'L':
+            inject_rateless = 1;
+            break;
+        case 'D':
+            data_copies = atoi(optarg);
+            if (data_copies < 1 || data_copies > 4) {
+                fprintf(stderr, "bridge: -D must be 1..4: %s\n", optarg);
+                return 1;
+            }
+            break;
+        case 'S':
+            stats_interval = atoi(optarg);
+            if (stats_interval < 0) {
+                fprintf(stderr, "bridge: -S must be >= 0: %s\n", optarg);
+                return 1;
+            }
+            break;
         case 'A':
             forward_all = 1;
             break;
@@ -1355,9 +1579,22 @@ int main(int argc, char *argv[])
     signal(SIGINT,  sig_handler);
     signal(SIGTERM, sig_handler);
     signal(SIGPIPE, SIG_IGN);
+    signal(SIGUSR1, sigusr1_handler);   /* dump stats on demand */
 
     fprintf(stderr, "bridge: hub=%s iface=%s channel=%d bw=%s node=%s\n",
             hub_path, ifname, channel_num, bw_str, node_id);
+    if (inject_mcs >= 0)
+        fprintf(stderr, "bridge: inject HT MCS%d copies=%d data-copies=%d\n",
+                inject_mcs, inject_copies, data_copies);
+    else if (inject_rateless)
+        fprintf(stderr, "bridge: inject rate-less (driver default) copies=%d "
+                "data-copies=%d\n", inject_copies, data_copies);
+    else if (inject_rate_rt)
+        fprintf(stderr, "bridge: inject rate=%.1f Mbps (fixed legacy) copies=%d "
+                "data-copies=%d\n", inject_rate_rt / 2.0, inject_copies, data_copies);
+    else
+        fprintf(stderr, "bridge: inject rate=auto (echo VM legacy rate) "
+                "copies=%d data-copies=%d\n", inject_copies, data_copies);
 
     /* Compute channel/bandwidth configuration */
     if (compute_channel_config() < 0)
@@ -1401,9 +1638,27 @@ int main(int argc, char *argv[])
     /* Main poll loop */
     {
         struct pollfd pfds[2];
+        struct timespec last_report;
         pfds[1].fd = hub_fd;   pfds[1].events = POLLIN;
+        clock_gettime(CLOCK_MONOTONIC, &last_report);
 
         while (g_running) {
+            /* Periodic (-S) or on-demand (SIGUSR1) throughput report. */
+            if (stats_interval || stats_dump_now) {
+                struct timespec now;
+                clock_gettime(CLOCK_MONOTONIC, &now);
+                double ms = (now.tv_sec - last_report.tv_sec) * 1000.0
+                          + (now.tv_nsec - last_report.tv_nsec) / 1e6;
+                if (stats_dump_now) {
+                    stats_report(ms);
+                    stats_dump_now = 0;
+                    last_report = now;
+                } else if (ms >= stats_interval * 1000.0) {
+                    stats_report(ms);
+                    last_report = now;
+                }
+            }
+
             /* A capture-interface flap (mt76 USB reset) is recoverable: reopen
              * the raw socket rather than tearing the whole bridge down. */
             if (raw_needs_reopen) {
@@ -1446,10 +1701,8 @@ int main(int argc, char *argv[])
     }
 
     /* Normal shutdown (reached after main loop exits) */
-    fprintf(stderr,
-        "bridge: shutting down -- hub->phys: %u frames, phys->hub: %u frames, "
-        "echoes suppressed: %u\n",
-        stats_hub_to_phys, stats_phys_to_hub, stats_echoes);
+    fprintf(stderr, "bridge: shutting down\n");
+    stats_report(0);
 
 out:
     if (hub_fd >= 0) close(hub_fd);
