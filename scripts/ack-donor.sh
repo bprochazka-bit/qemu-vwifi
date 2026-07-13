@@ -79,7 +79,7 @@ ip link show "$ACK_IF" >/dev/null 2>&1 || die "interface '$ACK_IF' not found"
 extra_vif() { printf 'ackd%d' "$1"; }
 
 # ---- teardown ---------------------------------------------------------------
-teardown() {
+teardown() {   # tear down our beacons + extra vifs; does NOT touch NM
     say "Tearing down"
     pkill -f "hostapd .*$RUN_DIR/" 2>/dev/null || true
     sleep 1
@@ -88,11 +88,16 @@ teardown() {
         iw dev "$(extra_vif "$i")" del 2>/dev/null || true
         i=$((i+1))
     done
-    # Hand the radio back to NetworkManager so it is usable again.
+}
+
+# Hand the radio back to NetworkManager. Done ONLY on explicit stop/exit -- never
+# during startup cleanup: re-enabling NM there lets it grab the interface and
+# race hostapd's AP-mode config, which fails as "Could not configure driver mode".
+restore_nm() {
     iw dev "$ACK_IF" set type managed 2>/dev/null || true
     nmcli device set "$ACK_IF" managed yes 2>/dev/null || true
 }
-if [ "${1:-}" = "stop" ]; then teardown; exit 0; fi
+if [ "${1:-}" = "stop" ]; then teardown; restore_nm; exit 0; fi
 
 # ---- MAC helpers ------------------------------------------------------------
 norm_mac() { printf '%s' "$1" | tr 'A-F' 'a-f'; }
@@ -178,6 +183,7 @@ say "Releasing $ACK_IF from NetworkManager / wpa_supplicant"
 nmcli device set "$ACK_IF" managed no 2>/dev/null || true
 pkill -f "wpa_supplicant.*$ACK_IF" 2>/dev/null || true
 rfkill unblock wifi 2>/dev/null || true
+sleep 1   # let NM/wpa_supplicant actually let go before we reconfigure
 
 # Configure + pin each vif, PRIMARY FIRST, then add+pin each extra one at a
 # time. This mirrors the proven lab-bringup order and churns the driver far
@@ -287,7 +293,7 @@ if [ "$WATCHDOG" != 1 ]; then
     say "WATCHDOG=0 -> setup complete, exiting (vifs/hostapd left running)."
     exit 0
 fi
-trap 'teardown; exit 0' INT TERM
+trap 'teardown; restore_nm; exit 0' INT TERM
 say "Watchdog running (re-pins on drift). Ctrl-C to tear down."
 while :; do
     sleep 3
