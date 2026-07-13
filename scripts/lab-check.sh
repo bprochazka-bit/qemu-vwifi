@@ -74,13 +74,18 @@ drv_of() {
 phy_of() { iw dev "$1" info 2>/dev/null | awk '/wiphy/{printf "phy%s",$2; exit}'; }
 
 # does this iface's phy advertise a given interface mode? (e.g. monitor, AP)
+# NB: it is `iw phy <phyname> info`, not `iw <phyname> info`; and Debian's
+# default awk is mawk, which has no \s -- so match lines containing '*' while
+# inside the "Supported interface modes" block instead. Advisory only: some
+# out-of-tree drivers (esp. Realtek) under-report modes to nl80211, so callers
+# treat the *current* interface type as authoritative and this as a hint.
 phy_supports() {
     local ph="$1" mode="$2"
-    iw "$ph" info 2>/dev/null | awk '
+    iw phy "$ph" info 2>/dev/null | awk '
         /Supported interface modes/ {inlist=1; next}
-        inlist && /^\s*\*/ {print}
-        inlist && /^[[:alpha:]]/ {inlist=0}
-    ' | grep -qiE "\* *$mode\b"
+        inlist && /\*/ {print; next}
+        inlist {inlist=0}
+    ' | grep -qiw -- "$mode"
 }
 
 # type/channel/addr for a netdev (from iw dev info)
@@ -132,7 +137,7 @@ for IF in $(list_wifi_ifaces); do
         "$(type_of "$IF" 2>/dev/null || echo -)" \
         "$(chan_of "$IF" 2>/dev/null || echo -)" \
         "$(addr_of "$IF")"
-    printf '  %-16s modes:%s\n' "" "${modes:- (none reported)}"
+    printf '  %-16s modes:%s\n' "" "${modes:- (iw phy reported none — driver may under-report; current type is authoritative)}"
 done
 [ "$found" = 1 ] || die "no wireless interfaces found (need phy80211 netdevs)"
 
@@ -154,8 +159,6 @@ elif ! ip link show "$INJECT_IF" >/dev/null 2>&1; then
     bad "interface '$INJECT_IF' not found"
 else
     iph="$(phy_of "$INJECT_IF")"; idrv="$(drv_of "$INJECT_IF")"
-    phy_supports "$iph" monitor && ok "$iph supports monitor mode" \
-        || bad "$iph does NOT advertise monitor mode (wrong radio for the bridge)"
 
     if [ "$APPLY_MONITOR" = 1 ]; then
         say "--apply-monitor: putting $INJECT_IF into monitor on channel $CHANNEL"
@@ -163,8 +166,16 @@ else
     fi
 
     itype="$(type_of "$INJECT_IF")"; ichan="$(chan_of "$INJECT_IF")"
-    [ "$itype" = monitor ] && ok "type=monitor" \
-        || bad "type=$itype (expected monitor — run mon-setup.sh $INJECT_IF $CHANNEL, or pass --apply-monitor)"
+    # Current mode is authoritative: a radio that is already a monitor vif
+    # obviously supports monitor, regardless of what `iw phy` chose to report.
+    if [ "$itype" = monitor ]; then
+        ok "type=monitor (radio is in monitor mode now)"
+    elif phy_supports "$iph" monitor; then
+        bad "type=$itype — supports monitor but not in it. Run: mon-setup.sh $INJECT_IF $CHANNEL (or --apply-monitor)"
+    else
+        bad "type=$itype and 'iw phy' didn't list monitor. If this radio DOES do monitor"
+        bad "(out-of-tree Realtek drivers often under-report), run mon-setup.sh; otherwise it's the wrong radio."
+    fi
     [ "$ichan" = "$CHANNEL" ] && ok "on channel $CHANNEL" \
         || bad "channel=$ichan (expected $CHANNEL — injection into the wrong/void channel)"
 
@@ -192,27 +203,37 @@ else
         bad "interface '$ACK_IF' not found"
     else
         aph="$(phy_of "$ACK_IF")"; atype="$(type_of "$ACK_IF")"; achan="$(chan_of "$ACK_IF")"
-        amac="$(addr_of "$ACK_IF")"
-        phy_supports "$aph" AP && ok "$aph supports AP opmode" \
-            || bad "$aph does NOT advertise AP mode — it cannot hardware-ACK a BSSID"
-        [ "$atype" = AP ] && ok "type=AP (in AP opmode -> PCU ACKs matching frames)" \
-            || bad "type=$atype (expected AP — start hostapd on it; see lab-bringup.sh)"
-        if [ -n "$achan" ]; then
-            [ "$achan" = "$CHANNEL" ] && ok "on channel $CHANNEL (matches inject radio)" \
-                || bad "channel=$achan (must equal the inject channel $CHANNEL)"
+        amac="$(addr_of "$ACK_IF")"; adrv="$(drv_of "$ACK_IF")"
+
+        if [ "$atype" = AP ]; then
+            ok "type=AP (in AP opmode -> PCU hardware-ACKs matching frames)"
+            if [ -n "$achan" ]; then
+                [ "$achan" = "$CHANNEL" ] && ok "on channel $CHANNEL (matches inject radio)" \
+                    || bad "channel=$achan (must equal the inject channel $CHANNEL)"
+            else
+                warn "channel not reported"
+            fi
+            # The AP MAC only matters once it IS an AP (bring-up pins it); judging
+            # the managed MAC would be meaningless, so we only check it here.
+            if mac_in_range "$amac" "$BSSID_BASE" "$BSSID_MASK"; then
+                ok "AP MAC $amac is within the ACKed BSSID range"
+            else
+                warn "AP MAC $amac is OUTSIDE $BSSID_BASE/$BSSID_MASK — the auto bssidmask"
+                warn "may not cover the VM BSSIDs. lab-bringup.sh pins :00 and :03 decoys so"
+                warn "the mask spans the VM range :01..:02."
+            fi
+            warn "Userspace can't read the hardware bssidmask. Confirm the ACK is real:"
+            warn "witness-capture on the inject radio for ACKs (subtype 0x1d) to the phone."
         else
-            warn "channel not reported (AP may not be up yet)"
+            # Not in AP mode == not set up yet. This is the right card for the job
+            # (ath9k_htc/AR9271 is the canonical ACK radio); it just needs bring-up.
+            bad "type=$atype — ACK radio is NOT in AP opmode yet, so nothing SIFS-ACKs the"
+            bad "STA uplink. This is a setup step, not a bad card ('$adrv' is fine). Bring it"
+            bad "up (AP opmode + decoy-BSSID mask) with:"
+            bad "    sudo AR9271_IF=$ACK_IF MT_IF=$INJECT_IF CHANNEL=$CHANNEL \\"
+            bad "         $SCRIPT_DIR/lab-bringup.sh"
+            bad "then re-run this check."
         fi
-        if mac_in_range "$amac" "$BSSID_BASE" "$BSSID_MASK"; then
-            ok "MAC $amac is within the ACKed BSSID range"
-        else
-            warn "MAC $amac is OUTSIDE $BSSID_BASE/$BSSID_MASK — the auto-computed"
-            warn "bssidmask likely won't cover the VM BSSIDs. lab-bringup.sh pins two"
-            warn "decoy BSSIDs (:00 and :03) so the mask spans the VM range :01..:02."
-        fi
-        warn "Userspace can't read the hardware bssidmask directly. Confirm the ACK is"
-        warn "real: witness-capture on the inject radio and look for ACKs (subtype 0x1d)"
-        warn "to the phone MAC during a connect (docs §5 has the tshark one-liner)."
     fi
 fi
 
