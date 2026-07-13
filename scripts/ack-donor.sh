@@ -88,6 +88,9 @@ teardown() {
         iw dev "$(extra_vif "$i")" del 2>/dev/null || true
         i=$((i+1))
     done
+    # Hand the radio back to NetworkManager so it is usable again.
+    iw dev "$ACK_IF" set type managed 2>/dev/null || true
+    nmcli device set "$ACK_IF" managed yes 2>/dev/null || true
 }
 if [ "${1:-}" = "stop" ]; then teardown; exit 0; fi
 
@@ -167,10 +170,22 @@ done
 # ---- 1. create ALL vifs first (so a later add can't reset an earlier pin) ---
 teardown >/dev/null 2>&1 || true
 sleep 1
+
+# Release the radio from anything that will fight hostapd for it. Without this,
+# hostapd fails with "Match already configured / Could not configure driver
+# mode" because NetworkManager/wpa_supplicant still holds the interface.
+say "Releasing $ACK_IF from NetworkManager / wpa_supplicant"
+nmcli device set "$ACK_IF" managed no 2>/dev/null || true
+pkill -f "wpa_supplicant.*$ACK_IF" 2>/dev/null || true
+rfkill unblock wifi 2>/dev/null || true
+
 say "Creating AP vifs"
+# Primary: leave it a *managed* netdev and let hostapd do the managed->AP
+# transition itself. Pre-setting the primary to __ap makes hostapd fail with
+# "Could not configure driver mode". Fresh *extra* vifs created as __ap are
+# adopted cleanly by hostapd via interface=.
 ip link set "$ACK_IF" down 2>/dev/null || true
-iw dev "$ACK_IF" set type __ap 2>/dev/null \
-    || { iw dev "$ACK_IF" set type managed 2>/dev/null || true; }
+iw dev "$ACK_IF" set type managed 2>/dev/null || true
 for i in $(seq 1 $(( ${#BSSID_ARR[@]} - 1 )) ); do
     v="$(extra_vif "$i")"
     iw dev "$v" del 2>/dev/null || true
