@@ -1411,8 +1411,10 @@ static void handle_phys_data(void)
 
     if (is_blockack_frame(frame, frame_len)) {
         stats_ba_forwarded++;
-        if (verbose)
-            log_blockack(frame, frame_len);
+        /* BlockAcks are low-rate, and seeing them IS the point of -K, so log
+         * every one unconditionally -- no need to turn on the -v per-frame
+         * firehose. Greppable as "bridge: BA". */
+        log_blockack(frame, frame_len);
     } else if (verbose) {
         fprintf(stderr,
             "bridge: phys->hub: forwarded %zu bytes "
@@ -1522,8 +1524,9 @@ static void usage(const char *prog)
         "  -K               Forward BlockAcks (subtype 9) for our BSSID to the\n"
         "                   hub instead of dropping them (experimental: the\n"
         "                   downlink-ACK feedback for honest A-MPDU completion).\n"
-        "                   With -v, each BlockAck is decoded (TID/SSN/acked).\n"
-        "                   Count shown in the -S report as ba=<n>.\n"
+        "                   Each BlockAck is decoded to stderr (TID/SSN/acked)\n"
+        "                   without needing -v; grep 'bridge: BA'. Count also\n"
+        "                   shown in the -S report as ba=<n>.\n"
         "  -v               Verbose logging\n"
         "  -h               This help\n"
         "\n"
