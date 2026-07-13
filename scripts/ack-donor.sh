@@ -17,8 +17,8 @@
 # then-check-once flow (as in lab-bringup.sh) can pass on a transient-good
 # state that drifts a moment later, and has no runtime guard -> "it said the
 # MACs were set, but they weren't." This tool fixes that with:
-#   * create ALL vifs first, then pin ALL MACs (a later add can't silently
-#     reset an earlier pin),
+#   * configure + pin one vif at a time, primary first (the proven lab-bringup
+#     order; churns the driver less than create-all-then-pin-all),
 #   * a STABILITY GATE: declare ready only when every MAC is correct AND
 #     unchanged for a full window of polls, not a single check,
 #   * a WATCHDOG: keep verifying at runtime and RE-PIN on drift, so the mask
@@ -167,7 +167,7 @@ for i in $(seq 1 $(( ${#BSSID_ARR[@]} - 1 )) ); do
     IFACES+=("$(extra_vif "$i")"); WANT+=("$(norm_mac "${BSSID_ARR[i]}")")
 done
 
-# ---- 1. create ALL vifs first (so a later add can't reset an earlier pin) ---
+# ---- 1. clean slate ---------------------------------------------------------
 teardown >/dev/null 2>&1 || true
 sleep 1
 
@@ -179,38 +179,32 @@ nmcli device set "$ACK_IF" managed no 2>/dev/null || true
 pkill -f "wpa_supplicant.*$ACK_IF" 2>/dev/null || true
 rfkill unblock wifi 2>/dev/null || true
 
-say "Creating AP vifs"
-# Primary: leave it a *managed* netdev and let hostapd do the managed->AP
-# transition itself. Pre-setting the primary to __ap makes hostapd fail with
-# "Could not configure driver mode". Fresh *extra* vifs created as __ap are
-# adopted cleanly by hostapd via interface=.
+# Configure + pin each vif, PRIMARY FIRST, then add+pin each extra one at a
+# time. This mirrors the proven lab-bringup order and churns the driver far
+# less than create-all-then-pin-all (which left the primary unable to enter AP
+# mode: "Could not configure driver mode"). The primary stays *managed* and
+# hostapd does the managed->AP transition itself; extras are fresh __ap vifs.
+say "Configuring + pinning vifs (primary first)"
 ip link set "$ACK_IF" down 2>/dev/null || true
 iw dev "$ACK_IF" set type managed 2>/dev/null || true
+pin_mac "$ACK_IF" "${WANT[0]}" || die "could not pin primary $ACK_IF to ${WANT[0]}"
+ok "$ACK_IF = ${WANT[0]}"
 for i in $(seq 1 $(( ${#BSSID_ARR[@]} - 1 )) ); do
     v="$(extra_vif "$i")"
     iw dev "$v" del 2>/dev/null || true
     iw phy "$PHY" interface add "$v" type __ap \
         || die "could not create vif $v (driver may not support multi-BSS)"
-    ip link set "$v" down 2>/dev/null || true
+    pin_mac "$v" "${WANT[i]}" \
+        || die "could not pin $v to ${WANT[i]} -- driver may not support pinned multi-BSS"
+    ok "$v = ${WANT[i]}"
 done
 
-# ---- 2. pin ALL MACs, then verify ALL --------------------------------------
-say "Pinning BSSIDs"
-pin_fail=0
-for idx in "${!IFACES[@]}"; do
-    if pin_mac "${IFACES[idx]}" "${WANT[idx]}"; then
-        ok "${IFACES[idx]} = ${WANT[idx]}"
-    else
-        pin_fail=1
-    fi
-done
-[ "$pin_fail" = 0 ] || die "one or more BSSIDs would not pin -- this driver may \
-not support pinned multi-BSS. Use a PCI ath9k, fewer BSSIDs, or a single BSSID."
-
-# ---- 3. start a minimal legacy hostapd per vif (beacon = holds AP + mask) ---
-say "Starting beacons (legacy, no HT/WMM -> simple SIFS ACK only)"
-for idx in "${!IFACES[@]}"; do
-    v="${IFACES[idx]}"; conf="$RUN_DIR/hostapd-$idx.conf"
+# Start a minimal legacy hostapd on a vif, with retry + log capture. ath9k_htc
+# intermittently rejects the managed->AP config ("Could not configure driver
+# mode"); a kill+retry usually clears it, the same way rerunning lab-bringup
+# does. On persistent failure the real hostapd log is printed.
+start_hostapd() {   # $1=idx  $2=iface
+    local idx="$1" v="$2" conf="$RUN_DIR/hostapd-$idx.conf" log="$RUN_DIR/hostapd-$idx.log" n=0
     cat > "$conf" <<EOF
 interface=$v
 driver=nl80211
@@ -223,8 +217,26 @@ beacon_int=$BEACON_INT
 ssid=${SSID_PREFIX}-$idx
 bssid=${WANT[idx]}
 EOF
-    hostapd -B -P "$RUN_DIR/hostapd-$idx.pid" "$conf" \
-        || die "hostapd failed on $v -- check: hostapd $conf"
+    while [ "$n" -lt 5 ]; do
+        pkill -f "$RUN_DIR/hostapd-$idx.conf" 2>/dev/null || true
+        sleep 0.5
+        if hostapd -B -P "$RUN_DIR/hostapd-$idx.pid" "$conf" >"$log" 2>&1; then
+            return 0
+        fi
+        n=$((n+1))
+        warn "hostapd on $v failed (try $n/5); retrying..."
+        sleep 1
+    done
+    warn "hostapd on $v would not start. Last log:"
+    sed 's/^/      /' "$log" >&2 2>/dev/null || true
+    return 1
+}
+
+say "Starting beacons (legacy, no HT/WMM -> simple SIFS ACK only)"
+for idx in "${!IFACES[@]}"; do
+    start_hostapd "$idx" "${IFACES[idx]}" || die "hostapd would not start on \
+${IFACES[idx]}. If this radio can't hold multiple AP vifs, try a single BSSID \
+(BSSIDS=\"<one>\") or a PCI ath9k. Log: $RUN_DIR/hostapd-$idx.log"
 done
 
 # ---- 4. STABILITY GATE: correct AND unchanged for a full window ------------
@@ -241,7 +253,7 @@ while [ "$attempt" -lt "$PIN_RETRIES" ]; do
                 warn "${IFACES[idx]} drifted to '$got' (want ${WANT[idx]}) -- re-pinning"
                 pkill -f "hostapd .*$RUN_DIR/hostapd-$idx" 2>/dev/null || true
                 pin_mac "${IFACES[idx]}" "${WANT[idx]}" || true
-                hostapd -B -P "$RUN_DIR/hostapd-$idx.pid" "$RUN_DIR/hostapd-$idx.conf" 2>/dev/null || true
+                start_hostapd "$idx" "${IFACES[idx]}" || true
                 stable=0
                 break
             fi
@@ -285,7 +297,7 @@ while :; do
             warn "$(date '+%H:%M:%S') ${IFACES[idx]} drifted to '$got' -- re-pinning ${WANT[idx]}"
             pkill -f "hostapd .*$RUN_DIR/hostapd-$idx" 2>/dev/null || true
             pin_mac "${IFACES[idx]}" "${WANT[idx]}" || true
-            hostapd -B -P "$RUN_DIR/hostapd-$idx.pid" "$RUN_DIR/hostapd-$idx.conf" 2>/dev/null || true
+            start_hostapd "$idx" "${IFACES[idx]}" || true
         fi
     done
 done
