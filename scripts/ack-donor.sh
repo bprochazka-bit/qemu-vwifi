@@ -172,24 +172,20 @@ for i in $(seq 1 $(( ${#BSSID_ARR[@]} - 1 )) ); do
     IFACES+=("$(extra_vif "$i")"); WANT+=("$(norm_mac "${BSSID_ARR[i]}")")
 done
 
-# ---- 1. clean slate ---------------------------------------------------------
-teardown >/dev/null 2>&1 || true
-sleep 1
-
-# Release the radio from anything that will fight hostapd for it. Without this,
-# hostapd fails with "Match already configured / Could not configure driver
-# mode" because NetworkManager/wpa_supplicant still holds the interface.
+# ---- 1. release NM, then clean slate — in lab-bringup's exact order ---------
+# lab-bringup releases NM/wpa_supplicant *first*, then clears old state, then
+# configures. Do the same; and do NOT run `rfkill unblock` (lab-bringup
+# doesn't, and it can nudge NM into re-grabbing the interface right as hostapd
+# tries to enter AP mode -> "Could not configure driver mode").
 say "Releasing $ACK_IF from NetworkManager / wpa_supplicant"
 nmcli device set "$ACK_IF" managed no 2>/dev/null || true
 pkill -f "wpa_supplicant.*$ACK_IF" 2>/dev/null || true
-rfkill unblock wifi 2>/dev/null || true
-sleep 1   # let NM/wpa_supplicant actually let go before we reconfigure
+teardown >/dev/null 2>&1 || true
+sleep 1
 
-# Configure + pin each vif, PRIMARY FIRST, then add+pin each extra one at a
-# time. This mirrors the proven lab-bringup order and churns the driver far
-# less than create-all-then-pin-all (which left the primary unable to enter AP
-# mode: "Could not configure driver mode"). The primary stays *managed* and
-# hostapd does the managed->AP transition itself; extras are fresh __ap vifs.
+# Configure + pin each vif, PRIMARY FIRST, mirroring lab-bringup exactly:
+# primary = down -> managed -> set address (hostapd does managed->AP itself);
+# each extra = del -> add __ap -> down -> set address.
 say "Configuring + pinning vifs (primary first)"
 ip link set "$ACK_IF" down 2>/dev/null || true
 iw dev "$ACK_IF" set type managed 2>/dev/null || true
@@ -200,6 +196,7 @@ for i in $(seq 1 $(( ${#BSSID_ARR[@]} - 1 )) ); do
     iw dev "$v" del 2>/dev/null || true
     iw phy "$PHY" interface add "$v" type __ap \
         || die "could not create vif $v (driver may not support multi-BSS)"
+    ip link set "$v" down 2>/dev/null || true
     pin_mac "$v" "${WANT[i]}" \
         || die "could not pin $v to ${WANT[i]} -- driver may not support pinned multi-BSS"
     ok "$v = ${WANT[i]}"
@@ -233,8 +230,12 @@ EOF
         warn "hostapd on $v failed (try $n/5); retrying..."
         sleep 1
     done
-    warn "hostapd on $v would not start. Last log:"
-    sed 's/^/      /' "$log" >&2 2>/dev/null || true
+    # Give up: capture the REAL netlink error with a foreground debug run so the
+    # log shows the errno behind "Could not configure driver mode".
+    warn "hostapd on $v would not start; capturing hostapd -dd..."
+    timeout 5 hostapd -dd "$conf" >"$log" 2>&1
+    grep -iE 'nl80211|mode|state|fail|-[0-9]+ \(|EBUSY|EOPNOTSUPP|EINVAL|EPERM' "$log" \
+        | tail -20 | sed 's/^/      /' >&2 || true
     return 1
 }
 
