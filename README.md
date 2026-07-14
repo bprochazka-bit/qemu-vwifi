@@ -509,6 +509,86 @@ Supported: **WPA2-Personal and WPA3-Personal (CCMP-128, incl. PMF), WPA-Personal
 (TKIP), and WEP-40 / 104 / 128.**  WPA3-Enterprise 192-bit (GCMP-256 /
 BIP-GMAC-256) would need a separate AES-GCM engine and is out of scope.
 
+## 802.11n Aggregation (A-MPDU / Block-Ack)
+
+The device handles hardware TX aggregation, so the AP and STA can run **802.11n
+(HT)** instead of being pinned to legacy 802.11g.  This is the lever for
+VM-to-VM throughput: without it, every data frame is its own transmit +
+interrupt; with it, mac80211 pushes a whole A-MPDU and the emulator completes it
+in one shot.
+
+### How it works
+
+When a Block-Ack session is up (mac80211 negotiates it over the medium with the
+usual ADDBA action frames — no device involvement), the `ath9k` driver builds an
+A-MPDU as a chain of TX descriptors, each carrying one subframe, all with
+`AR_IsAggr` set and `AR_MoreAggr` set on every subframe but the last.  The
+device:
+
+1. Forwards each subframe MPDU to the medium as an ordinary frame (the medium is
+   frame-level; there is no on-air aggregate to model).
+2. On the **last** subframe's descriptor — the one the driver reads as
+   `bf_lastbf` — synthesizes the immediate Block-Ack the peer would have
+   returned: `AR_TxBaStatus` in `ds_txstatus0`, the per-subframe ACK bitmap in
+   `ds_txstatus3/4`, and the BA window start in `AR_SeqNum` (`ds_txstatus9`).
+   `ath_tx_complete_aggr()` reads exactly these to mark each subframe ACKed.
+   The bitmap is computed per subframe from real sequence numbers, so a frame
+   dropped by a configured SNR/path-loss model leaves its bit clear and the
+   driver retransmits precisely that MPDU (the default `MODEL_NONE` medium is
+   lossless, so every subframe is ACKed).
+
+On receive, de-aggregated subframes arrive as individual frames; mac80211's
+reorder buffer (keyed on the BA session and sequence numbers) puts them back in
+order.  The RX path raises **one coalesced `RXOK`** per drained burst rather than
+one interrupt per frame — the driver's RX tasklet already drains the ring to
+completion, so this matches how an aggregate completes on real hardware and cuts
+per-frame interrupt cost.
+
+Legacy (non-aggregated) traffic is untouched: `agg_n == 0` for every frame that
+lacks `AR_IsAggr`, so the completion path is byte-for-byte the pre-existing one.
+
+### Enabling it
+
+Aggregation activates whenever the operator runs the AP in HT mode; there is no
+device switch.  On OpenWRT, replace the legacy pin (`htmode='NONE'`,
+`hw_mode=g` / `ieee80211n=0`) with, e.g.:
+
+```
+uci set wireless.radio0.htmode='HT20'   # or HT40
+uci commit wireless && wifi reload
+```
+
+(The AR9271 **phys-bridge** lab in `qemu-vwifi/docs/ar9271-phys-bridge-lab.md`
+still wants legacy for its own reason — real-radio monitor injection — so that
+lab's `htmode='NONE'` guidance is unchanged.  Aggregation is for the pure
+VM-to-VM path.)
+
+### Verification
+
+`make test-ampdu` builds and runs `tests/test_ampdu.c`, which checks the
+sequence-number / Block-Ack-bitmap arithmetic in `src/vwifi_ath9k_ampdu.h`
+against the kernel's `ATH_BA_INDEX` semantics: consecutive subframes, 4095→0
+wrap, a dropped subframe leaving exactly its bit clear, a full 64-frame window,
+subframes past the window, `AR_SeqNum` packing, and header seqno extraction.
+This is the pure logic; the descriptor plumbing must still be exercised end to
+end in a live guest.  In the VM-to-VM lab, confirm with:
+
+```
+# On the STA: the association and per-station rate should show HT/MCS, not legacy
+iw dev wlan0 link                     # look for "tx bitrate: ... MCS"
+iw dev wlan0 station dump | grep -i -E 'tx bitrate|rx bitrate'
+
+# A Block-Ack session should be established for the busy TID
+iw dev wlan0 station dump | grep -i -E 'tid|ampdu'   # or: cat /sys/kernel/debug/ieee80211/*/netdev:*/stations/*/agg_status
+
+# Then re-run the fast.com / iperf3 test and compare against the legacy baseline.
+```
+
+If throughput does **not** improve, capture the device trace
+(`VWIFI_ATH9K_TRACE`) and check for `TX A-MPDU complete: N subframes` lines; if
+they are absent, the AP is still associating legacy (HT not negotiated) — the
+descriptor path only engages once mac80211 sets up the BA session.
+
 ## EEPROM Image
 
 The generated EEPROM uses the AR9285 "4K" format:

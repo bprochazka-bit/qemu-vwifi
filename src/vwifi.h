@@ -232,8 +232,21 @@ struct vwifi_frame_hdr {
  *  from the stream socket.
  * ================================================================ */
 
-/* Buffer size: 4 (length prefix) + max message */
-#define VWIFI_RXBUF_SIZE         \
+/* One length-prefixed message: 4 (length prefix) + header + max frame. */
+#define VWIFI_MSG_SLOT_SIZE      \
     (4 + VWIFI_HDR_SIZE + VWIFI_MAX_FRAME_SIZE)
+
+/*
+ * Size the reassembly buffer to hold a whole burst, not a single frame.
+ * With 802.11n A-MPDU the medium delivers a run of de-aggregated subframes
+ * back-to-back; a one-frame buffer forced one read()/one main-loop
+ * iteration per subframe.  Holding a full BA window (64 subframes) lets a
+ * burst drain in a single read() and complete with one coalesced RXOK,
+ * which is where the aggregation throughput win is actually realized.
+ * (Bounds checks in vwifi_ath9k_fd_read are all relative to this size, so
+ * enlarging it is safe; a single message is still capped at
+ * VWIFI_MAX_MSG_SIZE.)
+ */
+#define VWIFI_RXBUF_SIZE         (32 * VWIFI_MSG_SLOT_SIZE)
 
 #endif /* VWIFI_H */

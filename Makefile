@@ -150,6 +150,14 @@ test-tkip:
 		-o tests/test_tkip tests/test_tkip.c
 	./tests/test_tkip
 
+.PHONY: test-ampdu
+test-ampdu:
+	@echo "=== Building and running A-MPDU / Block-Ack unit test ==="
+	@command -v cc >/dev/null 2>&1 || { echo "cc not found"; exit 1; }
+	cc -O2 -Wall -Isrc \
+		-o tests/test_ampdu tests/test_ampdu.c
+	./tests/test_ampdu
+
 # ---- Static analysis (optional, requires cppcheck) ----------------
 
 .PHONY: lint

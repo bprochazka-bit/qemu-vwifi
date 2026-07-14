@@ -61,8 +61,11 @@
 /* TX status words start at 0x38 */
 #define DESC_OFF_TX_STATUS0         0x38
 #define DESC_OFF_TX_STATUS1         0x3C
+#define DESC_OFF_TX_STATUS3         0x44  /* AR_BaBitmapLow  (BA ACK bits 0..31)  */
+#define DESC_OFF_TX_STATUS4         0x48  /* AR_BaBitmapHigh (BA ACK bits 32..63) */
+#define DESC_OFF_TX_STATUS5         0x4C
 #define DESC_OFF_TX_STATUS8         0x58
-#define DESC_OFF_TX_STATUS9         0x5C  /* contains AR_TxDone */
+#define DESC_OFF_TX_STATUS9         0x5C  /* contains AR_TxDone + AR_SeqNum */
 
 /* RX status word offsets (bytes from start of descriptor) */
 #define DESC_OFF_RX_STATUS0         0x10
@@ -121,7 +124,10 @@
 #define AR_ENCR_TYPE_TKIP           3
 
 /* ================================================================
- *  TX status word bit definitions (status8 = ds_txstatus8)
+ *  TX status word bit definitions (ds_txstatus9, written at 0x5C)
+ *
+ *  AR_SeqNum here doubles as the Block-Ack window start for an A-MPDU's
+ *  final descriptor (see AR_TxBaStatus / DESC_OFF_TX_STATUS3-4).
  * ================================================================ */
 
 #define AR_TxDone                   0x00000001
@@ -146,10 +152,17 @@
 #define AR_DescCfgErr               0x00040000
 #define AR_TxTimerExpired           0x00080000
 
-/* TX status word bits for TX rate / RSSI (status1, status5) */
+/* TX status word bits for TX rate / RSSI (status0, status5) */
 #define AR_TxRSSIAnt00              0x000000FF
 #define AR_TxRSSICombined           0xFF000000
 #define AR_TxRSSICombined_S         24
+
+/* ds_txstatus0: set when the frame was part of an A-MPDU and the peer's
+ * immediate BlockAck was received.  The ath9k aggregation-completion path
+ * (ath_tx_complete_aggr) only consults the BA bitmap in ds_txstatus3/4 and
+ * the window start in AR_SeqNum when this bit is set on the aggregate's
+ * last descriptor; otherwise it retransmits the whole aggregate. */
+#define AR_TxBaStatus               0x40000000
 
 /* ================================================================
  *  RX control / status bit definitions

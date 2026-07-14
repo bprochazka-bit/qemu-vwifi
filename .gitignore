@@ -1,3 +1,4 @@
 tests/test_ccmp
 tests/test_wep
 tests/test_tkip
+tests/test_ampdu
