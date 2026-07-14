@@ -55,8 +55,32 @@
 
 #define ATH9K_BEACON_INTERVAL_MS  100
 
-/* AR_PHY(0x37) – Channel select register, written by ar5008_hw_set_channel() */
+/* AR_PHY(0x37) – Channel select register, written by ar5008_hw_set_channel()
+ * on the *older* AR5416/AR9160 chips.  The AR9285 we emulate is an
+ * AR9280-family single-chip and does NOT use this path; it programs the
+ * synthesizer through AR_PHY_SYNTH_CONTROL instead (see below).  Kept only
+ * so a stray write is named in the trace, not used to derive the channel. */
 #define AR_PHY_CHANSEL              0x98DC
+
+/*
+ * AR_PHY_SYNTH_CONTROL (0x9874) – the synthesizer control register the
+ * AR9280/AR9285/AR9287 driver path (ar9002_hw_set_channel) writes to tune
+ * the radio.  This is where our emulated AR9285 actually learns its
+ * operating channel, so we decode it to stamp channel_freq into every v2
+ * medium header (without it the hub sees channel_freq=0 → "chan=-").
+ *
+ * 2.4 GHz fractional-mode layout (freq < 4800), per ar9002_phy.c:
+ *   reg32 = (bMode<<29) | (fracMode<<28) | (aModeRefSel<<26) | channelSel
+ *   channelSel = CHANSEL_2G(freq) = (freq * 0x10000) / 15
+ * so channelSel is the low 26 bits and:
+ *   freq = round(channelSel * 15 / 0x10000)
+ * The top two bits (30..31) are preserved by the driver and ignored here.
+ */
+#define AR_PHY_SYNTH_CONTROL       0x9874
+#define AR_PHY_SYNTH_2G_BMODE      (1u << 29)
+#define AR_PHY_SYNTH_2G_FRACMODE   (1u << 28)
+#define AR_PHY_SYNTH_CHANSEL_MASK  0x03FFFFFFu  /* low 26 bits */
+#define AR_PHY_SYNTH_CHANSEL_DIV   15
 
 /* Maximum 802.11 frame we'll extract from TX DMA */
 #define ATH9K_MAX_FRAME_SIZE      VWIFI_MAX_FRAME_SIZE
@@ -208,6 +232,7 @@ static const char *vwifi_ath9k_reg_name(hwaddr addr)
     case AR_PHY_ACTIVE: return "AR_PHY_ACTIVE";
     case AR_PHY_MODE: return "AR_PHY_MODE";
     case AR_PHY_CHANSEL: return "AR_PHY_CHANSEL";
+    case AR_PHY_SYNTH_CONTROL: return "AR_PHY_SYNTH_CONTROL";
     case AR_PHY_AGC_CONTROL: return "AR_PHY_AGC_CONTROL";
     case AR_PHY_RFBUS_REQ: return "AR_PHY_RFBUS_REQ";
     case AR_PHY_RFBUS_GRANT: return "AR_PHY_RFBUS_GRANT";
@@ -246,6 +271,54 @@ static inline void vwifi_ath9k_reg_write_raw(VwifiAth9kState *s, hwaddr addr,
         return;
     }
     vwifi_ath9k_error("write out of MMIO range: 0x%" HWADDR_PRIx, addr);
+}
+
+/*
+ * Decode the operating channel from a write to AR_PHY_SYNTH_CONTROL and, if
+ * it names a plausible 2.4 GHz channel, latch it into current_channel_freq /
+ * current_channel_flags.  The emulated AR9285 tunes exclusively through this
+ * register (the AR9280-family ar9002_hw_set_channel path), so this is the one
+ * place the device learns its channel; the value is stamped into the v2
+ * medium header on every TX, which is what lets the hub filter by channel and
+ * report a real "chan=" in LIST_PEERS instead of "chan=-".
+ *
+ * We only trust decodes that land in the 2.4 GHz band (2400..2500 MHz): the
+ * AR9285 is a single-band 2.4 GHz part, and the driver programs this register
+ * in several passes (some intermediate/analog writes are not clean channel
+ * values), so clamping to the band rejects garbage rather than latching it.
+ */
+static void vwifi_ath9k_synth_set_channel(VwifiAth9kState *s, uint32_t reg32)
+{
+    uint32_t channel_sel;
+    uint32_t freq;
+
+    /* 2.4 GHz uses fractional mode with bMode set; anything else here is not
+     * a channel we can decode with the 2G formula, so ignore it. */
+    if (!(reg32 & AR_PHY_SYNTH_2G_FRACMODE) ||
+        !(reg32 & AR_PHY_SYNTH_2G_BMODE)) {
+        return;
+    }
+
+    channel_sel = reg32 & AR_PHY_SYNTH_CHANSEL_MASK;
+    if (channel_sel == 0) {
+        return;
+    }
+
+    /* freq = round(channel_sel * 15 / 65536); +32768 gives round-to-nearest
+     * so standard channel centers (2412, 2437, 2484, ...) come out exact. */
+    freq = (uint32_t)(((uint64_t)channel_sel * AR_PHY_SYNTH_CHANSEL_DIV
+                       + 32768) >> 16);
+
+    if (freq < 2400 || freq > 2500) {
+        return;  /* not a 2.4 GHz channel center – don't latch garbage */
+    }
+
+    if ((uint16_t)freq != s->current_channel_freq) {
+        s->current_channel_freq = (uint16_t)freq;
+        s->current_channel_flags = VWIFI_CHAN_FLAG_2GHZ;
+        vwifi_ath9k_trace("CHANNEL: tuned to %u MHz (synth 0x%08x)",
+                          freq, reg32);
+    }
 }
 
 /* -------------------------------------------------------------------
@@ -2323,38 +2396,28 @@ static void vwifi_ath9k_mmio_write(void *opaque, hwaddr addr, uint64_t val64,
         break;
 
     /*
-     * Channel select register – AR_PHY(0x37) = 0x98DC.
+     * Synthesizer control register – AR_PHY_SYNTH_CONTROL = 0x9874.
      *
-     * The ath9k driver writes the channel divider here during
-     * ar5008_hw_set_channel().  For 2 GHz:
-     *   channelSel = CHANSEL_2G(freq) = ((freq - 704) * 2) / 5
-     *   reg = (channelSel << 2) | (bModeSynth << 1) | 1
-     * We reverse-decode the frequency so we can tag outgoing medium
-     * frames with the correct channel, enabling channel-aware filtering
-     * in the hub.
+     * This is the register the AR9280-family driver path (which our
+     * emulated AR9285 uses) writes to tune the radio, so it is where we
+     * learn the operating channel and reverse-decode the frequency for the
+     * v2 medium header.  Without this the hub only ever sees channel_freq=0
+     * and reports "chan=-" in LIST_PEERS.
      */
-    case AR_PHY_CHANSEL:
-    {
-        uint16_t chansel = (val >> 2) & 0xFFF;
-        uint16_t freq = 0;
-        if (chansel >= 683 && chansel <= 707) {
-            /* 2.4 GHz: freq = (chansel * 5 + 1) / 2 + 704 */
-            freq = (uint16_t)((chansel * 5 + 1) / 2 + 704);
-        } else if (chansel >= 128 && chansel <= 682) {
-            /* 5 GHz: chansel = (freq - 4800) / 5, reversed bits
-             * For simplicity, treat as freq = chansel * 5 + 4800.
-             * This is approximate; 5 GHz support can be refined later. */
-            freq = (uint16_t)(chansel * 5 + 4800);
-        }
-        if (freq != 0 && freq != s->current_channel_freq) {
-            s->current_channel_freq = freq;
-            s->current_channel_flags = (freq < 3000) ?
-                VWIFI_CHAN_FLAG_2GHZ : VWIFI_CHAN_FLAG_5GHZ;
-            vwifi_ath9k_trace("CHANNEL: tuned to %u MHz", freq);
-        }
+    case AR_PHY_SYNTH_CONTROL:
+        vwifi_ath9k_synth_set_channel(s, (uint32_t)val);
         vwifi_ath9k_reg_write_raw(s, addr, val);
         break;
-    }
+
+    /*
+     * Channel select register – AR_PHY(0x37) = 0x98DC.  Used only by the
+     * older ar5008_hw_set_channel() path (AR5416/AR9160), not by the AR9285
+     * we emulate, so we just shadow it; the channel is decoded from
+     * AR_PHY_SYNTH_CONTROL above.
+     */
+    case AR_PHY_CHANSEL:
+        vwifi_ath9k_reg_write_raw(s, addr, val);
+        break;
 
     /* --- Global IFS --- */
     case AR_D_GBL_IFS_SIFS:
