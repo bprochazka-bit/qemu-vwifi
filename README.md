@@ -264,11 +264,55 @@ SET_POS <node-id> <x> <y> [<z>]                  # position a node in metres
 SET_TXPOWER <node-id> <dBm>                      # set node TX power
 SET_SNR <mac-a> <mac-b> <snr-db>                 # pin a per-link SNR override
 CLEAR_SNR <mac-a> <mac-b>                        # release the override
+SURVEY [RESET]                                   # per-channel utilisation
 STATS                                            # global counters
 SAVE_CONFIG <path>                               # snapshot current config
 LOAD_CONFIG <path>                               # replay commands from a file
 QUIT                                             # close this connection
 ```
+
+### Node mode and channel
+
+`LIST_PEERS` reports each node's inferred interface **mode** and its
+last-seen **channel** alongside the existing position/power/counter
+fields:
+
+```
+  openwrt-a    online mode=AP  chan=6  band=2.4G width=HT20 cfreq=2437 macs=[52:54:00:7f:f4:5e] pos=(27.5,6.2,0.0) txpow=15.0 tx=25151 rx=7195 rx_drop=98 tx_drop=0
+  client-a     online mode=STA chan=6  band=2.4G width=HT20 cfreq=2437 macs=[52:54:00:4e:ca:0c] pos=(36.6,14.5,0.0) txpow=15.0 tx=7293 rx=20378 rx_drop=15 tx_drop=0
+```
+
+* `mode` is one of `AP`, `STA`, `MESH`, `IBSS`, or `?`. Nothing on the
+  wire carries the transmitter's cfg80211 iftype, so the hub **infers**
+  it from the 802.11 frames each node sends (Beacons and Probe/Assoc
+  Responses ⇒ AP; Probe/Assoc Requests and ToDS data ⇒ STA; 4-address
+  data ⇒ MESH). A node that has not yet transmitted anything conclusive
+  shows `?`.
+* `chan`/`band`/`width`/`cfreq` come from the v2 channel header the node
+  last transmitted with (`chan=-` if it has only ever sent v1 frames).
+  The channel is remembered across disconnect, so an `offline` node
+  still shows the channel it last used.
+
+### Site survey (channel utilisation)
+
+`SURVEY` reports per-channel airtime, the way `iw dev <if> survey dump`
+does on real hardware. Every transmitted frame is charged to its primary
+channel's airtime budget (estimated from frame size and rate code), so
+you can see which channels are busy and roughly how congested they are:
+
+```
+$ echo SURVEY | socat - UNIX-CONNECT:/tmp/vwifi.ctl
+OK survey window=42.10s chans=2
+  chan=6  freq=2437MHz band=2.4G width=HT20  nodes=2 frames=32446 bytes=41203712 airtime=6801.4ms util=16.2%
+  chan=36 freq=5180MHz band=5G   width=VHT80 nodes=1 frames=118   bytes=151040   airtime=39.2ms   util=0.1%
+```
+
+`util` is busy airtime as a percentage of the survey window. Send
+`SURVEY RESET` to zero the counters and restart the window (e.g. to
+measure utilisation over a specific test interval). Utilisation is a
+relative indicator, not MAC-accurate airtime accounting — it uses a
+coarse fixed per-frame PHY overhead and does not model contention or
+retransmission backoff.
 
 There's also a web UI in `medium-controller/` for the same control
 socket — see `medium-controller/README.md`.

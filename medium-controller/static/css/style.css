@@ -437,6 +437,19 @@ html, body {
   text-shadow: 0 2px 8px var(--bg);
 }
 
+/* Inferred mode + channel, shown under the node id */
+.node-sublabel {
+  position: absolute;
+  top: 76px; left: 50%;
+  transform: translateX(-50%);
+  font-family: var(--font-mono);
+  font-size: 9px; color: var(--text-muted);
+  white-space: nowrap;
+  text-shadow: 0 2px 8px var(--bg);
+  pointer-events: none;
+}
+.node-sublabel:empty { display: none; }
+
 /* ── Zoom controls ── */
 .zoom-controls {
   display: flex; align-items: center; gap: 6px;

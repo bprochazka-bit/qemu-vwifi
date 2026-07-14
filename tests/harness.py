@@ -1260,6 +1260,82 @@ def test_hub_survives_garbage(h: Harness):
 # =====================================================================
 # Main
 # =====================================================================
+def test_mode_and_channel_in_list_peers(h: Harness):
+    h.section('MODE+CHAN: LIST_PEERS reports inferred mode and channel')
+    h.restart_hub()
+    ap  = h.data_conn()
+    sta = h.data_conn()
+    try:
+        mac_ap  = b'\x02\x00\x00\x00\x0a\xaa'
+        mac_sta = b'\x02\x00\x00\x00\x0a\xbb'
+        # frame-control first byte/second byte:
+        beacon    = b'\x80\x00'   # mgmt subtype 8   -> AP
+        data_fds  = b'\x08\x02'   # data FromDS       -> AP
+        data_tods = b'\x08\x01'   # data ToDS         -> STA
+        CH6 = 2437
+        CHF = CHF_2GHZ | CHF_HT20
+        ap.sendall(make_frame(mac_ap, channel_freq=CH6, channel_flags=CHF,
+                              payload=beacon + b'\x00' * 64))
+        ap.sendall(make_frame(mac_ap, channel_freq=CH6, channel_flags=CHF,
+                              payload=data_fds + b'\x00' * 64))
+        sta.sendall(make_frame(mac_sta, channel_freq=CH6, channel_flags=CHF,
+                               payload=data_tods + b'\x00' * 64))
+        h.drain(ap); h.drain(sta)
+
+        r = h.ctl_cmd('LIST_PEERS')
+        ap_line  = next((l for l in r.splitlines()
+                         if '0a:aa' in l), '')
+        sta_line = next((l for l in r.splitlines()
+                         if '0a:bb' in l), '')
+        h.expect('mode=AP' in ap_line, 'beacon/FromDS sender inferred as AP',
+                 repr(ap_line))
+        h.expect('mode=STA' in sta_line, 'ToDS sender inferred as STA',
+                 repr(sta_line))
+        h.expect('chan=6' in ap_line and 'band=2.4G' in ap_line
+                 and 'width=HT20' in ap_line,
+                 'AP line reports channel 6 / 2.4G / HT20', repr(ap_line))
+    finally:
+        ap.close(); sta.close()
+
+
+def test_survey_channel_utilisation(h: Harness):
+    h.section('SURVEY: per-channel utilisation report')
+    h.restart_hub()
+    a = h.data_conn()
+    b = h.data_conn()
+    try:
+        mac_a = b'\x02\x00\x00\x00\x0b\xaa'
+        mac_b = b'\x02\x00\x00\x00\x0b\xbb'
+        CH6, CH36 = 2437, 5180
+        for _ in range(10):
+            a.sendall(make_frame(mac_a, channel_freq=CH6,
+                                 channel_flags=CHF_2GHZ | CHF_HT20,
+                                 payload=b'\x08\x02' + b'\x00' * 500))
+        b.sendall(make_frame(mac_b, channel_freq=CH36,
+                             channel_flags=CHF_5GHZ | CHF_HT20,
+                             payload=b'\x08\x02' + b'\x00' * 100))
+        h.drain(a); h.drain(b)
+
+        r = h.ctl_cmd('SURVEY')
+        h.expect(r.startswith('OK survey window='),
+                 'SURVEY returns a window header', repr(r[:80]))
+        h.expect('chan=6' in r and 'freq=2437MHz' in r,
+                 'SURVEY lists the 2.4G channel', repr(r))
+        h.expect('chan=36' in r and 'freq=5180MHz' in r,
+                 'SURVEY lists the 5G channel', repr(r))
+        h.expect('util=' in r and 'airtime=' in r,
+                 'SURVEY reports airtime + utilisation', repr(r))
+
+        # RESET clears the buckets.
+        rr = h.ctl_cmd('SURVEY RESET')
+        h.expect('OK survey reset' in rr, 'SURVEY RESET acknowledged',
+                 repr(rr))
+        r2 = h.ctl_cmd('SURVEY')
+        h.expect('chans=0' in r2, 'SURVEY empty after reset', repr(r2))
+    finally:
+        a.close(); b.close()
+
+
 TESTS = [
     test_c4_socket_perms,
     test_list_peers_empty,
@@ -1295,6 +1371,9 @@ TESTS = [
     test_b_bridge_trunk_not_channel_filtered,
     # Physical bridge: real-radio links bypass the simulated physics
     test_phys_bridge_exempt_from_physics,
+    # Mode inference + channel utilisation ("site survey")
+    test_mode_and_channel_in_list_peers,
+    test_survey_channel_utilisation,
     # Resource lifecycle + defensive
     test_h1h2_h7_node_recycling,
     test_hub_survives_garbage,
