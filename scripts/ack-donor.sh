@@ -238,11 +238,31 @@ EOF
     return 1
 }
 
+# Dump the radio's actual capabilities/state -- the answer to "why won't it go
+# AP" is almost always visible here (AP not in supported modes, a combination
+# that forbids it, rfkill, or a restrictive regdomain).
+dump_diag() {
+    warn "diagnostics for $PHY ($ACK_IF):"
+    {
+        echo "--- supported interface modes ---"
+        iw phy "$PHY" info 2>/dev/null | awk '/Supported interface modes/{f=1;next} f&&/\*/{print} f&&/^\t[A-Za-z]/{exit}'
+        echo "--- valid interface combinations ---"
+        iw phy "$PHY" info 2>/dev/null | awk '/valid interface combinations/{f=1;next} f&&/^\t\t/{print} f&&/^\t[A-Za-z]/{exit}'
+        echo "--- regulatory ---"; iw reg get 2>/dev/null | grep -E 'country|DFS' | head -3
+        echo "--- rfkill ---"; rfkill list 2>/dev/null
+        echo "--- vifs on all phys ---"; iw dev 2>/dev/null | awk '/phy#|Interface|type |addr /{print}'
+    } | sed 's/^/      /' >&2
+    warn "For the exact netlink error, run:"
+    warn "  sudo hostapd -dd $RUN_DIR/hostapd-0.conf 2>&1 | grep -iB1 -A2 'mode\\|nl80211\\|fail'"
+}
+
 say "Starting beacons (legacy, no HT/WMM -> simple SIFS ACK only)"
 for idx in "${!IFACES[@]}"; do
-    start_hostapd "$idx" "${IFACES[idx]}" || die "hostapd would not start on \
-${IFACES[idx]}. If this radio can't hold multiple AP vifs, try a single BSSID \
-(BSSIDS=\"<one>\") or a PCI ath9k. Log: $RUN_DIR/hostapd-$idx.log"
+    if ! start_hostapd "$idx" "${IFACES[idx]}"; then
+        dump_diag
+        die "hostapd would not start on ${IFACES[idx]}. Log: $RUN_DIR/hostapd-$idx.log \
+-- see diagnostics above (is 'AP' in supported modes? does a combination allow it?)."
+    fi
 done
 
 # ---- 4. STABILITY GATE: correct AND unchanged for a full window ------------
