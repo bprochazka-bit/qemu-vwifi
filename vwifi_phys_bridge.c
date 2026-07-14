@@ -56,6 +56,30 @@ static int raw_fd = -1;
 static uint8_t own_mac[6];
 static int forward_all;   /* -A: disable the relevance filter (sniff mode) */
 
+/* -K: forward BlockAck control frames (subtype 9) whose RA is in our BSSID
+ * range up to the hub, instead of dropping all control frames as PHY-local.
+ * This is the downlink-ACK feedback a virtual AP needs to complete an A-MPDU
+ * honestly over the lossy air injection (the phone ACKs the downlink in the
+ * air; that BlockAck carries the true per-subframe delivery bitmap). Off by
+ * default: the current lab relies on control frames being dropped, and the
+ * AP does not yet consume real BlockAcks -- this flag is the experimental
+ * first step (observe that the phone emits matchable compressed BlockAcks)
+ * toward real downlink-ACK completion. Bare ACKs stay dropped: an ACK frame
+ * is FC+Dur+RA only, with no TA or sequence number, so it cannot be matched
+ * to a transmitted frame once its SIFS timing is gone. */
+static int forward_blockack;
+
+/* A-MPDU (802.11n Block-Ack) session control for the bridged peer. Default:
+ * BLOCK it. Aggregated downlink cannot survive the single-shot monitor
+ * injection -- the client decodes none of the aggregate and its BlockAcks
+ * report acked=0/64 -- so we drop the ADDBA/DELBA Action frames in both
+ * directions, forcing the STA<->AP link non-aggregated (the mode that works).
+ * VM<->VM links never traverse this bridge, so they keep aggregating at full
+ * speed. Pass -a to ALLOW A-MPDU setup (e.g. to re-run the -K BlockAck
+ * experiment); a legacy AP never sends these frames, so blocking is a no-op
+ * there. */
+static int block_ampdu = 1;
+
 /* -b <bssid>: address the relevance filter matches on, instead of the
  * interface MAC. Needed for the two-radio setup where a dedicated ACK
  * radio holds MAC == BSSID and a *separate* radio runs this bridge for
@@ -145,6 +169,8 @@ static uint64_t stats_inject_writes;    /* write() calls incl. -r copies */
 static uint64_t stats_drop_enobufs;     /* injects dropped: driver TX queue full */
 static uint64_t stats_drop_eagain;      /* injects dropped: socket would block */
 static uint64_t stats_drop_err;         /* injects dropped: other write() error */
+static uint64_t stats_ba_forwarded;     /* -K: BlockAcks forwarded to the hub */
+static uint64_t stats_addba_blocked;    /* A-MPDU (ADDBA/DELBA) frames dropped */
 
 static int stats_interval;              /* -S <sec>: periodic report (0 = off) */
 static volatile sig_atomic_t stats_dump_now;  /* set by SIGUSR1 */
@@ -170,7 +196,7 @@ static void sigusr1_handler(int sig)
  * time since the previous report (0 => print cumulative only, no rates). */
 static void stats_report(double elapsed_ms)
 {
-    static uint64_t p_hp, p_ph, p_hpb, p_hpab, p_phb, p_deno, p_deag, p_derr, p_echo;
+    static uint64_t p_hp, p_ph, p_hpb, p_hpab, p_phb, p_deno, p_deag, p_derr, p_echo, p_ba;
 
     uint64_t d_hp   = stats_hub_to_phys   - p_hp;
     uint64_t d_ph   = stats_phys_to_hub   - p_ph;
@@ -193,18 +219,20 @@ static void stats_report(double elapsed_ms)
         fprintf(stderr,
             "bridge: stats %.1fs | hub->phys %.0f fps %.2f Mbps%s "
             "drop(enobufs=%llu eagain=%llu err=%llu) | "
-            "phys->hub %.0f fps %.2f Mbps | echoes %llu\n",
+            "phys->hub %.0f fps %.2f Mbps | echoes %llu | ba=%llu addba-blk=%llu\n",
             s,
             d_hp / s, good, airbuf,
             (unsigned long long)d_deno, (unsigned long long)d_deag,
             (unsigned long long)d_derr,
             d_ph / s, (d_phb * 8.0) / (s * 1e6),
-            (unsigned long long)d_echo);
+            (unsigned long long)d_echo,
+            (unsigned long long)(stats_ba_forwarded - p_ba),
+            (unsigned long long)stats_addba_blocked);
     } else {
         fprintf(stderr,
             "bridge: stats (cumulative) | hub->phys %llu frames %llu bytes "
             "drop(enobufs=%llu eagain=%llu err=%llu) | phys->hub %llu frames "
-            "%llu bytes | echoes %llu\n",
+            "%llu bytes | echoes %llu | ba=%llu addba-blk=%llu\n",
             (unsigned long long)stats_hub_to_phys,
             (unsigned long long)stats_hp_bytes,
             (unsigned long long)stats_drop_enobufs,
@@ -212,13 +240,15 @@ static void stats_report(double elapsed_ms)
             (unsigned long long)stats_drop_err,
             (unsigned long long)stats_phys_to_hub,
             (unsigned long long)stats_ph_bytes,
-            (unsigned long long)stats_echoes);
+            (unsigned long long)stats_echoes,
+            (unsigned long long)stats_ba_forwarded,
+            (unsigned long long)stats_addba_blocked);
     }
 
     p_hp = stats_hub_to_phys; p_ph = stats_phys_to_hub;
     p_hpb = stats_hp_bytes;   p_hpab = stats_hp_air_bytes; p_phb = stats_ph_bytes;
     p_deno = stats_drop_enobufs; p_deag = stats_drop_eagain;
-    p_derr = stats_drop_err;  p_echo = stats_echoes;
+    p_derr = stats_drop_err;  p_echo = stats_echoes; p_ba = stats_ba_forwarded;
 }
 
 /* ================================================================
@@ -728,6 +758,11 @@ static int open_raw_socket(const char *iface)
         }
     }
 
+    fprintf(stderr, "bridge: A-MPDU to bridged peer: %s\n",
+            block_ampdu
+              ? "BLOCKED (forcing non-aggregated; -a to allow)"
+              : "allowed (-a/-K)");
+
     /* Raise the MTU so full-size downlink frames can be injected. Drivers
      * cap this differently (ath9k_htc rejects 2400), so probe a descending
      * list and keep the highest the driver accepts. Best effort: if none
@@ -1003,6 +1038,8 @@ static int build_inject_rtap(uint8_t *buf, uint8_t medium_rate_code)
  * Process a single hub message (payload after the 4-byte length prefix).
  * Validates, filters by channel, and injects the frame.
  */
+static int is_ba_action_frame(const uint8_t *frame, size_t frame_len);
+
 static void process_hub_message(const uint8_t *payload, uint32_t payload_len)
 {
     const struct vwifi_frame_hdr *hdr;
@@ -1059,6 +1096,19 @@ static void process_hub_message(const uint8_t *payload, uint32_t payload_len)
         if (verbose)
             fprintf(stderr, "bridge: hub->phys: bad frame_len=%u\n",
                     frame_len);
+        return;
+    }
+
+    /* A-MPDU suppression (downlink ADDBA/DELBA AP->phone): drop the Block Ack
+     * Action frames so the client never sets up a receive reorder buffer and
+     * treats the downlink as non-aggregated -- the only mode the injection
+     * path can carry (aggregated downlink decodes as acked=0/64). The AP's
+     * mac80211 gets no ADDBA Response and falls back to non-aggregated TX.
+     * See block_ampdu. */
+    if (block_ampdu && is_ba_action_frame(frame, frame_len)) {
+        stats_addba_blocked++;
+        fprintf(stderr, "bridge: hub->phys: blocked A-MPDU setup "
+                "(ADDBA/DELBA) -> forcing non-aggregated (-a to allow)\n");
         return;
     }
 
@@ -1161,6 +1211,89 @@ static int ctl_frame_has_addr2(uint16_t fc)
     }
 }
 
+/* True if `frame` is a BlockAck control frame (type=ctrl, subtype=9). */
+static int is_blockack_frame(const uint8_t *frame, size_t frame_len)
+{
+    if (frame_len < 2)
+        return 0;
+    return ((frame[0] & 0x0C) == 0x04) &&        /* type = control */
+           (((frame[0] >> 4) & 0x0F) == 9);      /* subtype = BlockAck */
+}
+
+/*
+ * True for a Block Ack Action management frame (ADDBA Request/Response or
+ * DELBA) -- the frames that negotiate an 802.11n A-MPDU session. Dropping
+ * these on the bridge forces the STA<->AP link to stay NON-aggregated, which
+ * is the only mode that works over the lossy single-shot monitor injection:
+ * an aggregated downlink is not decoded by the client at all (its BlockAcks
+ * report acked=0/64). Category 3 = Block Ack; the category byte sits right
+ * after the 24-byte management header. PMF is off in this lab, so the Action
+ * frame is unencrypted and the category is directly readable.
+ */
+static int is_ba_action_frame(const uint8_t *frame, size_t frame_len)
+{
+    int ftype, fsub;
+    if (frame_len < 26)
+        return 0;
+    ftype = (frame[0] >> 2) & 0x3;
+    fsub  = (frame[0] >> 4) & 0xf;
+    if (ftype != 0)                      /* management */
+        return 0;
+    if (fsub != 13 && fsub != 14)        /* Action / Action No Ack */
+        return 0;
+    return frame[24] == 3;               /* category = Block Ack */
+}
+
+/*
+ * Decode and log a captured BlockAck so the -K experiment is self-describing:
+ * it shows whether the phone actually emits *compressed* BlockAcks and what
+ * they say about delivery (TID, window start, how many of the 64 bits are
+ * set). Compressed-BA layout, after FC(2) Dur(2) RA(6) TA(6):
+ *   [16] BA Control(2): bit1=Multi-TID, bit2=Compressed, bits12-15=TID
+ *   [18] Block Ack Starting Sequence Control(2): bits4-15 = SSN
+ *   [20] Block Ack Bitmap(8 = 64 bits): bit i => MPDU (SSN+i) received
+ */
+static void log_blockack(const uint8_t *frame, size_t frame_len)
+{
+    const uint8_t *ra = frame + 4;    /* A1 = originator being acked */
+    const uint8_t *ta = frame + 10;   /* A2 = the acking station     */
+    uint16_t bactl, ssc, ssn;
+    int tid, compressed, i, acked = 0;
+
+#define BA_MAC "%02x:%02x:%02x:%02x:%02x:%02x"
+#define BA_OCT(m) (m)[0], (m)[1], (m)[2], (m)[3], (m)[4], (m)[5]
+
+    if (frame_len < 20) {
+        fprintf(stderr, "bridge: BA  RA=" BA_MAC " TA=" BA_MAC
+                " (runt, %zu bytes)\n", BA_OCT(ra), BA_OCT(ta), frame_len);
+        return;
+    }
+
+    bactl = (uint16_t)(frame[16] | (frame[17] << 8));
+    ssc   = (uint16_t)(frame[18] | (frame[19] << 8));
+    tid        = (bactl >> 12) & 0x0F;
+    compressed = (bactl >> 2) & 0x1;
+    ssn        = (ssc >> 4) & 0x0FFF;
+
+    if (compressed && frame_len >= 28) {
+        for (i = 0; i < 8; i++) {
+            uint8_t b = frame[20 + i];
+            while (b) { acked += (b & 1); b >>= 1; }
+        }
+        fprintf(stderr, "bridge: BA  RA=" BA_MAC " TA=" BA_MAC
+                " TID=%d SSN=%u compressed acked=%d/64\n",
+                BA_OCT(ra), BA_OCT(ta), tid, ssn, acked);
+    } else {
+        fprintf(stderr, "bridge: BA  RA=" BA_MAC " TA=" BA_MAC
+                " TID=%d SSN=%u %s\n",
+                BA_OCT(ra), BA_OCT(ta), tid, ssn,
+                compressed ? "compressed (short)" : "legacy-128bit");
+    }
+
+#undef BA_MAC
+#undef BA_OCT
+}
+
 static void handle_phys_data(void)
 {
     uint8_t buf[8 + VWIFI_MAX_FRAME_SIZE + 64];
@@ -1214,13 +1347,27 @@ static void handle_phys_data(void)
     if (frame_len > VWIFI_MAX_FRAME_SIZE)
         return;
 
+    /* A-MPDU suppression (uplink ADDBA/DELBA phone->AP): drop the Block Ack
+     * Action frames so the STA never negotiates aggregation -- see block_ampdu.
+     * The AP then gets no ADDBA Response and falls back to non-aggregated. */
+    if (block_ampdu && is_ba_action_frame(frame, frame_len)) {
+        stats_addba_blocked++;
+        fprintf(stderr, "bridge: phys->hub: blocked A-MPDU setup "
+                "(ADDBA/DELBA) -> forcing non-aggregated (-a to allow)\n");
+        return;
+    }
+
     /* Relevance filter: on a busy channel the radio hears tens of thousands
      * of unrelated frames; forwarding them all floods the hub, loads the
      * bridge, and can crash the USB firmware. Keep only frames that belong to
      * our lab BSSID set. Disable with -A to forward everything.
      *
      *  - Control frames (ACK/RTS/CTS/BlockAck): never forwarded. They are
-     *    PHY-local and meaningless in the medium.
+     *    PHY-local and meaningless in the medium. Exception: with -K a
+     *    BlockAck (subtype 9) is let through, because its RA is the AP BSSID
+     *    (so it passes the unicast RA test below) and it carries the true
+     *    downlink delivery bitmap the AP needs. Bare ACKs stay dropped --
+     *    they have no TA/seqno and cannot be matched after capture.
      *  - Unicast: Addr1 (RA, offset 4) must be in our BSSID range.
      *  - Group-addressed: forward probe requests (discovery) and any frame
      *    whose BSSID (Addr3, offset 16) is in our range; drop foreign beacons
@@ -1231,8 +1378,8 @@ static void handle_phys_data(void)
         int ftype = (frame[0] >> 2) & 0x3;   /* 0=mgmt,1=ctrl,2=data */
         int fsub  = (frame[0] >> 4) & 0xf;
 
-        if (ftype == 1)                      /* control frame */
-            return;
+        if (ftype == 1 && !(forward_blockack && fsub == 9))
+            return;                          /* control frame: drop unless -K BlockAck */
 
         const uint8_t *ra = frame + 4;
         const uint8_t *key = have_filter_bssid ? filter_bssid : own_mac;
@@ -1329,11 +1476,19 @@ static void handle_phys_data(void)
 
     stats_phys_to_hub++;
     stats_ph_bytes += frame_len;
-    if (verbose)
+
+    if (is_blockack_frame(frame, frame_len)) {
+        stats_ba_forwarded++;
+        /* BlockAcks are low-rate, and seeing them IS the point of -K, so log
+         * every one unconditionally -- no need to turn on the -v per-frame
+         * firehose. Greppable as "bridge: BA". */
+        log_blockack(frame, frame_len);
+    } else if (verbose) {
         fprintf(stderr,
             "bridge: phys->hub: forwarded %zu bytes "
             "(rate=0x%02x rssi=%d ch=%u)\n",
             frame_len, hdr.rate_code, hdr.rssi, hdr.channel_freq);
+    }
 }
 
 /* ================================================================
@@ -1434,6 +1589,21 @@ static void usage(const char *prog)
         "  -A               Forward ALL captured frames (disable the relevance\n"
         "                   filter; only for sniffing -- floods the hub on a\n"
         "                   busy channel)\n"
+        "  -K               Forward BlockAcks (subtype 9) for our BSSID to the\n"
+        "                   hub instead of dropping them (experimental: the\n"
+        "                   downlink-ACK feedback for honest A-MPDU completion).\n"
+        "                   Each BlockAck is decoded to stderr (TID/SSN/acked)\n"
+        "                   without needing -v; grep 'bridge: BA'. Count also\n"
+        "                   shown in the -S report as ba=<n>. (Implies -a.)\n"
+        "  -a               Allow A-MPDU (802.11n Block-Ack) session setup for the\n"
+        "                   bridged peer. DEFAULT is to BLOCK it: aggregated\n"
+        "                   downlink can't survive single-shot monitor injection\n"
+        "                   (client decodes none of it -> BlockAcks acked=0/64),\n"
+        "                   so ADDBA/DELBA are dropped both ways to force the\n"
+        "                   STA<->AP link non-aggregated. VM<->VM links (not via\n"
+        "                   this bridge) keep aggregating. Use -a to re-run the -K\n"
+        "                   experiment. A legacy AP never sends these, so the\n"
+        "                   default is a no-op there.\n"
         "  -v               Verbose logging\n"
         "  -h               This help\n"
         "\n"
@@ -1461,7 +1631,7 @@ int main(int argc, char *argv[])
     /* Reset getopt to start scanning from argv[3] */
     optind = 3;
 
-    while ((opt = getopt(argc, argv, "c:w:s:n:b:m:r:R:M:D:S:LAvh")) != -1) {
+    while ((opt = getopt(argc, argv, "c:w:s:n:b:m:r:R:M:D:S:LAKavh")) != -1) {
         switch (opt) {
         case 'b': {
             unsigned int m[6];
@@ -1552,6 +1722,13 @@ int main(int argc, char *argv[])
             break;
         case 'A':
             forward_all = 1;
+            break;
+        case 'K':
+            forward_blockack = 1;
+            block_ampdu = 0;   /* observing BlockAcks requires a live BA session */
+            break;
+        case 'a':
+            block_ampdu = 0;
             break;
         case 'v':
             verbose = 1;
