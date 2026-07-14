@@ -25,12 +25,30 @@
  *   v2: Added channel_freq, channel_flags, channel_bond_freq fields;
  *       hub performs channel-aware filtering. Also center_freq1/2
  *       for VHT/HE wide-channel disambiguation.
+ *
+ * Provenance:
+ *   This is the v2 wire-protocol standard as defined by the qemu-vwifi
+ *   project (its canonical vwifi.h + vwifi-medium reference hub) and is
+ *   kept byte-for-byte in sync with that header so this device model and
+ *   the vwifi kernel host share one definition.  The only intentional
+ *   local deviation is VWIFI_RXBUF_SIZE (see the note at the bottom of
+ *   this file): the QEMU device sizes its reassembly buffer to hold a
+ *   whole A-MPDU burst rather than a single frame.  Every other constant,
+ *   the vwifi_frame_hdr layout, and the HELLO handshake below must match
+ *   qemu-vwifi exactly; update this file from there, don't fork it.
  */
 
 #ifndef VWIFI_H
 #define VWIFI_H
 
+#ifdef __KERNEL__
+#include <linux/types.h>
+/* The kernel's <linux/types.h> provides uint8_t/uint16_t/uint32_t/uint64_t
+ * but not the signed fixed-width aliases; vwifi_frame_hdr uses int8_t. */
+typedef __s8 int8_t;
+#else
 #include <stdint.h>
+#endif
 
 /* ================================================================
  *  Wire protocol constants
@@ -62,6 +80,18 @@
 /* Misc-device name exposed by the kernel module, as in /dev/vwifi.
  * The relay opens this path; the driver uses it as miscdevice .name. */
 #define VWIFI_CHRDEV_NAME        "vwifi"
+
+/* Hello/registration message: [uint32 HELLO_MAGIC][node_id\0][flags?]
+ *
+ * The flags byte is optional and trails the node_id's null terminator;
+ * hellos that omit it (QEMU guests, older bridges) imply flags = 0.
+ *
+ * VWIFI_HELLO_FLAG_PHYSICAL marks the peer as a real radio (the physical
+ * bridge): the hub exempts every link touching it from the simulated
+ * propagation model -- no synthetic frame-error drops and no RSSI
+ * rewrite -- because real-world RF is already the channel. Channel
+ * filtering still applies (a real radio only hears its own channel). */
+#define VWIFI_HELLO_FLAG_PHYSICAL  0x01
 
 /* ================================================================
  *  Frame header – prepended to every 802.11 frame on the wire
@@ -237,15 +267,16 @@ struct vwifi_frame_hdr {
     (4 + VWIFI_HDR_SIZE + VWIFI_MAX_FRAME_SIZE)
 
 /*
- * Size the reassembly buffer to hold a whole burst, not a single frame.
- * With 802.11n A-MPDU the medium delivers a run of de-aggregated subframes
- * back-to-back; a one-frame buffer forced one read()/one main-loop
- * iteration per subframe.  Holding a full BA window (64 subframes) lets a
- * burst drain in a single read() and complete with one coalesced RXOK,
- * which is where the aggregation throughput win is actually realized.
- * (Bounds checks in vwifi_ath9k_fd_read are all relative to this size, so
- * enlarging it is safe; a single message is still capped at
- * VWIFI_MAX_MSG_SIZE.)
+ * Local deviation from the canonical qemu-vwifi header (see provenance
+ * note at the top of this file): size the reassembly buffer to hold a
+ * whole burst, not a single frame.  With 802.11n A-MPDU the medium
+ * delivers a run of de-aggregated subframes back-to-back; a one-frame
+ * buffer forced one read()/one main-loop iteration per subframe.  Holding
+ * a full BA window (64 subframes) lets a burst drain in a single read()
+ * and complete with one coalesced RXOK, which is where the aggregation
+ * throughput win is actually realized.  (Bounds checks in
+ * vwifi_ath9k_fd_read are all relative to this size, so enlarging it is
+ * safe; a single message is still capped at VWIFI_MAX_MSG_SIZE.)
  */
 #define VWIFI_RXBUF_SIZE         (32 * VWIFI_MSG_SLOT_SIZE)
 

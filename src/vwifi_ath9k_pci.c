@@ -355,7 +355,18 @@ static bool vwifi_ath9k_try_connect(VwifiAth9kState *s)
     s->medium_rxbuf_used = 0;
     qemu_set_fd_handler(fd, vwifi_ath9k_fd_read, NULL, s);
 
-    /* Send hello with node_id if configured */
+    /*
+     * Send hello with node_id if configured.
+     *
+     * Wire format per the vwifi v2 standard (see vwifi.h):
+     *   [uint32 net len][uint32 VWIFI_HELLO_MAGIC][node_id\0][flags?]
+     *
+     * We deliberately omit the trailing optional flags byte, so the hub
+     * reads flags = 0 -- i.e. NOT VWIFI_HELLO_FLAG_PHYSICAL.  This is a
+     * simulated station, not a real radio, so it must stay subject to the
+     * hub's propagation model (synthetic FER drops and RSSI rewrite); only
+     * the physical bridge sets that flag to be exempted.
+     */
     if (s->node_id && s->node_id[0] != '\0') {
         size_t id_len = strlen(s->node_id) + 1; /* include NUL */
         uint32_t payload_len = 4 + (uint32_t)id_len;
