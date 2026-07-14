@@ -290,6 +290,8 @@ let hubParams = {
 // Per-node TX power from LIST_PEERS; keyed by node id
 let nodeTxPower = {};  // { "ap1": 15.0, "sta1": 15.0, ... }
 const DEFAULT_TX_POWER = 15.0;
+// Per-node inferred mode + last-seen channel from LIST_PEERS; keyed by id
+let nodeMeta = {};  // { "ap1": {mode:"AP", chan:6, band:"2.4G", width:"HT20"}, ... }
 
 function getTxPower(nodeId) {
   return nodeTxPower[nodeId] !== undefined ? nodeTxPower[nodeId] : DEFAULT_TX_POWER;
@@ -384,6 +386,10 @@ async function refreshStatus() {
       data.peers.forEach(p => {
         // Sync TX power
         if (p.txpow !== undefined) nodeTxPower[p.id] = p.txpow;
+        // Sync inferred mode + last-seen channel
+        nodeMeta[p.id] = {
+          mode: p.mode, chan: p.chan, band: p.band, width: p.width,
+        };
         const existing = nodes.find(n => n.id === p.id);
         if (p.pos && p.pos.length >= 2) {
           const px = p.pos[0] * PIXELS_PER_METER;
@@ -607,7 +613,34 @@ function renderPathLossView() {
   renderLinks();
   ensureCanvasNodes();
   updateAllNodePositions();
+  updateAllNodeMeta();
   renderPathLossTable();
+}
+
+// Refresh the inferred-mode / channel sub-label and hover tooltip on
+// every node from the latest LIST_PEERS data.
+function updateNodeMeta(id) {
+  const el = canvasNodeEls[id];
+  if (!el) return;
+  const sub = el.querySelector(".node-sublabel");
+  const m = nodeMeta[id];
+  if (!sub) return;
+  if (m && m.mode) {
+    const chan = (m.chan !== undefined && m.chan !== "-" && m.chan !== null)
+      ? ` · ch${m.chan}` : "";
+    sub.textContent = m.mode + chan;
+    const parts = [`mode: ${m.mode}`];
+    if (chan) parts.push(`channel: ${m.chan}${m.band ? " (" + m.band + ")" : ""}`);
+    if (m.width) parts.push(`width: ${m.width}`);
+    el.title = `${id}\n` + parts.join("\n");
+  } else {
+    sub.textContent = "";
+    el.title = id;
+  }
+}
+
+function updateAllNodeMeta() {
+  for (const id in canvasNodeEls) updateNodeMeta(id);
 }
 
 function updateCanvasTransform() {
@@ -665,7 +698,8 @@ function ensureCanvasNodes() {
     el.className = "node-handle"; el.dataset.nodeId = node.id;
     el.innerHTML = `<div class="node-ring"></div>
       <div class="node-body"><div class="node-core"></div></div>
-      <div class="node-label">${escHtml(node.id)}</div>`;
+      <div class="node-label">${escHtml(node.id)}</div>
+      <div class="node-sublabel"></div>`;
     el.addEventListener("mousedown", (e) => {
       e.preventDefault(); e.stopPropagation();
       const rect = document.getElementById("canvas").getBoundingClientRect();

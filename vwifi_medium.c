@@ -121,6 +121,8 @@
  * The minimum header size we'll accept is the v1 layout (28 bytes);
  * the v2 channel fields are an optional extension.
  */
+#define HDR_OFF_VERSION         offsetof(struct vwifi_frame_hdr, version)
+#define HDR_OFF_FRAME_LEN       offsetof(struct vwifi_frame_hdr, frame_len)
 #define HDR_OFF_TX_MAC          offsetof(struct vwifi_frame_hdr, tx_mac)
 #define HDR_OFF_RATE_CODE       offsetof(struct vwifi_frame_hdr, rate_code)
 #define HDR_OFF_RSSI            offsetof(struct vwifi_frame_hdr, rssi)
@@ -421,6 +423,20 @@ struct node_phys {
     bool        physical;       /* true = real radio (phys bridge): links to
                                  * this node bypass the simulated physics
                                  * model and keep their on-air RSSI. */
+    /* Last channel this node was seen transmitting on. Mirrors the bound
+     * peer's live channel state but persists after disconnect, so an
+     * offline node still reports the channel it last used (0 = never seen
+     * / v1 sender). */
+    uint16_t    last_chan_freq;
+    uint16_t    last_chan_bond_freq;
+    uint16_t    last_chan_flags;
+    uint16_t    last_center1;
+    uint16_t    last_center2;
+    /* Inferred interface mode. A bitmask of 802.11 frame evidence observed
+     * from this node's transmissions (IFEV_* below); the single-word label
+     * is derived at display time. There is no iftype field on the wire, so
+     * this is a best-effort inference, not an authoritative value. */
+    uint8_t     iftype_evidence;
 };
 
 static struct node_phys nodes[MAX_NODES];
@@ -630,6 +646,12 @@ struct peer {
     uint16_t    channel_flags;
     uint16_t    center_freq1;
     uint16_t    center_freq2;
+    /* Diagnostics: header version + payload size of the most recent frame,
+     * so an operator can tell (via DIAG) whether a peer is sending v1
+     * headers or v2 headers that carry channel_freq=0. */
+    uint16_t    last_hdr_version;
+    uint32_t    last_payload_len;
+    uint64_t    frames_seen;
 };
 
 static struct peer peers[MAX_PEERS];
@@ -1005,6 +1027,208 @@ static bool channels_match(const struct chan_state *a,
 }
 
 /* -------------------------------------------------------------------
+ *  Interface-mode inference
+ *
+ *  Nothing on the wire carries the transmitter's cfg80211 iftype, so we
+ *  infer it from the 802.11 frames a node actually sends. Each frame
+ *  contributes an evidence bit; the label is resolved from the union of
+ *  evidence at display time (see infer_mode). This is a heuristic --
+ *  reported for observability, never used for forwarding decisions.
+ * ------------------------------------------------------------------- */
+#define IFEV_BEACON       0x01  /* sent a Beacon (AP or IBSS or mesh)      */
+#define IFEV_AP_RESP      0x02  /* Probe/Assoc/Reassoc Response  -> AP     */
+#define IFEV_STA_REQ      0x04  /* Probe/Assoc/Reassoc Request   -> STA    */
+#define IFEV_DATA_FROMDS  0x08  /* Data FromDS only              -> AP     */
+#define IFEV_DATA_TODS    0x10  /* Data ToDS only                -> STA    */
+#define IFEV_DATA_4ADDR   0x20  /* Data ToDS+FromDS (4-addr)     -> mesh   */
+#define IFEV_DATA_NODS    0x40  /* Data neither DS bit           -> IBSS   */
+
+/* Fold one 802.11 frame's frame-control field into a node's evidence
+ * bitmask. `frame` points at the start of the 802.11 header (frame
+ * control first), `frame_len` is its length in bytes. */
+static void observe_iftype(struct node_phys *nd,
+                           const uint8_t *frame, uint32_t frame_len)
+{
+    if (!nd || frame_len < 2)
+        return;
+
+    uint8_t b0 = frame[0];
+    uint8_t b1 = frame[1];
+    uint8_t type    = (b0 >> 2) & 0x3;   /* 0=mgmt 1=ctrl 2=data 3=ext */
+    uint8_t subtype = (b0 >> 4) & 0xF;
+    bool    tods    = (b1 & 0x01) != 0;
+    bool    fromds  = (b1 & 0x02) != 0;
+
+    if (type == 0) {                     /* management */
+        switch (subtype) {
+        case 8:  nd->iftype_evidence |= IFEV_BEACON;  break; /* Beacon      */
+        case 1:                                                /* Assoc Resp  */
+        case 3:                                                /* Reassoc Rsp */
+        case 5:  nd->iftype_evidence |= IFEV_AP_RESP; break;  /* Probe Resp  */
+        case 0:                                                /* Assoc Req   */
+        case 2:                                                /* Reassoc Req */
+        case 4:  nd->iftype_evidence |= IFEV_STA_REQ; break;  /* Probe Req   */
+        default: break;
+        }
+    } else if (type == 2) {              /* data */
+        if (tods && fromds)  nd->iftype_evidence |= IFEV_DATA_4ADDR;
+        else if (tods)       nd->iftype_evidence |= IFEV_DATA_TODS;
+        else if (fromds)     nd->iftype_evidence |= IFEV_DATA_FROMDS;
+        else                 nd->iftype_evidence |= IFEV_DATA_NODS;
+    }
+    /* control frames (ACK/RTS/CTS/BA) don't cleanly reveal a role -- skip */
+}
+
+/* Resolve accumulated evidence into a single mode label. Precedence runs
+ * from most-specific to least: a 4-address frame is unambiguously mesh/WDS;
+ * AP-only responses or FromDS data mark an AP; a lone beacon paired with
+ * DS-less data is IBSS, otherwise a beacon means AP; ToDS/requests mark a
+ * STA. "?" means the node has not yet transmitted anything conclusive. */
+static const char *infer_mode(uint8_t ev)
+{
+    if (ev & IFEV_DATA_4ADDR)                       return "MESH";
+    if (ev & (IFEV_AP_RESP | IFEV_DATA_FROMDS))     return "AP";
+    if (ev & IFEV_BEACON)
+        return (ev & IFEV_DATA_NODS) ? "IBSS" : "AP";
+    if (ev & (IFEV_STA_REQ | IFEV_DATA_TODS))       return "STA";
+    if (ev & IFEV_DATA_NODS)                        return "IBSS";
+    return "?";
+}
+
+/* -------------------------------------------------------------------
+ *  Channel formatting helpers (frequency -> channel number / band /
+ *  bandwidth string) for LIST_PEERS and the SURVEY report.
+ * ------------------------------------------------------------------- */
+
+/* Map a primary 20 MHz center frequency (MHz) to an IEEE channel number.
+ * Covers 2.4 GHz, 5 GHz and 6 GHz (6E). Returns 0 if unrecognised. */
+static int freq_to_chan(uint16_t freq)
+{
+    if (freq == 0)                    return 0;
+    if (freq == 2484)                 return 14;
+    if (freq >= 2412 && freq <= 2472) return (freq - 2407) / 5;   /* 1..13   */
+    if (freq >= 5160 && freq <= 5885) return (freq - 5000) / 5;   /* 5 GHz   */
+    if (freq >= 5955 && freq <= 7115) return (freq - 5950) / 5;   /* 6 GHz   */
+    return 0;
+}
+
+/* Short band label for a frequency (falls back to flags for edge cases). */
+static const char *band_str(uint16_t freq, uint16_t flags)
+{
+    if (freq >= 5955)                       return "6G";
+    if (freq >= 5000)                       return "5G";
+    if (freq >= 2400 && freq < 2500)        return "2.4G";
+    if (flags & VWIFI_CHAN_FLAG_5GHZ)       return "5G";
+    if (flags & VWIFI_CHAN_FLAG_2GHZ)       return "2.4G";
+    return "?";
+}
+
+/* Human-readable bandwidth / PHY label derived from the channel flags. */
+static const char *width_str(uint16_t flags)
+{
+    if (flags & VWIFI_CHAN_FLAG_HE80_80)   return "HE80+80";
+    if (flags & VWIFI_CHAN_FLAG_HE160)     return "HE160";
+    if (flags & VWIFI_CHAN_FLAG_HE80)      return "HE80";
+    if (flags & VWIFI_CHAN_FLAG_HE40)      return "HE40";
+    if (flags & VWIFI_CHAN_FLAG_HE20)      return "HE20";
+    if (flags & VWIFI_CHAN_FLAG_VHT80_80)  return "VHT80+80";
+    if (flags & VWIFI_CHAN_FLAG_VHT160)    return "VHT160";
+    if (flags & VWIFI_CHAN_FLAG_VHT80)     return "VHT80";
+    if (flags & VWIFI_CHAN_FLAG_HT40PLUS)  return "HT40+";
+    if (flags & VWIFI_CHAN_FLAG_HT40MINUS) return "HT40-";
+    if (flags & VWIFI_CHAN_FLAG_HT20)      return "HT20";
+    return "20MHz";
+}
+
+/* Data rate (Mbps) for a rate code -- used to estimate frame airtime for
+ * the channel-utilisation survey. Unknown codes fall back to 6 Mbps, the
+ * same default the FER model uses. */
+static double rate_to_mbps(uint8_t rate_code)
+{
+    for (int i = 0; i < NUM_RATES; i++)
+        if (rate_table[i].code == rate_code)
+            return rate_table[i].mbps;
+    return 6.0;
+}
+
+/* -------------------------------------------------------------------
+ *  Channel-utilisation survey ("site survey")
+ *
+ *  Every transmitted frame occupies airtime on exactly one primary
+ *  channel, independent of how many receivers hear it. We bucket that
+ *  airtime (plus frame/byte counts) per 20 MHz primary frequency so the
+ *  SURVEY command can report per-channel busy time and utilisation, the
+ *  way `iw dev <if> survey dump` does on real hardware.
+ * ------------------------------------------------------------------- */
+#define MAX_SURVEY_CHANS   64
+
+/* Rough per-frame PHY overhead (preamble + PLCP + typical SIFS/ACK share),
+ * in microseconds. A coarse constant is fine: utilisation is a relative
+ * indicator here, not a MAC-accurate airtime accounting. */
+#define SURVEY_FRAME_OVERHEAD_US  50.0
+
+struct chan_survey {
+    uint16_t freq;         /* primary 20 MHz freq (0 = unknown/broadcast) */
+    uint16_t flags;        /* last-seen channel flags for width/band label */
+    uint64_t frames;
+    uint64_t bytes;        /* 802.11 frame bytes (goodput proxy)          */
+    double   airtime_us;   /* accumulated busy airtime                    */
+    bool     used;
+};
+static struct chan_survey surveys[MAX_SURVEY_CHANS];
+static struct timespec survey_start;   /* window start (CLOCK_MONOTONIC)  */
+
+/* Monotonic microseconds since an arbitrary epoch. */
+static uint64_t mono_us(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull;
+}
+
+/* Find (or, if room, create) the survey bucket for a primary frequency. */
+static struct chan_survey *survey_bucket(uint16_t freq)
+{
+    struct chan_survey *free_slot = NULL;
+    for (int i = 0; i < MAX_SURVEY_CHANS; i++) {
+        if (surveys[i].used && surveys[i].freq == freq)
+            return &surveys[i];
+        if (!surveys[i].used && !free_slot)
+            free_slot = &surveys[i];
+    }
+    if (free_slot) {
+        free_slot->used = true;
+        free_slot->freq = freq;
+        free_slot->flags = 0;
+        free_slot->frames = 0;
+        free_slot->bytes = 0;
+        free_slot->airtime_us = 0.0;
+    }
+    return free_slot;   /* NULL only if all MAX_SURVEY_CHANS are taken */
+}
+
+/* Account one transmitted frame against its channel's airtime budget. */
+static void survey_account(uint16_t freq, uint16_t flags,
+                           uint8_t rate_code, uint32_t frame_bytes)
+{
+    struct chan_survey *s = survey_bucket(freq);
+    if (!s)
+        return;
+    s->flags = flags;
+    s->frames++;
+    s->bytes += frame_bytes;
+    s->airtime_us += (frame_bytes * 8.0) / rate_to_mbps(rate_code)
+                     + SURVEY_FRAME_OVERHEAD_US;
+}
+
+/* Zero all buckets and restart the utilisation window. */
+static void survey_reset(void)
+{
+    memset(surveys, 0, sizeof(surveys));
+    clock_gettime(CLOCK_MONOTONIC, &survey_start);
+}
+
+/* -------------------------------------------------------------------
  *  Frame forwarding with TTL + physics
  *
  *  forward_message is invoked sequentially from the single-threaded
@@ -1077,6 +1301,55 @@ static void forward_message(int sender_idx, const uint8_t *msg,
         peers[sender_idx].channel_flags     = msg_chan.flags;
         peers[sender_idx].center_freq1      = msg_chan.center1;
         peers[sender_idx].center_freq2      = msg_chan.center2;
+    }
+
+    /* Record header version + size of this frame for DIAG. The version
+     * field sits right after the 4-byte magic, present in every header
+     * revision, so it is always readable here. */
+    {
+        uint16_t hdr_ver = 0;
+        memcpy(&hdr_ver, tmp + 4 + HDR_OFF_VERSION, 2);
+        peers[sender_idx].last_hdr_version = hdr_ver;
+        peers[sender_idx].last_payload_len = payload_len;
+        peers[sender_idx].frames_seen++;
+    }
+
+    /* --- Observe mode + channel, and account channel airtime ---
+     *
+     * Attribute the frame to the node that owns tx_mac. For a direct peer
+     * that is its own node; for a bridge trunk it is the real originator
+     * behind the bridge (if we've learned it), which is exactly the node
+     * whose mode/channel the frame reveals. */
+    struct node_phys *tx_nd = find_node_by_mac(tmp + 4 + HDR_OFF_TX_MAC);
+    if (!tx_nd && sender_ni >= 0)
+        tx_nd = &nodes[sender_ni];
+
+    if (tx_nd && msg_chan.freq != 0) {
+        /* Persist last-seen channel so it survives disconnect (unlike the
+         * per-peer copy). Never clobber a known channel with a v1 zero. */
+        tx_nd->last_chan_freq      = msg_chan.freq;
+        tx_nd->last_chan_bond_freq = msg_chan.bond_freq;
+        tx_nd->last_chan_flags     = msg_chan.flags;
+        tx_nd->last_center1        = msg_chan.center1;
+        tx_nd->last_center2        = msg_chan.center2;
+    }
+
+    /* Locate the 802.11 frame (after the v1 or v2 medium header) to read
+     * its frame-control field for mode inference and its length for the
+     * airtime survey. */
+    {
+        uint32_t hdr_sz = (payload_len >= VWIFI_HDR_SIZE)
+                        ? VWIFI_HDR_SIZE : VWIFI_HDR_SIZE_V1;
+        uint16_t hdr_frame_len = 0;
+        memcpy(&hdr_frame_len, tmp + 4 + HDR_OFF_FRAME_LEN, 2);
+        uint32_t body_avail = payload_len - hdr_sz;
+        uint32_t body_len = hdr_frame_len;
+        if (body_len > body_avail)
+            body_len = body_avail;
+        const uint8_t *body = tmp + 4 + hdr_sz;
+
+        observe_iftype(tx_nd, body, body_len);
+        survey_account(msg_chan.freq, msg_chan.flags, rate_code, body_len);
     }
 
     /* --- TTL handling (unchanged logic) --- */
@@ -1476,18 +1749,36 @@ static int ctl_process_command(int fd, char *line)
             uint64_t txd = (nd->peer_idx >= 0)
                 ? peers[nd->peer_idx].tx_dropped : 0;
 
+            /* Inferred mode + last-seen channel. Emitted as extra
+             * key=value tokens (order-independent for parsers). chan=-
+             * means the node has not transmitted a v2 channel header. */
+            char meta[128];
+            if (nd->last_chan_freq != 0) {
+                snprintf(meta, sizeof(meta),
+                    "mode=%s chan=%d band=%s width=%s cfreq=%u",
+                    infer_mode(nd->iftype_evidence),
+                    freq_to_chan(nd->last_chan_freq),
+                    band_str(nd->last_chan_freq, nd->last_chan_flags),
+                    width_str(nd->last_chan_flags),
+                    nd->last_chan_freq);
+            } else {
+                snprintf(meta, sizeof(meta), "mode=%s chan=-",
+                    infer_mode(nd->iftype_evidence));
+            }
+
             if (nd->pos_set)
-                ctl_respond(fd, "  %-12s %s macs=[%s] pos=(%.1f,%.1f,%.1f) "
+                ctl_respond(fd, "  %-12s %s %s macs=[%s] pos=(%.1f,%.1f,%.1f) "
                     "txpow=%.1f tx=%" PRIu64 " rx=%" PRIu64
                     " rx_drop=%" PRIu64 " tx_drop=%" PRIu64 "\n",
-                    nd->node_id, st, maclist, nd->pos_x, nd->pos_y, nd->pos_z,
+                    nd->node_id, st, meta, maclist,
+                    nd->pos_x, nd->pos_y, nd->pos_z,
                     nd->tx_power_dbm, nd->tx_frames, nd->rx_frames,
                     nd->rx_dropped, txd);
             else
-                ctl_respond(fd, "  %-12s %s macs=[%s] pos=none txpow=%.1f "
+                ctl_respond(fd, "  %-12s %s %s macs=[%s] pos=none txpow=%.1f "
                     "tx=%" PRIu64 " rx=%" PRIu64
                     " rx_drop=%" PRIu64 " tx_drop=%" PRIu64 "\n",
-                    nd->node_id, st, maclist, nd->tx_power_dbm,
+                    nd->node_id, st, meta, maclist, nd->tx_power_dbm,
                     nd->tx_frames, nd->rx_frames,
                     nd->rx_dropped, txd);
         }
@@ -1721,6 +2012,87 @@ static int ctl_process_command(int fd, char *line)
         return 0;
     }
 
+    /* ---- SURVEY [RESET] ---- channel-utilisation "site survey" ---- */
+    if (strncasecmp(cmd, "SURVEY", 6) == 0) {
+        char arg[32] = "";
+        sscanf(cmd + 6, "%31s", arg);
+        if (strcasecmp(arg, "RESET") == 0) {
+            survey_reset();
+            ctl_respond(fd, "OK survey reset\n");
+            return 0;
+        }
+
+        uint64_t now = mono_us();
+        uint64_t start = (uint64_t)survey_start.tv_sec * 1000000ull
+                       + (uint64_t)survey_start.tv_nsec / 1000ull;
+        double window_us = (now > start) ? (double)(now - start) : 1.0;
+
+        int nchans = 0;
+        for (int i = 0; i < MAX_SURVEY_CHANS; i++)
+            if (surveys[i].used) nchans++;
+
+        ctl_respond(fd, "OK survey window=%.2fs chans=%d\n",
+                    window_us / 1e6, nchans);
+
+        for (int i = 0; i < MAX_SURVEY_CHANS; i++) {
+            struct chan_survey *s = &surveys[i];
+            if (!s->used) continue;
+
+            /* Nodes currently parked on this primary frequency. */
+            int nnodes = 0;
+            if (s->freq != 0) {
+                for (int ni = 0; ni < num_nodes; ni++)
+                    if (nodes[ni].active &&
+                        nodes[ni].last_chan_freq == s->freq)
+                        nnodes++;
+            }
+
+            double util = s->airtime_us / window_us * 100.0;
+            if (util > 100.0) util = 100.0;
+
+            if (s->freq != 0)
+                ctl_respond(fd,
+                    "  chan=%d freq=%uMHz band=%s width=%s nodes=%d "
+                    "frames=%" PRIu64 " bytes=%" PRIu64
+                    " airtime=%.1fms util=%.1f%%\n",
+                    freq_to_chan(s->freq), s->freq,
+                    band_str(s->freq, s->flags), width_str(s->flags),
+                    nnodes, s->frames, s->bytes,
+                    s->airtime_us / 1000.0, util);
+            else
+                ctl_respond(fd,
+                    "  chan=- freq=unknown nodes=0 "
+                    "frames=%" PRIu64 " bytes=%" PRIu64
+                    " airtime=%.1fms util=%.1f%%\n",
+                    s->frames, s->bytes, s->airtime_us / 1000.0, util);
+        }
+        return 0;
+    }
+
+    /* ---- DIAG ---- per-peer wire diagnostics ----
+     *
+     * Answers "why is chan=- for a node?": shows the header version and
+     * the raw channel_freq of the most recent frame each connected peer
+     * sent. hdrver<2 or freq=0 on a v2 header means the *sender* is not
+     * populating the channel -- the medium reports faithfully whatever
+     * arrives on the wire. */
+    if (strncasecmp(cmd, "DIAG", 4) == 0) {
+        ctl_respond(fd, "OK diag %d peers\n", num_peers);
+        for (int pi = 0; pi < num_peers; pi++) {
+            struct peer *p = &peers[pi];
+            if (p->fd < 0) continue;
+            int ni = peer_node[pi];
+            const char *nid = (ni >= 0) ? nodes[ni].node_id : "(unbound)";
+            ctl_respond(fd,
+                "  peer=%d node=%-12s bridge=%d hdrver=%u paylen=%u frames=%"
+                PRIu64 " chan_freq=%u chan_flags=0x%04x bond=%u cf1=%u cf2=%u\n",
+                pi, nid, p->is_bridge, p->last_hdr_version, p->last_payload_len,
+                p->frames_seen, p->channel_freq, p->channel_flags,
+                p->channel_bond_freq, p->center_freq1, p->center_freq2);
+        }
+        return 0;
+    }
+
     /* ---- LOAD_CONFIG <path> ---- */
     if (strncasecmp(cmd, "LOAD_CONFIG ", 12) == 0) {
         /* Cap recursion so a config file that LOAD_CONFIGs itself (or
@@ -1837,7 +2209,9 @@ static int ctl_process_command(int fd, char *line)
     if (strncasecmp(cmd, "HELP", 4) == 0) {
         ctl_respond(fd,
             "OK commands:\n"
-            "  LIST_PEERS                          Show connected peers\n"
+            "  LIST_PEERS                          Show peers (incl. mode + channel)\n"
+            "  SURVEY [RESET]                       Per-channel utilisation (site survey)\n"
+            "  DIAG                                 Per-peer wire diagnostics (hdr ver, raw chan)\n"
             "  SET_POS <mac> <x> <y> [<z>]         Set node position (m)\n"
             "  GET_POS <mac>                        Query position\n"
             "  SET_TXPOWER <mac> <dBm>              Set TX power\n"
@@ -2173,6 +2547,9 @@ int main(int argc, char **argv)
 
     /* Seed the PRNG */
     rng_state = (uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32);
+
+    /* Start the channel-utilisation survey window. */
+    survey_reset();
 
     /* Allocate the per-frame forwarding scratch buffer once -- keeps
      * an 8 KB+ array off forward_message's stack frame. */
