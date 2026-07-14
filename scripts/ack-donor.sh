@@ -96,10 +96,30 @@ other_vifs_on_phy() {
     '
 }
 
+# Kill ANY hostapd bound to an interface on our phy -- including a still-running
+# lab-bringup (its /run/vwifi-lab/ hostapd) that our own $RUN_DIR pkill misses.
+# A leftover hostapd holds the AP / spurious-class3 registration and blocks ours
+# with EBUSY even after its vif is deleted. We read each hostapd's config to see
+# which interface it drives, and match against every vif on our phy.
+kill_hostapd_on_phy() {
+    local ifaces pid args conf iface w
+    ifaces="$ACK_IF $(other_vifs_on_phy)"
+    for pid in $(pgrep -x hostapd 2>/dev/null); do
+        args="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)"
+        conf="$(printf '%s\n' $args | grep -E '\.conf$' | tail -1)"
+        [ -n "$conf" ] && [ -r "$conf" ] || continue
+        iface="$(awk -F= '/^[[:space:]]*interface=/{print $2; exit}' "$conf" 2>/dev/null)"
+        for w in $ifaces; do
+            [ "$iface" = "$w" ] && { kill "$pid" 2>/dev/null || true; break; }
+        done
+    done
+}
+
 # ---- teardown ---------------------------------------------------------------
-teardown() {   # tear down our beacons + all non-primary vifs; does NOT touch NM
+teardown() {   # tear down beacons + all non-primary vifs on our phy; not NM
     say "Tearing down"
     pkill -f "hostapd .*$RUN_DIR/" 2>/dev/null || true
+    kill_hostapd_on_phy
     sleep 1
     local v
     for v in $(other_vifs_on_phy); do
