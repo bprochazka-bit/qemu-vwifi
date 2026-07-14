@@ -314,6 +314,39 @@ relative indicator, not MAC-accurate airtime accounting — it uses a
 coarse fixed per-frame PHY overhead and does not model contention or
 retransmission backoff.
 
+#### Troubleshooting `chan=-`
+
+`chan=-` (and `SURVEY` showing a `chan=-` bucket) means the frames
+arriving at the hub carry `channel_freq=0`: the medium reports the
+channel faithfully, but the **sender never put one in the header**. The
+hub only knows a node's channel because that node stamps it into the v2
+frame header on every TX — it cannot invent it.
+
+`DIAG` shows, per connected peer, the header version and the raw channel
+fields of the most recent frame, which tells you where the zero comes
+from:
+
+```
+$ echo DIAG | socat - UNIX-CONNECT:/tmp/vwifi.ctl
+OK diag 2 peers
+  peer=0 node=openwrt-a    bridge=0 hdrver=2 paylen=242 frames=196 chan_freq=0    chan_flags=0x0000 bond=0 cf1=0 cf2=0
+  peer=1 node=client-a     bridge=0 hdrver=2 paylen=131 frames=24  chan_freq=0    chan_flags=0x0000 bond=0 cf1=0 cf2=0
+```
+
+* `hdrver < 2` — the sender is emitting a v1 (pre-channel) header. Rebuild
+  and reload that component from current source.
+* `hdrver=2` **and** `chan_freq=0` — the sender speaks v2 but isn't
+  populating the channel. Fix the source:
+  * **Kernel driver (`vwifi_host.ko` in a VM):** the channel is filled
+    from `priv->channel_freq`, which mac80211 sets via the driver's
+    `.config`/chanctx path. A current build defaults to channel 1 and
+    tracks the configured channel; a `chan_freq=0` almost always means an
+    **older `.ko` is loaded** — rebuild and `rmmod`/`insmod` it in the VM.
+  * **`vwifi-phys-bridge`:** it stamps the channel from the captured
+    frame's radiotap, falling back to its **required** `-c <channel>`
+    option. Make sure it was launched with `-c` matching the radio's
+    channel (and `-w <bandwidth>` for HT40/VHT).
+
 There's also a web UI in `medium-controller/` for the same control
 socket — see `medium-controller/README.md`.
 

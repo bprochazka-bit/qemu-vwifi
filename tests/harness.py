@@ -1336,6 +1336,33 @@ def test_survey_channel_utilisation(h: Harness):
         a.close(); b.close()
 
 
+def test_diag_reports_sender_channel(h: Harness):
+    h.section('DIAG: exposes header version + raw channel of each sender')
+    h.restart_hub()
+    zero = h.data_conn()   # v2 header, but channel_freq=0 (buggy sender)
+    good = h.data_conn()   # v2 header with a real channel
+    try:
+        beacon = b'\x80\x00' + b'\x00' * 64
+        zero.sendall(make_frame(b'\x52\x54\x00\x00\x00\xaa',
+                                channel_freq=0, payload=beacon))
+        good.sendall(make_frame(b'\x52\x54\x00\x00\x00\xbb',
+                                channel_freq=2462,
+                                channel_flags=CHF_2GHZ | CHF_HT20,
+                                payload=beacon))
+        h.drain(zero); h.drain(good)
+
+        r = h.ctl_cmd('DIAG')
+        zero_line = next((l for l in r.splitlines() if '00:aa' in l or
+                          'peer=0' in l), '')
+        h.expect('hdrver=2' in r, 'DIAG reports header version', repr(r))
+        h.expect('chan_freq=0' in r,
+                 'DIAG shows the zero-channel sender as chan_freq=0', repr(r))
+        h.expect('chan_freq=2462' in r,
+                 'DIAG shows the good sender as chan_freq=2462', repr(r))
+    finally:
+        zero.close(); good.close()
+
+
 TESTS = [
     test_c4_socket_perms,
     test_list_peers_empty,
@@ -1374,6 +1401,7 @@ TESTS = [
     # Mode inference + channel utilisation ("site survey")
     test_mode_and_channel_in_list_peers,
     test_survey_channel_utilisation,
+    test_diag_reports_sender_channel,
     # Resource lifecycle + defensive
     test_h1h2_h7_node_recycling,
     test_hub_survives_garbage,

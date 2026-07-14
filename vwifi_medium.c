@@ -121,6 +121,7 @@
  * The minimum header size we'll accept is the v1 layout (28 bytes);
  * the v2 channel fields are an optional extension.
  */
+#define HDR_OFF_VERSION         offsetof(struct vwifi_frame_hdr, version)
 #define HDR_OFF_FRAME_LEN       offsetof(struct vwifi_frame_hdr, frame_len)
 #define HDR_OFF_TX_MAC          offsetof(struct vwifi_frame_hdr, tx_mac)
 #define HDR_OFF_RATE_CODE       offsetof(struct vwifi_frame_hdr, rate_code)
@@ -645,6 +646,12 @@ struct peer {
     uint16_t    channel_flags;
     uint16_t    center_freq1;
     uint16_t    center_freq2;
+    /* Diagnostics: header version + payload size of the most recent frame,
+     * so an operator can tell (via DIAG) whether a peer is sending v1
+     * headers or v2 headers that carry channel_freq=0. */
+    uint16_t    last_hdr_version;
+    uint32_t    last_payload_len;
+    uint64_t    frames_seen;
 };
 
 static struct peer peers[MAX_PEERS];
@@ -1294,6 +1301,17 @@ static void forward_message(int sender_idx, const uint8_t *msg,
         peers[sender_idx].channel_flags     = msg_chan.flags;
         peers[sender_idx].center_freq1      = msg_chan.center1;
         peers[sender_idx].center_freq2      = msg_chan.center2;
+    }
+
+    /* Record header version + size of this frame for DIAG. The version
+     * field sits right after the 4-byte magic, present in every header
+     * revision, so it is always readable here. */
+    {
+        uint16_t hdr_ver = 0;
+        memcpy(&hdr_ver, tmp + 4 + HDR_OFF_VERSION, 2);
+        peers[sender_idx].last_hdr_version = hdr_ver;
+        peers[sender_idx].last_payload_len = payload_len;
+        peers[sender_idx].frames_seen++;
     }
 
     /* --- Observe mode + channel, and account channel airtime ---
@@ -2051,6 +2069,30 @@ static int ctl_process_command(int fd, char *line)
         return 0;
     }
 
+    /* ---- DIAG ---- per-peer wire diagnostics ----
+     *
+     * Answers "why is chan=- for a node?": shows the header version and
+     * the raw channel_freq of the most recent frame each connected peer
+     * sent. hdrver<2 or freq=0 on a v2 header means the *sender* is not
+     * populating the channel -- the medium reports faithfully whatever
+     * arrives on the wire. */
+    if (strncasecmp(cmd, "DIAG", 4) == 0) {
+        ctl_respond(fd, "OK diag %d peers\n", num_peers);
+        for (int pi = 0; pi < num_peers; pi++) {
+            struct peer *p = &peers[pi];
+            if (p->fd < 0) continue;
+            int ni = peer_node[pi];
+            const char *nid = (ni >= 0) ? nodes[ni].node_id : "(unbound)";
+            ctl_respond(fd,
+                "  peer=%d node=%-12s bridge=%d hdrver=%u paylen=%u frames=%"
+                PRIu64 " chan_freq=%u chan_flags=0x%04x bond=%u cf1=%u cf2=%u\n",
+                pi, nid, p->is_bridge, p->last_hdr_version, p->last_payload_len,
+                p->frames_seen, p->channel_freq, p->channel_flags,
+                p->channel_bond_freq, p->center_freq1, p->center_freq2);
+        }
+        return 0;
+    }
+
     /* ---- LOAD_CONFIG <path> ---- */
     if (strncasecmp(cmd, "LOAD_CONFIG ", 12) == 0) {
         /* Cap recursion so a config file that LOAD_CONFIGs itself (or
@@ -2169,6 +2211,7 @@ static int ctl_process_command(int fd, char *line)
             "OK commands:\n"
             "  LIST_PEERS                          Show peers (incl. mode + channel)\n"
             "  SURVEY [RESET]                       Per-channel utilisation (site survey)\n"
+            "  DIAG                                 Per-peer wire diagnostics (hdr ver, raw chan)\n"
             "  SET_POS <mac> <x> <y> [<z>]         Set node position (m)\n"
             "  GET_POS <mac>                        Query position\n"
             "  SET_TXPOWER <mac> <dBm>              Set TX power\n"
