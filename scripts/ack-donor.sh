@@ -75,18 +75,35 @@ for t in iw ip hostapd; do command -v "$t" >/dev/null || die "missing tool: $t";
 [ -n "$ACK_IF" ] || die "set ACK_IF=<radio interface>"
 ip link show "$ACK_IF" >/dev/null 2>&1 || die "interface '$ACK_IF' not found"
 
+# The phy backing the ACK radio. Needed by teardown (which enumerates the phy's
+# vifs), so compute it up front, before the `stop` path may call teardown.
+PHY="$(iw dev "$ACK_IF" info 2>/dev/null | awk '/wiphy/{print "phy"$2; exit}')"
+[ -n "$PHY" ] || die "could not determine phy for $ACK_IF"
+
 # Managed vif names we create for the 2nd..Nth BSSID.
 extra_vif() { printf 'ackd%d' "$1"; }
 
+# Every vif currently on $PHY except the primary ($ACK_IF). ath9k_htc allows
+# only a tiny interface combination and one spurious-class3 registration, so a
+# single leftover AP vif (e.g. lab-bringup's lab-decoy-b) blocks our AP with
+# "Register spurious class3 failed: -16 (EBUSY)". We must clear them ALL, not
+# just our own ackd* names.
+other_vifs_on_phy() {
+    local target="phy#${PHY#phy}"
+    iw dev 2>/dev/null | awk -v want="$target" -v primary="$ACK_IF" '
+        /^phy#/       { cur=$1 }
+        /Interface /  { if (cur==want && $2!=primary) print $2 }
+    '
+}
+
 # ---- teardown ---------------------------------------------------------------
-teardown() {   # tear down our beacons + extra vifs; does NOT touch NM
+teardown() {   # tear down our beacons + all non-primary vifs; does NOT touch NM
     say "Tearing down"
     pkill -f "hostapd .*$RUN_DIR/" 2>/dev/null || true
     sleep 1
-    local i=1
-    while [ "$i" -lt 32 ]; do
-        iw dev "$(extra_vif "$i")" del 2>/dev/null || true
-        i=$((i+1))
+    local v
+    for v in $(other_vifs_on_phy); do
+        iw dev "$v" del 2>/dev/null || true
     done
 }
 
@@ -158,9 +175,6 @@ read -ra BSSID_ARR <<<"$(printf '%s' "$BSSIDS" | tr ',' ' ')"
 for m in "${BSSID_ARR[@]}"; do valid_mac "$m" || die "bad BSSID: $m"; done
 
 case "$CHANNEL" in ''|*[!0-9]*) die "CHANNEL must be numeric";; esac
-
-PHY="$(iw dev "$ACK_IF" info 2>/dev/null | awk '/wiphy/{print "phy"$2; exit}')"
-[ -n "$PHY" ] || die "could not determine phy for $ACK_IF"
 
 mkdir -p "$RUN_DIR"
 say "Stateless ACK donor on $ACK_IF ($PHY), channel $CHANNEL, ${#BSSID_ARR[@]} BSSID(s)"
