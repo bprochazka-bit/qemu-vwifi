@@ -11,8 +11,9 @@ simulated medium behaves like radio rather than a hub.
 |---|---|
 | `vwifi.h` | Shared wire-protocol header (kernel + userspace) |
 | `vwifi_medium.c` → `vwifi-medium` | Userspace medium hub; fans frames out to all connected peers with channel-aware filtering and per-link SNR |
-| `vwifi_host.c` → `vwifi_host.ko` | Kernel module — mac80211 radio + char device at `/dev/vwifi` |
-| `vwifi_host_relay.c` → `vwifi-host-relay` | Bridges `/dev/vwifi` ↔ hub Unix socket |
+| `vwifi_host.c` → `vwifi_host.ko` | Kernel module — dynamically created mac80211 radios, each with its own char device, plus a control node at `/dev/vwifi-ctl` |
+| `vwifi_host_relay.c` → `vwifi-host-relay` | Bridges a radio's char device ↔ hub Unix socket |
+| `vwifi_ctl.c` → `vwifi-ctl` | Creates/destroys radios at runtime via `/dev/vwifi-ctl`, and renames a radio's `wlanX` netdev |
 | `vwifi_phys_bridge.c` → `vwifi-phys-bridge` | Bridges a real WiFi interface in monitor mode into the medium |
 | `tests/harness.py` | Userspace regression harness |
 | `medium-controller/` | Web UI + Python helpers for the hub's control socket |
@@ -126,36 +127,62 @@ commands are unauthenticated and include `SAVE_CONFIG`.
 
 ```bash
 sudo insmod vwifi_host.ko
-# or with a custom MAC address:
-sudo insmod vwifi_host.ko macaddr=00:03:7F:CC:DD:02
 ```
 
-This creates:
-- A new `wlanX` interface visible in `iw dev`
-- A char device at `/dev/vwifi`
+Loading the module creates the control node `/dev/vwifi-ctl` but **no radio
+yet** — radios are created on demand (see below). To get the classic
+single-radio behaviour of older builds, load with `default_radio=1`:
+
+```bash
+# One radio at /dev/vwifi with the macaddr= address, ready immediately:
+sudo insmod vwifi_host.ko default_radio=1 macaddr=00:03:7F:CC:DD:02
+```
+
+### Step 2b: Create a radio
+
+Each radio is an independent mac80211 wiphy (its own `wlanX`) backed by its
+own char device at `/dev/<name>`. Create one with `vwifi-ctl`:
+
+```bash
+# Radio at /dev/vwifi-lab, netdev renamed to vwm-lab and brought up:
+sudo ./vwifi-ctl create --dev vwifi-lab --ifname vwm-lab
+# ...prints: created radio 'vwifi-lab' id=0 phy=phyN mac=... dev=/dev/vwifi-lab
+```
+
+`--mac aa:bb:cc:dd:ee:ff` sets the MAC explicitly; omitted, a stable
+locally-administered MAC is derived from the name. Tear a radio down (after
+its relay has stopped) with:
+
+```bash
+sudo ./vwifi-ctl destroy --dev vwifi-lab
+```
+
+You can create as many radios as you like; each joins the medium as a
+separate node through its own relay.
 
 ### Step 3: Start the relay daemon
 
 ```bash
-sudo ./vwifi-host-relay /tmp/vwifi.sock
+sudo ./vwifi-host-relay /tmp/vwifi.sock /dev/vwifi-lab
 ```
 
-The relay bridges `/dev/vwifi` to the hub's Unix socket. Full options:
+The relay bridges a radio's char device to the hub's Unix socket. Full
+options:
 
 ```
 Usage: ./vwifi-host-relay <hub-socket-path> [chardev-path]
 
   hub-socket-path  Path to vwifi-medium Unix socket
-  chardev-path     Path to kernel module char device
-                   (default: /dev/vwifi)
+  chardev-path     Path to the radio's char device
+                   (default: /dev/vwifi, i.e. the default_radio node)
 ```
 
 It logs to stderr:
 
 ```
-relay: chardev /dev/vwifi opened (fd=3)
+relay: chardev /dev/vwifi-lab opened (fd=3)
 relay: connected to hub /tmp/vwifi.sock (fd=4)
-relay: bridging /dev/vwifi ↔ /tmp/vwifi.sock
+relay: bridging /dev/vwifi-lab ↔ /tmp/vwifi.sock
 ```
 
 ### Step 4: Start QEMU VMs
@@ -371,13 +398,31 @@ Host B:
 `wlanX` on both hosts and every QEMU VM on both hosts now share
 the same medium.
 
+## Dynamic radios
+
+The module registers a control node, `/dev/vwifi-ctl`. Userspace issues two
+ioctls on it — `VWIFI_IOC_CREATE_RADIO` and `VWIFI_IOC_DESTROY_RADIO` (see
+`vwifi.h`) — to add and remove radios at runtime. `vwifi-ctl` is the CLI
+front-end. Each radio:
+
+- is an independent mac80211 wiphy with its own `wlanX` and MAC;
+- exposes its own data char device at `/dev/<name>`, which exactly one
+  `vwifi-host-relay` bridges to a medium hub;
+- can be created and destroyed without touching any other radio, and
+  without reloading the module.
+
+Destroying a radio is refused (`EBUSY`) while a relay still holds its char
+device open, so stop the relay first. This is the model Nyxus drives to add
+and remove host interfaces per medium on demand.
+
 ## Module parameters
 
 | Parameter | Default | Description |
 |---|---|---|
-| `macaddr` | `00:03:7F:CC:DD:01` | MAC address for the virtual radio |
+| `default_radio` | `0` | Create one radio at load time, exposed at `/dev/vwifi` with the `macaddr` address (classic single-radio behaviour). Off by default so a controller managing radios via `/dev/vwifi-ctl` gets no stray interface. |
+| `macaddr` | `00:03:7F:CC:DD:01` | MAC address for the `default_radio`. Dynamically created radios set their own MAC via `vwifi-ctl --mac` (or derive one from the radio name). |
 
-The MAC must be unique on the medium.
+Every radio's MAC must be unique on the medium.
 
 ## How it works
 
@@ -440,25 +485,38 @@ fans frames back to the relay.
 
 ## Troubleshooting
 
-### `No such device` opening `/dev/vwifi`
+### `No such device` opening `/dev/vwifi-ctl`
 
 The module isn't loaded:
 
 ```bash
 sudo insmod vwifi_host.ko
-ls -la /dev/vwifi
+ls -la /dev/vwifi-ctl
 ```
+
+### `No such file or directory` opening a radio's `/dev/<name>`
+
+The radio hasn't been created (or was destroyed). Create it:
+
+```bash
+sudo ./vwifi-ctl create --dev vwifi-lab --ifname vwm-lab
+```
+
+### `Device or resource busy` destroying a radio
+
+A relay still holds that radio's char device open. Stop the relay first,
+then `vwifi-ctl destroy`.
 
 ### `Device or resource busy` from the relay
 
-Only one relay daemon can be attached at a time. Check for stale
-processes:
+Only one relay daemon can be attached to a given radio at a time. Check for
+stale processes:
 
 ```bash
 ps aux | grep vwifi-host-relay
 ```
 
-### No `wlanX` interface after `insmod`
+### No `wlanX` interface after creating a radio
 
 Check `dmesg`:
 
@@ -469,10 +527,13 @@ dmesg | grep vwifi_host
 You should see something like:
 
 ```
-vwifi_host v1.0: registered — MAC 00:03:7f:cc:dd:01, chardev /dev/vwifi
+vwifi_host v1.0: created radio 'vwifi-lab' id=0 phy=phy0 MAC=02:03:7f:.. chardev /dev/vwifi-lab
 ```
 
-If mac80211 registration fails, ensure `mac80211` is loaded:
+(Note: just loading the module logs only `control device /dev/vwifi-ctl
+ready` — no radio is created until you ask for one, unless you loaded with
+`default_radio=1`.) If mac80211 registration fails, ensure `mac80211` is
+loaded:
 
 ```bash
 sudo modprobe mac80211

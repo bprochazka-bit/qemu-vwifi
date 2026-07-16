@@ -33,14 +33,18 @@
 #include <linux/init.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
+#include <linux/mutex.h>
+#include <linux/list.h>
 #include <linux/wait.h>
 #include <linux/poll.h>
 #include <linux/miscdevice.h>
+#include <linux/fs.h>
 #include <linux/uaccess.h>
 #include <linux/workqueue.h>
 #include <linux/skbuff.h>
 #include <linux/etherdevice.h>
 #include <linux/platform_device.h>
+#include <linux/jhash.h>
 #include <net/mac80211.h>
 
 #include "vwifi.h"
@@ -52,16 +56,52 @@
  *  Module parameters
  * ------------------------------------------------------------------- */
 
-/* MAC address for the virtual radio.  Default uses Atheros OUI. */
+/* MAC address for the optional boot-time radio.  Default uses Atheros OUI. */
 static char *macaddr = "00:03:7F:CC:DD:01";
 module_param(macaddr, charp, 0444);
-MODULE_PARM_DESC(macaddr, "MAC address for the virtual radio (default: 00:03:7F:CC:DD:01)");
+MODULE_PARM_DESC(macaddr, "MAC address for the default radio (default: 00:03:7F:CC:DD:01)");
+
+/*
+ * Whether to create one radio automatically at module load, exposed at
+ * /dev/vwifi (VWIFI_CHRDEV_NAME) with the `macaddr` MAC. Off by default:
+ * controllers that manage radios dynamically via /dev/vwifi-ctl don't want
+ * a stray interface. Set default_radio=1 to restore the classic
+ * single-radio behaviour of just `modprobe vwifi_host`.
+ */
+static bool default_radio;
+module_param(default_radio, bool, 0444);
+MODULE_PARM_DESC(default_radio,
+    "create one radio at load time as /dev/" VWIFI_CHRDEV_NAME " (default: 0)");
 
 /* -------------------------------------------------------------------
  *  Per-radio state
  * ------------------------------------------------------------------- */
 struct vwifi_priv {
     struct ieee80211_hw     *hw;
+
+    /* Radio registry linkage (protected by vwifi_radios_lock). */
+    struct list_head        list;
+    int                     radio_id;
+
+    /* Per-radio data chardev (/dev/<devname>). The relay opens this to
+     * bridge the radio to a medium hub. devname backs miscdev.name, so
+     * it must live as long as the miscdevice registration. */
+    struct miscdevice       miscdev;
+    char                    devname[VWIFI_RADIO_NAME_MAX];
+
+    /*
+     * Per-radio copies of the supported-band descriptors. The channel
+     * arrays MUST be private to each wiphy: cfg80211's regulatory core
+     * writes per-device state (channel ->flags, ->orig_flags, max power)
+     * into them at registration and on reg changes, so sharing one static
+     * array across radios would let one radio's regulatory state clobber
+     * another's. Rates/HT/VHT/HE capability data is treated read-only by
+     * the stack and is copied by value / shared from the static templates.
+     */
+    struct ieee80211_channel        *chans_2ghz;
+    struct ieee80211_channel        *chans_5ghz;
+    struct ieee80211_supported_band  band_2ghz;
+    struct ieee80211_supported_band  band_5ghz;
 
     /* Current operating state. The wide-channel fields mirror what
      * the hub-side filter consumes (vwifi.h channel_* layout);
@@ -111,8 +151,20 @@ struct vwifi_priv {
     u64                     tx_drop_count;
 };
 
-static struct vwifi_priv *g_priv;  /* single-radio for now */
-static struct platform_device *g_pdev; /* fake parent device for wiphy */
+/*
+ * Radio registry. All radios live on vwifi_radios; vwifi_radios_lock
+ * serialises create/destroy/lookup so a chardev open() can never race a
+ * destroy into a use-after-free (open looks a radio up on this list under
+ * the mutex; destroy removes it from the list under the same mutex before
+ * tearing it down, so a lookup either finds a live radio or nothing).
+ */
+static LIST_HEAD(vwifi_radios);
+static DEFINE_MUTEX(vwifi_radios_lock);
+static int vwifi_next_radio_id;        /* monotonic id source */
+
+static struct platform_device *g_pdev; /* shared fake parent for every wiphy */
+
+static int parse_mac(const char *str, u8 *mac);
 
 /* -------------------------------------------------------------------
  *  2.4 GHz band definition (matches AR9285 capabilities)
@@ -868,30 +920,64 @@ static void vwifi_rx_frame(struct vwifi_priv *priv,
  *  poll()  — relay waits for TX frames or chardev readiness
  * ------------------------------------------------------------------- */
 
+/* Find a radio by its data-chardev minor. Caller holds vwifi_radios_lock. */
+static struct vwifi_priv *vwifi_find_by_minor(int minor)
+{
+    struct vwifi_priv *priv;
+
+    list_for_each_entry(priv, &vwifi_radios, list) {
+        if (priv->miscdev.minor == minor)
+            return priv;
+    }
+    return NULL;
+}
+
+/* Find a radio by data-chardev name. Caller holds vwifi_radios_lock. */
+static struct vwifi_priv *vwifi_find_by_name(const char *name)
+{
+    struct vwifi_priv *priv;
+
+    list_for_each_entry(priv, &vwifi_radios, list) {
+        if (!strcmp(priv->devname, name))
+            return priv;
+    }
+    return NULL;
+}
+
 static int vwifi_chrdev_open(struct inode *inode, struct file *filp)
 {
-    struct vwifi_priv *priv = g_priv;
+    struct vwifi_priv *priv;
     unsigned long flags;
-    bool taken;
+    bool taken = false;
 
+    /*
+     * Resolve the radio from the opened minor under the registry lock.
+     * Going through the list (rather than container_of on the miscdevice
+     * misc_open handed us) is what makes open safe against a concurrent
+     * destroy: destroy removes the radio from the list before freeing it,
+     * so once we hold the lock the radio is either present and live, or
+     * already gone (-ENODEV) -- never a dangling pointer.
+     */
+    mutex_lock(&vwifi_radios_lock);
+    priv = vwifi_find_by_minor(iminor(inode));
     if (!priv) {
+        mutex_unlock(&vwifi_radios_lock);
         return -ENODEV;
     }
 
-    /* Atomically claim the single-relay slot. Without the lock two
-     * concurrent open()s could both observe relay_connected=false and
-     * both succeed, leaving two relays sharing the same tx_queue. */
+    /* Claim the single-relay slot atomically. */
     spin_lock_irqsave(&priv->state_lock, flags);
     taken = priv->relay_connected;
     if (!taken)
         priv->relay_connected = true;
     spin_unlock_irqrestore(&priv->state_lock, flags);
+    mutex_unlock(&vwifi_radios_lock);
 
     if (taken)
         return -EBUSY;  /* only one relay at a time */
 
     filp->private_data = priv;
-    pr_info(DRV_NAME ": relay daemon connected\n");
+    pr_info(DRV_NAME ": relay daemon connected to %s\n", priv->devname);
     return 0;
 }
 
@@ -1087,12 +1173,6 @@ static const struct file_operations vwifi_chrdev_fops = {
     .poll    = vwifi_chrdev_poll,
 };
 
-static struct miscdevice vwifi_miscdev = {
-    .minor  = MISC_DYNAMIC_MINOR,
-    .name   = VWIFI_CHRDEV_NAME,
-    .fops   = &vwifi_chrdev_fops,
-};
-
 /* -------------------------------------------------------------------
  *  MAC address parsing
  * ------------------------------------------------------------------- */
@@ -1114,57 +1194,83 @@ static int parse_mac(const char *str, u8 *mac)
     return 0;
 }
 
-/* -------------------------------------------------------------------
- *  Module init / exit
- * ------------------------------------------------------------------- */
-static int __init vwifi_init(void)
+/*
+ * Derive a stable, locally-administered unicast MAC from a radio name.
+ * Same name -> same MAC across reloads, so a controller doesn't have to
+ * track and re-supply per-radio addresses; different names collide only
+ * with astronomically small probability (24-bit hash in the low bytes).
+ */
+static void vwifi_derive_mac(const char *name, u8 *mac)
 {
-    struct ieee80211_hw *hw;
-    struct vwifi_priv *priv;
-    u8 mac[ETH_ALEN];
-    int ret;
+    u32 h = jhash(name, strlen(name), 0x76776966 /* "vwif" */);
 
-    /* Parse MAC address */
-    ret = parse_mac(macaddr, mac);
-    if (ret) {
-        pr_err(DRV_NAME ": invalid MAC address '%s'\n", macaddr);
-        return ret;
+    mac[0] = 0x02;   /* locally administered (bit1), unicast (bit0 clear) */
+    mac[1] = 0x03;
+    mac[2] = 0x7f;   /* nod to the Atheros OUI the default radio used */
+    mac[3] = (h >> 16) & 0xff;
+    mac[4] = (h >> 8) & 0xff;
+    mac[5] = h & 0xff;
+}
+
+/* A radio name becomes a /dev node basename, so keep it to a safe,
+ * non-empty, bounded character set. */
+static bool vwifi_valid_radio_name(const char *name)
+{
+    size_t len, i;
+
+    if (!name)
+        return false;
+    len = strnlen(name, VWIFI_RADIO_NAME_MAX);
+    if (len == 0 || len >= VWIFI_RADIO_NAME_MAX)
+        return false;
+    if (!strcmp(name, ".") || !strcmp(name, ".."))
+        return false;
+    for (i = 0; i < len; i++) {
+        char c = name[i];
+
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+              (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-'))
+            return false;
     }
+    return true;
+}
 
-    /*
-     * Create a platform device as the parent for wiphy.
-     * mac80211 / cfg80211 requires a non-NULL struct device * parent
-     * for sysfs registration.  This is the same approach used by
-     * mac80211_hwsim.
-     */
-    g_pdev = platform_device_register_simple(DRV_NAME, -1, NULL, 0);
-    if (IS_ERR(g_pdev)) {
-        pr_err(DRV_NAME ": platform_device_register failed: %ld\n",
-               PTR_ERR(g_pdev));
-        g_pdev = NULL;
+/* -------------------------------------------------------------------
+ *  Per-radio hardware setup
+ *
+ *  Factored out of the old single-radio init so create_radio can build
+ *  any number of independent wiphys. Each radio gets private copies of
+ *  the channel arrays (the regulatory core writes per-device state into
+ *  them); rate and HT/VHT/HE capability data is read-only and shared
+ *  from the static templates.
+ * ------------------------------------------------------------------- */
+static int vwifi_setup_hw(struct vwifi_priv *priv)
+{
+    struct ieee80211_hw *hw = priv->hw;
+
+    priv->chans_2ghz = kmemdup(vwifi_channels_2ghz,
+                               sizeof(vwifi_channels_2ghz), GFP_KERNEL);
+    priv->chans_5ghz = kmemdup(vwifi_channels_5ghz,
+                               sizeof(vwifi_channels_5ghz), GFP_KERNEL);
+    if (!priv->chans_2ghz || !priv->chans_5ghz) {
+        kfree(priv->chans_2ghz);
+        kfree(priv->chans_5ghz);
+        priv->chans_2ghz = NULL;
+        priv->chans_5ghz = NULL;
         return -ENOMEM;
     }
 
-    /* Allocate ieee80211_hw with our private data */
-    hw = ieee80211_alloc_hw(sizeof(*priv), &vwifi_ops);
-    if (!hw) {
-        pr_err(DRV_NAME ": ieee80211_alloc_hw failed\n");
-        ret = -ENOMEM;
-        goto err_free_pdev;
-    }
+    priv->band_2ghz = vwifi_band_2ghz;                 /* struct copy */
+    priv->band_2ghz.channels = priv->chans_2ghz;
+    priv->band_5ghz = vwifi_band_5ghz;                 /* struct copy */
+    priv->band_5ghz.channels = priv->chans_5ghz;
+    /* HE iftype data is per-iftype capability info, read-only to the
+     * stack, so every radio can point at the shared static array. */
+    priv->band_5ghz.iftype_data   = vwifi_he_5ghz;
+    priv->band_5ghz.n_iftype_data = ARRAY_SIZE(vwifi_he_5ghz);
 
-    priv = hw->priv;
-    memset(priv, 0, sizeof(*priv));
-    priv->hw = hw;
-    memcpy(priv->mac_addr, mac, ETH_ALEN);
-
-    spin_lock_init(&priv->state_lock);
-    skb_queue_head_init(&priv->tx_queue);
-    init_waitqueue_head(&priv->tx_waitq);
-
-    /* Set up hardware capabilities */
     SET_IEEE80211_DEV(hw, &g_pdev->dev);
-    SET_IEEE80211_PERM_ADDR(hw, mac);
+    SET_IEEE80211_PERM_ADDR(hw, priv->mac_addr);
 
     ieee80211_hw_set(hw, SIGNAL_DBM);
     ieee80211_hw_set(hw, MFP_CAPABLE);
@@ -1175,24 +1281,16 @@ static int __init vwifi_init(void)
      * Do NOT set IEEE80211_HW_SW_CRYPTO_CONTROL. Despite the name, that flag
      * does not enable software crypto -- it tells mac80211 "the driver
      * controls crypto, so do not fall back to software unless set_key()
-     * returns 1". This is a purely virtual radio: it has no crypto hardware
-     * and no set_key() op, so with that flag set mac80211 refuses to perform
-     * software CCMP/GCMP/BIP and every encrypted data frame is dropped
-     * (WPA2 associates -- EAPOL is done in userspace -- but no data flows,
-     * showing up as climbing "rx drop misc" on the peer). Leaving the flag
-     * unset lets mac80211 do CCMP/GCMP/BIP in software, which is what a
-     * virtual radio wants; open networks were unaffected either way.
+     * returns 1". This is a purely virtual radio with no set_key() op, so
+     * with that flag set mac80211 refuses software CCMP/GCMP/BIP and every
+     * encrypted data frame is dropped. Leaving it unset lets mac80211 do
+     * crypto in software, which is what a virtual radio wants.
      */
 
     hw->queues = 4;  /* AC_VO, AC_VI, AC_BE, AC_BK */
 
-    hw->wiphy->bands[NL80211_BAND_2GHZ] = &vwifi_band_2ghz;
-    /* Attach HE iftype data to the 5 GHz band at runtime; the field
-     * isn't a designated initializer in older kernel headers, so
-     * setting it here keeps the static structs portable. */
-    vwifi_band_5ghz.iftype_data   = vwifi_he_5ghz;
-    vwifi_band_5ghz.n_iftype_data = ARRAY_SIZE(vwifi_he_5ghz);
-    hw->wiphy->bands[NL80211_BAND_5GHZ] = &vwifi_band_5ghz;
+    hw->wiphy->bands[NL80211_BAND_2GHZ] = &priv->band_2ghz;
+    hw->wiphy->bands[NL80211_BAND_5GHZ] = &priv->band_5ghz;
 
     hw->wiphy->interface_modes =
         BIT(NL80211_IFTYPE_STATION) |
@@ -1202,61 +1300,307 @@ static int __init vwifi_init(void)
         BIT(NL80211_IFTYPE_MESH_POINT);
 
     hw->wiphy->n_addresses = 1;
-
-    /* Set regulatory domain hint */
     hw->wiphy->regulatory_flags |= REGULATORY_CUSTOM_REG;
 
-    /* Register with mac80211 */
+    return 0;
+}
+
+/* -------------------------------------------------------------------
+ *  Radio create / destroy
+ * ------------------------------------------------------------------- */
+
+/*
+ * Create, register and expose a new radio.
+ *
+ * name    data-chardev basename; the node appears at /dev/<name>.
+ * mac_in  desired MAC, or NULL / all-zero to derive one from the name.
+ * out     optional; filled with the assigned id, phy name and MAC.
+ *
+ * Locking: ieee80211_register_hw() takes the RTNL and misc_register()
+ * takes misc_mtx, and chardev open() runs with misc_mtx held (misc_open)
+ * and then takes vwifi_radios_lock. To avoid an ABBA deadlock we must
+ * never hold vwifi_radios_lock across register_hw / misc_register. So we
+ * build and register the radio unlocked, then take vwifi_radios_lock only
+ * to publish it on the list (the authoritative duplicate check). A racing
+ * create of the same name loses at that commit point and unwinds; the
+ * radio is invisible to open() until list_add, since open() resolves the
+ * minor via the list under the lock.
+ */
+static int vwifi_create_radio(const char *name, const u8 *mac_in,
+                              struct vwifi_ioc_create *out)
+{
+    struct ieee80211_hw *hw;
+    struct vwifi_priv *priv;
+    u8 mac[ETH_ALEN];
+    int ret;
+
+    if (!vwifi_valid_radio_name(name))
+        return -EINVAL;
+
+    if (mac_in && !is_zero_ether_addr(mac_in)) {
+        ether_addr_copy(mac, mac_in);
+        if (!is_valid_ether_addr(mac))
+            return -EINVAL;
+    } else {
+        vwifi_derive_mac(name, mac);
+    }
+
+    /* Cheap early-out for the common duplicate case; the binding check is
+     * the list_add under the lock below. */
+    mutex_lock(&vwifi_radios_lock);
+    ret = vwifi_find_by_name(name) ? -EEXIST : 0;
+    mutex_unlock(&vwifi_radios_lock);
+    if (ret)
+        return ret;
+
+    hw = ieee80211_alloc_hw(sizeof(*priv), &vwifi_ops);
+    if (!hw) {
+        pr_err(DRV_NAME ": ieee80211_alloc_hw failed\n");
+        return -ENOMEM;
+    }
+
+    priv = hw->priv;
+    memset(priv, 0, sizeof(*priv));
+    priv->hw = hw;
+    INIT_LIST_HEAD(&priv->list);
+    ether_addr_copy(priv->mac_addr, mac);
+    spin_lock_init(&priv->state_lock);
+    skb_queue_head_init(&priv->tx_queue);
+    init_waitqueue_head(&priv->tx_waitq);
+    priv->channel_freq = 2412;             /* default to channel 1 */
+    priv->channel_band = NL80211_BAND_2GHZ;
+    scnprintf(priv->devname, sizeof(priv->devname), "%s", name);
+
+    ret = vwifi_setup_hw(priv);
+    if (ret)
+        goto err_free_hw;
+
     ret = ieee80211_register_hw(hw);
     if (ret) {
         pr_err(DRV_NAME ": ieee80211_register_hw failed: %d\n", ret);
-        goto err_free_hw;
+        goto err_free_bands;
     }
 
-    /* Register the character device */
-    ret = misc_register(&vwifi_miscdev);
+    priv->miscdev.minor = MISC_DYNAMIC_MINOR;
+    priv->miscdev.name  = priv->devname;
+    priv->miscdev.fops  = &vwifi_chrdev_fops;
+    ret = misc_register(&priv->miscdev);
     if (ret) {
-        pr_err(DRV_NAME ": misc_register failed: %d\n", ret);
+        pr_err(DRV_NAME ": misc_register(%s) failed: %d\n", priv->devname, ret);
         goto err_unreg_hw;
     }
 
-    g_priv = priv;
-    priv->channel_freq = 2412;  /* default to channel 1 */
-    priv->channel_band = NL80211_BAND_2GHZ;
+    /* Publish. If another create won the name in the meantime, unwind. */
+    mutex_lock(&vwifi_radios_lock);
+    if (vwifi_find_by_name(name)) {
+        mutex_unlock(&vwifi_radios_lock);
+        ret = -EEXIST;
+        goto err_dereg_misc;
+    }
+    priv->radio_id = vwifi_next_radio_id++;
+    list_add_tail(&priv->list, &vwifi_radios);
+    if (out) {
+        memset(out, 0, sizeof(*out));
+        scnprintf(out->name, sizeof(out->name), "%s", priv->devname);
+        out->radio_id = priv->radio_id;
+        scnprintf(out->phy, sizeof(out->phy), "%s", wiphy_name(hw->wiphy));
+        ether_addr_copy(out->mac_out, priv->mac_addr);
+    }
+    mutex_unlock(&vwifi_radios_lock);
 
-    pr_info(DRV_NAME " v" DRV_VERSION ": registered — "
-            "MAC %pM, chardev /dev/" VWIFI_CHRDEV_NAME "\n", mac);
-
+    pr_info(DRV_NAME ": created radio '%s' id=%d phy=%s MAC=%pM chardev /dev/%s\n",
+            priv->devname, priv->radio_id, wiphy_name(hw->wiphy),
+            priv->mac_addr, priv->devname);
     return 0;
 
+err_dereg_misc:
+    misc_deregister(&priv->miscdev);
 err_unreg_hw:
     ieee80211_unregister_hw(hw);
+err_free_bands:
+    kfree(priv->chans_2ghz);
+    kfree(priv->chans_5ghz);
 err_free_hw:
     ieee80211_free_hw(hw);
-err_free_pdev:
-    platform_device_unregister(g_pdev);
-    g_pdev = NULL;
     return ret;
+}
+
+/*
+ * Destroy a radio by name. Refuses (-EBUSY) while a relay still holds the
+ * data chardev open: the relay must be stopped first, which is exactly the
+ * ordering the systemd units enforce. Once removed from the registry under
+ * the lock, this thread is the sole owner and can tear down outside it.
+ */
+static int vwifi_destroy_radio(const char *name)
+{
+    struct vwifi_priv *priv;
+    unsigned long flags;
+    bool busy;
+
+    mutex_lock(&vwifi_radios_lock);
+    priv = vwifi_find_by_name(name);
+    if (!priv) {
+        mutex_unlock(&vwifi_radios_lock);
+        return -ENODEV;
+    }
+
+    spin_lock_irqsave(&priv->state_lock, flags);
+    busy = priv->relay_connected;
+    spin_unlock_irqrestore(&priv->state_lock, flags);
+    if (busy) {
+        mutex_unlock(&vwifi_radios_lock);
+        return -EBUSY;
+    }
+
+    list_del(&priv->list);
+    mutex_unlock(&vwifi_radios_lock);
+
+    misc_deregister(&priv->miscdev);
+    ieee80211_unregister_hw(priv->hw);
+    skb_queue_purge(&priv->tx_queue);
+    kfree(priv->chans_2ghz);
+    kfree(priv->chans_5ghz);
+    pr_info(DRV_NAME ": destroyed radio '%s' id=%d\n",
+            priv->devname, priv->radio_id);
+    ieee80211_free_hw(priv->hw);  /* frees priv */
+    return 0;
+}
+
+/* Tear down every radio (module unload). The module refcount held by each
+ * open chardev fd means no relay can be attached here, so no -EBUSY case. */
+static void vwifi_destroy_all(void)
+{
+    struct vwifi_priv *priv, *tmp;
+    LIST_HEAD(dead);
+
+    mutex_lock(&vwifi_radios_lock);
+    list_splice_init(&vwifi_radios, &dead);
+    mutex_unlock(&vwifi_radios_lock);
+
+    list_for_each_entry_safe(priv, tmp, &dead, list) {
+        list_del(&priv->list);
+        misc_deregister(&priv->miscdev);
+        ieee80211_unregister_hw(priv->hw);
+        skb_queue_purge(&priv->tx_queue);
+        kfree(priv->chans_2ghz);
+        kfree(priv->chans_5ghz);
+        ieee80211_free_hw(priv->hw);
+    }
+}
+
+/* -------------------------------------------------------------------
+ *  Control device — /dev/vwifi-ctl (dynamic radio management)
+ * ------------------------------------------------------------------- */
+static long vwifi_ctl_ioctl(struct file *filp, unsigned int cmd,
+                            unsigned long arg)
+{
+    void __user *argp = (void __user *)arg;
+    int ret;
+
+    switch (cmd) {
+    case VWIFI_IOC_CREATE_RADIO: {
+        struct vwifi_ioc_create req;
+
+        if (copy_from_user(&req, argp, sizeof(req)))
+            return -EFAULT;
+        req.name[sizeof(req.name) - 1] = '\0';
+
+        ret = vwifi_create_radio(req.name, req.mac, &req);
+        if (ret)
+            return ret;
+
+        if (copy_to_user(argp, &req, sizeof(req))) {
+            /* Radio is live but the caller's buffer went bad. Roll back so
+             * we don't leak an unreferenced radio the caller can't see. */
+            vwifi_destroy_radio(req.name);
+            return -EFAULT;
+        }
+        return 0;
+    }
+    case VWIFI_IOC_DESTROY_RADIO: {
+        struct vwifi_ioc_destroy req;
+
+        if (copy_from_user(&req, argp, sizeof(req)))
+            return -EFAULT;
+        req.name[sizeof(req.name) - 1] = '\0';
+        return vwifi_destroy_radio(req.name);
+    }
+    default:
+        return -ENOTTY;
+    }
+}
+
+static const struct file_operations vwifi_ctl_fops = {
+    .owner          = THIS_MODULE,
+    .unlocked_ioctl = vwifi_ctl_ioctl,
+    .compat_ioctl   = compat_ptr_ioctl,
+};
+
+static struct miscdevice vwifi_ctl_miscdev = {
+    .minor = MISC_DYNAMIC_MINOR,
+    .name  = VWIFI_CTL_NAME,
+    .fops  = &vwifi_ctl_fops,
+};
+
+/* -------------------------------------------------------------------
+ *  Module init / exit
+ * ------------------------------------------------------------------- */
+static int __init vwifi_init(void)
+{
+    u8 mac[ETH_ALEN];
+    int ret;
+
+    /*
+     * Create a platform device as the shared parent for every wiphy.
+     * mac80211 / cfg80211 requires a non-NULL struct device * parent for
+     * sysfs registration. This is the same approach used by mac80211_hwsim.
+     */
+    g_pdev = platform_device_register_simple(DRV_NAME, -1, NULL, 0);
+    if (IS_ERR(g_pdev)) {
+        pr_err(DRV_NAME ": platform_device_register failed: %ld\n",
+               PTR_ERR(g_pdev));
+        g_pdev = NULL;
+        return -ENOMEM;
+    }
+
+    /* Control node: userspace creates/destroys radios here. */
+    ret = misc_register(&vwifi_ctl_miscdev);
+    if (ret) {
+        pr_err(DRV_NAME ": misc_register(" VWIFI_CTL_NAME ") failed: %d\n", ret);
+        platform_device_unregister(g_pdev);
+        g_pdev = NULL;
+        return ret;
+    }
+
+    pr_info(DRV_NAME " v" DRV_VERSION ": control device /dev/"
+            VWIFI_CTL_NAME " ready\n");
+
+    /*
+     * Optionally bring up one radio at load time for the classic
+     * single-radio workflow (`modprobe vwifi_host default_radio=1`),
+     * exposed at /dev/vwifi with the macaddr= address. A failure here is
+     * non-fatal: the control device stays up so radios can still be
+     * created dynamically.
+     */
+    if (default_radio) {
+        ret = parse_mac(macaddr, mac);
+        if (ret) {
+            pr_err(DRV_NAME ": invalid macaddr '%s'; skipping default radio\n",
+                   macaddr);
+        } else {
+            ret = vwifi_create_radio(VWIFI_CHRDEV_NAME, mac, NULL);
+            if (ret)
+                pr_err(DRV_NAME ": default radio create failed: %d\n", ret);
+        }
+    }
+
+    return 0;
 }
 
 static void __exit vwifi_exit(void)
 {
-    struct vwifi_priv *priv = g_priv;
-
-    if (!priv) {
-        return;
-    }
-
-    g_priv = NULL;
-
-    misc_deregister(&vwifi_miscdev);
-
-    /* Drain the TX queue */
-    skb_queue_purge(&priv->tx_queue);
-    wake_up_interruptible(&priv->tx_waitq);
-
-    ieee80211_unregister_hw(priv->hw);
-    ieee80211_free_hw(priv->hw);
+    vwifi_destroy_all();
+    misc_deregister(&vwifi_ctl_miscdev);
 
     if (g_pdev) {
         platform_device_unregister(g_pdev);

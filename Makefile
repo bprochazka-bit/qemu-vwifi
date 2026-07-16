@@ -46,12 +46,15 @@ vwifi_host.o: vwifi.h
 CC      ?= gcc
 CFLAGS  ?= -Wall -Wextra -O2
 
-USERSPACE_BINS := vwifi-medium vwifi-host-relay vwifi-phys-bridge vwifi-linkbench
+USERSPACE_BINS := vwifi-medium vwifi-host-relay vwifi-phys-bridge vwifi-linkbench vwifi-ctl
 
 vwifi-medium: vwifi_medium.c vwifi.h
 	$(CC) $(CFLAGS) -o $@ $< -lm
 
 vwifi-host-relay: vwifi_host_relay.c vwifi.h
+	$(CC) $(CFLAGS) -o $@ $<
+
+vwifi-ctl: vwifi_ctl.c vwifi.h
 	$(CC) $(CFLAGS) -o $@ $<
 
 vwifi-phys-bridge: vwifi_phys_bridge.c vwifi.h
