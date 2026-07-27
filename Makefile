@@ -1,89 +1,138 @@
-# Makefile for qemu-vwifi
+# Makefile for qemu-vwifi — top level
+#
+# The repository holds four kinds of thing (see README.md):
+#   abi/      shared contracts, header-only
+#   medium/   the hub and the tools that attach to it  -> userspace binaries
+#   host/     the host's own mac80211 radio            -> kernel module + tools
+#   devices/  QEMU device models                       -> built inside a QEMU tree
+#   drivers/  guest drivers                            -> built with each OS's SDK
+#
+# This Makefile builds everything a plain host toolchain can build. The
+# QEMU devices need a QEMU source tree and the guest drivers need their
+# own SDKs, so they have their own entry points:
+#
+#   make -C devices/ath9k integrate QEMU_SRC=/path/to/qemu
+#   make -C devices/vwifi integrate QEMU_SRC=/path/to/qemu
 #
 # Targets:
-#   make                    — build kernel module against running kernel
-#   make KDIR=/path/to/src  — build module against specific kernel source
-#   make install            — install module (requires root)
-#   make install SKIP_SIGN=1 — install without the (failing) module-signing
-#                             step on distros that ship no signing key
-#   make userspace          — build vwifi-medium / vwifi-host-relay /
-#                             vwifi-phys-bridge userspace binaries
-#   make install-userspace  — install userspace binaries only, no kernel
-#                             module (honors PREFIX, DESTDIR)
-#   make uninstall-userspace — remove installed userspace binaries
-#   make test               — run tests/harness.py (requires userspace built)
-#   make clean              — remove all build artifacts (kernel + userspace)
+#   make                     — userspace binaries (no kernel headers needed)
+#   make module              — host kernel module against the running kernel
+#   make module KDIR=/path   — ... against a specific kernel source tree
+#   make install             — install the kernel module (requires root)
+#   make install SKIP_SIGN=1 — install without the module-signing step, for
+#                              distros that ship no signing key
+#   make install-userspace   — install userspace binaries (honors PREFIX, DESTDIR)
+#   make uninstall-userspace — remove them again
+#   make test                — every test suite that runs on the host
+#   make legacy              — build the superseded ath9k_medium hubs
+#   make clean               — remove all build artifacts
+
+TOPDIR := $(CURDIR)
+BUILD  ?= $(TOPDIR)/build
+ABI    := $(TOPDIR)/abi
+
+CC       ?= gcc
+CFLAGS   ?= -Wall -Wextra -O2
+CPPFLAGS += -I$(ABI)
+
+# ---------- Userspace ----------
+
+MEDIUM_BINS := \
+	$(BUILD)/vwifi-medium \
+	$(BUILD)/vwifi-phys-bridge \
+	$(BUILD)/vwifi-linkbench
+
+HOST_BINS := \
+	$(BUILD)/vwifi-host-relay \
+	$(BUILD)/vwifi-ctl
+
+USERSPACE_BINS := $(MEDIUM_BINS) $(HOST_BINS)
+
+.PHONY: all userspace medium host-tools
+all: userspace
+userspace: $(USERSPACE_BINS)
+medium: $(MEDIUM_BINS)
+host-tools: $(HOST_BINS)
+
+$(BUILD):
+	@mkdir -p $(BUILD)
+
+# The hub is the only binary that needs libm (the propagation model).
+$(BUILD)/vwifi-medium: medium/src/vwifi_medium.c $(ABI)/vwifi.h | $(BUILD)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ $< -lm
+
+$(BUILD)/vwifi-phys-bridge: medium/tools/vwifi_phys_bridge.c $(ABI)/vwifi.h | $(BUILD)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ $<
+
+$(BUILD)/vwifi-linkbench: medium/tools/vwifi_linkbench.c | $(BUILD)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ $<
+
+$(BUILD)/vwifi-host-relay: host/tools/vwifi_host_relay.c $(ABI)/vwifi.h | $(BUILD)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ $<
+
+$(BUILD)/vwifi-ctl: host/tools/vwifi_ctl.c $(ABI)/vwifi.h $(ABI)/vwifi_host_ioctl.h | $(BUILD)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ $<
+
+# ---------- Legacy medium hubs ----------
+# Superseded by vwifi-medium; see medium/legacy/README.md.
+
+LEGACY_BINS := $(BUILD)/ath9k_medium_hub $(BUILD)/ath9k_medium_hub_scalable
+
+.PHONY: legacy
+legacy: $(LEGACY_BINS)
+
+$(BUILD)/ath9k_medium_hub: medium/legacy/ath9k_medium_hub.c | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $<
+
+$(BUILD)/ath9k_medium_hub_scalable: medium/legacy/ath9k_medium_hub_scalable.c | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $<
+
+# ---------- Host kernel module ----------
 
 KDIR ?= /lib/modules/$(shell uname -r)/build
-PWD  := $(shell pwd)
 
-obj-m += vwifi_host.o
-ccflags-y += -DDEBUG
-
-# ---------- Kernel module ----------
-all:
-	$(MAKE) -C $(KDIR) M=$(PWD) modules
-
-# Module signing: stock Debian/Ubuntu kernel-headers packages do not ship
-# the private signing key, so Kbuild's post-install sign-file step fails
-# harmlessly (the module is simply left unsigned, which is fine unless
-# Secure Boot is enabled). Pass SKIP_SIGN=1 to skip signing and silence
-# that noisy OpenSSL "no such file" error.
-SKIP_SIGN ?=
-ifeq ($(SKIP_SIGN),1)
-MODINST_ARGS := mod_sign_cmd=true
-endif
+.PHONY: module install
+module:
+	$(MAKE) -C host KDIR=$(KDIR)
 
 install:
-	$(MAKE) -C $(KDIR) M=$(PWD) modules_install $(MODINST_ARGS)
-	depmod -a
+	$(MAKE) -C host install KDIR=$(KDIR) SKIP_SIGN=$(SKIP_SIGN)
 
-vwifi_host.o: vwifi.h
+# ---------- Install ----------
 
-# ---------- Userspace utilities ----------
-# These don't require kernel headers, so they can be built standalone
-# (e.g. in CI environments without a matching kernel-headers package).
-CC      ?= gcc
-CFLAGS  ?= -Wall -Wextra -O2
-
-USERSPACE_BINS := vwifi-medium vwifi-host-relay vwifi-phys-bridge vwifi-linkbench vwifi-ctl
-
-vwifi-medium: vwifi_medium.c vwifi.h
-	$(CC) $(CFLAGS) -o $@ $< -lm
-
-vwifi-host-relay: vwifi_host_relay.c vwifi.h
-	$(CC) $(CFLAGS) -o $@ $<
-
-vwifi-ctl: vwifi_ctl.c vwifi.h
-	$(CC) $(CFLAGS) -o $@ $<
-
-vwifi-phys-bridge: vwifi_phys_bridge.c vwifi.h
-	$(CC) $(CFLAGS) -o $@ $<
-
-vwifi-linkbench: vwifi_linkbench.c
-	$(CC) $(CFLAGS) -o $@ $<
-
-userspace: $(USERSPACE_BINS)
-
-# Install destination (DESTDIR for staged/packaged installs).
 PREFIX  ?= /usr/local
 BINDIR  ?= $(PREFIX)/bin
 INSTALL ?= install
 
+.PHONY: install-userspace uninstall-userspace
 install-userspace: $(USERSPACE_BINS)
 	$(INSTALL) -d $(DESTDIR)$(BINDIR)
 	$(INSTALL) -m 0755 $(USERSPACE_BINS) $(DESTDIR)$(BINDIR)
 
 uninstall-userspace:
-	rm -f $(addprefix $(DESTDIR)$(BINDIR)/,$(USERSPACE_BINS))
+	rm -f $(addprefix $(DESTDIR)$(BINDIR)/,$(notdir $(USERSPACE_BINS)))
 
 # ---------- Tests ----------
-test: vwifi-medium
-	python3 tests/harness.py
+#
+# Everything here runs on a plain host toolchain: no QEMU, no guest, no
+# kernel headers. Both QEMU device models keep their logic in a portable
+# core that the tests drive through a mock backend.
+
+.PHONY: test test-medium test-devices
+test: test-medium test-devices
+
+test-medium: $(BUILD)/vwifi-medium
+	VWIFI_MEDIUM=$(BUILD)/vwifi-medium python3 medium/tests/harness.py
+
+test-devices:
+	$(MAKE) -C devices/vwifi test
+	$(MAKE) -C devices/ath9k test-crypto test-wep test-tkip test-ampdu
 
 # ---------- Clean ----------
-clean:
-	-$(MAKE) -C $(KDIR) M=$(PWD) clean 2>/dev/null || true
-	rm -f $(USERSPACE_BINS)
 
-.PHONY: all install userspace install-userspace uninstall-userspace test clean
+.PHONY: clean
+clean:
+	rm -rf $(BUILD)
+	$(MAKE) -C host clean KDIR=$(KDIR)
+	$(MAKE) -C devices/vwifi clean
+	$(MAKE) -C devices/ath9k clean-tests

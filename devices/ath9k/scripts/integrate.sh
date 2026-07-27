@@ -18,6 +18,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 SRC_DIR="${PROJECT_ROOT}/src"
+# The medium wire protocol is shared with the hub, the host module and the
+# other QEMU devices. There is one copy of it, at the top of the repo, and
+# it is copied into the QEMU tree rather than forked here.
+ABI_DIR="$(cd "${PROJECT_ROOT}/../.." && pwd)/abi"
 
 if [ $# -ne 1 ]; then
     echo "Usage: $0 /path/to/qemu-source-tree" >&2
@@ -50,7 +54,7 @@ cp -v "${SRC_DIR}/vwifi_ath9k_eeprom.h" "${TARGET_DIR}/"
 cp -v "${SRC_DIR}/vwifi_ath9k_crypto.h" "${TARGET_DIR}/"
 cp -v "${SRC_DIR}/vwifi_ath9k_wep.h"    "${TARGET_DIR}/"
 cp -v "${SRC_DIR}/vwifi_ath9k_tkip.h"   "${TARGET_DIR}/"
-cp -v "${SRC_DIR}/vwifi.h"              "${TARGET_DIR}/"
+cp -v "${ABI_DIR}/vwifi.h"              "${TARGET_DIR}/"
 cp -v "${SRC_DIR}/meson.build"          "${TARGET_DIR}/"
 cp -v "${SRC_DIR}/Kconfig"              "${TARGET_DIR}/"
 echo "   Sources copied to ${TARGET_DIR}/"

@@ -41,6 +41,22 @@
 /* -------------------------------------------------------------------
  *  Compile-time knobs
  * ------------------------------------------------------------------- */
+/*
+ * Reassembly buffer for the medium socket.
+ *
+ * The shared header's default (VWIFI_RXBUF_SIZE) holds exactly one
+ * length-prefixed message.  This device wants a whole burst: with
+ * 802.11n A-MPDU the medium delivers a run of de-aggregated subframes
+ * back-to-back, and a one-message buffer forces one read() and one
+ * main-loop iteration per subframe.  Holding a full BA window (64
+ * subframes) lets a burst drain in a single read() and complete with one
+ * coalesced RXOK, which is where the aggregation throughput win is
+ * actually realized.  Bounds checks in vwifi_ath9k_fd_read are all
+ * relative to this size, so enlarging it is safe; a single message is
+ * still capped at VWIFI_MAX_MSG_SIZE.
+ */
+#define VWIFI_ATH9K_RXBUF_SIZE  (32 * VWIFI_MSG_SLOT_SIZE)
+
 #define ATH9K_VIRT_DEBUG        1
 #define ATH9K_MMIO_SIZE         (64 * KiB)
 #define ATH9K_REG_COUNT         (ATH9K_MMIO_SIZE / sizeof(uint32_t))
@@ -147,7 +163,7 @@ struct VwifiAth9kState {
     bool        medium_connected; /* true when socket is open */
 
     /* Stream reassembly buffer for length-prefixed messages */
-    uint8_t     medium_rxbuf[VWIFI_RXBUF_SIZE];
+    uint8_t     medium_rxbuf[VWIFI_ATH9K_RXBUF_SIZE];
     uint32_t    medium_rxbuf_used;  /* bytes currently in rxbuf */
 
     /* Our MAC address (read from EEPROM at realize) */
@@ -388,7 +404,7 @@ static void vwifi_ath9k_raise_irq(VwifiAth9kState *s, uint32_t isr_bits)
  * ================================================================ */
 
 #define MEDIUM_RECONNECT_MS  2000   /* retry every 2 seconds */
-#define VWIFI_HELLO_MAGIC    0x52495756  /* "VWIR" – vwifi registration */
+/* VWIFI_HELLO_MAGIC comes from the shared abi/vwifi.h. */
 #define HELLO_MAGIC          VWIFI_HELLO_MAGIC
 
 /* Forward declarations */
@@ -1837,7 +1853,7 @@ static void vwifi_ath9k_fd_read(void *opaque)
         return;
     }
 
-    avail = VWIFI_RXBUF_SIZE - s->medium_rxbuf_used;
+    avail = VWIFI_ATH9K_RXBUF_SIZE - s->medium_rxbuf_used;
     if (avail == 0) {
         vwifi_ath9k_error("MEDIUM RX: buffer full, resetting");
         s->medium_rxbuf_used = 0;

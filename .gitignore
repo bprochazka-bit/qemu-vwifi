@@ -1,8 +1,31 @@
-vwifi-medium
-vwifi-host-relay
-vwifi-phys-bridge
-vwifi-linkbench
+# Userspace binaries — the top-level Makefile builds everything here
+build/
 
-# Python bytecode cache (medium-controller)
+# Kernel module build artifacts (host/)
+*.ko
+*.o
+*.mod
+*.mod.c
+*.mod.o
+Module.symvers
+modules.order
+.tmp_versions/
+.*.cmd
+
+# Test binaries
+tests/build/
+
+# Windows driver build output (MSBuild / WDK)
+*.obj
+*.sys
+*.pdb
+*.cat
+*.inf
+x64/
+Debug/
+Release/
+.vs/
+
+# Python bytecode cache (medium/controller, medium/tests)
 __pycache__/
 *.pyc

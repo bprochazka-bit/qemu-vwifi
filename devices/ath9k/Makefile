@@ -94,9 +94,9 @@ test: check-qemu-src
 	@test -x "$(QEMU_BINARY)" || \
 		{ echo "ERROR: $(QEMU_BINARY) not found. Run 'make build' first."; exit 1; }
 ifdef GUEST_IMAGE
-	./tests/test_probe.sh "$(QEMU_BINARY)" "$(GUEST_IMAGE)"
+	./tests/build/test_probe.sh "$(QEMU_BINARY)" "$(GUEST_IMAGE)"
 else
-	./tests/test_probe.sh "$(QEMU_BINARY)"
+	./tests/build/test_probe.sh "$(QEMU_BINARY)"
 endif
 
 install: check-qemu-src
@@ -130,33 +130,37 @@ clean: check-qemu-src
 test-crypto:
 	@echo "=== Building and running CCMP crypto unit test ==="
 	@command -v cc >/dev/null 2>&1 || { echo "cc not found"; exit 1; }
-	cc -O2 -Wall -Wno-deprecated-declarations -Isrc \
-		-o tests/test_ccmp tests/test_ccmp.c -lcrypto
-	./tests/test_ccmp
+	@mkdir -p tests/build
+	cc -O2 -Wall -Wno-deprecated-declarations -Isrc -I../../abi \
+		-o tests/build/test_ccmp tests/test_ccmp.c -lcrypto
+	./tests/build/test_ccmp
 
 .PHONY: test-wep
 test-wep:
 	@echo "=== Building and running WEP crypto unit test ==="
 	@command -v cc >/dev/null 2>&1 || { echo "cc not found"; exit 1; }
-	cc -O2 -Wall -Isrc \
-		-o tests/test_wep tests/test_wep.c -lz
-	./tests/test_wep
+	@mkdir -p tests/build
+	cc -O2 -Wall -Isrc -I../../abi \
+		-o tests/build/test_wep tests/test_wep.c -lz
+	./tests/build/test_wep
 
 .PHONY: test-tkip
 test-tkip:
 	@echo "=== Building and running TKIP crypto unit test ==="
 	@command -v cc >/dev/null 2>&1 || { echo "cc not found"; exit 1; }
-	cc -O2 -Wall -Isrc \
-		-o tests/test_tkip tests/test_tkip.c
-	./tests/test_tkip
+	@mkdir -p tests/build
+	cc -O2 -Wall -Isrc -I../../abi \
+		-o tests/build/test_tkip tests/test_tkip.c
+	./tests/build/test_tkip
 
 .PHONY: test-ampdu
 test-ampdu:
 	@echo "=== Building and running A-MPDU / Block-Ack unit test ==="
 	@command -v cc >/dev/null 2>&1 || { echo "cc not found"; exit 1; }
-	cc -O2 -Wall -Isrc \
-		-o tests/test_ampdu tests/test_ampdu.c
-	./tests/test_ampdu
+	@mkdir -p tests/build
+	cc -O2 -Wall -Isrc -I../../abi \
+		-o tests/build/test_ampdu tests/test_ampdu.c
+	./tests/build/test_ampdu
 
 # ---- Static analysis (optional, requires cppcheck) ----------------
 
@@ -167,4 +171,10 @@ lint:
 		{ echo "cppcheck not found – skipping"; exit 0; }
 	cppcheck --enable=all --suppress=missingInclude \
 		--suppress=unusedFunction \
-		-I src/ src/vwifi_ath9k_pci.c
+		-I src/ -I ../../abi src/vwifi_ath9k_pci.c
+
+# ---- Test cleanup -------------------------------------------------
+
+.PHONY: clean-tests
+clean-tests:
+	rm -rf tests/build

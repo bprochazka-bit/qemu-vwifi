@@ -1,583 +1,160 @@
-# vwifi — Virtual WiFi Medium for QEMU
+# qemu-vwifi — a virtual 802.11 medium for QEMU, and the radios on it
 
-A virtual 802.11 medium for QEMU guests, plus a kernel module that lets
-the host join the medium as a regular mac80211 radio. The hub is
-channel-aware and models per-link SNR / frame-error rates, so the
-simulated medium behaves like radio rather than a hub.
+One shared virtual radio medium, several virtual radios that attach to
+it, and the guest drivers that make those radios look real to the OS
+inside the VM.
 
-## Components
+A guest sees a wireless NIC. It scans, associates, encrypts, roams —
+the whole 802.11 state machine — against other VMs, against the host's
+own `wlanX`, and optionally against a real radio bridged in over the
+air. No RF hardware required for any of it.
 
-| File / Binary | Description |
+## The four layers
+
+```
+ drivers/    what the guest OS binds to        vwifi.sys (Windows), in-tree ath9k (Linux)
+     |
+ devices/    what QEMU exposes on the PCI bus  vwifi-virt, vwifi-ath9k
+     |
+ medium/     the shared air                    vwifi-medium (the hub)
+     |
+ host/       the host's own radio on that air  vwifi_host.ko + relay + ctl
+
+ abi/        the contracts every layer agrees on
+```
+
+Each layer talks to the next through exactly one contract, and each
+contract has exactly one copy, in `abi/`. That is the rule the layout
+exists to enforce — see [`abi/README.md`](abi/README.md) for why.
+
+## Repository layout
+
+| Path | What lives there |
 |---|---|
-| `vwifi.h` | Shared wire-protocol header (kernel + userspace) |
-| `vwifi_medium.c` → `vwifi-medium` | Userspace medium hub; fans frames out to all connected peers with channel-aware filtering and per-link SNR |
-| `vwifi_host.c` → `vwifi_host.ko` | Kernel module — dynamically created mac80211 radios, each with its own char device, plus a control node at `/dev/vwifi-ctl` |
-| `vwifi_host_relay.c` → `vwifi-host-relay` | Bridges a radio's char device ↔ hub Unix socket |
-| `vwifi_ctl.c` → `vwifi-ctl` | Creates/destroys radios at runtime via `/dev/vwifi-ctl`, and renames a radio's `wlanX` netdev |
-| `vwifi_phys_bridge.c` → `vwifi-phys-bridge` | Bridges a real WiFi interface in monitor mode into the medium |
-| `tests/harness.py` | Userspace regression harness |
-| `medium-controller/` | Web UI + Python helpers for the hub's control socket |
+| [`abi/`](abi/) | The shared contracts. `vwifi.h` (medium wire protocol), `vwifi_abi.h` (vwifi-virt device ↔ guest driver), `vwifi_host_ioctl.h` (host module control) |
+| [`medium/`](medium/) | The hub (`vwifi-medium`), the tools that attach to it (phys bridge, linkbench), the web controller, and the regression harness |
+| [`host/`](host/) | `vwifi_host.ko` — mac80211 radios for the host machine — plus `vwifi-host-relay` and `vwifi-ctl` |
+| [`devices/ath9k/`](devices/ath9k/) | `vwifi-ath9k`: a QEMU model of an Atheros AR9285, driven by the unmodified in-tree Linux `ath9k` driver |
+| [`devices/vwifi/`](devices/vwifi/) | `vwifi-virt`: a QEMU device with a purpose-built ABI, for guests where no suitable real NIC can be emulated |
+| [`drivers/vwifi/`](drivers/vwifi/) | Guest drivers for `vwifi-virt` — Windows today, Linux and macOS planned |
+| [`docs/`](docs/) | Development plans and lab notes |
+| [`scripts/`](scripts/), [`examples/`](examples/) | Lab bring-up helpers and sample hostapd configs |
+
+## The two devices, and why there are two
+
+They are not redundant. They solve different problems, and both attach
+to the same medium at the same time.
+
+**`vwifi-ath9k`** emulates real silicon (Atheros AR9285, PCI ID
+168C:002B). Its whole point is that the guest needs *no special driver*:
+Linux already ships `ath9k`, so a stock distro image boots and finds
+Wi-Fi. The device therefore has to be faithful at the register level —
+EEPROM layout, reset sequencing, descriptor DMA, hardware crypto.
+
+**`vwifi-virt`** emulates nothing. It exposes a clean ring-and-opcode
+ABI of our own design, and the guest needs a driver we write. That is
+the right trade when no emulatable real NIC has a usable driver in the
+target OS — Windows being the case that motivated it. Because the ABI
+is ours, the device can own the 802.11 state machine (scan, assoc,
+CCMP, SoftAP) and the guest driver stays thin. That in turn means the
+interesting logic is testable without ever booting the guest.
+
+| | `vwifi-ath9k` | `vwifi-virt` |
+|---|---|---|
+| Guest driver | in-tree Linux `ath9k`, unmodified | ours ([`drivers/vwifi/`](drivers/vwifi/)) |
+| Guest OS | Linux | Windows now; Linux and macOS planned |
+| 802.11 state machine | in the guest (mac80211) | in the device |
+| Testable without a guest | crypto and A-MPDU units | the entire device core |
 
 ## Architecture
 
 ```
- ┌──────────────────────── Host Machine ────────────────────────┐
- │                                                              │
- │  hostapd / wpa_supplicant / iw / NetworkManager              │
- │         │                                                    │
- │     mac80211  (wlanX)                                        │
- │         │                                                    │
- │   vwifi_host.ko        ← kernel module                       │
- │         │  /dev/vwifi                                        │
- │   vwifi-host-relay     ← userspace daemon                    │
- │         │                                                    │
- └─────────┼────────────────────────────────────────────────────┘
-           │  unix socket
-   vwifi-medium             ← shared medium hub
-           │
-    ┌──────┼──────┬────────────────┐
-    │      │      │                │
-  QEMU   QEMU   QEMU         vwifi-phys-bridge
-  VM-A   VM-B   VM-C        (optional: real radio
-                             on a monitor-mode iface)
+ ┌─────────────── Host machine ────────────────────────────────┐
+ │                                                             │
+ │  hostapd / wpa_supplicant / iw / NetworkManager             │
+ │        │                                                    │
+ │   mac80211 (wlanX)                                          │
+ │        │                                                    │
+ │   vwifi_host.ko          ← host/                            │
+ │        │  /dev/<radio>                                      │
+ │   vwifi-host-relay       ← host/tools/                      │
+ │        │                                                    │
+ └────────┼────────────────────────────────────────────────────┘
+          │ unix socket
+    vwifi-medium            ← medium/     the shared air:
+          │                                channel-aware, per-link SNR,
+          │                                frame-error model, airtime survey
+    ┌─────┼───────────────┬────────────────────┐
+    │     │               │                    │
+ ┌──▼──┐ ┌▼─────┐   ┌─────▼──────┐   ┌─────────▼─────────┐
+ │Linux│ │Windows│   │ other VMs │   │ vwifi-phys-bridge │
+ │ VM  │ │  VM   │   │           │   │ (real radio in    │
+ │     │ │       │   │           │   │  monitor mode)    │
+ │ath9k│ │vwifi. │   │           │   └───────────────────┘
+ │ ↑   │ │ sys ↑ │   │           │
+ │vwifi│ │vwifi- │   │           │
+ │-ath9k│ │virt  │   │           │
+ └─────┘ └───────┘   └───────────┘
 ```
 
-The host's `wlanX` interface is a full mac80211 radio — it supports
-hostapd (AP mode), wpa_supplicant (STA mode), monitor mode, mesh, and
-ad-hoc. Frames flow through the hub to all connected QEMU guests and
-back.
+Every peer on the medium speaks the same 40-byte v2 frame header from
+`abi/vwifi.h`. The hub filters by channel (including HT40 bonding and
+VHT/HE center frequencies), models per-link SNR and frame error, and
+charges airtime per channel. A peer that registers as *physical* — the
+phys bridge — is exempt from the simulated propagation model, because
+real-world RF is already the channel.
 
-## Building
+## Quick start
 
-### Userspace binaries
-
-No kernel headers required:
+Nothing here needs QEMU, a guest image, or kernel headers.
 
 ```bash
-make userspace
+make            # userspace binaries -> build/
+make test       # medium harness + both devices' unit tests
 ```
 
-This builds three binaries:
+`make test` runs the hub's 58-assertion regression harness and both
+device cores against mock backends — scan, association, WPA2/CCMP,
+monitor mode, SoftAP, A-MPDU, WEP/TKIP/CCMP known-answer vectors.
 
-```
-vwifi-medium        # the medium hub
-vwifi-host-relay    # chardev <-> hub bridge daemon
-vwifi-phys-bridge   # real-radio <-> hub bridge
-```
-
-### Kernel module
-
-Requires kernel headers for your running kernel:
+Then bring up a medium and put the host on it:
 
 ```bash
-# Debian/Ubuntu
-sudo apt install linux-headers-$(uname -r)
+./build/vwifi-medium /tmp/vwifi.sock -c /tmp/vwifi.ctl   # the air
 
-# Build
-make                               # produces vwifi_host.ko
-
-# Build against a different kernel
-make KDIR=/path/to/kernel/source
+make module && sudo insmod host/vwifi_host.ko            # host radio
+sudo ./build/vwifi-ctl create --dev vwifi-lab --ifname vwm-lab
+sudo ./build/vwifi-host-relay /tmp/vwifi.sock /dev/vwifi-lab
 ```
 
-### Tests
+`vwm-lab` is now a full mac80211 radio: hostapd, wpa_supplicant,
+monitor mode, mesh and ad-hoc all work on it, and everything it
+transmits reaches every VM on the medium.
+
+To put a guest on the medium, build QEMU with one of the devices and
+point it at the same socket:
 
 ```bash
-make test     # runs python3 tests/harness.py against ./vwifi-medium
-```
+make -C devices/ath9k integrate build QEMU_SRC=/path/to/qemu   # Linux guests
+make -C devices/vwifi integrate build QEMU_SRC=/path/to/qemu   # Windows guests
 
-See [`tests/README.md`](tests/README.md) for what the harness covers
-(it doesn't cover kernel-side fixes that need a real module + VM).
-
-## Usage
-
-### Step 1: Start the hub
-
-```bash
-# Local medium only
-./vwifi-medium /tmp/vwifi.sock
-
-# Medium with runtime control socket (recommended)
-./vwifi-medium /tmp/vwifi.sock -c /tmp/vwifi.ctl
-
-# Medium that also listens for incoming TCP bridge connections
-./vwifi-medium /tmp/vwifi.sock -c /tmp/vwifi.ctl -t 5550
-
-# Medium with a startup config file
-./vwifi-medium /tmp/vwifi.sock -c /tmp/vwifi.ctl -C medium.cfg
-```
-
-Full options:
-
-```
-Usage: ./vwifi-medium <unix-socket-path> [options]
-
-  -t <port>        TCP listen port for incoming bridge connections
-  -u <host:port>   Connect to upstream hub (repeatable, max 16)
-  -c <path>        Control socket path (for runtime commands)
-  -C <path>        Initial config file (commands run at startup)
-  -h               Show this help
-```
-
-The data socket is created mode 0666 so any user can connect QEMU
-clients. The control socket is created mode 0600 because its
-commands are unauthenticated and include `SAVE_CONFIG`.
-
-### Step 2: Load the kernel module
-
-```bash
-sudo insmod vwifi_host.ko
-```
-
-Loading the module creates the control node `/dev/vwifi-ctl` but **no radio
-yet** — radios are created on demand (see below). To get the classic
-single-radio behaviour of older builds, load with `default_radio=1`:
-
-```bash
-# One radio at /dev/vwifi with the macaddr= address, ready immediately:
-sudo insmod vwifi_host.ko default_radio=1 macaddr=00:03:7F:CC:DD:02
-```
-
-### Step 2b: Create a radio
-
-Each radio is an independent mac80211 wiphy (its own `wlanX`) backed by its
-own char device at `/dev/<name>`. Create one with `vwifi-ctl`:
-
-```bash
-# Radio at /dev/vwifi-lab, netdev renamed to vwm-lab and brought up:
-sudo ./vwifi-ctl create --dev vwifi-lab --ifname vwm-lab
-# ...prints: created radio 'vwifi-lab' id=0 phy=phyN mac=... dev=/dev/vwifi-lab
-```
-
-`--mac aa:bb:cc:dd:ee:ff` sets the MAC explicitly; omitted, a stable
-locally-administered MAC is derived from the name. Tear a radio down (after
-its relay has stopped) with:
-
-```bash
-sudo ./vwifi-ctl destroy --dev vwifi-lab
-```
-
-You can create as many radios as you like; each joins the medium as a
-separate node through its own relay.
-
-### Step 3: Start the relay daemon
-
-```bash
-sudo ./vwifi-host-relay /tmp/vwifi.sock /dev/vwifi-lab
-```
-
-The relay bridges a radio's char device to the hub's Unix socket. Full
-options:
-
-```
-Usage: ./vwifi-host-relay <hub-socket-path> [chardev-path]
-
-  hub-socket-path  Path to vwifi-medium Unix socket
-  chardev-path     Path to the radio's char device
-                   (default: /dev/vwifi, i.e. the default_radio node)
-```
-
-It logs to stderr:
-
-```
-relay: chardev /dev/vwifi-lab opened (fd=3)
-relay: connected to hub /tmp/vwifi.sock (fd=4)
-relay: bridging /dev/vwifi-lab ↔ /tmp/vwifi.sock
-```
-
-### Step 4: Start QEMU VMs
-
-```bash
-qemu-system-x86_64 -machine q35 -m 512 \
-  -drive file=vm.qcow2,format=qcow2 \
+qemu-system-x86_64 -machine q35 -m 2048 -drive file=vm.qcow2,format=qcow2 \
   -chardev socket,id=medium,path=/tmp/vwifi.sock,server=off \
-  -device vwifi-virt,chardev=medium \
-  -nographic
+  -device vwifi-ath9k,chardev=medium,node_id=linux-vm
 ```
 
-### Step 5: Use the host WiFi interface
-
-The host's `wlanX` is now on the same wireless medium as the guests.
-
-Host as AP, guest as STA:
-
-```bash
-# Host
-sudo ip link set wlan0 up
-sudo hostapd /etc/hostapd/hostapd.conf
-
-# Inside the VM
-sudo wpa_supplicant -i wlan0 -c /etc/wpa_supplicant.conf
-```
-
-Host as STA, guest as AP:
-
-```bash
-# Inside the VM: run hostapd to create the AP
-# Host
-sudo iw dev wlan0 scan
-sudo wpa_supplicant -i wlan0 -c /etc/wpa_supplicant.conf
-```
-
-Host as monitor:
-
-```bash
-sudo iw dev wlan0 set type monitor
-sudo ip link set wlan0 up
-sudo tcpdump -i wlan0 -e -n
-```
-
-## Bridging in a real radio (optional)
-
-`vwifi-phys-bridge` connects a physical WiFi interface in monitor
-mode to the medium, making the virtual APs/clients **observable** over
-the air (and real traffic injectable into the sim).
-
-```bash
-sudo ./vwifi-phys-bridge /tmp/vwifi.sock wlx90de801c625f -c 6 -v
-```
-
-> **Association caveat.** Plain monitor mode lets a real device *see*
-> the virtual APs but **not reliably *join* one**: an 802.11 STA needs
-> its frames ACKed within SIFS (~10–16 µs), which only a real radio's
-> MAC hardware can do — a software relay is ~1000× too slow. To let an
-> unmodifiable real station (e.g. an Android phone) actually associate
-> to a virtual OpenWRT AP using a single radio, see
-> [`docs/ar9271-phys-bridge-lab.md`](docs/ar9271-phys-bridge-lab.md),
-> which keeps the VM as the literal AP and adds a hardware-ACK hook on
-> an AR9271 (open firmware).
-
-Options:
-
-```
-Usage: sudo ./vwifi-phys-bridge <hub-socket-path> <interface> -c <channel> [options]
-
-  -c <channel>     Channel number (1-14, 36, 40, ...) or freq in MHz
-                   Values <= 200 are channel numbers, > 200 are MHz
-  -w <bandwidth>   Channel width (default: HT20):
-                   HT20, HT40+, HT40-, VHT80, VHT160, VHT80+80
-  -s <center2_mhz> Secondary 80MHz center freq (VHT80+80 only)
-  -n <node_id>     Node ID for hub registration (default: phys-<ifname>)
-  -v               Verbose logging
-  -h               Show this help
-```
-
-Put the interface in monitor mode first:
-
-```bash
-sudo iw dev wlx90de801c625f set type monitor
-sudo ip link set wlx90de801c625f up
-sudo iw dev wlx90de801c625f set channel 6
-```
-
-## Runtime control
-
-When the hub is started with `-c <path>`, a Unix socket at that
-path accepts text commands. Connect with `socat` or `nc`:
-
-```bash
-# One-shot:
-echo LIST_PEERS | socat - UNIX-CONNECT:/tmp/vwifi.ctl
-
-# Interactive:
-socat READLINE UNIX-CONNECT:/tmp/vwifi.ctl
-```
-
-Some useful commands (send `HELP` for the full list):
-
-```
-LIST_PEERS                                       # show all nodes + state
-SET_POS <node-id> <x> <y> [<z>]                  # position a node in metres
-SET_TXPOWER <node-id> <dBm>                      # set node TX power
-SET_SNR <mac-a> <mac-b> <snr-db>                 # pin a per-link SNR override
-CLEAR_SNR <mac-a> <mac-b>                        # release the override
-SURVEY [RESET]                                   # per-channel utilisation
-STATS                                            # global counters
-SAVE_CONFIG <path>                               # snapshot current config
-LOAD_CONFIG <path>                               # replay commands from a file
-QUIT                                             # close this connection
-```
-
-### Node mode and channel
-
-`LIST_PEERS` reports each node's inferred interface **mode** and its
-last-seen **channel** alongside the existing position/power/counter
-fields:
-
-```
-  openwrt-a    online mode=AP  chan=6  band=2.4G width=HT20 cfreq=2437 macs=[52:54:00:7f:f4:5e] pos=(27.5,6.2,0.0) txpow=15.0 tx=25151 rx=7195 rx_drop=98 tx_drop=0
-  client-a     online mode=STA chan=6  band=2.4G width=HT20 cfreq=2437 macs=[52:54:00:4e:ca:0c] pos=(36.6,14.5,0.0) txpow=15.0 tx=7293 rx=20378 rx_drop=15 tx_drop=0
-```
-
-* `mode` is one of `AP`, `STA`, `MESH`, `IBSS`, or `?`. Nothing on the
-  wire carries the transmitter's cfg80211 iftype, so the hub **infers**
-  it from the 802.11 frames each node sends (Beacons and Probe/Assoc
-  Responses ⇒ AP; Probe/Assoc Requests and ToDS data ⇒ STA; 4-address
-  data ⇒ MESH). A node that has not yet transmitted anything conclusive
-  shows `?`.
-* `chan`/`band`/`width`/`cfreq` come from the v2 channel header the node
-  last transmitted with (`chan=-` if it has only ever sent v1 frames).
-  The channel is remembered across disconnect, so an `offline` node
-  still shows the channel it last used.
-
-### Site survey (channel utilisation)
-
-`SURVEY` reports per-channel airtime, the way `iw dev <if> survey dump`
-does on real hardware. Every transmitted frame is charged to its primary
-channel's airtime budget (estimated from frame size and rate code), so
-you can see which channels are busy and roughly how congested they are:
-
-```
-$ echo SURVEY | socat - UNIX-CONNECT:/tmp/vwifi.ctl
-OK survey window=42.10s chans=2
-  chan=6  freq=2437MHz band=2.4G width=HT20  nodes=2 frames=32446 bytes=41203712 airtime=6801.4ms util=16.2%
-  chan=36 freq=5180MHz band=5G   width=VHT80 nodes=1 frames=118   bytes=151040   airtime=39.2ms   util=0.1%
-```
-
-`util` is busy airtime as a percentage of the survey window. Send
-`SURVEY RESET` to zero the counters and restart the window (e.g. to
-measure utilisation over a specific test interval). Utilisation is a
-relative indicator, not MAC-accurate airtime accounting — it uses a
-coarse fixed per-frame PHY overhead and does not model contention or
-retransmission backoff.
-
-#### Troubleshooting `chan=-`
-
-`chan=-` (and `SURVEY` showing a `chan=-` bucket) means the frames
-arriving at the hub carry `channel_freq=0`: the medium reports the
-channel faithfully, but the **sender never put one in the header**. The
-hub only knows a node's channel because that node stamps it into the v2
-frame header on every TX — it cannot invent it.
-
-`DIAG` shows, per connected peer, the header version and the raw channel
-fields of the most recent frame, which tells you where the zero comes
-from:
-
-```
-$ echo DIAG | socat - UNIX-CONNECT:/tmp/vwifi.ctl
-OK diag 2 peers
-  peer=0 node=openwrt-a    bridge=0 hdrver=2 paylen=242 frames=196 chan_freq=0    chan_flags=0x0000 bond=0 cf1=0 cf2=0
-  peer=1 node=client-a     bridge=0 hdrver=2 paylen=131 frames=24  chan_freq=0    chan_flags=0x0000 bond=0 cf1=0 cf2=0
-```
-
-* `hdrver < 2` — the sender is emitting a v1 (pre-channel) header. Rebuild
-  and reload that component from current source.
-* `hdrver=2` **and** `chan_freq=0` — the sender speaks v2 but isn't
-  populating the channel. Fix the source:
-  * **Kernel driver (`vwifi_host.ko` in a VM):** the channel is filled
-    from `priv->channel_freq`, which mac80211 sets via the driver's
-    `.config`/chanctx path. A current build defaults to channel 1 and
-    tracks the configured channel; a `chan_freq=0` almost always means an
-    **older `.ko` is loaded** — rebuild and `rmmod`/`insmod` it in the VM.
-  * **`vwifi-phys-bridge`:** it stamps the channel from the captured
-    frame's radiotap, falling back to its **required** `-c <channel>`
-    option. Make sure it was launched with `-c` matching the radio's
-    channel (and `-w <bandwidth>` for HT40/VHT).
-
-There's also a web UI in `medium-controller/` for the same control
-socket — see `medium-controller/README.md`.
-
-## Multi-host setup
-
-The hub supports TCP bridging between hosts. The kernel module and
-relay always connect to a local hub; remote hubs are linked via the
-hub's own `-t`/`-u` options.
-
-```
-Host A:
-  ./vwifi-medium /tmp/a.sock -t 5550
-  sudo insmod vwifi_host.ko
-  sudo ./vwifi-host-relay /tmp/a.sock
-
-Host B:
-  ./vwifi-medium /tmp/b.sock -u hostA:5550
-  sudo insmod vwifi_host.ko macaddr=00:03:7F:CC:DD:02
-  sudo ./vwifi-host-relay /tmp/b.sock
-```
-
-`wlanX` on both hosts and every QEMU VM on both hosts now share
-the same medium.
-
-## Dynamic radios
-
-The module registers a control node, `/dev/vwifi-ctl`. Userspace issues two
-ioctls on it — `VWIFI_IOC_CREATE_RADIO` and `VWIFI_IOC_DESTROY_RADIO` (see
-`vwifi.h`) — to add and remove radios at runtime. `vwifi-ctl` is the CLI
-front-end. Each radio:
-
-- is an independent mac80211 wiphy with its own `wlanX` and MAC;
-- exposes its own data char device at `/dev/<name>`, which exactly one
-  `vwifi-host-relay` bridges to a medium hub;
-- can be created and destroyed without touching any other radio, and
-  without reloading the module.
-
-Destroying a radio is refused (`EBUSY`) while a relay still holds its char
-device open, so stop the relay first. This is the model Nyxus drives to add
-and remove host interfaces per medium on demand.
-
-## Module parameters
-
-| Parameter | Default | Description |
-|---|---|---|
-| `default_radio` | `0` | Create one radio at load time, exposed at `/dev/vwifi` with the `macaddr` address (classic single-radio behaviour). Off by default so a controller managing radios via `/dev/vwifi-ctl` gets no stray interface. |
-| `macaddr` | `00:03:7F:CC:DD:01` | MAC address for the `default_radio`. Dynamically created radios set their own MAC via `vwifi-ctl --mac` (or derive one from the radio name). |
-
-Every radio's MAC must be unique on the medium.
-
-## How it works
-
-### TX path (host → VMs)
-
-1. Application sends data through `wlanX`.
-2. mac80211 builds an 802.11 frame and calls the module's `.tx`.
-3. The module wraps the frame in a `vwifi_frame_hdr` (40-byte v2
-   header) with the wire-protocol length prefix. The header
-   carries `tx_mac`, `rate_code` (translated from
-   `tx_info->control.rates[0]` to our HT/VHT MCS namespace), and
-   the current operating channel (`channel_freq`,
-   `channel_bond_freq`, `channel_flags`, `center_freq{1,2}`).
-4. The frame is enqueued for the relay daemon. If the queue
-   crosses the high watermark, the module calls
-   `ieee80211_stop_queues()` so mac80211 stops handing us frames
-   until the relay drains.
-5. The relay daemon's `poll()` wakes, `read()`s the message from
-   `/dev/vwifi`, and `write()`s it to the hub's Unix socket.
-6. The hub looks up each peer's last known channel and fans the
-   frame out only to peers whose channel matches (including HT40
-   bond_freq and VHT80+ center_freq disambiguation; the HT40 bond
-   pair is only enforced when both peers declare one, so a narrow
-   station still hears a bonded AP on the shared primary). A
-   per-link SNR model decides per-frame whether to drop based on
-   the sender's rate code and the receiver's link SNR. Links that
-   touch a **physical radio** (the phys bridge, which registers
-   with the `physical` hello flag) are exempt from this model:
-   real-world RF is the channel, so the hub never adds simulated
-   loss or rewrites their RSSI. Inter-hub TCP **bridges** are
-   multi-channel trunks and are likewise never channel-filtered;
-   the downstream hub filters per-receiver.
-7. Each QEMU vwifi-virt device injects the frame into the guest's
-   RX path.
-
-### RX path (VMs → host)
-
-1. QEMU vwifi-virt sends an 802.11 frame to the hub.
-2. The hub fans it out (including to the relay).
-3. The relay reads the framed message and writes it to
-   `/dev/vwifi`.
-4. The module parses the wire protocol (accepting both v1 28-byte
-   and v2 40-byte headers) and calls `ieee80211_rx_irqsafe()`.
-5. mac80211 delivers the frame to hostapd / wpa_supplicant / etc.
-
-### TX status
-
-The medium has no over-the-air ACK. The driver reports
-`IEEE80211_TX_STAT_ACK` for frames successfully enqueued for the
-relay. If the TX queue is full despite backpressure (relay died,
-or a producer raced past the high watermark), the driver reports
-the frame with `STAT_ACK` cleared so mac80211's retry counter and
-rate-control logic see a real failure rather than a fake success.
-
-### Own-frame filtering
-
-The module compares each RX frame's `tx_mac` against its own MAC
-and drops frames it originally sent, preventing echo when the hub
-fans frames back to the relay.
-
-## Troubleshooting
-
-### `No such device` opening `/dev/vwifi-ctl`
-
-The module isn't loaded:
-
-```bash
-sudo insmod vwifi_host.ko
-ls -la /dev/vwifi-ctl
-```
-
-### `No such file or directory` opening a radio's `/dev/<name>`
-
-The radio hasn't been created (or was destroyed). Create it:
-
-```bash
-sudo ./vwifi-ctl create --dev vwifi-lab --ifname vwm-lab
-```
-
-### `Device or resource busy` destroying a radio
-
-A relay still holds that radio's char device open. Stop the relay first,
-then `vwifi-ctl destroy`.
-
-### `Device or resource busy` from the relay
-
-Only one relay daemon can be attached to a given radio at a time. Check for
-stale processes:
-
-```bash
-ps aux | grep vwifi-host-relay
-```
-
-### No `wlanX` interface after creating a radio
-
-Check `dmesg`:
-
-```bash
-dmesg | grep vwifi_host
-```
-
-You should see something like:
-
-```
-vwifi_host v1.0: created radio 'vwifi-lab' id=0 phy=phy0 MAC=02:03:7f:.. chardev /dev/vwifi-lab
-```
-
-(Note: just loading the module logs only `control device /dev/vwifi-ctl
-ready` — no radio is created until you ask for one, unless you loaded with
-`default_radio=1`.) If mac80211 registration fails, ensure `mac80211` is
-loaded:
-
-```bash
-sudo modprobe mac80211
-```
-
-### Frames not flowing
-
-1. Verify the hub is running and that both the relay and at least
-   one QEMU peer are connected (check the hub's stderr).
-2. Verify the relay logged `bridging`.
-3. `dmesg | grep "radio started"` to confirm mac80211 started TX.
-4. If you suspect channel filtering is dropping frames, query
-   `LIST_PEERS` on the control socket — each node's current
-   channel is learned from its most recent TX.
-5. Use monitor mode on the host to see raw frames:
-
-   ```bash
-   sudo iw dev wlan0 set type monitor
-   sudo ip link set wlan0 up
-   sudo tcpdump -i wlan0 -c 10
-   ```
-
-### Unloading
-
-```bash
-# Stop the relay first
-sudo killall vwifi-host-relay
-
-# Bring down the interface
-sudo ip link set wlan0 down
-
-# Remove the module
-sudo rmmod vwifi_host
-```
-
-## Limitations
-
-- Single radio per module load (no multi-radio yet)
-- No regulatory domain enforcement (virtual medium, no real RF)
-- The relay daemon must be running for frames to flow
-- HE (802.11ax) is advertised on 5 GHz STATION mode only; the
-  driver's TX path emits VHT rate codes for HE frames and the
-  hub's rate table covers HE80 NSS 1/2 MCS 0–11 but not HE160 /
-  HE80+80
-- `RX_INCLUDES_FCS` is set in hw flags; frames from the medium
-  should include FCS or mac80211 will complain (the QEMU device
-  appends a 4-byte FCS placeholder)
+## Where to go next
+
+| You want to | Read |
+|---|---|
+| Run the hub, drive it at runtime, bridge hosts or a real radio | [`medium/README.md`](medium/README.md) |
+| Give the host machine its own radios | [`host/README.md`](host/README.md) |
+| Build the Linux (AR9285) device | [`devices/ath9k/README.md`](devices/ath9k/README.md) |
+| Build the vwifi-virt device | [`devices/vwifi/README.md`](devices/vwifi/README.md) |
+| Write or build a guest driver | [`drivers/README.md`](drivers/README.md) |
+| Change anything on the wire | [`abi/README.md`](abi/README.md) |
+| Watch a medium in a browser | [`medium/controller/README.md`](medium/controller/README.md) |
+
+## License
+
+GPL-2.0-or-later, matching QEMU and the Linux kernel.

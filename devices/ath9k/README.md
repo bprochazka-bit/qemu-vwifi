@@ -60,10 +60,10 @@ a physics-inspired channel model.
 | `src/vwifi_ath9k_regs.h` | Register addresses and bit-field definitions from the kernel's `reg.h` |
 | `src/vwifi_ath9k_eeprom.h` | EEPROM image generator – builds a valid 4K-format EEPROM at init |
 | `src/vwifi_ath9k_dma.h` | TX/RX descriptor DMA ring definitions |
-| `src/vwifi.h` | Virtual-medium wire protocol shared with the medium hub |
+| `../../abi/vwifi.h` | Medium wire protocol, shared with the hub and every other peer. One copy, at the top of the repo; `integrate.sh` copies it into the QEMU tree |
 | `src/meson.build` | Meson build integration for QEMU's build system |
 | `src/Kconfig` | Kconfig entry for enabling the device |
-| `scripts/integrate.sh` | Shell script to copy files into a QEMU tree and patch build files |
+| `scripts/integrate.sh` | Copies sources plus the shared `abi/` headers into a QEMU tree and patches its build files. Idempotent |
 | `tests/test_probe.sh` | Three-level test script (registration → instantiation → guest boot) |
 | `Makefile` | Top-level convenience targets |
 
@@ -188,7 +188,7 @@ standalone beacon-only mode with an auto-generated MAC address.
 ```
 
 - Path to the Unix-domain stream socket exported by a medium hub
-  (`src/ath9k_medium_hub.c` or `src/ath9k_medium_hub_scalable.c`).
+  (`vwifi-medium`; see [`../../medium/README.md`](../../medium/README.md)).
 - The hub does **not** need to be running first: if the socket is
   absent or the connection drops, the device automatically retries
   every 2 seconds (`MEDIUM_RECONNECT_MS`). On each successful

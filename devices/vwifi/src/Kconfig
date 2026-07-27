@@ -1,0 +1,7 @@
+# Add to hw/net/Kconfig (or a dedicated Kconfig.vwifi alongside).
+
+config VWIFI_VIRT
+    bool
+    default y if PCI_DEVICES
+    depends on PCI
+    select MSIX
