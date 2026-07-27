@@ -177,6 +177,12 @@ endif
 # Reject typos loudly rather than silently building nothing.
 BAD_DEVICES := $(filter-out $(ALL_DEVICES),$(DEVICE_LIST))
 
+# Everything that, if changed, makes the existing build directory wrong.
+# Not just the device set: changing QEMU_CONFIGURE_FLAGS to turn features
+# on is exactly the case where silently reusing an old configure would
+# hand you a QEMU without the features you just asked for.
+QEMU_CONFIG_KEY = $(DEVICE_LIST) | $(QEMU_TARGET_LIST) | $(INSTALL_PREFIX) | $(QEMU_CONFIGURE_FLAGS)
+
 # Records which devices the build directory was configured for, so that
 # changing DEVICES between runs forces a reconfigure instead of quietly
 # producing a QEMU without the device you just asked for.
@@ -243,7 +249,7 @@ qemu-configure: qemu-integrate
 	@mkdir -p "$(QEMU_BUILD_DIR)"
 	@if [ -f "$(QEMU_BUILD_DIR)/build.ninja" ] && \
 	   [ -f "$(DEVICE_STAMP)" ] && \
-	   [ "$$(cat '$(DEVICE_STAMP)')" = "$(DEVICE_LIST)" ]; then \
+	   [ "$$(cat '$(DEVICE_STAMP)')" = "$(QEMU_CONFIG_KEY)" ]; then \
 		echo "   already configured for: $(DEVICE_LIST) – skipping"; \
 		echo "   (use 'make qemu-reconfigure' to force)"; \
 	else \
@@ -253,7 +259,7 @@ qemu-configure: qemu-integrate
 				--target-list=$(QEMU_TARGET_LIST) \
 				--prefix="$(INSTALL_PREFIX)" \
 				$(QEMU_CONFIGURE_FLAGS) || exit 1; \
-		echo "$(DEVICE_LIST)" > "$(DEVICE_STAMP)"; \
+		echo "$(QEMU_CONFIG_KEY)" > "$(DEVICE_STAMP)"; \
 	fi
 
 qemu-reconfigure: check-qemu-src

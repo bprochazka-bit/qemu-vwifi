@@ -146,9 +146,17 @@ make qemu QEMU_SRC=/path/to/qemu DEVICES=vwifi  # vwifi-virt only
 
 That runs integrate → configure → build. Integration is idempotent, and
 the configure step is skipped when the build directory is already set up
-for the same device set — changing `DEVICES` forces a reconfigure by
-itself, so you never get a binary quietly missing the device you just
-asked for.
+the same way. "The same way" covers `DEVICES`, `QEMU_TARGET_LIST`,
+`INSTALL_PREFIX` and `QEMU_CONFIGURE_FLAGS` — change any of them and it
+reconfigures by itself, so you never get a binary quietly missing the
+device or the feature you just asked for.
+
+To turn QEMU features on, pass them through:
+
+```bash
+make qemu QEMU_SRC=/path/to/qemu \
+  QEMU_CONFIGURE_FLAGS="--enable-debug --enable-modules --enable-slirp"
+```
 
 Then install it:
 
