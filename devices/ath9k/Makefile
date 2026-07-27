@@ -21,15 +21,16 @@
 # ---- Configuration ------------------------------------------------
 
 QEMU_SRC       ?=
+QEMU_ARCH      ?= x86_64
 QEMU_BUILD_DIR  = $(QEMU_SRC)/build
-QEMU_BINARY     = $(QEMU_BUILD_DIR)/qemu-system-x86_64
+QEMU_BINARY     = $(QEMU_BUILD_DIR)/qemu-system-$(QEMU_ARCH)
 GUEST_IMAGE    ?=
 NPROC          := $(shell nproc 2>/dev/null || echo 4)
 
 # Where the built QEMU binary gets installed.  Overridable, e.g.
 #   make install QEMU_SRC=/path/to/qemu INSTALL_PREFIX=$HOME/.local
 INSTALL_PREFIX ?= /usr/local
-INSTALLED_BINARY = $(INSTALL_PREFIX)/bin/qemu-system-x86_64
+INSTALLED_BINARY = $(INSTALL_PREFIX)/bin/qemu-system-$(QEMU_ARCH)
 
 # ---- Validation ---------------------------------------------------
 
@@ -79,7 +80,7 @@ configure: check-qemu-src
 	mkdir -p "$(QEMU_BUILD_DIR)"
 	cd "$(QEMU_BUILD_DIR)" && \
 		"$(QEMU_SRC)/configure" \
-			--target-list=x86_64-softmmu \
+			--target-list=$(QEMU_ARCH)-softmmu \
 			--prefix="$(INSTALL_PREFIX)" \
 			--enable-debug
 
@@ -94,9 +95,9 @@ test: check-qemu-src
 	@test -x "$(QEMU_BINARY)" || \
 		{ echo "ERROR: $(QEMU_BINARY) not found. Run 'make build' first."; exit 1; }
 ifdef GUEST_IMAGE
-	./tests/build/test_probe.sh "$(QEMU_BINARY)" "$(GUEST_IMAGE)"
+	./tests/test_probe.sh "$(QEMU_BINARY)" "$(GUEST_IMAGE)"
 else
-	./tests/build/test_probe.sh "$(QEMU_BINARY)"
+	./tests/test_probe.sh "$(QEMU_BINARY)"
 endif
 
 install: check-qemu-src

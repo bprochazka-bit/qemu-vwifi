@@ -7,14 +7,11 @@
 #   devices/  QEMU device models                       -> built inside a QEMU tree
 #   drivers/  guest drivers                            -> built with each OS's SDK
 #
-# This Makefile builds everything a plain host toolchain can build. The
-# QEMU devices need a QEMU source tree and the guest drivers need their
-# own SDKs, so they have their own entry points:
+# This Makefile builds everything a plain host toolchain can build, and
+# drives a QEMU source tree to build the device models. The guest drivers
+# need their own SDKs and are not built from here.
 #
-#   make -C devices/ath9k integrate QEMU_SRC=/path/to/qemu
-#   make -C devices/vwifi integrate QEMU_SRC=/path/to/qemu
-#
-# Targets:
+# Host-side targets:
 #   make                     — userspace binaries (no kernel headers needed)
 #   make module              — host kernel module against the running kernel
 #   make module KDIR=/path   — ... against a specific kernel source tree
@@ -25,7 +22,21 @@
 #   make uninstall-userspace — remove them again
 #   make test                — every test suite that runs on the host
 #   make legacy              — build the superseded ath9k_medium hubs
-#   make clean               — remove all build artifacts
+#   make clean               — remove host-side build artifacts
+#
+# QEMU targets (all need QEMU_SRC=/path/to/qemu):
+#   make qemu                — integrate + configure + build, both devices
+#   make qemu DEVICES=ath9k  — ... with only vwifi-ath9k
+#   make qemu DEVICES=vwifi  — ... with only vwifi-virt
+#   make qemu-install        — install the built QEMU, but NOT over an
+#                              existing install (see "install vs upgrade")
+#   make qemu-upgrade        — install, overwriting an existing install
+#   make qemu-test           — run the ath9k probe tests against the build
+#   make qemu-reconfigure    — force a fresh configure
+#   make qemu-clean          — clean the QEMU build directory
+#   make qemu-help           — the same list, with the variables
+#
+# See "QEMU device builds" below for the full variable list.
 
 TOPDIR := $(CURDIR)
 BUILD  ?= $(TOPDIR)/build
@@ -111,6 +122,194 @@ install-userspace: $(USERSPACE_BINS)
 
 uninstall-userspace:
 	rm -f $(addprefix $(DESTDIR)$(BINDIR)/,$(notdir $(USERSPACE_BINS)))
+
+# ---------- QEMU device builds ----------
+#
+# Both devices go into ONE QEMU tree and ONE build directory: a single
+# qemu-system binary that carries whichever devices you asked for. They
+# do not conflict — each lands in its own hw/net/<device>/ subdirectory
+# with its own Kconfig symbol, and both can be present at once. Pick per
+# VM at runtime with -device vwifi-ath9k or -device vwifi-virt.
+#
+# Variables:
+#   QEMU_SRC              path to a QEMU source tree (required)
+#   DEVICES               all (default) | ath9k | vwifi | "ath9k vwifi"
+#   QEMU_ARCH             guest architecture (default x86_64)
+#   QEMU_TARGET_LIST      meson target list (default $(QEMU_ARCH)-softmmu)
+#   QEMU_CONFIGURE_FLAGS  extra configure flags (default --enable-debug)
+#   INSTALL_PREFIX        install prefix (default /usr/local)
+#   GUEST_IMAGE           qcow2 for the level-3 probe test (optional)
+#
+# install vs upgrade
+# ------------------
+# `qemu-install` refuses to overwrite an existing qemu-system binary at
+# the install prefix and says so. `qemu-upgrade` overwrites it. The
+# distinction matters because the default prefix is /usr/local, where a
+# distro or an earlier build may already have put a QEMU that other
+# things on the machine depend on — clobbering it as a side effect of a
+# build would be a nasty surprise. So installing over one is opt-in, and
+# `qemu-upgrade` is how you opt in. The per-device Makefiles have had
+# the same pair for the same reason; this is that behaviour, hoisted to
+# cover a build carrying both devices.
+
+QEMU_SRC             ?=
+DEVICES              ?= all
+QEMU_ARCH            ?= x86_64
+QEMU_TARGET_LIST     ?= $(QEMU_ARCH)-softmmu
+QEMU_CONFIGURE_FLAGS ?= --enable-debug
+INSTALL_PREFIX       ?= /usr/local
+GUEST_IMAGE          ?=
+NPROC                := $(shell nproc 2>/dev/null || echo 4)
+
+QEMU_BUILD_DIR    = $(QEMU_SRC)/build
+QEMU_BINARY       = $(QEMU_BUILD_DIR)/qemu-system-$(QEMU_ARCH)
+INSTALLED_BINARY  = $(INSTALL_PREFIX)/bin/qemu-system-$(QEMU_ARCH)
+
+ALL_DEVICES := ath9k vwifi
+comma       := ,
+ifeq ($(strip $(DEVICES)),all)
+DEVICE_LIST := $(ALL_DEVICES)
+else
+# Accept both DEVICES="ath9k vwifi" and DEVICES=ath9k,vwifi.
+DEVICE_LIST := $(strip $(subst $(comma), ,$(DEVICES)))
+endif
+
+# Reject typos loudly rather than silently building nothing.
+BAD_DEVICES := $(filter-out $(ALL_DEVICES),$(DEVICE_LIST))
+
+# Records which devices the build directory was configured for, so that
+# changing DEVICES between runs forces a reconfigure instead of quietly
+# producing a QEMU without the device you just asked for.
+DEVICE_STAMP = $(QEMU_BUILD_DIR)/.vwifi-devices
+
+.PHONY: qemu-help
+qemu-help:
+	@echo ""
+	@echo "QEMU device builds — all targets need QEMU_SRC=/path/to/qemu"
+	@echo "==========================================================="
+	@echo ""
+	@echo "  qemu               integrate + configure + build"
+	@echo "  qemu-integrate     copy device sources into the QEMU tree"
+	@echo "  qemu-configure     configure the QEMU build directory"
+	@echo "  qemu-reconfigure   force a fresh configure"
+	@echo "  qemu-build         build QEMU"
+	@echo "  qemu-install       install, but NOT over an existing install"
+	@echo "  qemu-upgrade       install, overwriting an existing install"
+	@echo "  qemu-test          run the ath9k probe tests against the build"
+	@echo "  qemu-clean         clean the QEMU build directory"
+	@echo ""
+	@echo "  DEVICES=all        both devices (default)"
+	@echo "  DEVICES=ath9k      vwifi-ath9k only  (AR9285, stock Linux driver)"
+	@echo "  DEVICES=vwifi      vwifi-virt only   (Windows guests)"
+	@echo '  DEVICES="ath9k vwifi"  explicit list'
+	@echo ""
+	@echo "  QEMU_ARCH=x86_64            guest architecture"
+	@echo "  QEMU_TARGET_LIST=...        meson target list"
+	@echo "  QEMU_CONFIGURE_FLAGS=...    extra configure flags"
+	@echo "  INSTALL_PREFIX=/usr/local   install prefix"
+	@echo "  GUEST_IMAGE=/path/to.qcow2  for the level-3 probe test"
+	@echo ""
+	@echo "Currently selected: DEVICES=$(DEVICE_LIST)"
+	@echo ""
+
+.PHONY: check-qemu-src
+check-qemu-src:
+ifndef QEMU_SRC
+	$(error QEMU_SRC is not set. Usage: make <target> QEMU_SRC=/path/to/qemu)
+endif
+	@test -f "$(QEMU_SRC)/meson.build" || \
+		{ echo "ERROR: $(QEMU_SRC)/meson.build not found."; \
+		  echo "       Is $(QEMU_SRC) a QEMU source tree?"; exit 1; }
+ifneq ($(BAD_DEVICES),)
+	$(error Unknown device(s) in DEVICES: $(BAD_DEVICES). Valid: $(ALL_DEVICES) all)
+endif
+
+.PHONY: qemu qemu-integrate qemu-configure qemu-reconfigure qemu-build
+.PHONY: qemu-install qemu-upgrade qemu-test qemu-clean
+
+qemu: qemu-build
+
+qemu-integrate: check-qemu-src
+	@echo "=== Integrating device(s) into QEMU: $(DEVICE_LIST) ==="
+	@for d in $(DEVICE_LIST); do \
+		$(MAKE) --no-print-directory -C devices/$$d integrate \
+			QEMU_SRC="$(QEMU_SRC)" || exit 1; \
+	done
+
+# Skips the (slow) configure when the build directory is already set up
+# for exactly this device set. Changing DEVICES invalidates it.
+qemu-configure: qemu-integrate
+	@echo "=== Configuring QEMU build ==="
+	@mkdir -p "$(QEMU_BUILD_DIR)"
+	@if [ -f "$(QEMU_BUILD_DIR)/build.ninja" ] && \
+	   [ -f "$(DEVICE_STAMP)" ] && \
+	   [ "$$(cat '$(DEVICE_STAMP)')" = "$(DEVICE_LIST)" ]; then \
+		echo "   already configured for: $(DEVICE_LIST) – skipping"; \
+		echo "   (use 'make qemu-reconfigure' to force)"; \
+	else \
+		echo "   configuring for: $(DEVICE_LIST)"; \
+		cd "$(QEMU_BUILD_DIR)" && \
+			"$(QEMU_SRC)/configure" \
+				--target-list=$(QEMU_TARGET_LIST) \
+				--prefix="$(INSTALL_PREFIX)" \
+				$(QEMU_CONFIGURE_FLAGS) || exit 1; \
+		echo "$(DEVICE_LIST)" > "$(DEVICE_STAMP)"; \
+	fi
+
+qemu-reconfigure: check-qemu-src
+	@rm -f "$(DEVICE_STAMP)"
+	@$(MAKE) --no-print-directory qemu-configure
+
+qemu-build: qemu-configure
+	@echo "=== Building QEMU with: $(DEVICE_LIST) ==="
+	$(MAKE) -C "$(QEMU_BUILD_DIR)" -j$(NPROC)
+	@echo ""
+	@echo "   Built $(QEMU_BINARY)"
+	@echo "   Devices available: $(foreach d,$(DEVICE_LIST),$(if $(filter ath9k,$(d)),vwifi-ath9k,vwifi-virt))"
+	@echo ""
+
+# Deliberately non-destructive — see "install vs upgrade" above.
+qemu-install: check-qemu-src
+	@echo "=== Installing QEMU ==="
+	@if [ -x "$(INSTALLED_BINARY)" ]; then \
+		echo "   $(INSTALLED_BINARY) already exists – skipping install"; \
+		echo "   Run 'make qemu-upgrade' to overwrite it."; \
+	else \
+		test -x "$(QEMU_BINARY)" || \
+			{ echo "ERROR: $(QEMU_BINARY) not found. Run 'make qemu' first."; exit 1; }; \
+		echo "   Installing into $(INSTALL_PREFIX) ..."; \
+		$(MAKE) -C "$(QEMU_BUILD_DIR)" install; \
+		echo "   Installed $(INSTALLED_BINARY)"; \
+	fi
+
+qemu-upgrade: check-qemu-src
+	@echo "=== Upgrading QEMU install ==="
+	@test -x "$(QEMU_BINARY)" || \
+		{ echo "ERROR: $(QEMU_BINARY) not found. Run 'make qemu' first."; exit 1; }
+	@echo "   Reinstalling into $(INSTALL_PREFIX) (overwriting existing) ..."
+	$(MAKE) -C "$(QEMU_BUILD_DIR)" install
+	@echo "   Installed $(INSTALLED_BINARY)"
+
+# The probe suite belongs to the ath9k device: it boots a guest and checks
+# the stock Linux ath9k driver binds. vwifi-virt has no equivalent, because
+# its guest driver is the part that still needs hardware in the loop; its
+# device logic is covered by 'make test-devices' instead.
+qemu-test: check-qemu-src
+	@test -x "$(QEMU_BINARY)" || \
+		{ echo "ERROR: $(QEMU_BINARY) not found. Run 'make qemu' first."; exit 1; }
+ifeq ($(filter ath9k,$(DEVICE_LIST)),)
+	@echo "   DEVICES=$(DEVICE_LIST) does not include ath9k – nothing to run."
+	@echo "   The guest probe suite is ath9k-only; see 'make test-devices'."
+else
+	$(MAKE) -C devices/ath9k test QEMU_SRC="$(QEMU_SRC)" \
+		GUEST_IMAGE="$(GUEST_IMAGE)"
+endif
+
+qemu-clean: check-qemu-src
+	@echo "=== Cleaning QEMU build ==="
+	@rm -f "$(DEVICE_STAMP)"
+	@test -d "$(QEMU_BUILD_DIR)" && \
+		$(MAKE) -C "$(QEMU_BUILD_DIR)" clean || true
 
 # ---------- Tests ----------
 #

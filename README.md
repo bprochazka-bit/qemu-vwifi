@@ -131,13 +131,47 @@ sudo ./build/vwifi-host-relay /tmp/vwifi.sock /dev/vwifi-lab
 monitor mode, mesh and ad-hoc all work on it, and everything it
 transmits reaches every VM on the medium.
 
-To put a guest on the medium, build QEMU with one of the devices and
-point it at the same socket:
+## Building QEMU with the devices
+
+Both devices go into **one** QEMU tree and **one** binary. They do not
+conflict — each lands in its own `hw/net/<device>/` with its own Kconfig
+symbol — so a single `qemu-system` can carry both, and you pick per VM
+at runtime with `-device`.
 
 ```bash
-make -C devices/ath9k integrate build QEMU_SRC=/path/to/qemu   # Linux guests
-make -C devices/vwifi integrate build QEMU_SRC=/path/to/qemu   # Windows guests
+make qemu QEMU_SRC=/path/to/qemu                # both devices (default)
+make qemu QEMU_SRC=/path/to/qemu DEVICES=ath9k  # vwifi-ath9k only
+make qemu QEMU_SRC=/path/to/qemu DEVICES=vwifi  # vwifi-virt only
+```
 
+That runs integrate → configure → build. Integration is idempotent, and
+the configure step is skipped when the build directory is already set up
+for the same device set — changing `DEVICES` forces a reconfigure by
+itself, so you never get a binary quietly missing the device you just
+asked for.
+
+Then install it:
+
+```bash
+sudo make qemu-install QEMU_SRC=/path/to/qemu   # will NOT overwrite an
+                                                # existing install
+sudo make qemu-upgrade QEMU_SRC=/path/to/qemu   # overwrites it
+```
+
+**`install` vs `upgrade`** is a deliberate pair, not a redundancy. The
+default prefix is `/usr/local`, where a distro package or an earlier
+build may already have put a `qemu-system` binary that other things on
+the machine depend on. `qemu-install` refuses to overwrite one and tells
+you so; `qemu-upgrade` is how you opt in. Nothing clobbers an existing
+QEMU as a side effect of a build.
+
+`make qemu-help` lists every target and variable — `QEMU_ARCH`,
+`QEMU_TARGET_LIST`, `QEMU_CONFIGURE_FLAGS`, `INSTALL_PREFIX`,
+`GUEST_IMAGE`.
+
+Now put a guest on the medium:
+
+```bash
 qemu-system-x86_64 -machine q35 -m 2048 -drive file=vm.qcow2,format=qcow2 \
   -chardev socket,id=medium,path=/tmp/vwifi.sock,server=off \
   -device vwifi-ath9k,chardev=medium,node_id=linux-vm

@@ -74,7 +74,10 @@ fi
 
 # ---- Step 4: Patch hw/net/Kconfig ----
 NET_KCONFIG="${QEMU_DIR}/hw/net/Kconfig"
-if grep -q "VWIFI_VIRT" "${NET_KCONFIG}" 2>/dev/null; then
+# Match the line we actually append, not the Kconfig symbol name: the
+# appended line names the lowercase path, so a symbol-name grep never
+# matches and the entry is duplicated on every run.
+if grep -qx "source vwifi-virt/Kconfig" "${NET_KCONFIG}" 2>/dev/null; then
     echo "   hw/net/Kconfig already has VWIFI_VIRT entry – skipping"
 else
     echo "" >> "${NET_KCONFIG}"

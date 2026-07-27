@@ -14,10 +14,12 @@
 #   make build     QEMU_SRC=/path/to/qemu
 
 QEMU_SRC       ?=
+QEMU_ARCH      ?= x86_64
 QEMU_BUILD_DIR  = $(QEMU_SRC)/build
-QEMU_BINARY     = $(QEMU_BUILD_DIR)/qemu-system-x86_64
+QEMU_BINARY     = $(QEMU_BUILD_DIR)/qemu-system-$(QEMU_ARCH)
 NPROC          := $(shell nproc 2>/dev/null || echo 4)
 INSTALL_PREFIX ?= /usr/local
+INSTALLED_BINARY = $(INSTALL_PREFIX)/bin/qemu-system-$(QEMU_ARCH)
 
 .PHONY: help
 help:
@@ -30,6 +32,8 @@ help:
 	@echo "  integrate  Copy sources into a QEMU tree and patch its build files"
 	@echo "  configure  Run QEMU's configure step"
 	@echo "  build      Build QEMU with the device"
+	@echo "  install    Install the built QEMU, but not over an existing install"
+	@echo "  upgrade    Install, overwriting an existing install"
 	@echo "  clean      Remove test binaries"
 	@echo ""
 	@echo "Required for integrate/configure/build:"
@@ -57,7 +61,7 @@ test:
 
 # ---- QEMU integration ---------------------------------------------
 
-.PHONY: integrate configure build clean
+.PHONY: integrate configure build install upgrade clean
 integrate: check-qemu-src
 	@echo "=== Integrating vwifi-virt sources into QEMU ==="
 	./scripts/integrate.sh "$(QEMU_SRC)"
@@ -67,7 +71,7 @@ configure: check-qemu-src
 	mkdir -p "$(QEMU_BUILD_DIR)"
 	cd "$(QEMU_BUILD_DIR)" && \
 		"$(QEMU_SRC)/configure" \
-			--target-list=x86_64-softmmu \
+			--target-list=$(QEMU_ARCH)-softmmu \
 			--prefix="$(INSTALL_PREFIX)" \
 			--enable-debug
 
@@ -76,6 +80,32 @@ build: check-qemu-src
 	@test -d "$(QEMU_BUILD_DIR)" || \
 		{ echo "ERROR: Build directory not found. Run 'make configure' first."; exit 1; }
 	$(MAKE) -C "$(QEMU_BUILD_DIR)" -j$(NPROC)
+
+# install refuses to overwrite an existing qemu-system binary; upgrade
+# is how you opt in to overwriting one. The default prefix is
+# /usr/local, where a distro or an earlier build may already have put a
+# QEMU that other things depend on, so clobbering it is never a silent
+# side effect of a build.
+install: check-qemu-src
+	@echo "=== Installing QEMU ==="
+	@if [ -x "$(INSTALLED_BINARY)" ]; then \
+		echo "   $(INSTALLED_BINARY) already exists - skipping install"; \
+		echo "   Run 'make upgrade' to overwrite it."; \
+	else \
+		test -x "$(QEMU_BINARY)" || \
+			{ echo "ERROR: $(QEMU_BINARY) not found. Run 'make build' first."; exit 1; }; \
+		echo "   Installing into $(INSTALL_PREFIX) ..."; \
+		$(MAKE) -C "$(QEMU_BUILD_DIR)" install; \
+		echo "   Installed $(INSTALLED_BINARY)"; \
+	fi
+
+upgrade: check-qemu-src
+	@echo "=== Upgrading QEMU install ==="
+	@test -x "$(QEMU_BINARY)" || \
+		{ echo "ERROR: $(QEMU_BINARY) not found. Run 'make build' first."; exit 1; }
+	@echo "   Reinstalling into $(INSTALL_PREFIX) (overwriting existing) ..."
+	$(MAKE) -C "$(QEMU_BUILD_DIR)" install
+	@echo "   Installed $(INSTALLED_BINARY)"
 
 clean:
 	rm -rf tests/build

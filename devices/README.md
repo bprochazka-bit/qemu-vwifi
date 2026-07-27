@@ -28,10 +28,27 @@ has an `integrate.sh` that copies its sources plus the shared `abi/`
 headers into `hw/net/<device>/` inside a QEMU source tree and patches
 that tree's `meson.build` and `Kconfig`. Both scripts are idempotent.
 
+Drive it from the repository root, which handles one device or both in a
+single QEMU build:
+
 ```bash
-make -C devices/ath9k integrate configure build QEMU_SRC=/path/to/qemu
-make -C devices/vwifi integrate configure build QEMU_SRC=/path/to/qemu
+make qemu QEMU_SRC=/path/to/qemu                # both
+make qemu QEMU_SRC=/path/to/qemu DEVICES=ath9k  # one
+make qemu-help                                  # every target and variable
 ```
+
+They share one build directory and one output binary — each device has
+its own subdirectory and its own Kconfig symbol, so they never collide,
+and you choose per VM at runtime with `-device`.
+
+`make qemu-install` will not overwrite an existing QEMU at the install
+prefix; `make qemu-upgrade` will. That pair exists because the default
+prefix is `/usr/local`, where something else may already have installed
+a `qemu-system` binary other things depend on.
+
+Each device Makefile also still works on its own
+(`make -C devices/ath9k integrate build QEMU_SRC=...`), with the same
+`install`/`upgrade` semantics, if you want to drive one in isolation.
 
 The copies inside the QEMU tree are outputs, not sources. Edit here,
 re-run `integrate`.
