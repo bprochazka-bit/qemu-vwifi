@@ -33,6 +33,7 @@
 #include "hw/core/qdev-properties-system.h"
 #include "chardev/char-fe.h"
 #include "migration/vmstate.h"
+#include "net/net.h"        /* MACAddr, as DEFINE_PROP_MACADDR requires */
 
 #include "vwifi_abi.h"
 #include "vwifi_device.h"
@@ -46,10 +47,15 @@ struct VWifiState {
     PCIDevice     parent_obj;
 
     MemoryRegion  mmio;
-    CharBackend   chr;
+    /* CharBackend up to QEMU 10.1; renamed CharFrontend in 10.2, which
+     * is the name that matches what this side of the chardev actually
+     * is. Every qemu_chr_fe_* call below takes one of these. */
+    CharFrontend  chr;
     char         *node_id;
     bool          verbose;
-    uint8_t       default_mac[6];
+    /* MACAddr, not a bare uint8_t[6]: DEFINE_PROP_MACADDR type-checks
+     * the field against MACAddr and will not compile against an array. */
+    MACAddr       default_mac;
 
     /* One-shot timer backing the device's scan dwell progression. */
     QEMUTimer    *scan_timer;
@@ -103,8 +109,13 @@ static int qemu_be_medium_send(void *be, const void *buf, size_t len)
     return 0;
 }
 
-static void qemu_be_log(void *be, const struct vwifi_dev *dev,
-                        enum vwifi_log_level level, const char *fmt, va_list ap)
+/* G_GNUC_PRINTF(4, 0): fmt is the 4th argument and the varargs arrive as
+ * a va_list, which is what the trailing 0 means. QEMU builds with
+ * -Werror and -Wsuggest-attribute=format, so a function that forwards a
+ * format string to vsnprintf without this annotation fails the build. */
+static void G_GNUC_PRINTF(4, 0)
+qemu_be_log(void *be, const struct vwifi_dev *dev,
+            enum vwifi_log_level level, const char *fmt, va_list ap)
 {
     VWifiState *s = be;
     (void)dev;
@@ -237,14 +248,14 @@ static void vwifi_realize(PCIDevice *pdev, Error **errp)
     Error *local_err = NULL;
 
     /* Default MAC derivation. */
-    if ((s->default_mac[0] | s->default_mac[1] | s->default_mac[2] |
-         s->default_mac[3] | s->default_mac[4] | s->default_mac[5]) == 0) {
-        s->default_mac[0] = 0x00;
-        s->default_mac[1] = 0x03;
-        s->default_mac[2] = 0x7F;
-        s->default_mac[3] = 0xCC;
-        s->default_mac[4] = 0xDD;
-        s->default_mac[5] = 0x10 + (PCI_FUNC(pdev->devfn) & 0xF);
+    if ((s->default_mac.a[0] | s->default_mac.a[1] | s->default_mac.a[2] |
+         s->default_mac.a[3] | s->default_mac.a[4] | s->default_mac.a[5]) == 0) {
+        s->default_mac.a[0] = 0x00;
+        s->default_mac.a[1] = 0x03;
+        s->default_mac.a[2] = 0x7F;
+        s->default_mac.a[3] = 0xCC;
+        s->default_mac.a[4] = 0xDD;
+        s->default_mac.a[5] = 0x10 + (PCI_FUNC(pdev->devfn) & 0xF);
     }
 
     pci_config_set_interrupt_pin(config, 1);
@@ -267,7 +278,7 @@ static void vwifi_realize(PCIDevice *pdev, Error **errp)
 
     s->dev = g_malloc0(vwifi_dev_sizeof());
     vwifi_dev_init(s->dev, &qemu_backend_ops, s,
-                   s->node_id, s->verbose, s->default_mac);
+                   s->node_id, s->verbose, s->default_mac.a);
     if (qemu_chr_fe_backend_connected(&s->chr)) {
         vwifi_medium_link_event(s->dev, true);
     }
@@ -340,7 +351,10 @@ static const TypeInfo vwifi_info = {
     .parent        = TYPE_PCI_DEVICE,
     .instance_size = sizeof(VWifiState),
     .class_init    = vwifi_class_init,
-    .interfaces    = (const InterfaceInfo[]) {
+    /* Left non-const deliberately: it converts to a const-qualified
+     * field if TypeInfo has one, and still compiles if it does not.
+     * The reverse is not true. Same form as the ath9k device. */
+    .interfaces    = (InterfaceInfo[]) {
         { INTERFACE_CONVENTIONAL_PCI_DEVICE },
         { },
     },

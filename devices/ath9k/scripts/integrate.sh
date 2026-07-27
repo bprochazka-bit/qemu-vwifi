@@ -43,6 +43,25 @@ fi
 
 echo "=== Integrating vwifi-ath9k into QEMU tree at ${QEMU_DIR} ==="
 
+# An older version of this script installed the device as hw/net/ath9k/
+# rather than hw/net/vwifi-ath9k/. A tree that saw both ends up building
+# two copies of the same device model, which at best wastes a compile and
+# at worst aborts QEMU at startup with a duplicate QOM type registration.
+# Warn rather than delete: this is the user's QEMU tree, not ours.
+LEGACY_DIR="${QEMU_DIR}/hw/net/ath9k"
+if [ -d "${LEGACY_DIR}" ]; then
+    echo ""
+    echo "   WARNING: a stale ${LEGACY_DIR} exists."
+    echo "   It is from an older integrate.sh that used the 'ath9k' name."
+    echo "   It is still being compiled and may collide with this device."
+    echo "   Remove it and its build-file entries:"
+    echo "       rm -rf ${LEGACY_DIR}"
+    echo "       # then drop the ath9k lines from:"
+    echo "       #   ${QEMU_DIR}/hw/net/meson.build"
+    echo "       #   ${QEMU_DIR}/hw/net/Kconfig"
+    echo ""
+fi
+
 # ---- Step 1: Create target directory and copy sources ----
 TARGET_DIR="${QEMU_DIR}/hw/net/vwifi-ath9k"
 mkdir -p "${TARGET_DIR}"
