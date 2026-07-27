@@ -43,23 +43,57 @@ fi
 
 echo "=== Integrating vwifi-ath9k into QEMU tree at ${QEMU_DIR} ==="
 
+# ---- Step 0: Deal with the legacy 'ath9k' integration ----
+#
 # An older version of this script installed the device as hw/net/ath9k/
-# rather than hw/net/vwifi-ath9k/. A tree that saw both ends up building
-# two copies of the same device model, which at best wastes a compile and
-# at worst aborts QEMU at startup with a duplicate QOM type registration.
-# Warn rather than delete: this is the user's QEMU tree, not ours.
+# rather than hw/net/vwifi-ath9k/, and added matching entries to the
+# tree's meson.build and Kconfig. Two states need handling:
+#
+#   directory present  -> two copies of the same device model get built.
+#                         Warn; deleting a populated directory out of
+#                         someone's QEMU tree is not ours to decide.
+#
+#   directory absent,
+#   entries present    -> the tree does not configure AT ALL: minikconf
+#                         dies on `source ath9k/Kconfig` with a
+#                         FileNotFoundError before reaching any device.
+#                         Here the entries are unambiguously dangling, so
+#                         remove them. This is the state a tree lands in
+#                         when someone deletes the directory on its own.
 LEGACY_DIR="${QEMU_DIR}/hw/net/ath9k"
+NET_MESON="${QEMU_DIR}/hw/net/meson.build"
+NET_KCONFIG="${QEMU_DIR}/hw/net/Kconfig"
+
 if [ -d "${LEGACY_DIR}" ]; then
     echo ""
     echo "   WARNING: a stale ${LEGACY_DIR} exists."
     echo "   It is from an older integrate.sh that used the 'ath9k' name."
     echo "   It is still being compiled and may collide with this device."
-    echo "   Remove it and its build-file entries:"
+    echo "   To remove it:"
     echo "       rm -rf ${LEGACY_DIR}"
-    echo "       # then drop the ath9k lines from:"
-    echo "       #   ${QEMU_DIR}/hw/net/meson.build"
-    echo "       #   ${QEMU_DIR}/hw/net/Kconfig"
+    echo "   then re-run this script and it will clean up the leftover"
+    echo "   meson.build and Kconfig entries for you."
     echo ""
+else
+    # Directory is gone. Any remaining reference to it is dangling and
+    # breaks the build, so drop it.
+    # Write back through the original file rather than mv'ing a new one
+    # over it, so the tree's permissions and ownership are preserved.
+    if grep -qx "source ath9k/Kconfig" "${NET_KCONFIG}" 2>/dev/null; then
+        grep -vx "source ath9k/Kconfig" "${NET_KCONFIG}" > "${NET_KCONFIG}.tmp"
+        cat "${NET_KCONFIG}.tmp" > "${NET_KCONFIG}"
+        rm -f "${NET_KCONFIG}.tmp"
+        echo "   Removed dangling 'source ath9k/Kconfig' from ${NET_KCONFIG}"
+    fi
+    if grep -qx "subdir('ath9k')" "${NET_MESON}" 2>/dev/null; then
+        # Drop the comment the old script wrote above it too. -x means
+        # this cannot match the vwifi-ath9k comment, which differs.
+        grep -vx "subdir('ath9k')" "${NET_MESON}" \
+            | grep -vx "# Virtual Atheros AR9285 (ath9k)" > "${NET_MESON}.tmp"
+        cat "${NET_MESON}.tmp" > "${NET_MESON}"
+        rm -f "${NET_MESON}.tmp"
+        echo "   Removed dangling \"subdir('ath9k')\" from ${NET_MESON}"
+    fi
 fi
 
 # ---- Step 1: Create target directory and copy sources ----
