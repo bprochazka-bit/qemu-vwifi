@@ -45,6 +45,14 @@ tests/
 
 ## Building it into QEMU
 
+Requires **QEMU 10.x**, same as the ath9k device. Several things the
+backend touches changed incompatibly in QEMU 10.0: `qdev-properties*.h`
+moved under `hw/core/`, `class_init` callbacks take a `const void *`,
+`Property` arrays became const and lost their `DEFINE_PROP_END_OF_LIST`
+terminator, `DeviceClass::reset` was replaced by
+`device_class_set_legacy_reset()`, and `sysemu/dma.h` became
+`system/dma.h`.
+
 ```bash
 make integrate configure build QEMU_SRC=/path/to/qemu
 ```

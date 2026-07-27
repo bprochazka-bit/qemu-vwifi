@@ -1,7 +1,22 @@
-# Add to hw/net/Kconfig (or a dedicated Kconfig.vwifi alongside).
+# vwifi-virt PCI device emulation
+#
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# Sourced from hw/net/Kconfig by scripts/integrate.sh.
+#
+# MSI_NONBROKEN, not MSIX: QEMU has no Kconfig symbol for MSI-X. The
+# MSI-X core (hw/pci/msix.c) is built unconditionally as part of the PCI
+# core, so there is nothing to select. MSI_NONBROKEN is what a device
+# that *requires* working MSI/MSI-X depends on -- it is selected by
+# interrupt controllers whose MSI implementation is good, so this device
+# is simply not built for machines where MSI is broken. That matters
+# here because vwifi_qemu.c calls msix_init_exclusive_bar() and fails
+# realize() if it does not succeed; there is no INTx fallback path.
+#
+# Same shape as hw/net's ROCKER, which is likewise a conventional PCI
+# device requiring MSI.
 
 config VWIFI_VIRT
     bool
     default y if PCI_DEVICES
-    depends on PCI
-    select MSIX
+    depends on PCI && MSI_NONBROKEN

@@ -70,7 +70,9 @@ a physics-inspired channel model.
 ## Prerequisites
 
 - **QEMU source tree**: Git clone of `https://github.com/qemu/qemu.git`.
-  Tested with QEMU 8.x and 9.x.  Any version with Meson build should work.
+  **QEMU 10.x.**  The device uses the post-10.0 QOM idioms (class_init
+  takes a `const void *`), so it does not build against 8.x or 9.x
+  unmodified.
 
 - **Build dependencies** (for QEMU itself):
   ```

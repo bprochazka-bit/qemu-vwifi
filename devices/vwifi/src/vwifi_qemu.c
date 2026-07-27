@@ -9,19 +9,30 @@
  * that adapts QEMU's DMA/IRQ/logging APIs to the portable device.
  */
 
+/*
+ * Targets QEMU 10.x, like the vwifi-ath9k device alongside it. Several
+ * of the includes and idioms below changed in QEMU 10.0 and are not
+ * backward compatible: qdev-properties*.h moved under hw/core/,
+ * class_init callbacks take a const void *, Property arrays are const
+ * and unterminated, and DeviceClass::reset is gone.
+ */
 #include "qemu/osdep.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "qemu/error-report.h"
 #include "qemu/main-loop.h"
+#include "qemu/timer.h"
 #include "qapi/error.h"
 #include "hw/pci/pci.h"
+/* pci_dma_read/write live here, not in the DMA header -- which is also
+ * why we do not include that header at all: it moved from sysemu/dma.h
+ * to system/dma.h in QEMU 10.0, and pci_device.h spans the rename. */
+#include "hw/pci/pci_device.h"
 #include "hw/pci/msix.h"
-#include "hw/qdev-properties.h"
-#include "hw/qdev-properties-system.h"
+#include "hw/core/qdev-properties.h"
+#include "hw/core/qdev-properties-system.h"
 #include "chardev/char-fe.h"
 #include "migration/vmstate.h"
-#include "sysemu/dma.h"
 
 #include "vwifi_abi.h"
 #include "vwifi_device.h"
@@ -209,12 +220,14 @@ static void vwifi_chr_event(void *opaque, QEMUChrEvent ev)
  * PCI lifecycle
  * ============================================================ */
 
-static Property vwifi_properties[] = {
+/* const, and no DEFINE_PROP_END_OF_LIST: QEMU 10.0 removed the
+ * terminator and device_class_set_props() now takes the array length
+ * from ARRAY_SIZE(). */
+static const Property vwifi_properties[] = {
     DEFINE_PROP_CHR("chardev", VWifiState, chr),
     DEFINE_PROP_STRING("node_id", VWifiState, node_id),
     DEFINE_PROP_BOOL("verbose", VWifiState, verbose, false),
     DEFINE_PROP_MACADDR("mac", VWifiState, default_mac),
-    DEFINE_PROP_END_OF_LIST(),
 };
 
 static void vwifi_realize(PCIDevice *pdev, Error **errp)
@@ -300,7 +313,7 @@ static const VMStateDescription vwifi_vmstate = {
     .unmigratable = 1,
 };
 
-static void vwifi_class_init(ObjectClass *klass, void *data)
+static void vwifi_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
@@ -314,7 +327,10 @@ static void vwifi_class_init(ObjectClass *klass, void *data)
 
     dc->desc  = "Paravirtual virtual-Wi-Fi adapter";
     dc->vmsd  = &vwifi_vmstate;
-    dc->reset = vwifi_pci_reset;
+    /* DeviceClass::reset was removed in QEMU 10.0. This helper keeps the
+     * plain (DeviceState *) reset signature; converting to the
+     * Resettable phases would be a behavioural change, not a build fix. */
+    device_class_set_legacy_reset(dc, vwifi_pci_reset);
     device_class_set_props(dc, vwifi_properties);
     set_bit(DEVICE_CATEGORY_NETWORK, dc->categories);
 }
@@ -324,7 +340,7 @@ static const TypeInfo vwifi_info = {
     .parent        = TYPE_PCI_DEVICE,
     .instance_size = sizeof(VWifiState),
     .class_init    = vwifi_class_init,
-    .interfaces    = (InterfaceInfo[]) {
+    .interfaces    = (const InterfaceInfo[]) {
         { INTERFACE_CONVENTIONAL_PCI_DEVICE },
         { },
     },
