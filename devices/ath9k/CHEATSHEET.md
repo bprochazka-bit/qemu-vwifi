@@ -1,0 +1,1 @@
+qemu-system-x86_64 -machine q35 -smp 4 -m 2048 -device vwifi-ath9k,medium=medium_hub_1.sock,node_id=vm-a -d guest_errors,unimp -D VM-A.log -drive file=wifi.qcow2,format=qcow2,if=virtio -netdev user,id=net0 -device virtio-net-pci,netdev=net0 -nographic -enable-kvm

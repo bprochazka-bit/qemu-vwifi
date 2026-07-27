@@ -1,0 +1,8 @@
+# Virtual Atheros AR9285 (vwifi-ath9k) PCI device emulation
+#
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+config VWIFI_ATH9K
+    bool
+    default y
+    depends on PCI

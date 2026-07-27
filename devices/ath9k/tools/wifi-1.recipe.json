@@ -1,0 +1,56 @@
+{
+  "_meta": {
+    "version": 1,
+    "created": "2026-02-21T04:34:22.949198+00:00",
+    "description": "Wifi-node"
+  },
+  "image": {
+    "output": "wifi-1.qcow2",
+    "disk_size": "8G",
+    "fs_type": "ext4"
+  },
+  "debian": {
+    "suite": "trixie",
+    "arch": "amd64",
+    "mirror": "http://deb.debian.org/debian"
+  },
+  "system": {
+    "hostname": "wifi-1",
+    "root_password": "changeme",
+    "locale": "en_US.UTF-8",
+    "timezone": "UTC",
+    "dns": "1.1.1.1"
+  },
+  "user": {
+    "username": "",
+    "password": ""
+  },
+  "packages": {
+    "base": [
+      "openssh-server",
+      "sudo",
+      "curl",
+      "wget",
+      "vim",
+      "net-tools",
+      "ca-certificates",
+      "locales",
+      "systemd-sysv",
+      "linux-image-amd64",
+      "grub-pc"
+    ],
+    "extra": [
+      "hostapd",
+      "wpasupplicant",
+      "iw",
+      "iproute2",
+      "wireless-tools",
+      "firmware-ath9k-htc"
+    ]
+  },
+  "options": {
+    "enable_serial": true,
+    "enable_ssh": true,
+    "permit_root_ssh": true
+  }
+}
