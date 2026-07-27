@@ -109,11 +109,11 @@ static int qemu_be_medium_send(void *be, const void *buf, size_t len)
     return 0;
 }
 
-/* G_GNUC_PRINTF(4, 0): fmt is the 4th argument and the varargs arrive as
- * a va_list, which is what the trailing 0 means. QEMU builds with
- * -Werror and -Wsuggest-attribute=format, so a function that forwards a
- * format string to vsnprintf without this annotation fails the build. */
-static void G_GNUC_PRINTF(4, 0)
+/* Same annotation the vtable member carries (see vwifi_backend.h): fmt
+ * is argument 4, and the trailing 0 says the varargs arrive as a
+ * va_list. QEMU builds with -Wmissing-format-attribute -Werror, which
+ * rejects both an unannotated forwarder and an unannotated pointer. */
+static void VWIFI_PRINTF_FMT(4, 0)
 qemu_be_log(void *be, const struct vwifi_dev *dev,
             enum vwifi_log_level level, const char *fmt, va_list ap)
 {

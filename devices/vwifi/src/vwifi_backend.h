@@ -25,6 +25,28 @@
 #include <stdbool.h>
 #include <stddef.h>
 
+/*
+ * printf-format annotation for the log op.
+ *
+ * QEMU builds this file with -Wmissing-format-attribute -Werror, which
+ * fires on both ends: on a function that forwards a format string to
+ * vsnprintf, and on the function *pointer* such a function is assigned
+ * to. Annotating only the implementation is not enough -- the vtable
+ * member below needs it too, or assigning to it is an error.
+ *
+ * `fmt_idx` is the 1-based position of the format string; `first_arg`
+ * is 0 when the varargs arrive as a va_list rather than inline.
+ *
+ * Guarded because this header is deliberately portable: the device core
+ * is meant to build against QEMU, libvfio-user, and a bare test harness.
+ */
+#if defined(__GNUC__) || defined(__clang__)
+# define VWIFI_PRINTF_FMT(fmt_idx, first_arg) \
+    __attribute__((format(printf, fmt_idx, first_arg)))
+#else
+# define VWIFI_PRINTF_FMT(fmt_idx, first_arg)
+#endif
+
 /* Log levels — mapped by each backend to whatever it uses. */
 enum vwifi_log_level {
     VWIFI_LOG_ERR   = 0,
@@ -72,7 +94,8 @@ struct vwifi_backend_ops {
     /* Log a message. Each backend routes this to its native logger.
      * `dev` is provided so the backend can prefix with node_id etc. */
     void (*log)(void *be, const struct vwifi_dev *dev,
-                enum vwifi_log_level level, const char *fmt, va_list ap);
+                enum vwifi_log_level level, const char *fmt, va_list ap)
+        VWIFI_PRINTF_FMT(4, 0);
 
     /* Current time in microseconds from a monotonic source. Used to
      * stamp medium frames with a TSF and to age the BSS table. QEMU

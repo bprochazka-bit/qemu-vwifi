@@ -85,8 +85,9 @@ static int mock_medium_send(void *be, const void *buf, size_t len)
     return 0;
 }
 
-static void mock_log(void *be, const struct vwifi_dev *dev,
-                     enum vwifi_log_level level, const char *fmt, va_list ap)
+static void VWIFI_PRINTF_FMT(4, 0)
+mock_log(void *be, const struct vwifi_dev *dev,
+         enum vwifi_log_level level, const char *fmt, va_list ap)
 {
     struct mock_backend *m = be;
     (void)dev;

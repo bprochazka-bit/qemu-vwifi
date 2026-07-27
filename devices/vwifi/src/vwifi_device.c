@@ -377,8 +377,13 @@ static unsigned freq_to_chan(uint16_t freq);
  * Logging helpers — thin wrappers that route through the vtable.
  * ============================================================ */
 
-static void vwifi_logf(struct vwifi_dev *d, enum vwifi_log_level lvl,
-                       const char *fmt, ...)
+/* (3, 4): fmt is argument 3 and the varargs start at 4. Unlike the
+ * vtable member, this one takes them inline, so the second number is a
+ * real position rather than 0. Annotating it also makes the compiler
+ * format-check every VWIFI_ERR/WARN/INFO/TRACE call site below. */
+static void VWIFI_PRINTF_FMT(3, 4)
+vwifi_logf(struct vwifi_dev *d, enum vwifi_log_level lvl,
+           const char *fmt, ...)
 {
     va_list ap;
     va_start(ap, fmt);
