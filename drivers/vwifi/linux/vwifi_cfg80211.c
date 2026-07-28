@@ -448,19 +448,38 @@ static int vwifi_op_change_iface(struct wiphy *wiphy, struct net_device *ndev,
 				 struct vif_params *params)
 {
 	struct vwifi_priv *p = wiphy_priv(wiphy);
-	struct vwifi_op_mode mode;
 
-	/*
-	 * STA is the only mode this driver can actually deliver. Monitor
-	 * would need a radiotap path that does not exist yet; accepting
-	 * the switch would stop the device doing 802.11 framing and leave
-	 * the interface silent with no way back short of a reload.
-	 */
-	if (type != NL80211_IFTYPE_STATION)
+	switch (type) {
+	case NL80211_IFTYPE_STATION:
+		return vwifi_monitor_set_mode(p, false);
+	case NL80211_IFTYPE_MONITOR:
+		return vwifi_monitor_set_mode(p, true);
+	default:
 		return -EOPNOTSUPP;
-	mode.mode = VWIFI_MODE_STA;
+	}
+}
 
-	return vwifi_ctrl_cmd(p, VWIFI_OP_SET_OP_MODE, &mode, sizeof(mode),
+/*
+ * Park the radio on a channel for monitoring. In STA mode the channel
+ * comes from the connect request instead, so this is monitor-only.
+ */
+static int vwifi_op_set_monitor_channel(struct wiphy *wiphy,
+					struct cfg80211_chan_def *chandef)
+{
+	struct vwifi_priv *p = wiphy_priv(wiphy);
+	struct vwifi_channel ch;
+
+	if (!chandef || !chandef->chan)
+		return -EINVAL;
+
+	memset(&ch, 0, sizeof(ch));
+	ch.primary_freq = chandef->chan->center_freq;
+	ch.flags = (chandef->chan->band == NL80211_BAND_5GHZ) ?
+		VWIFI_CHAN_FLAG_5GHZ : VWIFI_CHAN_FLAG_2GHZ;
+	if (chandef->center_freq1)
+		ch.center_freq1 = chandef->center_freq1;
+
+	return vwifi_ctrl_cmd(p, VWIFI_OP_SET_CHANNEL, &ch, sizeof(ch),
 			      NULL, 0, NULL);
 }
 
@@ -473,6 +492,7 @@ static const struct cfg80211_ops vwifi_cfg80211_ops = {
 	.set_default_key	= vwifi_op_set_default_key,
 	.get_station		= vwifi_op_get_station,
 	.change_virtual_intf	= vwifi_op_change_iface,
+	.set_monitor_channel	= vwifi_op_set_monitor_channel,
 };
 
 const struct cfg80211_ops *vwifi_cfg80211_ops_get(void)
@@ -651,7 +671,8 @@ void vwifi_handle_event(struct vwifi_priv *p, u16 event,
 static const struct ieee80211_iface_limit vwifi_iface_limits[] = {
 	{
 		.max = 1,
-		.types = BIT(NL80211_IFTYPE_STATION),
+		.types = BIT(NL80211_IFTYPE_STATION) |
+			 BIT(NL80211_IFTYPE_MONITOR),
 	},
 };
 
@@ -710,13 +731,11 @@ int vwifi_cfg80211_init(struct vwifi_priv *p)
 	 * claiming support for them would be a lie. */
 	p->wiphy->max_scan_ie_len = 0;
 	p->wiphy->signal_type = CFG80211_SIGNAL_TYPE_MBM;
-	/*
-	 * STA only. The device supports monitor mode, but this driver has
-	 * no radiotap path and drops every RX_F_RAW frame, so offering
-	 * NL80211_IFTYPE_MONITOR would give userspace an interface that
-	 * switches successfully and then goes permanently silent.
-	 */
 	p->wiphy->interface_modes = BIT(NL80211_IFTYPE_STATION);
+	/* Only offered if the device actually implements it -- monitor RX
+	 * and injection both go through the device's raw path. */
+	if (p->caps.caps & VWIFI_CAP_MONITOR)
+		p->wiphy->interface_modes |= BIT(NL80211_IFTYPE_MONITOR);
 	p->wiphy->iface_combinations = vwifi_iface_combos;
 	p->wiphy->n_iface_combinations = ARRAY_SIZE(vwifi_iface_combos);
 	p->wiphy->cipher_suites = vwifi_cipher_suites;

@@ -81,8 +81,8 @@ esac
 need_root
 have_dkms
 
-if [ ! -f "${ABI_DIR}/vwifi_abi.h" ]; then
-    echo "ERROR: ${ABI_DIR}/vwifi_abi.h not found." >&2
+if [ ! -f "${ABI_DIR}/vwifi_abi.h" ] || [ ! -f "${ABI_DIR}/vwifi.h" ]; then
+    echo "ERROR: shared ABI headers not found under ${ABI_DIR}." >&2
     echo "       Run this from a checkout of the repository — the driver" >&2
     echo "       cannot be staged without the shared ABI header." >&2
     exit 1
@@ -114,6 +114,7 @@ SOURCES=(
     vwifi_main.c
     vwifi_cfg80211.c
     vwifi_net.c
+    vwifi_monitor.c
     vwifi_drv.h
     Makefile
     dkms.conf
@@ -130,11 +131,16 @@ done
 [ -f "${SCRIPT_DIR}/README.md" ] && \
     install -m 0644 "${SCRIPT_DIR}/README.md" "${DEST}/"
 
-# The staged copy of the shared contract. Generated, not source.
+# The staged copies of the shared contracts. Generated, not source.
+#   vwifi_abi.h  device <-> driver
+#   vwifi.h      medium wire protocol, for the channel-flag definitions
+#                struct vwifi_channel is specified in terms of
 install -m 0644 "${ABI_DIR}/vwifi_abi.h" "${DEST}/"
+install -m 0644 "${ABI_DIR}/vwifi.h"     "${DEST}/"
 cat > "${DEST}/ABI-HEADER-IS-A-COPY" <<EOF
-vwifi_abi.h in this directory is a COPY, staged by dkms-install.sh from
-the repository's abi/vwifi_abi.h. It is regenerated on every install.
+vwifi_abi.h and vwifi.h in this directory are COPIES, staged by
+dkms-install.sh from the repository's abi/. They are regenerated on
+every install.
 
 Do not edit it here. Edits belong in the repository, where the QEMU
 device and the Windows driver compile against the same file. A local

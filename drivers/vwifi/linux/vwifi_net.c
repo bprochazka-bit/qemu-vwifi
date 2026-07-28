@@ -40,9 +40,32 @@ static netdev_tx_t vwifi_ndo_start_xmit(struct sk_buff *skb,
 	struct vwifi_priv *p = ndev_priv(ndev);
 	struct vwifi_tx_desc *d;
 	unsigned long flags;
+	const void *frame = skb->data;
+	unsigned int frame_len = skb->len;
+	u16 desc_flags = VWIFI_DESC_F_OWN;
 	u32 idx;
 
-	if (skb->len > VWIFI_TX_BUF_SIZE) {
+	/*
+	 * On a monitor interface the payload is radiotap + 802.11, not
+	 * Ethernet. Strip the radiotap and mark the descriptor INJECT so
+	 * the device puts the frame on the medium verbatim: no 802.3
+	 * translation, no encryption, and the transmitter address taken
+	 * from the frame's own addr2 rather than the station MAC.
+	 */
+	if (p->monitor) {
+		int off = vwifi_monitor_strip_radiotap(skb);
+
+		if (off < 0) {
+			ndev->stats.tx_errors++;
+			dev_kfree_skb_any(skb);
+			return NETDEV_TX_OK;
+		}
+		frame      = skb->data + off;
+		frame_len  = skb->len - off;
+		desc_flags |= VWIFI_TX_F_INJECT;
+	}
+
+	if (frame_len > VWIFI_TX_BUF_SIZE) {
 		ndev->stats.tx_dropped++;
 		dev_kfree_skb_any(skb);
 		return NETDEV_TX_OK;
@@ -74,12 +97,13 @@ static netdev_tx_t vwifi_ndo_start_xmit(struct sk_buff *skb,
 	}
 
 	memcpy((u8 *)p->tx.bufs + (size_t)idx * p->tx.buf_size,
-	       skb->data, skb->len);
+	       frame, frame_len);
 
 	memset(d, 0, sizeof(*d));
 	d->frame_addr = p->tx.bufs_dma + (dma_addr_t)idx * p->tx.buf_size;
-	d->frame_len  = skb->len;
-	d->flags      = VWIFI_DESC_F_OWN;
+	d->frame_len  = frame_len;
+	dma_wmb();	/* descriptor body before the OWN that publishes it */
+	WRITE_ONCE(d->flags, desc_flags);
 
 	wmb();	/* descriptor complete before the doorbell */
 	p->tx.head++;
@@ -88,7 +112,7 @@ static netdev_tx_t vwifi_ndo_start_xmit(struct sk_buff *skb,
 	spin_unlock_irqrestore(&p->ring_lock, flags);
 
 	ndev->stats.tx_packets++;
-	ndev->stats.tx_bytes += skb->len;
+	ndev->stats.tx_bytes += frame_len;
 	dev_kfree_skb_any(skb);
 	return NETDEV_TX_OK;
 }
@@ -107,10 +131,14 @@ void vwifi_rx_frame(struct vwifi_priv *p, const struct vwifi_rx_desc *desc,
 	if (!ndev || !netif_running(ndev))
 		return;
 
+	/*
+	 * Monitor captures come up with the raw 802.11 frame and a
+	 * radiotap header built from the descriptor's metadata; they are
+	 * not Ethernet and must not go through eth_type_trans().
+	 */
 	if (desc->flags & VWIFI_RX_F_RAW) {
-		/* Monitor-mode capture. Delivering these means a radiotap
-		 * header and a monitor interface; neither exists yet. */
-		ndev->stats.rx_dropped++;
+		if (!vwifi_monitor_rx(p, desc, data))
+			ndev->stats.rx_dropped++;
 		return;
 	}
 

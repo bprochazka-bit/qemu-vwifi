@@ -6,7 +6,7 @@ device. One per guest OS; all of them implement the same contract,
 
 | OS | Directory | Status |
 |---|---|---|
-| Linux | [`linux/`](linux/) | **Compiles** clean against 6.8; not yet run in a guest |
+| Linux | [`linux/`](linux/) | STA + monitor + injection; **compiles** clean against 6.8, not yet run in a guest |
 | Windows 10 / 11 | [`windows/`](windows/) | Written (~5100 lines), **never compiled** — needs a WDK |
 | macOS | [`macos/`](macos/) | Planned, with open feasibility questions |
 

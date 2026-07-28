@@ -12,7 +12,7 @@
 ifneq ($(KERNELRELEASE),)
 
 obj-m += vwifi.o
-vwifi-y := vwifi_main.o vwifi_cfg80211.o vwifi_net.o
+vwifi-y := vwifi_main.o vwifi_cfg80211.o vwifi_net.o vwifi_monitor.o
 
 # vwifi_abi.h is reached from one of two places, and the build has to
 # work either way:

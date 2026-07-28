@@ -12,7 +12,8 @@ WPA2, and passes traffic.
 | Run in a guest | **Not yet.** Never loaded, never bound to a live device |
 | Reviewed | Yes — an adversarial pass found 15 issues; the real ones are fixed |
 | STA mode: scan, connect, WPA2 (CCMP), data | Implemented |
-| Monitor mode | **Not offered.** The device supports it; this driver has no radiotap path, so advertising it would hand you a silent interface |
+| Monitor mode + radiotap RX | Implemented |
+| Raw frame injection | Implemented |
 | SoftAP | Not implemented — the device supports it, the driver does not |
 
 Treat "compiles" as what it is. Every ring interaction is written
@@ -71,6 +72,7 @@ vwifi_drv.h        driver-private state; ring and buffer sizes
 vwifi_main.c       PCI attach, MMIO, MSI-X, the four rings, control transport
 vwifi_cfg80211.c   wiphy setup, cfg80211_ops, device events -> notifications
 vwifi_net.c        netdev: 802.3 in and out of the TX/RX rings
+vwifi_monitor.c    radiotap on RX, radiotap stripping + injection on TX
 ```
 
 The contract is `../../../abi/vwifi_abi.h`, included verbatim — the same
@@ -183,11 +185,50 @@ driver sees nothing, the fault is on this side.
 echo 'module vwifi +p' | sudo tee /sys/kernel/debug/dynamic_debug/control
 ```
 
+## Monitor mode and injection
+
+```bash
+sudo ip link set wlan0 down
+sudo iw dev wlan0 set type monitor
+sudo ip link set wlan0 up
+sudo iw dev wlan0 set channel 6
+
+sudo tcpdump -i wlan0 -e -n            # every frame on the channel
+```
+
+The interface becomes `ARPHRD_IEEE80211_RADIOTAP`, and each frame
+arrives with a radiotap header carrying the TSF, rate, channel and RSSI
+the device recovered from the medium. Wireshark and tcpdump read it as
+an ordinary 802.11 capture.
+
+The mode switch is refused while the interface is up (`-EBUSY`). That is
+deliberate: libpcap latches the link type at open, so changing it under
+a running capture yields frames that decode as the wrong protocol rather
+than an error.
+
+**Injection** works on the same interface — write a radiotap header
+followed by an 802.11 frame to a packet socket, and the driver strips
+the radiotap and marks the descriptor `VWIFI_TX_F_INJECT`. The device
+then puts the frame on the medium verbatim: no 802.3 translation, no
+encryption, and the transmitter address taken from the frame's own
+`addr2` rather than the station MAC. Anything `aireplay-ng`, `packetforge-ng`
+or a raw socket can build will go out as written.
+
+That is what makes the medium testable from inside a guest: forge a
+beacon, a deauth, or a deliberately malformed frame and watch what the
+other peers do with it.
+
+Two limits worth knowing:
+
+- **Rate reporting is legacy-only.** The medium's rate codes at `0x80`
+  and above are HT/VHT/HE MCS values, which radiotap's `RATE` field
+  cannot express. Those are reported as rate 0 rather than as a wrong
+  legacy rate; the radiotap MCS field is a later revision.
+- **No FCS.** The device de-aggregates MPDUs and does not reproduce a
+  trailing FCS, so the radiotap flags do not claim one is present.
+
 ## Not done yet
 
-- **Monitor mode RX.** `SET_OP_MODE` works and the device will send raw
-  frames with `RX_F_RAW`, but there is no monitor interface or radiotap
-  header, so those frames are counted and dropped.
 - **SoftAP.** `START_AP`/`STOP_AP` exist in the ABI and the device
   implements them; no `.start_ap` here yet.
 - **Management frame TX/RX to userspace.** Needed for SAE (WPA3). The

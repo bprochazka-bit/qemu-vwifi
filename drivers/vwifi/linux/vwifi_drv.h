@@ -19,6 +19,10 @@
 #include <net/cfg80211.h>
 
 #include "vwifi_abi.h"
+/* struct vwifi_channel's flags field is defined in terms of the medium
+ * protocol's VWIFI_CHAN_FLAG_*, so the driver needs that header too.
+ * Both are kernel-safe and share no symbols. */
+#include "vwifi.h"
 
 #define VWIFI_DRV_NAME "vwifi"
 
@@ -139,6 +143,10 @@ struct vwifi_priv {
 
 	struct vwifi_caps	 caps;
 	bool			 rings_enabled;
+	/* Monitor mode: changes the netdev link type and the meaning of
+	 * everything on the TX and RX rings, so it is tracked here rather
+	 * than inferred from wdev->iftype at each use. */
+	bool			 monitor;
 };
 
 /* MMIO helpers. The device's registers are all 32-bit. */
@@ -169,6 +177,12 @@ int  vwifi_cfg80211_init(struct vwifi_priv *p);
 void vwifi_cfg80211_deinit(struct vwifi_priv *p);
 void vwifi_handle_event(struct vwifi_priv *p, u16 event,
 			const void *payload, u32 len);
+
+/* vwifi_monitor.c */
+bool vwifi_monitor_rx(struct vwifi_priv *p, const struct vwifi_rx_desc *desc,
+		      const void *data);
+int  vwifi_monitor_strip_radiotap(const struct sk_buff *skb);
+int  vwifi_monitor_set_mode(struct vwifi_priv *p, bool monitor);
 
 /* vwifi_net.c */
 extern const struct net_device_ops vwifi_netdev_ops;
