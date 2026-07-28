@@ -247,7 +247,16 @@ static void vwifi_realize(PCIDevice *pdev, Error **errp)
     uint8_t *config = pdev->config;
     Error *local_err = NULL;
 
-    /* Default MAC derivation. */
+    /*
+     * Default MAC derivation, for a device attached without mac=.
+     *
+     * It has to differ per device: two stations sharing an address on
+     * one medium accept each other's frames and cannot be told apart in
+     * the hub's peer list. devfn is what makes them distinct — several
+     * radios on one guest are separate PCI *slots*, all function 0, so
+     * keying on PCI_FUNC alone handed every one of them the same
+     * address.
+     */
     if ((s->default_mac.a[0] | s->default_mac.a[1] | s->default_mac.a[2] |
          s->default_mac.a[3] | s->default_mac.a[4] | s->default_mac.a[5]) == 0) {
         s->default_mac.a[0] = 0x00;
@@ -255,7 +264,7 @@ static void vwifi_realize(PCIDevice *pdev, Error **errp)
         s->default_mac.a[2] = 0x7F;
         s->default_mac.a[3] = 0xCC;
         s->default_mac.a[4] = 0xDD;
-        s->default_mac.a[5] = 0x10 + (PCI_FUNC(pdev->devfn) & 0xF);
+        s->default_mac.a[5] = (uint8_t)(pdev->devfn & 0xFF);
     }
 
     pci_config_set_interrupt_pin(config, 1);

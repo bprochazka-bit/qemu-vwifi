@@ -44,6 +44,13 @@ to touch this code could fall back into.
   CCMP-128 keys. Offering WEP/TKIP lets a supplicant negotiate a cipher
   that fails at `.add_key` mid-handshake, leaving an associated but
   unkeyed link and a deauth loop.
+- **Setting the netdev's address is not enough to keep it.** The MAC
+  from `-device vwifi-virt,mac=...` arrives in `GET_CAPS`, and it also
+  has to be published as the *permanent* address — `wiphy->perm_addr`
+  and `ndev->perm_addr`. NetworkManager randomizes a Wi-Fi MAC for
+  scanning by default and then restores the permanent one; with no
+  permanent address to restore, the configured MAC quietly does not
+  survive the first scan.
 
 ## Why full-MAC, not mac80211
 

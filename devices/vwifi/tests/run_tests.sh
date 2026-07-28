@@ -14,7 +14,7 @@ cd "$(dirname "$0")"
 CC=${CC:-cc}
 CFLAGS="-Wall -Wextra -O2 -I../src -I../../../abi -I."
 SRC="../src/vwifi_device.c ../src/vwifi_crypto.c mock_backend.c"
-TESTS="crypto medium_proto smoke_get_caps monitor_mode scan connect wpa2 softap"
+TESTS="crypto medium_proto smoke_get_caps sta_mac monitor_mode scan connect wpa2 softap"
 
 mkdir -p build
 fail=0

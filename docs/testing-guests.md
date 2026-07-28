@@ -319,3 +319,20 @@ each peer's channel.
 
 **QEMU exits immediately with a chardev error.** The hub was not
 running. Start `vwifi-medium` first, or add `reconnect-ms=2000`.
+
+**The guest's MAC is not the one passed to `mac=`.** The device hands
+its address to the guest in `GET_CAPS`, and the driver publishes it as
+the interface's *permanent* address. Check each hop in turn:
+
+```bash
+iw phy phy0 info | head -2      # wiphy perm_addr — what the device gave us
+ethtool -P wlan0                # netdev perm_addr — same value
+ip link show wlan0              # current address, which userspace may change
+```
+
+If the first two agree with `mac=` but `ip link` disagrees, something in
+the guest changed it after the fact — NetworkManager randomizes Wi-Fi
+MACs for scanning by default. `nmcli device show wlan0` reports both the
+permanent and the in-use address; `wifi.cloned-mac-address=permanent`
+pins it. If the first two are all-zero, the driver predates this being
+published — rebuild it.
