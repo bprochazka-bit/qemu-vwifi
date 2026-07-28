@@ -218,14 +218,52 @@ That is what makes the medium testable from inside a guest: forge a
 beacon, a deauth, or a deliberately malformed frame and watch what the
 other peers do with it.
 
-Two limits worth knowing:
+### Rate reporting
 
-- **Rate reporting is legacy-only.** The medium's rate codes at `0x80`
-  and above are HT/VHT/HE MCS values, which radiotap's `RATE` field
-  cannot express. Those are reported as rate 0 rather than as a wrong
-  legacy rate; the radiotap MCS field is a later revision.
-- **No FCS.** The device de-aggregates MPDUs and does not reproduce a
-  trailing FCS, so the radiotap flags do not claim one is present.
+Full, across legacy, HT and VHT. Radiotap's `RATE` field really is
+legacy-only — the spec says it must be absent for HT and above — but
+radiotap carries dedicated `MCS` (bit 19) and `VHT` (bit 21) fields for
+exactly that case, and the driver emits them.
+
+Nothing is lost on the wire: the medium's rate-code namespace already
+encodes bandwidth, spatial streams and MCS index in the code itself
+(`abi/vwifi.h`), so it is all recoverable at this end.
+
+| Medium code | Reported as |
+|---|---|
+| `0x00`–`0x1F` | `RATE`, in 500 kbps units, with the CCK/OFDM channel flag |
+| `0x80`–`0x9F` | `MCS`, with MCS 0–15 and 20/40 MHz bandwidth |
+| `0xA0`–`0xDF` | `VHT`, with MCS, NSS and 80/160 MHz bandwidth |
+| `0xE0`–`0xFB` | `VHT` at 80 MHz — see below |
+
+HE codes report as VHT80. Radiotap's HE field is a six-word structure
+whose useful subset needs more than the medium encodes, and a
+half-filled HE field is read as wrong data rather than as missing data.
+Since these frames are VHT80-equivalent on this medium, that is what
+they are reported as. Widening the medium's rate encoding is the
+prerequisite for doing better, not a change on this side.
+
+Because which fields are present now varies per frame, the header is
+built rather than copied from a fixed struct. Radiotap requires each
+field aligned to its own size relative to the start of the header; the
+builder is the only thing that moves the cursor, and the resulting
+layouts (23 / 26 / 36 bytes for legacy / HT / VHT) were checked against
+that rule field by field.
+
+### No FCS, and that is correct
+
+Frames on this medium carry no FCS **by convention, not by accident**:
+`vwifi-phys-bridge` strips it from real captures on the way in, and the
+QEMU devices never add one — `vwifi-ath9k` explicitly sends
+`frame_len - FCS_LEN` to the medium and appends a dummy FCS only on the
+guest-facing side, because the `ath9k` driver expects
+`RX_INCLUDES_FCS`.
+
+So the radiotap flags do not set `IEEE80211_RADIOTAP_F_FCS`. Claiming
+one would point a capture tool at four bytes of payload. Synthesising a
+real CRC-32 here would be easy and pointless — it would be a value this
+driver computed, not the one a transmitter sent, so it could never fail
+and would carry no information.
 
 ## Not done yet
 
