@@ -106,7 +106,8 @@ enabled). Any Debian/Ubuntu cloud image works too, as long as it has
 /usr/local/bin/qemu-system-x86_64 \
   -machine q35 -m 2048 -smp 2 -enable-kvm \
   -drive file=wifi-1.qcow2,format=qcow2,if=virtio \
-  -device vwifi-ath9k,medium=/tmp/vwifi.sock,node_id=linux-sta \
+  -chardev socket,id=medium,path=/tmp/vwifi.sock,server=off,reconnect-ms=2000 \
+  -device vwifi-ath9k,chardev=medium,node_id=linux-sta \
   -nographic
 ```
 

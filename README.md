@@ -181,13 +181,13 @@ Now put a guest on the medium:
 
 ```bash
 qemu-system-x86_64 -machine q35 -m 2048 -drive file=vm.qcow2,format=qcow2 \
-  -device vwifi-ath9k,medium=/tmp/vwifi.sock,node_id=linux-vm
+  -chardev socket,id=medium,path=/tmp/vwifi.sock,server=off,reconnect-ms=2000 \
+  -device vwifi-ath9k,chardev=medium,node_id=linux-vm
 ```
 
-`vwifi-ath9k` opens the hub socket itself and takes a path.
-`vwifi-virt` goes through a QEMU chardev instead and takes a chardev
-id — see [`devices/README.md`](devices/README.md), the two command
-lines are not interchangeable.
+Both devices attach the same way — swap `vwifi-ath9k` for `vwifi-virt`
+and the rest of the line is unchanged. `reconnect-ms` is what lets a
+guest survive a hub restart.
 
 ## Where to go next
 

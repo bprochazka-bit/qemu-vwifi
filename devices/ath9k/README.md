@@ -179,30 +179,48 @@ standalone beacon-only mode with an auto-generated MAC address.
 
 | Argument | Type | Default | Description |
 |----------|------|---------|-------------|
-| `medium` | string (path) | _(empty → standalone)_ | Filesystem path to the virtual-medium hub's `AF_UNIX` stream socket. When set, the device connects to the hub so frames can be exchanged with other VMs. When empty or omitted, the device runs standalone (beacon-only, no inter-VM traffic). |
-| `node_id` | string | _(empty → auto)_ | Stable identity string for this node, sent in the hello handshake when connecting to the medium hub. Lets the hub recognise the same node across reconnects regardless of its (possibly random) MAC. Ignored when no `medium` is configured. |
+| `chardev` | chardev id | _(none → standalone)_ | Id of a QEMU chardev connected to the virtual-medium hub's socket. When set, frames are exchanged with other VMs through the hub. When omitted, the device runs standalone (beacon-only, no inter-VM traffic). |
+| `node_id` | string | _(empty → auto)_ | Stable identity string for this node, sent in the hello handshake when connecting to the medium hub. Lets the hub recognise the same node across reconnects regardless of its (possibly random) MAC. Ignored when no `chardev` is configured. |
 | `macaddr` | string (`xx:xx:xx:xx:xx:xx`) | auto-random `00:03:7F:xx:xx:xx` | Station MAC address. The six colon-separated hex bytes are patched into the emulated EEPROM so the unmodified `ath9k` driver reads it through its normal EEPROM path. |
 
-### `medium`
+### `chardev`
 
 ```bash
--device vwifi-ath9k,medium=/tmp/vwifi.sock
+-chardev socket,id=medium,path=/tmp/vwifi.sock,server=off,reconnect-ms=2000
+-device vwifi-ath9k,chardev=medium
 ```
 
-- Path to the Unix-domain stream socket exported by a medium hub
-  (`vwifi-medium`; see [`../../medium/README.md`](../../medium/README.md)).
-- The hub does **not** need to be running first: if the socket is
-  absent or the connection drops, the device automatically retries
-  every 2 seconds (`MEDIUM_RECONNECT_MS`). On each successful
-  connect it re-sends the `node_id` hello.
-- Empty/omitted ⇒ **standalone mode**: the device still emulates the
-  NIC and emits beacons internally, but no frames leave or enter the
-  VM. Useful for driver-probe testing without a hub.
+- The chardev points at the Unix-domain stream socket exported by a
+  medium hub (`vwifi-medium`; see
+  [`../../medium/README.md`](../../medium/README.md)).
+- The hub does **not** need to be running first, provided you pass
+  `reconnect-ms`: the chardev retries on that interval, and the device
+  re-sends its `node_id` hello on every successful connect. Without
+  `reconnect-ms` a guest started before the hub, or running when the
+  hub restarts, stays offline.
+- Because it is an ordinary chardev, anything QEMU can express works
+  here: `socket,host=...,port=...` for a hub on another machine,
+  `chardev-add` over QMP to attach a medium to a running guest.
+- Omitted ⇒ **standalone mode**: the device still emulates the NIC and
+  emits beacons internally, but no frames leave or enter the VM. Useful
+  for driver-probe testing without a hub.
+
+> **This replaced a `medium=<path>` property.** The device used to open
+> the socket itself and run its own reconnect timer. `vwifi-virt`
+> already used a chardev; now both do, and the command lines are
+> interchangeable apart from the device name.
+>
+> This did not change TX backpressure: the hub's stream is
+> length-prefixed, so a message has to go out whole or not at all, and a
+> hub that stops draining this peer still stalls the guest's vCPU
+> thread. It spins in 100 µs sleeps now rather than blocking in the
+> kernel indefinitely — better, not fixed.
 
 ### `node_id`
 
 ```bash
--device vwifi-ath9k,medium=/tmp/vwifi.sock,node_id=ap1
+-chardev socket,id=medium,path=/tmp/vwifi.sock,server=off,reconnect-ms=2000
+-device vwifi-ath9k,chardev=medium,node_id=ap1
 ```
 
 - An arbitrary short string (e.g. `ap1`, `vm-a`, `station3`) sent to
@@ -238,12 +256,14 @@ Two VMs sharing one medium hub, each with a stable id and MAC:
 ```bash
 # VM A
 qemu-system-x86_64 -machine q35 -m 2048 \
-    -device vwifi-ath9k,medium=/tmp/vwifi.sock,node_id=vm-a,macaddr=00:03:7F:00:00:01 \
+    -chardev socket,id=medium,path=/tmp/vwifi.sock,server=off,reconnect-ms=2000 \
+    -device vwifi-ath9k,chardev=medium,node_id=vm-a,macaddr=00:03:7F:00:00:01 \
     -drive file=vm-a.qcow2,format=qcow2,if=virtio -nographic
 
 # VM B
 qemu-system-x86_64 -machine q35 -m 2048 \
-    -device vwifi-ath9k,medium=/tmp/vwifi.sock,node_id=vm-b,macaddr=00:03:7F:00:00:02 \
+    -chardev socket,id=medium,path=/tmp/vwifi.sock,server=off,reconnect-ms=2000 \
+    -device vwifi-ath9k,chardev=medium,node_id=vm-b,macaddr=00:03:7F:00:00:02 \
     -drive file=vm-b.qcow2,format=qcow2,if=virtio -nographic
 ```
 

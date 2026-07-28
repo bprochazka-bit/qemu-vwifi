@@ -66,17 +66,14 @@ asserts the format field by field; treat it as the reference for what
 
 ## Attaching a device to a medium
 
-The two devices reach the hub differently, and the command lines are
-**not** interchangeable.
-
-`vwifi-ath9k` opens the hub's Unix socket itself, so it takes a path:
+Both devices attach to the hub through a QEMU chardev, and the command
+lines differ only in the device name:
 
 ```bash
 qemu-system-x86_64 ... \
-  -device vwifi-ath9k,medium=/tmp/vwifi.sock,node_id=linux-vm
+  -chardev socket,id=medium,path=/tmp/vwifi.sock,server=off,reconnect-ms=2000 \
+  -device vwifi-ath9k,chardev=medium,node_id=linux-vm
 ```
-
-`vwifi-virt` goes through a QEMU chardev, so it takes a chardev id:
 
 ```bash
 qemu-system-x86_64 ... \
@@ -84,14 +81,25 @@ qemu-system-x86_64 ... \
   -device vwifi-virt,chardev=medium,node_id=virt-guest
 ```
 
-`vwifi-ath9k` has no `chardev` property — it registers exactly
-`medium`, `macaddr` and `node_id` — so borrowing the second form for it
-fails at startup with "Property 'vwifi-ath9k.chardev' not found".
+`reconnect-ms` is what makes a guest survive a hub restart, and lets you
+start the guest first. Without it the chardev connects once and stays
+dead afterwards.
 
-Both survive a hub restart, by different means: `vwifi-ath9k` runs its
-own 2-second reconnect timer, and `vwifi-virt` gets the same from the
-chardev layer's `reconnect-ms`. Omit `reconnect-ms` and the vwifi-virt
-guest stays dead after the hub goes away.
+Because the transport is an ordinary chardev, a hub on another machine
+is just `socket,host=...,port=...`, and QMP `chardev-add` can attach a
+medium to a running guest.
+
+> `vwifi-ath9k` took a `medium=<path>` property until it was converted;
+> it opened the Unix socket itself. Old command lines now fail with
+> "Property 'vwifi-ath9k.medium' not found" — add a `-chardev` and pass
+> its id.
+>
+> Note this did **not** fix TX backpressure. Both devices write whole
+> messages synchronously, because the hub's stream is length-prefixed
+> and a partial write corrupts it, so a hub that stops draining a peer
+> still stalls that guest's vCPU thread. The chardev version spins in
+> 100 µs sleeps instead of blocking indefinitely in the kernel, which is
+> better and not a fix.
 
 `node_id` is what the peer calls itself in the hub's `LIST_PEERS`,
 `SURVEY` and `SET_POS` output. Give every peer a distinct one — an

@@ -25,6 +25,12 @@
 #include "qemu/main-loop.h"
 #include "qom/object.h"
 #include "crypto/aes.h"
+/* Same set the vwifi-virt device uses for its chardev and properties.
+ * qdev-properties*.h live under hw/core/ as of QEMU 10.0, and
+ * DEFINE_PROP_CHR specifically comes from the -system variant. */
+#include "chardev/char-fe.h"
+#include "hw/core/qdev-properties.h"
+#include "hw/core/qdev-properties-system.h"
 
 #include "vwifi_ath9k_regs.h"
 #include "vwifi_ath9k_eeprom.h"
@@ -34,9 +40,6 @@
 #include "vwifi_ath9k_wep.h"
 #include "vwifi_ath9k_tkip.h"
 #include "vwifi.h"
-
-#include <sys/socket.h>
-#include <sys/un.h>
 
 /* -------------------------------------------------------------------
  *  Compile-time knobs
@@ -51,7 +54,7 @@
  * main-loop iteration per subframe.  Holding a full BA window (64
  * subframes) lets a burst drain in a single read() and complete with one
  * coalesced RXOK, which is where the aggregation throughput win is
- * actually realized.  Bounds checks in vwifi_ath9k_fd_read are all
+ * actually realized.  Bounds checks in vwifi_ath9k_drain_rxbuf are all
  * relative to this size, so enlarging it is safe; a single message is
  * still capped at VWIFI_MAX_MSG_SIZE.
  */
@@ -156,11 +159,12 @@ struct VwifiAth9kState {
 
     /* --- Phase 3: Virtual wireless medium --- */
     char       *macaddr;          /* -device vwifi-ath9k,macaddr=00:03:7f:... */
-    char       *medium_path;      /* -device vwifi-ath9k,medium=/tmp/x.sock */
     char       *node_id;          /* -device vwifi-ath9k,node_id=ap1 (stable identity) */
-    QEMUTimer  *medium_reconnect_timer;
-    int         medium_fd;        /* connected socket fd, or -1 */
-    bool        medium_connected; /* true when socket is open */
+    /* CharBackend up to QEMU 10.1, CharFrontend from 10.2 -- the same
+     * type the vwifi-virt device uses, and every qemu_chr_fe_* call
+     * here takes one. */
+    CharFrontend chr;
+    bool        medium_connected; /* true while the chardev is open */
 
     /* Stream reassembly buffer for length-prefixed messages */
     uint8_t     medium_rxbuf[VWIFI_ATH9K_RXBUF_SIZE];
@@ -397,121 +401,135 @@ static void vwifi_ath9k_raise_irq(VwifiAth9kState *s, uint32_t isr_bits)
  * ------------------------------------------------------------------- */
 
 /* ================================================================
- *  Medium reconnect support
+ *  Medium connection
  *
- *  If the medium hub restarts or the socket breaks, we automatically
- *  retry every 2 seconds.  On reconnect, we re-send the node_id hello.
+ *  The hub is reached through a QEMU chardev, exactly as the
+ *  vwifi-virt device does it:
+ *
+ *    -chardev socket,id=medium,path=/tmp/vwifi.sock,server=off,reconnect-ms=2000
+ *    -device vwifi-ath9k,chardev=medium,node_id=ap1
+ *
+ *  This device used to open the Unix socket itself, on a blocking fd,
+ *  and run its own 2-second reconnect timer. That worked, but it was a
+ *  second way of doing something QEMU already does. Going through the
+ *  chardev means one command-line form for both devices, reconnect
+ *  handled by reconnect-ms, and every other chardev backend for free
+ *  (socket,host=...,port=... for a hub on another machine; QMP
+ *  chardev-add to attach a medium to a running guest).
+ *
+ *  What it does NOT fix is TX backpressure. See vwifi_ath9k_send_rate():
+ *  a hub that stops draining this peer can still stall the vCPU thread,
+ *  because the alternative is corrupting the hub's framing.
  * ================================================================ */
 
-#define MEDIUM_RECONNECT_MS  2000   /* retry every 2 seconds */
 /* VWIFI_HELLO_MAGIC comes from the shared abi/vwifi.h. */
 #define HELLO_MAGIC          VWIFI_HELLO_MAGIC
 
-/* Forward declarations */
-static void vwifi_ath9k_reconnect_cb(void *opaque);
-static void vwifi_ath9k_fd_read(void *opaque);
+/* Defined further down, next to the frame-processing code it drives. */
+static void vwifi_ath9k_drain_rxbuf(VwifiAth9kState *s);
 
 /*
- * Try to connect (or reconnect) to the medium hub.
- * On success, sends a hello message with our node_id.
- * Returns true if connected.
+ * Register with the hub. Sent on every CHR_EVENT_OPENED, so a
+ * reconnect re-announces this node without any extra bookkeeping.
+ *
+ * Wire format per the vwifi v2 standard (see vwifi.h):
+ *   [uint32 net len][uint32 VWIFI_HELLO_MAGIC][node_id\0][flags?]
+ *
+ * We deliberately omit the trailing optional flags byte, so the hub
+ * reads flags = 0 -- i.e. NOT VWIFI_HELLO_FLAG_PHYSICAL. This is a
+ * simulated station, not a real radio, so it must stay subject to the
+ * hub's propagation model (synthetic FER drops and RSSI rewrite); only
+ * the physical bridge sets that flag to be exempted.
  */
-static bool vwifi_ath9k_try_connect(VwifiAth9kState *s)
+static void vwifi_ath9k_send_hello(VwifiAth9kState *s)
 {
-    struct sockaddr_un sun;
-    int fd;
+    size_t   id_len;
+    uint32_t payload_len, net_len, hello_magic = HELLO_MAGIC;
+    uint8_t  hello_buf[4 + 4 + 32];
 
-    if (!s->medium_path || s->medium_path[0] == '\0')
-        return false;
-    if (s->medium_connected)
-        return true;
-
-    fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (fd < 0)
-        return false;
-
-    memset(&sun, 0, sizeof(sun));
-    sun.sun_family = AF_UNIX;
-    strncpy(sun.sun_path, s->medium_path, sizeof(sun.sun_path) - 1);
-
-    if (connect(fd, (struct sockaddr *)&sun, sizeof(sun)) < 0) {
-        close(fd);
-        return false;
-    }
-
-    s->medium_fd = fd;
-    s->medium_connected = true;
-    s->medium_rxbuf_used = 0;
-    qemu_set_fd_handler(fd, vwifi_ath9k_fd_read, NULL, s);
-
-    /*
-     * Send hello with node_id if configured.
-     *
-     * Wire format per the vwifi v2 standard (see vwifi.h):
-     *   [uint32 net len][uint32 VWIFI_HELLO_MAGIC][node_id\0][flags?]
-     *
-     * We deliberately omit the trailing optional flags byte, so the hub
-     * reads flags = 0 -- i.e. NOT VWIFI_HELLO_FLAG_PHYSICAL.  This is a
-     * simulated station, not a real radio, so it must stay subject to the
-     * hub's propagation model (synthetic FER drops and RSSI rewrite); only
-     * the physical bridge sets that flag to be exempted.
-     */
-    if (s->node_id && s->node_id[0] != '\0') {
-        size_t id_len = strlen(s->node_id) + 1; /* include NUL */
-        uint32_t payload_len = 4 + (uint32_t)id_len;
-        uint32_t net_len = htonl(payload_len);
-        uint32_t hello_magic = HELLO_MAGIC;
-        uint8_t hello_buf[4 + 4 + 32];
-        memcpy(hello_buf, &net_len, 4);
-        memcpy(hello_buf + 4, &hello_magic, 4);
-        memcpy(hello_buf + 8, s->node_id, id_len);
-        ssize_t wr = write(fd, hello_buf, 4 + payload_len);
-        (void)wr;
-    }
-
-    qemu_log_mask(LOG_GUEST_ERROR,
-                  "vwifi-ath9k: medium connected to %s "
-                  "(node_id=%s, MAC %02x:%02x:%02x:%02x:%02x:%02x)\n",
-                  s->medium_path,
-                  (s->node_id && s->node_id[0]) ? s->node_id : "(auto)",
-                  s->our_mac[0], s->our_mac[1], s->our_mac[2],
-                  s->our_mac[3], s->our_mac[4], s->our_mac[5]);
-
-    /* Cancel reconnect timer since we're connected now */
-    timer_del(s->medium_reconnect_timer);
-
-    return true;
-}
-
-/*
- * Start the reconnect timer.  Called when we detect a disconnect.
- */
-static void vwifi_ath9k_schedule_reconnect(VwifiAth9kState *s)
-{
-    if (!s->medium_path || s->medium_path[0] == '\0')
-        return;
-    qemu_log_mask(LOG_GUEST_ERROR,
-                  "vwifi-ath9k: medium disconnected, will retry in %dms\n",
-                  MEDIUM_RECONNECT_MS);
-    timer_mod(s->medium_reconnect_timer,
-              qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + MEDIUM_RECONNECT_MS);
-}
-
-/*
- * Reconnect timer callback — runs in QEMU main loop context.
- */
-static void vwifi_ath9k_reconnect_cb(void *opaque)
-{
-    VwifiAth9kState *s = VWIFI_ATH9K(opaque);
-
-    if (s->medium_connected)
+    if (!s->node_id || s->node_id[0] == '\0')
         return;
 
-    if (!vwifi_ath9k_try_connect(s)) {
-        /* Still can't connect, try again later */
-        timer_mod(s->medium_reconnect_timer,
-                  qemu_clock_get_ms(QEMU_CLOCK_REALTIME)
-                  + MEDIUM_RECONNECT_MS);
+    id_len = strlen(s->node_id) + 1;            /* include NUL */
+    if (id_len > sizeof(hello_buf) - 8)
+        id_len = sizeof(hello_buf) - 8;
+
+    payload_len = 4 + (uint32_t)id_len;
+    net_len     = htonl(payload_len);
+    memcpy(hello_buf, &net_len, 4);
+    memcpy(hello_buf + 4, &hello_magic, 4);
+    memcpy(hello_buf + 8, s->node_id, id_len);
+    hello_buf[8 + id_len - 1] = '\0';
+
+    qemu_chr_fe_write_all(&s->chr, hello_buf, 4 + payload_len);
+}
+
+/* ================================================================
+ *  Chardev callbacks
+ * ================================================================ */
+
+/*
+ * How many bytes the reassembly buffer can take right now. Returning
+ * the real figure is what applies backpressure to the hub; answering
+ * with the buffer size regardless would let the chardev overrun it and
+ * silently lose the tail of a message, which desynchronises the length
+ * prefix and corrupts every frame after it.
+ */
+static int vwifi_ath9k_chr_can_read(void *opaque)
+{
+    VwifiAth9kState *s = opaque;
+
+    return (int)(VWIFI_ATH9K_RXBUF_SIZE - s->medium_rxbuf_used);
+}
+
+static void vwifi_ath9k_chr_read(void *opaque, const uint8_t *buf, int size)
+{
+    VwifiAth9kState *s = opaque;
+    uint32_t avail = VWIFI_ATH9K_RXBUF_SIZE - s->medium_rxbuf_used;
+
+    if (size <= 0)
+        return;
+    if ((uint32_t)size > avail)
+        size = (int)avail;                      /* can_read should prevent this */
+
+    memcpy(s->medium_rxbuf + s->medium_rxbuf_used, buf, (size_t)size);
+    s->medium_rxbuf_used += (uint32_t)size;
+
+    vwifi_ath9k_drain_rxbuf(s);
+
+    /* Draining freed space, so tell the chardev to resume polling. A
+     * front end that once answered can_read() with 0 is not polled again
+     * until it says so, and the resulting stall is permanent and silent.
+     * The buffer holds 32 message slots and a drain leaves at most one
+     * partial message, so this should never be load-bearing -- which is
+     * exactly why it would go unnoticed if it ever became so. */
+    qemu_chr_fe_accept_input(&s->chr);
+}
+
+static void vwifi_ath9k_chr_event(void *opaque, QEMUChrEvent ev)
+{
+    VwifiAth9kState *s = opaque;
+
+    switch (ev) {
+    case CHR_EVENT_OPENED:
+        s->medium_connected  = true;
+        s->medium_rxbuf_used = 0;
+        vwifi_ath9k_send_hello(s);
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "vwifi-ath9k: medium connected "
+                      "(node_id=%s, MAC %02x:%02x:%02x:%02x:%02x:%02x)\n",
+                      (s->node_id && s->node_id[0]) ? s->node_id : "(auto)",
+                      s->our_mac[0], s->our_mac[1], s->our_mac[2],
+                      s->our_mac[3], s->our_mac[4], s->our_mac[5]);
+        break;
+    case CHR_EVENT_CLOSED:
+        s->medium_connected  = false;
+        s->medium_rxbuf_used = 0;
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "vwifi-ath9k: medium disconnected\n");
+        break;
+    default:
+        break;
     }
 }
 
@@ -536,7 +554,7 @@ static void vwifi_ath9k_send_rate(VwifiAth9kState *s, const uint8_t *frame,
     uint32_t net_len;
     uint8_t sendbuf[4 + VWIFI_HDR_SIZE + VWIFI_MAX_FRAME_SIZE];
 
-    if (!s->medium_connected || s->medium_fd < 0 ||
+    if (!s->medium_connected ||
         frame_len == 0 ||
         frame_len > VWIFI_MAX_FRAME_SIZE) {
         return;
@@ -566,26 +584,28 @@ static void vwifi_ath9k_send_rate(VwifiAth9kState *s, const uint8_t *frame,
     memcpy(sendbuf + 4, &hdr, VWIFI_HDR_SIZE);
     memcpy(sendbuf + 4 + VWIFI_HDR_SIZE, frame, frame_len);
 
-    /* Write the entire wire message atomically (best-effort) */
-    {
-        uint32_t total = 4 + msg_len;
-        uint32_t off = 0;
-        while (off < total) {
-            ssize_t n = write(s->medium_fd, sendbuf + off, total - off);
-            if (n <= 0) {
-                if (n < 0 && (errno == EINTR || errno == EAGAIN)) {
-                    continue;
-                }
-                vwifi_ath9k_warn("MEDIUM TX: write failed, disconnecting");
-                qemu_set_fd_handler(s->medium_fd, NULL, NULL, NULL);
-                close(s->medium_fd);
-                s->medium_fd = -1;
-                s->medium_connected = false;
-                vwifi_ath9k_schedule_reconnect(s);
-                return;
-            }
-            off += (uint32_t)n;
-        }
+    /*
+     * write_all, not write: the hub's stream is length-prefixed, so a
+     * partial write desynchronises it and corrupts every frame after
+     * this one. There is no "drop the rest of the message" that leaves
+     * the peer intact.
+     *
+     * The cost is honest and unfixed: qemu_chr_fe_write_all() retries
+     * EAGAIN with a 100us sleep, so a hub that stops draining this peer
+     * stalls the caller -- and the caller is the vCPU thread holding the
+     * BQL. That is better than the blocking write() this replaced (a
+     * bounded spin rather than an indefinite kernel block) but it is the
+     * same failure. Fixing it properly means buffering the remainder and
+     * flushing from a qemu_chr_fe_add_watch() callback, which is what a
+     * chardev front end is supposed to do and what this is not.
+     *
+     * A short return means the chardev is gone. Drop the frame; a lost
+     * frame is something the medium already models.
+     */
+    if (qemu_chr_fe_write_all(&s->chr, sendbuf, 4 + msg_len)
+            != (int)(4 + msg_len)) {
+        vwifi_ath9k_warn("MEDIUM TX: short write, frame dropped");
+        return;
     }
 
     s->tx_frames_to_medium++;
@@ -1437,7 +1457,7 @@ static void vwifi_ath9k_swba_timer_cb(void *opaque)
      * beacon tasklet can't produce new beacons because the TX descriptor
      * chain is stale.
      */
-    if (s->cached_beacon_len > 0 && s->medium_fd >= 0) {
+    if (s->cached_beacon_len > 0 && s->medium_connected) {
         int64_t now_ms = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
         if (now_ms - s->last_beacon_tx_ms > 500) {
             /* Update TSF timestamp in cached beacon (bytes 24-31) */
@@ -1493,7 +1513,8 @@ static inline bool in_range(hwaddr addr, uint32_t base, uint32_t count)
 /*
  * Inject one received frame into the RX descriptor ring.  Returns true if a
  * frame was written into a descriptor (the caller batches these and raises a
- * single RXOK once the whole burst is drained — see vwifi_ath9k_fd_read).
+ * single RXOK once the whole burst is drained — see
+ * vwifi_ath9k_drain_rxbuf).
  * Returns false when nothing was injected (RX disabled, ring empty/RXEOL, or
  * a DMA error); RXEOL is still raised inline as it is an error condition, not
  * a normal completion.
@@ -1838,43 +1859,14 @@ static bool vwifi_ath9k_process_msg(VwifiAth9kState *s,
 }
 
 /* -------------------------------------------------------------------
- *  FD read handler for the medium socket
+ *  Drain the reassembly buffer
  *
- *  Registered via qemu_set_fd_handler() — called when the socket
- *  has data available.  We reassemble length-prefixed messages.
+ *  Called from the chardev read callback once the newly arrived bytes
+ *  have been appended. Reassembles length-prefixed messages.
  * ------------------------------------------------------------------- */
-static void vwifi_ath9k_fd_read(void *opaque)
+static void vwifi_ath9k_drain_rxbuf(VwifiAth9kState *s)
 {
-    VwifiAth9kState *s = VWIFI_ATH9K(opaque);
-    uint32_t avail, msg_len, net_len, consumed;
-    ssize_t n;
-
-    if (s->medium_fd < 0) {
-        return;
-    }
-
-    avail = VWIFI_ATH9K_RXBUF_SIZE - s->medium_rxbuf_used;
-    if (avail == 0) {
-        vwifi_ath9k_error("MEDIUM RX: buffer full, resetting");
-        s->medium_rxbuf_used = 0;
-        return;
-    }
-
-    n = read(s->medium_fd, s->medium_rxbuf + s->medium_rxbuf_used, avail);
-    if (n <= 0) {
-        if (n < 0 && (errno == EINTR || errno == EAGAIN)) {
-            return;
-        }
-        vwifi_ath9k_trace("MEDIUM: socket closed (read returned %zd)", n);
-        qemu_set_fd_handler(s->medium_fd, NULL, NULL, NULL);
-        close(s->medium_fd);
-        s->medium_fd = -1;
-        s->medium_connected = false;
-        s->medium_rxbuf_used = 0;
-        vwifi_ath9k_schedule_reconnect(s);
-        return;
-    }
-    s->medium_rxbuf_used += (uint32_t)n;
+    uint32_t msg_len, net_len, consumed;
 
     /*
      * Drain every complete message this read produced, then raise a single
@@ -2560,9 +2552,10 @@ static void vwifi_ath9k_init_registers(VwifiAth9kState *s)
     s->tx_frames_to_medium = 0;
     s->rx_frames_from_medium = 0;
 
-    /* Medium state (socket connection is set up in realize) */
-    s->medium_fd = -1;
-    s->medium_connected = false;
+    /* Medium state. medium_connected is owned by the chardev event
+     * callback and deliberately NOT cleared here: a device reset does
+     * not close the hub connection, and clearing it would strand the
+     * device offline until the chardev happened to reconnect. */
     s->medium_rxbuf_used = 0;
 }
 
@@ -2667,23 +2660,24 @@ static void vwifi_ath9k_realize(PCIDevice *pci_dev, Error **errp)
     s->swba_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
                                  vwifi_ath9k_swba_timer_cb, s);
 
-    /* Create medium reconnect timer (QEMU_CLOCK_REALTIME so it fires
-     * even when the guest is idle / vCPU is halted) */
-    s->medium_reconnect_timer = timer_new_ms(QEMU_CLOCK_REALTIME,
-                                              vwifi_ath9k_reconnect_cb, s);
-
-    /* Initial connection attempt */
-    if (s->medium_path && s->medium_path[0] != '\0') {
-        if (!vwifi_ath9k_try_connect(s)) {
-            qemu_log_mask(LOG_GUEST_ERROR,
-                          "vwifi-ath9k: medium %s not available, "
-                          "will retry every %dms\n",
-                          s->medium_path, MEDIUM_RECONNECT_MS);
-            vwifi_ath9k_schedule_reconnect(s);
-        }
+    /*
+     * Attach to the medium chardev, if one was given. No chardev is a
+     * supported configuration -- the device then beacons to nobody,
+     * which is how the probe tests run it.
+     *
+     * Reconnection belongs to the chardev now (reconnect-ms), so there
+     * is no timer here and no initial connect: CHR_EVENT_OPENED tells
+     * us when the hub is there, and sends the hello.
+     */
+    if (qemu_chr_fe_backend_connected(&s->chr)) {
+        qemu_chr_fe_set_handlers(&s->chr,
+                                 vwifi_ath9k_chr_can_read,
+                                 vwifi_ath9k_chr_read,
+                                 vwifi_ath9k_chr_event,
+                                 NULL, s, NULL, true);
     } else {
         qemu_log_mask(LOG_GUEST_ERROR,
-                      "vwifi-ath9k: no medium path – "
+                      "vwifi-ath9k: no medium chardev – "
                       "standalone beacon-only mode\n");
     }
 
@@ -2702,18 +2696,12 @@ static void vwifi_ath9k_exit(PCIDevice *pci_dev)
     timer_free(s->beacon_timer);
     vwifi_ath9k_swba_timer_stop(s);
     timer_free(s->swba_timer);
-    timer_del(s->medium_reconnect_timer);
-    timer_free(s->medium_reconnect_timer);
 
-    if (s->medium_fd >= 0) {
-        qemu_set_fd_handler(s->medium_fd, NULL, NULL, NULL);
-        close(s->medium_fd);
-        s->medium_fd = -1;
-        s->medium_connected = false;
+    if (qemu_chr_fe_backend_connected(&s->chr)) {
+        qemu_chr_fe_deinit(&s->chr, true);
     }
+    s->medium_connected = false;
 
-    g_free(s->medium_path);
-    s->medium_path = NULL;
     g_free(s->macaddr);
     s->macaddr = NULL;
     g_free(s->node_id);
@@ -2762,60 +2750,23 @@ static const VMStateDescription vmstate_vwifi_ath9k = {
 };
 
 /* -------------------------------------------------------------------
- *  QOM string property for "medium" – uses object_property_add_str()
- *  instead of DEFINE_PROP_STRING (which requires hw/qdev-properties.h)
+ *  Properties
+ *
+ *  These were hand-rolled with object_property_add_str() to avoid
+ *  including hw/qdev-properties.h. DEFINE_PROP_CHR needs that header
+ *  anyway, so the whole set moved to the ordinary Property array --
+ *  the same shape the vwifi-virt device uses, which is worth more than
+ *  the include it saved.
+ *
+ *  const, and no DEFINE_PROP_END_OF_LIST: QEMU 10.0 removed the
+ *  terminator and device_class_set_props() takes the length from
+ *  ARRAY_SIZE().
  * ------------------------------------------------------------------- */
-static char *vwifi_ath9k_get_medium(Object *obj, Error **errp)
-{
-    VwifiAth9kState *s = VWIFI_ATH9K(obj);
-    return g_strdup(s->medium_path ? s->medium_path : "");
-}
-
-static void vwifi_ath9k_set_medium(Object *obj, const char *value, Error **errp)
-{
-    VwifiAth9kState *s = VWIFI_ATH9K(obj);
-    g_free(s->medium_path);
-    s->medium_path = g_strdup(value);
-}
-
-static char *vwifi_ath9k_get_macaddr(Object *obj, Error **errp)
-{
-    VwifiAth9kState *s = VWIFI_ATH9K(obj);
-    return g_strdup(s->macaddr ? s->macaddr : "");
-}
-
-static void vwifi_ath9k_set_macaddr(Object *obj, const char *value, Error **errp)
-{
-    VwifiAth9kState *s = VWIFI_ATH9K(obj);
-    g_free(s->macaddr);
-    s->macaddr = g_strdup(value);
-}
-
-static char *vwifi_ath9k_get_node_id(Object *obj, Error **errp)
-{
-    VwifiAth9kState *s = VWIFI_ATH9K(obj);
-    return g_strdup(s->node_id ? s->node_id : "");
-}
-
-static void vwifi_ath9k_set_node_id(Object *obj, const char *value, Error **errp)
-{
-    VwifiAth9kState *s = VWIFI_ATH9K(obj);
-    g_free(s->node_id);
-    s->node_id = g_strdup(value);
-}
-
-static void vwifi_ath9k_instance_init(Object *obj)
-{
-    object_property_add_str(obj, "medium",
-                            vwifi_ath9k_get_medium,
-                            vwifi_ath9k_set_medium);
-    object_property_add_str(obj, "macaddr",
-                            vwifi_ath9k_get_macaddr,
-                            vwifi_ath9k_set_macaddr);
-    object_property_add_str(obj, "node_id",
-                            vwifi_ath9k_get_node_id,
-                            vwifi_ath9k_set_node_id);
-}
+static const Property vwifi_ath9k_properties[] = {
+    DEFINE_PROP_CHR("chardev", VwifiAth9kState, chr),
+    DEFINE_PROP_STRING("macaddr", VwifiAth9kState, macaddr),
+    DEFINE_PROP_STRING("node_id", VwifiAth9kState, node_id),
+};
 
 static void vwifi_ath9k_class_init(ObjectClass *klass, const void *data)
 {
@@ -2834,6 +2785,7 @@ static void vwifi_ath9k_class_init(ObjectClass *klass, const void *data)
 
     dc->desc  = "Virtual Atheros AR9285 802.11n (vwifi-ath9k)";
     dc->vmsd  = &vmstate_vwifi_ath9k;
+    device_class_set_props(dc, vwifi_ath9k_properties);
 
     set_bit(DEVICE_CATEGORY_NETWORK, dc->categories);
 }
@@ -2842,7 +2794,6 @@ static const TypeInfo vwifi_ath9k_info = {
     .name          = TYPE_VWIFI_ATH9K,
     .parent        = TYPE_PCI_DEVICE,
     .instance_size = sizeof(VwifiAth9kState),
-    .instance_init = vwifi_ath9k_instance_init,
     .class_init    = vwifi_ath9k_class_init,
     .interfaces    = (InterfaceInfo[]) {
         { INTERFACE_PCIE_DEVICE },

@@ -95,16 +95,22 @@ static void qemu_be_raise_irq(void *be, unsigned vec)
 static int qemu_be_medium_send(void *be, const void *buf, size_t len)
 {
     VWifiState *s = be;
-    const uint8_t *p = buf;
-    size_t remaining = len;
-    while (remaining) {
-        int n = qemu_chr_fe_write(&s->chr, p, remaining);
-        if (n < 0) {
-            if (errno == EAGAIN || errno == EINTR) continue;
-            return -1;
-        }
-        if (n == 0) return -1;
-        p += n; remaining -= n;
+
+    /*
+     * write_all, not a qemu_chr_fe_write() loop. The hub's stream is
+     * length-prefixed, so a message goes out whole or the peer's framing
+     * is corrupted from there on -- there is no partial-send that leaves
+     * it intact. The hand-rolled loop this replaced retried EAGAIN with
+     * no delay at all, which is the same stall plus a spin.
+     *
+     * The stall itself is not fixed and cannot be here: this runs on the
+     * vCPU thread with the BQL held, and a hub that stops draining this
+     * peer blocks it. Fixing that means buffering the remainder and
+     * flushing from a qemu_chr_fe_add_watch() callback.
+     */
+    if (qemu_chr_fe_write_all(&s->chr, (const uint8_t *)buf,
+                              (int)len) != (int)len) {
+        return -1;
     }
     return 0;
 }
@@ -214,7 +220,14 @@ static int vwifi_chr_can_read(void *opaque)
 static void vwifi_chr_read(void *opaque, const uint8_t *buf, int size)
 {
     VWifiState *s = opaque;
+
     vwifi_medium_rx_bytes(s->dev, buf, (size_t)size);
+
+    /* The call above consumes whole messages out of the reassembly
+     * buffer, so space has usually just been freed. A front end that
+     * answered can_read() with 0 is not polled again until it accepts
+     * input, and that stall is permanent and silent. */
+    qemu_chr_fe_accept_input(&s->chr);
 }
 
 static void vwifi_chr_event(void *opaque, QEMUChrEvent ev)
