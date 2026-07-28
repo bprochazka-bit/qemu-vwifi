@@ -1,73 +1,132 @@
-# Linux driver for vwifi-virt — planned
+# vwifi — Linux driver for vwifi-virt
 
-Nothing here yet. This file records the shape of the port so it can be
-picked up without re-deriving the decisions.
+A full-MAC `cfg80211` driver. Builds `vwifi.ko`, which binds to PCI
+`1AF4:0E00` and gives the guest a `wlan0` that scans, associates with
+WPA2, and passes traffic.
 
-## Do you actually want this?
+## Status, honestly
 
-For most Linux guests: no. Use
-[`vwifi-ath9k`](../../../devices/ath9k/) instead — the guest needs no
-driver at all, because Linux has shipped `ath9k` since 2009. That is
-strictly less work than anything described below.
-
-This port earns its keep in three cases:
-
-- **Testing the `vwifi_abi.h` contract from a second implementation.**
-  A Linux driver is far cheaper to iterate on than the Windows one, and
-  a second consumer of the ABI finds specification gaps that a single
-  consumer never will.
-- **Guests where `ath9k` is unavailable** — a stripped or embedded
-  kernel with no `CONFIG_ATH9K`.
-- **Exercising device-owned 802.11.** `vwifi-ath9k` puts the state
-  machine in mac80211; `vwifi-virt` puts it in the device. Comparing the
-  two on one medium is a useful thing to be able to do.
-
-## Shape of the port
-
-The device owns scanning, association, key management and framing, so
-this is a **full-MAC** driver: register `cfg80211_ops` directly, do not
-pull in mac80211. mac80211 would insist on running a state machine the
-device has already run.
-
-```
-  cfg80211
-     |  .scan, .connect, .add_key, .start_ap, ...
-  vwifi_virt.ko
-     |  MMIO + MSI-X + 4 DMA rings
-  vwifi-virt (QEMU)
-```
-
-Rough mapping — the device side of each is already implemented and
-tested in `devices/vwifi/`:
-
-| `cfg80211_ops` | Control opcode |
+| | |
 |---|---|
-| `.scan` | `VWIFI_OP_SCAN`, then `VWIFI_EV_SCAN_COMPLETE` + BSS entries |
-| `.connect` | `VWIFI_OP_CONNECT` → `VWIFI_EV_ASSOC_RESULT` |
-| `.disconnect` | `VWIFI_OP_DISCONNECT` |
-| `.add_key` / `.del_key` | `VWIFI_OP_SET_KEY` / `VWIFI_OP_DEL_KEY` |
-| `.set_monitor_channel` | `VWIFI_OP_SET_CHANNEL` + `SET_OP_MODE` |
-| `.start_ap` / `.stop_ap` | `VWIFI_OP_START_AP` / `VWIFI_OP_STOP_AP` |
+| Compiles | **Yes** — clean at `W=1` against kernel 6.8 headers |
+| Run in a guest | **Not yet.** Never loaded, never bound to a live device |
+| STA mode: scan, connect, WPA2, data | Implemented |
+| Monitor mode | Mode switch works; RX frames are dropped (no radiotap path) |
+| SoftAP | Not implemented — the device supports it, the driver does not |
 
-The data path is a `netdev` moving 802.3 frames over the TX and RX
-rings. Monitor mode is the exception: raw 802.11 with radiotap, gated by
-`VWIFI_OP_SET_RAW_FILTER`.
+Treat "compiles" as what it is. Every ring interaction below is written
+against the device's actual implementation rather than guessed at, but
+the first `insmod` is still the first time any of it executes.
 
-## Suggested order
+## Why full-MAC, not mac80211
 
-1. PCI probe, BAR0 map, signature and ABI-version check, MSI-X.
-2. Ring allocation and the control request/response path. `GET_CAPS`
-   round-tripping is the first real milestone.
-3. `cfg80211` registration with scan only — `iw dev wlanX scan` against
-   a hub with a SoftAP peer on it.
-4. Connect, key install, and the data path.
-5. Monitor mode and injection.
-6. SoftAP.
+The device runs the 802.11 state machine: it scans channels, parses
+beacons, does auth/assoc, encrypts with CCMP, and translates
+802.3↔802.11. Registering with mac80211 would put a second state machine
+on top of one that has already done all of that — two schedulers fighting
+over one radio.
 
-## Before writing any of it
+So this driver registers `cfg80211_ops` directly. Each operation is one
+control opcode; each device event is one cfg80211 notification. That
+symmetry is essentially the whole driver:
 
-Read [`../../../abi/vwifi_abi.h`](../../../abi/vwifi_abi.h) — it is the
-contract, and it is the specification. Then run
-`make -C devices/vwifi test`: the device core is driven end to end
-against a mock backend there, and those tests are the clearest available
-statement of what the device does with each opcode.
+| cfg80211 | opcode |
+|---|---|
+| `.scan` | `SCAN` → `EV_BSS_FOUND` ×N, `EV_SCAN_COMPLETE` |
+| `.connect` | `CONNECT` → `EV_ASSOC_RESULT` |
+| `.disconnect` | `DISCONNECT` → `EV_DISCONNECTED` |
+| `.add_key` / `.del_key` | `SET_KEY` / `DEL_KEY` |
+| `.change_virtual_intf` | `SET_OP_MODE` |
+
+## Layout
+
+```
+vwifi_drv.h        driver-private state; ring and buffer sizes
+vwifi_main.c       PCI attach, MMIO, MSI-X, the four rings, control transport
+vwifi_cfg80211.c   wiphy setup, cfg80211_ops, device events -> notifications
+vwifi_net.c        netdev: 802.3 in and out of the TX/RX rings
+```
+
+The contract is `../../../abi/vwifi_abi.h`, included verbatim — the same
+header the device and the Windows driver compile against. Nothing in it
+is restated here. If it changes, everything changes together, which is
+the point.
+
+## Two things worth knowing before you change anything
+
+**Ring ownership is asymmetric.** The control-request and TX rings are
+driver-produced: fill the descriptor, set `OWN`, ring the doorbell, and
+the device clears `OWN` when it consumes. The control-response and RX
+rings are the other way round — the *driver* pre-arms slots with a
+buffer and `OWN` set, and the device only writes into a slot that has
+`OWN` set, clearing it as it does. So on those two rings "OWN clear"
+means "completed", and **a slot you forget to re-arm is a slot lost
+forever**.
+
+**There is no TX completion interrupt.** The device raises only
+`VEC_CTRL_RSP` and `VEC_RX`; it drains the whole TX ring synchronously
+on each doorbell write. That is why `ndo_start_xmit` drops on a full
+ring instead of calling `netif_stop_queue()` — a stopped queue would
+have nothing to wake it and transmit would wedge permanently.
+
+## Building
+
+```bash
+sudo apt install linux-headers-$(uname -r)
+make                        # against the running kernel
+make KDIR=/path/to/kernel   # against another tree
+sudo make install           # modules_install + depmod
+```
+
+Build it in the guest, or on a host with matching headers and copy
+`vwifi.ko` in.
+
+## Using it
+
+Start a hub and a peer to talk to first — see
+[`../../../docs/testing-guests.md`](../../../docs/testing-guests.md).
+Then, in a guest booted with `-device vwifi-virt`:
+
+```bash
+sudo insmod vwifi.ko
+dmesg | tail                # expect "vwifi-virt bound: ABI 1, caps 0x..., hub link up"
+
+ip link set wlan0 up
+iw dev wlan0 scan | grep SSID
+
+wpa_passphrase Lab-AP-1 correcthorse1 > /tmp/wpa.conf
+sudo wpa_supplicant -B -i wlan0 -c /tmp/wpa.conf
+iw dev wlan0 link
+sudo dhclient wlan0
+```
+
+If `insmod` succeeds but no `wlan0` appears, the probe failed — `dmesg`
+will say why. The two interesting failures are a bad signature (BAR not
+decoding) and an ABI mismatch (device and driver built from different
+versions of `vwifi_abi.h`), both of which refuse to bind rather than
+limp along.
+
+## What to do first when it misbehaves
+
+Reach for `devices/vwifi/tools/vwifi-probe` before the kernel debugger.
+It reads the same registers from userspace with nothing bound, so it
+separates "the device is broken" from "the driver is broken" in one
+command. If `vwifi-probe` shows `LINK_UP` and healthy counters but the
+driver sees nothing, the fault is on this side.
+
+`dev_dbg()` output needs `CONFIG_DYNAMIC_DEBUG`:
+
+```bash
+echo 'module vwifi +p' | sudo tee /sys/kernel/debug/dynamic_debug/control
+```
+
+## Not done yet
+
+- **Monitor mode RX.** `SET_OP_MODE` works and the device will send raw
+  frames with `RX_F_RAW`, but there is no monitor interface or radiotap
+  header, so those frames are counted and dropped.
+- **SoftAP.** `START_AP`/`STOP_AP` exist in the ABI and the device
+  implements them; no `.start_ap` here yet.
+- **Management frame TX/RX to userspace.** Needed for SAE (WPA3). The
+  device already reports `EV_MGMT_RX`; the handler is a stub.
+- **Multiple interfaces.** One netdev per device, one device per wiphy.

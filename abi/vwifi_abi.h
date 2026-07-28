@@ -28,7 +28,17 @@
 #ifndef VWIFI_ABI_H
 #define VWIFI_ABI_H
 
+/*
+ * Consumers of this header now include a Linux kernel module, where
+ * <stdint.h> does not exist. The kernel's <linux/types.h> supplies the
+ * whole fixed-width set this header uses -- signed included -- so the
+ * struct definitions below need no other conditionals.
+ */
+#ifdef __KERNEL__
+#include <linux/types.h>
+#else
 #include <stdint.h>
+#endif
 
 /* ================================================================
  * Identification

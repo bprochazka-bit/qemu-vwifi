@@ -11,18 +11,20 @@ for a guest wastes an afternoon.
 
 | | Linux guest | Windows guest |
 |---|---|---|
-| **`vwifi-ath9k`** | **Works.** Stock `ath9k` binds, you get a real `wlan0` | No usable in-box driver |
-| **`vwifi-virt`** | Device enumerates; **no driver exists yet** | Driver written, **never compiled** |
+| **`vwifi-ath9k`** | **Proven.** Stock `ath9k` binds, you get a real `wlan0` | No usable in-box driver |
+| **`vwifi-virt`** | Driver compiles, **not yet run** — plus a no-driver probe | Driver written, **never compiled** |
 
 So:
 
-- **To see working Wi-Fi in a VM today, use `vwifi-ath9k` with a Linux
-  guest.** That is the proven path, and it exercises the whole stack:
+- **For a known-good Wi-Fi VM, use `vwifi-ath9k` with a Linux guest.**
+  That is the path with mileage on it, and it exercises the whole stack:
   hub, medium protocol, channel model, association, encryption.
-- **To test the `vwifi-virt` device itself**, use a Linux guest plus
-  `tools/vwifi-probe`. There is no driver, but the device can still be
-  proven to enumerate, decode MMIO, connect to the hub, and move frames.
-- **The Windows driver is the open work item.** It has never been
+- **`vwifi-virt` now has a Linux driver**
+  ([`../drivers/vwifi/linux/`](../drivers/vwifi/linux/)) that builds
+  clean but has never been loaded. Bringing it up is Part 4 below —
+  expect to debug it, and use `vwifi-probe` to tell device faults from
+  driver faults.
+- **The Windows driver is still the open work item.** It has never been
   through a compiler. Expect to fix member names on the first build —
   see [`../drivers/vwifi/windows/README.md`](../drivers/vwifi/windows/README.md).
 
@@ -134,11 +136,11 @@ hostapd, with real WPA2 in between.
 
 ---
 
-## Part 4 — Linux guest with `vwifi-virt` (device smoke test)
+## Part 4 — Linux guest with `vwifi-virt`
 
-No driver exists, so this does **not** give you a `wlan0`. What it does
-give you is proof the device model works, which is what you actually
-want to know after changing it.
+Two things to do here, in this order: prove the device works with no
+driver at all, then load the driver. Doing it in that order means that
+when something breaks you already know which half to blame.
 
 ### 4a. Build the probe tool
 
@@ -204,6 +206,30 @@ means the BAR is not decoding, not that the device is broken.
 Run `sudo ./vwifi-probe -w` while the host AP is beaconing and the RX
 counter should climb — the device is parsing beacons off the medium with
 no guest driver involved at all.
+
+### 4d. Load the driver
+
+```bash
+sudo apt install linux-headers-$(uname -r)      # in the guest
+make -C drivers/vwifi/linux                      # or build on the host
+sudo insmod vwifi.ko
+dmesg | tail
+```
+
+Expect `vwifi-virt bound: ABI 1, caps 0x..., hub link up` and a `wlan0`.
+Then the same sequence as the ath9k guest:
+
+```bash
+ip link set wlan0 up
+iw dev wlan0 scan | grep SSID
+wpa_passphrase Lab-AP-1 correcthorse1 > /tmp/wpa.conf
+sudo wpa_supplicant -B -i wlan0 -c /tmp/wpa.conf
+iw dev wlan0 link
+```
+
+This driver has never been run. If it misbehaves, `vwifi-probe` still
+works alongside it and tells you whether the device is healthy —
+see [`../drivers/vwifi/linux/README.md`](../drivers/vwifi/linux/README.md).
 
 ---
 

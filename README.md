@@ -36,7 +36,7 @@ exists to enforce — see [`abi/README.md`](abi/README.md) for why.
 | [`host/`](host/) | `vwifi_host.ko` — mac80211 radios for the host machine — plus `vwifi-host-relay` and `vwifi-ctl` |
 | [`devices/ath9k/`](devices/ath9k/) | `vwifi-ath9k`: a QEMU model of an Atheros AR9285, driven by the unmodified in-tree Linux `ath9k` driver |
 | [`devices/vwifi/`](devices/vwifi/) | `vwifi-virt`: a QEMU device with a purpose-built ABI, for guests where no suitable real NIC can be emulated |
-| [`drivers/vwifi/`](drivers/vwifi/) | Guest drivers for `vwifi-virt` — Windows today, Linux and macOS planned |
+| [`drivers/vwifi/`](drivers/vwifi/) | Guest drivers for `vwifi-virt` — a Linux `cfg80211` driver and a Windows WDI miniport |
 | [`docs/`](docs/) | Development plans and lab notes |
 | [`scripts/`](scripts/), [`examples/`](examples/) | Lab bring-up helpers and sample hostapd configs |
 
@@ -62,7 +62,7 @@ interesting logic is testable without ever booting the guest.
 | | `vwifi-ath9k` | `vwifi-virt` |
 |---|---|---|
 | Guest driver | in-tree Linux `ath9k`, unmodified | ours ([`drivers/vwifi/`](drivers/vwifi/)) |
-| Guest OS | Linux | Windows now; Linux and macOS planned |
+| Guest OS | Linux | Linux and Windows; macOS planned |
 | 802.11 state machine | in the guest (mac80211) | in the device |
 | Testable without a guest | crypto and A-MPDU units | the entire device core |
 
