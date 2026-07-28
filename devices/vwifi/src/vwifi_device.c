@@ -908,6 +908,56 @@ static bool ies_find_ssid(const uint8_t *ies, uint16_t ie_len,
     return true;
 }
 
+/*
+ * Append the Supported Rates element, plus Extended Supported Rates
+ * when the set does not fit in the eight octets EID 1 allows.
+ *
+ * Rates are in units of 500 kbit/s; the high bit marks a rate as
+ * "basic", i.e. one the sender requires of anyone joining. The sets
+ * below are the ordinary 802.11g and 802.11a ones, which is what every
+ * peer on this medium can decode -- the medium's rate model is about
+ * airtime and error probability, not about what a receiver can demodulate.
+ *
+ * This is not decoration. hostapd's copy_supp_rates() rejects an
+ * Association Request that carries no Supported Rates element with
+ * WLAN_STATUS_UNSPECIFIED_FAILURE (1), which arrives here as a bare
+ * "Assoc Response REJECTED status=1" and explains nothing. The same
+ * element is required in a Probe Request by 802.11 and some APs decline
+ * to answer without it.
+ */
+#define IEEE80211_EID_SUPP_RATES      1
+#define IEEE80211_EID_EXT_SUPP_RATES  50
+
+static uint16_t ie_put_supp_rates(uint8_t *buf, uint16_t len, uint16_t freq)
+{
+    /* 802.11a: 6/9/12/18/24/36/48/54, basic 6/12/24. No CCK on 5 GHz. */
+    static const uint8_t rates_5[] = {
+        0x8C, 0x12, 0x98, 0x24, 0xB0, 0x48, 0x60, 0x6C,
+    };
+    /* 802.11g: CCK 1/2/5.5/11 (basic) then OFDM 6/9/12/18, with
+     * 24/36/48/54 spilling into the extended element. */
+    static const uint8_t rates_24[] = {
+        0x82, 0x84, 0x8B, 0x96, 0x0C, 0x12, 0x18, 0x24,
+    };
+    static const uint8_t rates_24_ext[] = { 0x30, 0x48, 0x60, 0x6C };
+
+    bool is_5ghz = (freq >= 5000);
+    const uint8_t *rates = is_5ghz ? rates_5 : rates_24;
+
+    buf[len++] = IEEE80211_EID_SUPP_RATES;
+    buf[len++] = 8;
+    memcpy(buf + len, rates, 8);
+    len += 8;
+
+    if (!is_5ghz) {
+        buf[len++] = IEEE80211_EID_EXT_SUPP_RATES;
+        buf[len++] = (uint8_t)sizeof(rates_24_ext);
+        memcpy(buf + len, rates_24_ext, sizeof(rates_24_ext));
+        len += (uint16_t)sizeof(rates_24_ext);
+    }
+    return len;
+}
+
 /* ============================================================
  * BSS table
  * ============================================================ */
@@ -1116,7 +1166,8 @@ static void scan_tune(struct vwifi_dev *d, uint16_t freq)
 /* Build and inject a probe request for an active scan. */
 static void scan_send_probe_req(struct vwifi_dev *d, unsigned ssid_idx)
 {
-    uint8_t frame[IEEE80211_MGMT_HDR_LEN + 2 + 32];
+    /* mgmt header + SSID IE + Supported Rates + Extended Supported Rates */
+    uint8_t frame[IEEE80211_MGMT_HDR_LEN + (2 + 32) + (2 + 8) + (2 + 4)];
     uint16_t len = 0;
     uint8_t  ssid_len = 0;
     const uint8_t *ssid = NULL;
@@ -1141,6 +1192,8 @@ static void scan_send_probe_req(struct vwifi_dev *d, unsigned ssid_idx)
         memcpy(frame + len, ssid, ssid_len);
         len += ssid_len;
     }
+
+    len = ie_put_supp_rates(frame, len, d->channel.primary_freq);
 
     medium_send_frame(d, frame, len, 0, d->channel.primary_freq,
                       d->ops->now_us(d->be), false);
@@ -1414,7 +1467,9 @@ static void conn_send_auth_req(struct vwifi_dev *d)
 
 static void conn_send_assoc_req(struct vwifi_dev *d)
 {
-    uint8_t frame[IEEE80211_MGMT_HDR_LEN + 4 + 2 + 33 + VWIFI_ASSOC_IE_MAX];
+    /* mgmt header + fixed body + SSID + rates + whatever the driver adds */
+    uint8_t frame[IEEE80211_MGMT_HDR_LEN + 4 + (2 + 33) +
+                  (2 + 8) + (2 + 4) + VWIFI_ASSOC_IE_MAX];
     uint16_t len = mgmt_hdr(d, frame, IEEE80211_SUBTYPE_ASSOC_REQ,
                             d->conn.bssid, d->conn.bssid);
 
@@ -1429,6 +1484,11 @@ static void conn_send_assoc_req(struct vwifi_dev *d)
     frame[len++] = (uint8_t)d->conn.ssid_len;
     memcpy(frame + len, d->conn.ssid, d->conn.ssid_len);
     len += d->conn.ssid_len;
+
+    /* Supported (and Extended Supported) Rates. Required: an AP running
+     * hostapd answers an Association Request without them with a bare
+     * status 1, and the SSID element alone is not enough to associate. */
+    len = ie_put_supp_rates(frame, len, d->conn.channel_freq);
 
     /* Driver-supplied IEs (RSN element for WPA2, etc). */
     if (d->conn.req_ie_len) {
@@ -1750,11 +1810,11 @@ static uint16_t ap_build_beacon_like(struct vwifi_dev *d, uint8_t *buf,
     len += d->ap.ssid_len;
 
     /* Supported rates IE — a station that sees no rates may refuse to
-     * associate, so this is not optional in practice. */
-    buf[len++] = 1;    /* EID_SUPP_RATES */
-    buf[len++] = 4;
-    buf[len++] = 0x82; buf[len++] = 0x84;   /* 1, 2 Mbps (basic) */
-    buf[len++] = 0x8B; buf[len++] = 0x96;   /* 5.5, 11 Mbps (basic) */
+     * associate, so this is not optional in practice. Band-aware: the
+     * CCK rates this used to advertise unconditionally do not exist on
+     * 5 GHz, and a station that reads them there sees a beacon whose
+     * basic-rate set it cannot satisfy. */
+    len = ie_put_supp_rates(buf, len, d->ap.channel_freq);
 
     /* DS Parameter Set — tells scanners which channel we're really on,
      * which matters when a beacon is heard on an adjacent channel. */

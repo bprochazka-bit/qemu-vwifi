@@ -332,12 +332,30 @@ int main(void)
         assert(ie[0] == 0);                      /* SSID IE */
         assert(ie[1] == strlen("vwifi-test"));
         assert(memcmp(ie + 2, "vwifi-test", 10) == 0);
-        /* The driver's RSN IE must follow the SSID IE. */
-        const uint8_t *rsnie = ie + 2 + 10;
+
+        /*
+         * Supported Rates must follow. hostapd rejects an Association
+         * Request without this element with WLAN_STATUS_UNSPECIFIED_
+         * FAILURE, which surfaces as an unexplained "status=1" and
+         * nothing else -- worth a test that names the element.
+         */
+        const uint8_t *rates = ie + 2 + 10;
+        assert(rates[0] == 1);                   /* EID Supported Rates */
+        assert(rates[1] == 8);
+        assert(rates[2] == 0x82);                /* 1 Mbit/s, basic */
+
+        /* 2.4 GHz overflows into Extended Supported Rates. */
+        const uint8_t *ext = rates + 2 + 8;
+        assert(ext[0] == 50);
+        assert(ext[1] == 4);
+        assert(ext[2] == 0x30);                  /* 24 Mbit/s */
+
+        /* Then the driver's own IEs. */
+        const uint8_t *rsnie = ext + 2 + 4;
         assert(rsnie[0] == 48);
         assert(rsnie[1] == 4);
     }
-    printf("  Auth Response drives Assoc Request w/ SSID + RSN IEs: PASS\n");
+    printf("  Assoc Request carries SSID + rates + driver RSN IEs: PASS\n");
 
     /* ---- 3. Assoc Response -> ASSOC_RESULT ---- */
     arm_all_rsp_slots();
