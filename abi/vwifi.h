@@ -20,6 +20,21 @@
  *   [struct vwifi_frame_hdr]                 -- medium header
  *   [uint8_t payload[...]]                   -- raw 802.11 frame
  *
+ * FRAMES CARRY NO FCS.
+ *
+ * The payload ends at the last byte of the 802.11 frame body; there is
+ * no trailing four-byte checksum. Every peer already honours this --
+ * vwifi-phys-bridge strips the FCS from real captures on the way in,
+ * vwifi-ath9k sends frame_len - FCS_LEN and appends a dummy FCS only on
+ * its guest-facing side, and vwifi-virt never adds one.
+ *
+ * A peer that assumes otherwise does not fail loudly. It quietly loses
+ * the last four bytes of every frame: a beacon's trailing IE gets
+ * clipped and a CCMP MIC gets truncated, so decryption and the 4-way
+ * handshake fail with nothing to point at. This has already cost one
+ * debugging session -- vwifi_host.ko set mac80211's RX_INCLUDES_FCS,
+ * which makes mac80211 trim four bytes off every frame it is handed.
+ *
  * Protocol version history:
  *   v1: Original protocol, no channel info
  *   v2: Added channel_freq, channel_flags, channel_bond_freq fields;

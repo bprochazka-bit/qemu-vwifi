@@ -1277,7 +1277,30 @@ static int vwifi_setup_hw(struct vwifi_priv *priv)
     ieee80211_hw_set(hw, MFP_CAPABLE);
     ieee80211_hw_set(hw, SUPPORTS_PS);
     ieee80211_hw_set(hw, HOST_BROADCAST_PS_BUFFERING);
-    ieee80211_hw_set(hw, RX_INCLUDES_FCS);
+    /*
+     * Do NOT set IEEE80211_HW_RX_INCLUDES_FCS.
+     *
+     * Frames on the vwifi medium carry no FCS -- that is the medium's
+     * convention, not an accident: vwifi-phys-bridge strips it from
+     * real captures on the way in, vwifi-ath9k sends frame_len -
+     * FCS_LEN and appends a dummy FCS only on its guest-facing side,
+     * and vwifi-virt never adds one.
+     *
+     * The flag tells mac80211 the last four bytes of every frame we
+     * hand up are an FCS. mac80211 believes it: ieee80211_rx_list()
+     * calls ieee80211_rx_monitor() for every non-802.3 frame, which
+     * returns ieee80211_clean_skb(), which does
+     *
+     *     if (present_fcs_len)
+     *             __pskb_trim(skb, skb->len - present_fcs_len);
+     *
+     * and the trimmed skb is what continues into
+     * __ieee80211_rx_handle_packet(). Setting the flag without an
+     * actual FCS therefore removes four bytes of real payload from
+     * every received frame -- clipping the trailing IE of a beacon and
+     * truncating the MIC of every CCMP frame, so decryption and the
+     * 4-way handshake fail with nothing obvious to blame.
+     */
     /*
      * Do NOT set IEEE80211_HW_SW_CRYPTO_CONTROL. Despite the name, that flag
      * does not enable software crypto -- it tells mac80211 "the driver
