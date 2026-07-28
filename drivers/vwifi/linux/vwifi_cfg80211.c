@@ -668,31 +668,24 @@ void vwifi_handle_event(struct vwifi_priv *p, u16 event,
  * Registration
  * ============================================================ */
 
-static const struct ieee80211_iface_limit vwifi_iface_limits[] = {
-	{
-		.max = 1,
-		.types = BIT(NL80211_IFTYPE_STATION) |
-			 BIT(NL80211_IFTYPE_MONITOR),
-	},
-};
-
-static const struct ieee80211_iface_combination vwifi_iface_combos[] = {
-	{
-		.limits = vwifi_iface_limits,
-		.n_limits = ARRAY_SIZE(vwifi_iface_limits),
-		.max_interfaces = 1,
-		.num_different_channels = 1,
-	},
-};
-
 /*
- * CCMP only. The device's SET_KEY accepts VWIFI_CIPHER_CCMP128 with a
- * 16-byte key and rejects everything else outright, so advertising
- * WEP/TKIP/GCMP would let wpa_supplicant negotiate a cipher that then
- * fails at .add_key -- mid-four-way-handshake, leaving an associated
- * but unkeyed link and a deauth loop. GCMP-256 is appended only if the
- * device claims WPA3.
+ * No iface_combinations here, deliberately.
+ *
+ * cfg80211 rejects a combination that permits only one interface --
+ * wiphy_verify_combinations() in net/wireless/core.c:
+ *
+ *     // Combinations with just one interface aren't real,
+ *     // however we make an exception for DFS.
+ *     if (WARN_ON((c->max_interfaces < 2) && !c->radar_detect_widths))
+ *             return -EINVAL;
+ *
+ * This driver supports exactly one interface at a time, so declaring a
+ * combination for it made wiphy_register() fail with -EINVAL and a
+ * WARNING backtrace. Combinations are optional; omitting them is how a
+ * single-interface driver says what it can do. interface_modes still
+ * advertises STA and monitor, and cfg80211 allows one of them at a time.
  */
+
 static const u32 vwifi_cipher_suites[] = {
 	WLAN_CIPHER_SUITE_CCMP,
 	WLAN_CIPHER_SUITE_GCMP_256,	/* only exposed with VWIFI_CAP_WPA3 */
@@ -736,8 +729,6 @@ int vwifi_cfg80211_init(struct vwifi_priv *p)
 	 * and injection both go through the device's raw path. */
 	if (p->caps.caps & VWIFI_CAP_MONITOR)
 		p->wiphy->interface_modes |= BIT(NL80211_IFTYPE_MONITOR);
-	p->wiphy->iface_combinations = vwifi_iface_combos;
-	p->wiphy->n_iface_combinations = ARRAY_SIZE(vwifi_iface_combos);
 	p->wiphy->cipher_suites = vwifi_cipher_suites;
 	p->wiphy->n_cipher_suites = (p->caps.caps & VWIFI_CAP_WPA3) ?
 		ARRAY_SIZE(vwifi_cipher_suites) : VWIFI_N_CIPHERS_BASE;

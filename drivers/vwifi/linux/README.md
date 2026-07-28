@@ -9,7 +9,7 @@ WPA2, and passes traffic.
 | | |
 |---|---|
 | Compiles | **Yes** — clean at `W=1` against kernel 6.8 headers |
-| Run in a guest | **Not yet.** Never loaded, never bound to a live device |
+| Loads in a guest | Fixed after a first attempt failed — see below. Bound-and-working is still unconfirmed |
 | Reviewed | Yes — an adversarial pass found 15 issues; the real ones are fixed |
 | STA mode: scan, connect, WPA2 (CCMP), data | Implemented |
 | Monitor mode + radiotap RX | Implemented |
@@ -20,6 +20,20 @@ Treat "compiles" as what it is. Every ring interaction is written
 against the device's actual implementation rather than guessed at, and
 a review pass caught three memory-safety bugs before anyone ran it —
 but the first `insmod` is still the first time any of it executes.
+
+### Things the first load attempt caught
+
+- **cfg80211 rejects a single-interface `iface_combination`.**
+  `wiphy_verify_combinations()` warns and returns `-EINVAL` for a
+  combination with `max_interfaces < 2` and no radar detection —
+  "combinations with just one interface aren't real". This driver
+  supports one interface at a time, so it declares no combinations at
+  all, which is how that is expressed. Symptom was a `WARNING` at
+  `net/wireless/core.c:625` and `wiphy_register failed: -22`.
+- **`asm/unaligned.h` became `linux/unaligned.h` in 6.12.** Sidestepped
+  by not using `put_unaligned_le*()` at all — the two stores it was
+  doing are into a local buffer, where a `memcpy` is equivalent and
+  carries no version dependency.
 
 ### Things the review caught, worth knowing about
 
@@ -113,6 +127,8 @@ Build it in the guest, or on a host with matching headers and copy
 
 ```bash
 sudo apt install dkms linux-headers-$(uname -r)
+
+# from the repository root, or from this directory
 sudo make dkms              # stage, add, build, install
 sudo modprobe vwifi
 

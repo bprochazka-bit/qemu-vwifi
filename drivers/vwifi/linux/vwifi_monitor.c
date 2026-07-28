@@ -26,7 +26,6 @@
 #include <linux/ieee80211.h>
 #include <linux/if_arp.h>	/* ARPHRD_IEEE80211_RADIOTAP */
 #include <net/ieee80211_radiotap.h>
-#include <asm/unaligned.h>
 
 #include "vwifi_drv.h"
 
@@ -244,11 +243,23 @@ bool vwifi_monitor_rx(struct vwifi_priv *p, const struct vwifi_rx_desc *desc,
 		vwifi_rt_put(&b, IEEE80211_RADIOTAP_VHT, &vht, sizeof(vht), 2);
 	}
 
-	/* Fixed header last: it_len is only known now. */
-	b.buf[0] = 0;				/* it_version */
-	b.buf[1] = 0;				/* it_pad */
-	put_unaligned_le16(b.len, &b.buf[2]);	/* it_len */
-	put_unaligned_le32(b.present, &b.buf[4]);
+	/*
+	 * Fixed header last: it_len is only known now.
+	 *
+	 * memcpy rather than put_unaligned_le*(): that lives in
+	 * <asm/unaligned.h> up to 6.11 and <linux/unaligned.h> from 6.12,
+	 * and there is no reason to take a version dependency for two
+	 * stores into a local buffer.
+	 */
+	{
+		__le16 it_len = cpu_to_le16(b.len);
+		__le32 present = cpu_to_le32(b.present);
+
+		b.buf[0] = 0;			/* it_version */
+		b.buf[1] = 0;			/* it_pad */
+		memcpy(&b.buf[2], &it_len, sizeof(it_len));
+		memcpy(&b.buf[4], &present, sizeof(present));
+	}
 
 	skb = netdev_alloc_skb(ndev, b.len + desc->frame_len);
 	if (!skb)

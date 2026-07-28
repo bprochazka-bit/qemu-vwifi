@@ -28,7 +28,7 @@
 
 /* Must match PACKAGE_VERSION in dkms.conf. dkms-install.sh refuses to
  * stage the driver if the two disagree. */
-#define VWIFI_DRV_VERSION "1.0.0"
+#define VWIFI_DRV_VERSION "1.0.1"
 
 /*
  * Ring sizes. All must be powers of two — the device masks indices

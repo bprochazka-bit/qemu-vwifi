@@ -13,6 +13,9 @@
 #
 # Host-side targets:
 #   make                     — userspace binaries (no kernel headers needed)
+#   make driver              — the vwifi-virt Linux guest driver
+#   sudo make dkms           — ... installed via DKMS (survives kernel upgrades)
+#   sudo make dkms-remove    — ... unregistered again
 #   make module              — host kernel module against the running kernel
 #   make module KDIR=/path   — ... against a specific kernel source tree
 #   make install             — install the kernel module (requires root)
@@ -97,6 +100,23 @@ $(BUILD)/ath9k_medium_hub: medium/legacy/ath9k_medium_hub.c | $(BUILD)
 
 $(BUILD)/ath9k_medium_hub_scalable: medium/legacy/ath9k_medium_hub_scalable.c | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $<
+
+# ---------- Guest driver (vwifi-virt) ----------
+#
+# The Linux driver for the vwifi-virt device. It builds like any
+# out-of-tree module, but DKMS is what you want in a guest whose kernel
+# gets upgraded -- a plain module is built for one kernel version and
+# stops loading after the next upgrade.
+
+.PHONY: driver dkms dkms-remove
+driver:
+	$(MAKE) -C drivers/vwifi/linux KDIR=$(KDIR)
+
+dkms:
+	$(MAKE) -C drivers/vwifi/linux dkms
+
+dkms-remove:
+	$(MAKE) -C drivers/vwifi/linux dkms-remove
 
 # ---------- Host kernel module ----------
 
@@ -339,5 +359,6 @@ test-devices:
 clean:
 	rm -rf $(BUILD)
 	$(MAKE) -C host clean KDIR=$(KDIR)
+	$(MAKE) -C drivers/vwifi/linux clean KDIR=$(KDIR)
 	$(MAKE) -C devices/vwifi clean
 	$(MAKE) -C devices/ath9k clean-tests
