@@ -57,7 +57,7 @@ re-run `integrate`.
 
 `abi/vwifi.h`, the v2 medium protocol: a 40-byte header carrying tx MAC,
 rate code, RSSI, TSF and the full channel tuple, behind a big-endian
-length prefix, over a chardev socket to the hub.
+length prefix, over a Unix socket to the hub.
 
 A device that gets that header wrong does not fail loudly — the hub
 drops its frames and logs nothing. `devices/vwifi/tests/medium_proto.c`
@@ -66,11 +66,32 @@ asserts the format field by field; treat it as the reference for what
 
 ## Attaching a device to a medium
 
+The two devices reach the hub differently, and the command lines are
+**not** interchangeable.
+
+`vwifi-ath9k` opens the hub's Unix socket itself, so it takes a path:
+
 ```bash
 qemu-system-x86_64 ... \
-  -chardev socket,id=medium,path=/tmp/vwifi.sock,server=off \
-  -device vwifi-ath9k,chardev=medium,node_id=linux-vm
+  -device vwifi-ath9k,medium=/tmp/vwifi.sock,node_id=linux-vm
 ```
+
+`vwifi-virt` goes through a QEMU chardev, so it takes a chardev id:
+
+```bash
+qemu-system-x86_64 ... \
+  -chardev socket,id=medium,path=/tmp/vwifi.sock,server=off,reconnect-ms=2000 \
+  -device vwifi-virt,chardev=medium,node_id=virt-guest
+```
+
+`vwifi-ath9k` has no `chardev` property — it registers exactly
+`medium`, `macaddr` and `node_id` — so borrowing the second form for it
+fails at startup with "Property 'vwifi-ath9k.chardev' not found".
+
+Both survive a hub restart, by different means: `vwifi-ath9k` runs its
+own 2-second reconnect timer, and `vwifi-virt` gets the same from the
+chardev layer's `reconnect-ms`. Omit `reconnect-ms` and the vwifi-virt
+guest stays dead after the hub goes away.
 
 `node_id` is what the peer calls itself in the hub's `LIST_PEERS`,
 `SURVEY` and `SET_POS` output. Give every peer a distinct one — an
