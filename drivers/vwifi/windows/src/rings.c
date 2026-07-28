@@ -222,6 +222,39 @@ VwifiRingsProgramMmio(_In_ PVWIFI_ADAPTER Adapter)
 }
 
 /* ============================================================
+ * Arm every control-response descriptor.
+ *
+ * The device picks the next response slot with an index of its own,
+ * advanced by asynchronous EVENTS as well as by replies to requests --
+ * BSS_FOUND, SCAN_COMPLETE, ASSOC_RESULT and LINK_STATE all consume a
+ * slot. It refuses to post into a slot whose OWN bit is clear, and
+ * drops the event when that happens.
+ *
+ * So the whole ring has to be armed up front, exactly as the Linux
+ * driver does it. Arming slots lazily, one per outgoing request, breaks
+ * the moment an event is posted: the two indices drift apart, leaving
+ * some slots unarmed when the device needs them and letting a preload
+ * overwrite a slot the device has already filled. Both failures are
+ * silent -- an event simply never arrives, and a scan reports fewer
+ * networks or never completes.
+ * ============================================================ */
+VOID
+VwifiRingsArmCtrlRsp(_Inout_ PVWIFI_ADAPTER Adapter)
+{
+    struct vwifi_ctrl_rsp_desc *descs = Adapter->CtrlRspRing.VirtualAddress;
+
+    for (ULONG i = 0; i < Adapter->CtrlRspRing.NumDescs; i++) {
+        struct vwifi_ctrl_rsp_desc *d = &descs[i];
+        RtlZeroMemory(d, sizeof(*d));
+        d->payload_addr = Adapter->CtrlRspPayloadPa.QuadPart
+                        + (ULONGLONG)i * VWIFI_CTRL_PAYLOAD_SIZE;
+        d->payload_len  = VWIFI_CTRL_PAYLOAD_SIZE;
+        d->flags        = VWIFI_DESC_F_OWN;
+    }
+    Adapter->CtrlRspRing.NextIndex = 0;
+}
+
+/* ============================================================
  * Post initial RX buffers so the device has somewhere to deliver
  * frames when the medium starts flowing.
  * ============================================================ */
@@ -288,7 +321,6 @@ VwifiCtrlSendSync(
 {
     ULONG slot;
     struct vwifi_ctrl_req_desc *desc;
-    struct vwifi_ctrl_rsp_desc *rsp_desc;
     VWIFI_PENDING_REQ req = { 0 };
     LARGE_INTEGER timeout;
 
@@ -322,17 +354,18 @@ VwifiCtrlSendSync(
             InPayload, InLen);
     }
 
-    /* Preload the matching rsp slot so the device has a payload
-     * address to write into. The rsp ring is indexed identically
-     * on slot number; we rely on in-order response completion. */
-    rsp_desc = (struct vwifi_ctrl_rsp_desc *)
-        ((PUCHAR)Adapter->CtrlRspRing.VirtualAddress +
-         slot * sizeof(struct vwifi_ctrl_rsp_desc));
-    RtlZeroMemory(rsp_desc, sizeof(*rsp_desc));
-    rsp_desc->payload_addr = Adapter->CtrlRspPayloadPa.QuadPart
-                           + slot * VWIFI_CTRL_PAYLOAD_SIZE;
-    rsp_desc->payload_len  = VWIFI_CTRL_PAYLOAD_SIZE;
-    rsp_desc->flags        = VWIFI_DESC_F_OWN;
+    /*
+     * No response slot is preloaded here on purpose.
+     *
+     * The response ring is armed in full by VwifiRingsArmCtrlRsp() and
+     * re-armed slot by slot as the DPC drains it. Arming one here, at
+     * the index of the REQUEST slot, assumed the device answers on the
+     * matching index -- it does not. It uses a producer index of its
+     * own that also advances for every asynchronous event, so the two
+     * drift apart as soon as a single BSS_FOUND is posted, and this
+     * store would then land on a slot the device had already filled and
+     * the DPC had not yet read.
+     */
 
     /* Build and publish the request descriptor. */
     RtlZeroMemory(desc, sizeof(*desc));

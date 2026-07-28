@@ -284,6 +284,7 @@ BOOLEAN     VwifiHwInterruptDpc(_In_ PVWIFI_ADAPTER Adapter);
 NDIS_STATUS VwifiRingsAllocate(_Inout_ PVWIFI_ADAPTER Adapter);
 VOID        VwifiRingsFree(_Inout_ PVWIFI_ADAPTER Adapter);
 VOID        VwifiRingsProgramMmio(_In_ PVWIFI_ADAPTER Adapter);
+VOID        VwifiRingsArmCtrlRsp(_Inout_ PVWIFI_ADAPTER Adapter);
 VOID        VwifiRingsPostRxBuffers(_Inout_ PVWIFI_ADAPTER Adapter);
 
 /* Synchronous control command. Blocks until response arrives or

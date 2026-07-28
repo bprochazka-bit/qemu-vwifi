@@ -188,6 +188,7 @@ VwifiHwInitialize(
     status = VwifiRingsAllocate(Adapter);
     if (status != NDIS_STATUS_SUCCESS) goto fail_mmio;
     VwifiRingsProgramMmio(Adapter);
+    VwifiRingsArmCtrlRsp(Adapter);
     VwifiRingsPostRxBuffers(Adapter);
 
     /* RX NBL pool for monitor-mode indications. */
@@ -309,6 +310,7 @@ VwifiHwReset(_Inout_ PVWIFI_ADAPTER Adapter)
     /* Re-enable. Rings' base addresses are still valid — the
      * device zeros only the status bits, not the ring MMIO regs. */
     VwifiRingsProgramMmio(Adapter);
+    VwifiRingsArmCtrlRsp(Adapter);
     VwifiRingsPostRxBuffers(Adapter);
     VwifiWrite32(Adapter, VWIFI_REG_CTRL,
                  VWIFI_CTRL_ENABLE | VWIFI_CTRL_IRQ_ENABLE);

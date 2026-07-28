@@ -5,6 +5,12 @@
 #
 #   sudo ./dkms-install.sh          # stage, add, build, install
 #   sudo ./dkms-install.sh remove   # unregister and clean /usr/src
+#        ./dkms-install.sh stage DIR  # stage only, into DIR (no root)
+#
+# The "stage" action exists so dkms-selftest.sh can build the exact tree
+# DKMS would build without needing dkms or root. Keeping one copy of the
+# file list is the point: a staged tree that differs from what the
+# selftest checks is a selftest that proves nothing.
 #
 # Why a script rather than "dkms add ." straight from the repo:
 #
@@ -70,16 +76,22 @@ remove)
     echo "=== ${PACKAGE_NAME} ${PACKAGE_VERSION} removed ==="
     exit 0
     ;;
+stage)
+    if [ $# -lt 2 ]; then
+        echo "Usage: $0 stage <directory>" >&2
+        exit 1
+    fi
+    DEST="$2"
+    ;;
 install)
+    need_root
+    have_dkms
     ;;
 *)
-    echo "Usage: $0 [install|remove]" >&2
+    echo "Usage: $0 [install|remove|stage <dir>]" >&2
     exit 1
     ;;
 esac
-
-need_root
-have_dkms
 
 if [ ! -f "${ABI_DIR}/vwifi_abi.h" ] || [ ! -f "${ABI_DIR}/vwifi.h" ]; then
     echo "ERROR: shared ABI headers not found under ${ABI_DIR}." >&2
@@ -102,8 +114,10 @@ fi
 
 echo "=== Staging ${PACKAGE_NAME} ${PACKAGE_VERSION} into ${DEST} ==="
 
-dkms_purge
-rm -rf "${DEST}"
+if [ "${ACTION}" = "install" ]; then
+    dkms_purge
+    rm -rf "${DEST}"
+fi
 mkdir -p "${DEST}"
 
 # Enumerated, not globbed. A *.c glob also picks up vwifi.mod.c if the
@@ -150,6 +164,10 @@ guest/host boundary.
 EOF
 
 echo "   staged $(ls -1 "${DEST}" | wc -l) files"
+
+if [ "${ACTION}" = "stage" ]; then
+    exit 0
+fi
 
 echo "=== dkms add / build / install ==="
 dkms add     -m "${PACKAGE_NAME}" -v "${PACKAGE_VERSION}"

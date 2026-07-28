@@ -167,6 +167,42 @@ static const uint8_t *last_tx_frame(uint16_t *len_out)
     return found->medium_buf + 4 + MEDIUM_HDR_LEN;
 }
 
+/* Channel the device stamped on the last frame it sent. */
+static uint16_t last_tx_freq(void)
+{
+    const struct mock_event *found = NULL;
+    for (size_t i = 0; i < mock_backend_event_count(g_mock); i++) {
+        const struct mock_event *e = &mock_backend_events(g_mock)[i];
+        if (e->kind == MOCK_EV_MEDIUM_TX && e->medium_len > 4 + MEDIUM_HDR_LEN) {
+            found = e;
+        }
+    }
+    if (!found) return 0;
+    struct vwifi_frame_hdr h;
+    memcpy(&h, found->medium_buf + 4, sizeof(h));
+    return h.channel_freq;
+}
+
+/* Minimal beacon: mgmt header, fixed fields, one SSID element. */
+static uint16_t build_beacon(uint8_t *buf, const uint8_t bssid[6],
+                             const char *ssid)
+{
+    uint16_t len = 0;
+    uint8_t slen = (uint8_t)strlen(ssid);
+
+    memset(buf, 0, 64);
+    buf[0] = (8 << 4);                  /* mgmt, beacon */
+    memset(buf + 4, 0xFF, 6);           /* addr1 broadcast */
+    memcpy(buf + 10, bssid, 6);         /* addr2 */
+    memcpy(buf + 16, bssid, 6);         /* addr3 = BSSID */
+    len = 24 + 12;                      /* header + tsf/interval/caps */
+    buf[len++] = 0;                     /* SSID element */
+    buf[len++] = slen;
+    memcpy(buf + len, ssid, slen);
+    len += slen;
+    return len;
+}
+
 static uint16_t le16(const uint8_t *p) { return (uint16_t)p[0] | ((uint16_t)p[1] << 8); }
 static void put16(uint8_t *p, uint16_t v) { p[0] = v & 0xFF; p[1] = v >> 8; }
 
@@ -501,6 +537,46 @@ int main(void)
         assert(ar->status_code == 16);   /* auth sequence timeout */
     }
     printf("  no AP reply -> connect times out with status 16: PASS\n");
+
+    /* ---- 9. A connect with no channel takes it from the BSS table ----
+     *
+     * wpa_supplicant omits the channel whenever it will let the driver
+     * roam, and WDI's connect parameters have no channel field at all,
+     * so "the driver always tells us" is not an assumption the device
+     * can make. Falling back to the currently tuned channel puts the
+     * exchange on whatever the last scan restored. */
+    {
+        static const uint8_t AP2[6] = { 0xAA, 0xBB, 0xCC, 0x00, 0x00, 0x02 };
+        uint8_t beacon[64];
+        uint16_t blen = build_beacon(beacon, AP2, "other-ap");
+        uint8_t cbuf[sizeof(struct vwifi_connect_req)];
+        struct vwifi_connect_req *c2 = (struct vwifi_connect_req *)cbuf;
+
+        /* Park the radio on "unknown" first. A device tuned to 2437
+         * from the earlier test would drop a 5220 MHz beacon in its own
+         * RX filter, and a fallback to the current channel would then
+         * be indistinguishable from the lookup being tested. */
+        struct vwifi_channel any = { 0 };
+        assert(ctrl_send(VWIFI_OP_SET_CHANNEL, &any, sizeof(any)) == 0);
+
+        /* Heard outside any scan -- the BSS table is populated by the
+         * RX path, not by scanning. */
+        medium_rx(beacon, blen, 5220, AP2);
+
+        memset(cbuf, 0, sizeof(cbuf));
+        memcpy(c2->bssid, AP2, 6);
+        c2->ssid_len = (uint16_t)strlen("other-ap");
+        memcpy(c2->ssid, "other-ap", c2->ssid_len);
+        c2->channel_freq = 0;              /* the case under test */
+        c2->auth_algo    = VWIFI_AUTH_OPEN;
+
+        arm_all_rsp_slots();
+        mock_backend_clear_events(g_mock);
+        assert(ctrl_send(VWIFI_OP_CONNECT, cbuf, sizeof(cbuf)) == 0);
+        assert(last_tx_freq() == 5220);
+        assert(ctrl_send(VWIFI_OP_DISCONNECT, NULL, 0) == 0);
+        printf("  connect w/o channel uses the BSS table's: PASS\n");
+    }
 
     printf("connect: PASS\n");
     free(g_dev);

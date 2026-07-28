@@ -575,7 +575,7 @@ Modes:
       Blast frames for S seconds at maximum rate, check integrity.
 
   dump     <sock>
-      Passive listener — prints all frames (like medium_dump.py -v).
+      Passive listener — prints all frames (like tools/vwifi_dump.py -v).
 
 Examples:
   # Quick self-test:
@@ -609,7 +609,7 @@ def parse_args(argv):
 
 
 def run_dump(sock_path):
-    """Passive frame dump (like medium_dump.py but integrated)."""
+    """Passive frame dump (like tools/vwifi_dump.py but integrated)."""
     sock = connect_to_hub(sock_path)
     print(f"Connected to {sock_path}, dumping frames...\n")
     count = 0

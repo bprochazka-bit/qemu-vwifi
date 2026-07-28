@@ -106,10 +106,17 @@ VwifiTlvParseScanRequest(
 
     /* Channel hints. WDI may give a channel list; a scan is always
      * allowed to cover more than requested, so if anything is unclear
-     * we fall back to "all 2.4 GHz channels" rather than scanning
-     * nothing. That degrades to a slower scan, never a broken one. */
-    ReqBuf->channel_mask_24 = 0x3FFE;   /* channels 1..13 */
-    ReqBuf->channel_mask_5  = 0;        /* device has no 5 GHz yet */
+     * we leave both masks at zero and let VwifiHandleTaskScan fill them
+     * from the device's advertised capabilities. That degrades to a
+     * slower scan, never a broken one.
+     *
+     * Leaving them zero rather than hardcoding 2.4 GHz here is the
+     * point: the device grew 5 GHz support, and a mask hardcoded in
+     * this file meant a Windows guest never scanned above channel 14 no
+     * matter what the device advertised. Capabilities belong to the one
+     * place that reads them. */
+    ReqBuf->channel_mask_24 = 0;
+    ReqBuf->channel_mask_5  = 0;
     ReqBuf->dwell_ms        = 100;
     ReqBuf->flags           = 0;
 
@@ -339,7 +346,12 @@ VwifiTlvParseConnectRequest(
     ReqBuf->ssid_len = static_cast<USHORT>(ssidLen);
     RtlCopyMemory(ReqBuf->ssid, cp->SSID.SSID, ssidLen);
 
-    ReqBuf->channel_freq = 0;   /* let the device use the BSS's channel */
+    /* WDI's connect parameters carry no channel, so this stays zero and
+     * the device resolves it: it looks the BSSID up in the BSS table it
+     * filled while scanning. Before that fallback existed, zero meant
+     * "use whatever channel we happen to be tuned to", which after a
+     * scan is the restored pre-scan channel. */
+    ReqBuf->channel_freq = 0;
 
     WdiAuthToVwifi(cp->AuthAlgo, &ReqBuf->auth_algo, &ReqBuf->akm_suite);
     ReqBuf->cipher_pairwise = WdiCipherToVwifi(cp->UnicastCipherAlgo);

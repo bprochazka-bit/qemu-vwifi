@@ -83,7 +83,18 @@ VwifiRateCodeTo500Kbps(UCHAR rate_code)
     case 0x1A: return 4;    /* 2 Mbps  */
     case 0x19: return 11;   /* 5.5 Mbps*/
     case 0x18: return 22;   /* 11 Mbps */
-    default:   return 12;   /* fall back to 6 Mbps */
+
+    /*
+     * Anything else has no legacy rate to report, and rate codes at
+     * 0x80 and above are exactly that: HT/VHT MCS values, which this
+     * field cannot express. Report 0 rather than "6 Mbps".
+     *
+     * A capture showing 0 Mb/s is obviously incomplete and gets
+     * questioned; a capture showing 6 Mb/s for every 802.11n frame
+     * looks right and gets believed. The Linux driver's monitor path
+     * and medium/tools/vwifi_dump.py make the same choice.
+     */
+    default:   return 0;
     }
 }
 

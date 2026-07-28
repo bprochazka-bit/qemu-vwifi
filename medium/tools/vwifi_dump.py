@@ -1,26 +1,44 @@
 #!/usr/bin/env python3
 """
-medium_dump.py — Tap into the vwifi virtual medium hub and dump frames.
+vwifi_dump.py — attach to the vwifi medium hub and capture every frame.
 
-Connects to the hub as a regular client and prints hex dumps of all
-frames seen on the medium. Optionally writes a pcap file with proper
-radiotap headers for analysis in Wireshark.
+Connects to the hub as an ordinary peer, prints a decoded one-line
+summary of each frame, and optionally writes a pcap with radiotap
+headers for Wireshark.
 
 Usage:
-    python3 medium_dump.py /tmp/medium_hub_1.sock
-    python3 medium_dump.py /tmp/medium_hub_1.sock -v
-    python3 medium_dump.py /tmp/medium_hub_1.sock -w capture.pcap
-    python3 medium_dump.py /tmp/medium_hub_1.sock -w capture.pcap -v
+    python3 vwifi_dump.py /tmp/vwifi.sock
+    python3 vwifi_dump.py /tmp/vwifi.sock -v
+    python3 vwifi_dump.py /tmp/vwifi.sock -w capture.pcap
+    python3 vwifi_dump.py /tmp/vwifi.sock -w - | wireshark -k -i -
 
-Notes on pcap output:
-    The pcap file uses link type 127 (LINKTYPE_IEEE802_11_RADIOTAP).
-    Each packet is prefixed with a radiotap header containing:
-      - TSFT (timestamp from the medium header TSF fields)
-      - Rate (from the medium header rate_code)
-      - Antenna signal (dBm, from the medium header rssi)
-      - Channel frequency and flags (from v2 medium header, or defaults)
-    This allows Wireshark to display channel info, signal strength,
-    data rate, and timestamps alongside the decoded 802.11 frames.
+Why this peer stays anonymous
+-----------------------------
+It never sends a hello and never transmits, and both matter:
+
+  * The hub learns a peer's channel from the frames that peer sends.
+    Having sent none, this one's channel stays 0, which the hub's
+    channel filter treats as "matches anything" -- so the capture sees
+    every channel at once rather than whichever one it last claimed.
+
+  * A hello binds a peer to a node, and a node is subject to the
+    propagation model. A tap that silently loses frames because the
+    simulation decided they were too weak is worse than no tap at all.
+
+The cost is that the hub logs it as an unnamed `local-qemu` peer. That
+is the right trade: this is a wiretap on the medium, not a radio in it.
+
+pcap output
+-----------
+Link type 127 (LINKTYPE_IEEE802_11_RADIOTAP). Each frame gets a
+radiotap header carrying the TSF, the channel, the signal level, and
+the rate -- as a legacy rate when the medium's rate code is one, and as
+a radiotap MCS field when it is an HT code. An unrecognised code emits
+neither rather than a plausible-looking 6 Mbps, because a wrong rate in
+a capture is harder to catch than a missing one.
+
+The frames carry NO FCS (see abi/vwifi.h), so no FCS flag is set and
+Wireshark is told not to expect four trailing bytes.
 """
 
 import socket
@@ -61,10 +79,12 @@ RADIOTAP_HEADER_REVISION = 0
 
 # Radiotap present flags (bitmask)
 RADIOTAP_TSFT          = (1 << 0)
+RADIOTAP_FLAGS         = (1 << 1)
 RADIOTAP_RATE          = (1 << 2)
 RADIOTAP_CHANNEL       = (1 << 3)
 RADIOTAP_DBM_ANTSIGNAL = (1 << 5)
 RADIOTAP_ANTENNA       = (1 << 11)
+RADIOTAP_MCS           = (1 << 19)
 
 # Radiotap channel flags
 RADIOTAP_CHAN_TURBO  = 0x0010
@@ -144,9 +164,40 @@ def freq_to_channel(freq):
     return 0
 
 
-def rate_is_ofdm(rate_code):
-    """Check if a rate code is OFDM (vs CCK)."""
-    return rate_code in (0x0B, 0x0F, 0x0A, 0x0E, 0x09, 0x0D, 0x08, 0x0C)
+# CCK rate codes, needed for the radiotap channel flags.
+CCK_RATE_CODES = (0x1B, 0x1A, 0x19, 0x18)
+
+
+def decode_rate(code):
+    """
+    Split a medium rate code into what radiotap can express.
+
+    Mirrors vwifi_decode_rate() in the Linux driver's monitor path --
+    the two read the same field off the same wire and disagreeing about
+    it would make a guest capture and a hub capture of one frame report
+    different rates.
+
+    Returns a dict; legacy_500kbps is 0 and mcs is None when the code
+    has no representation, which is the caller's cue to omit the field.
+    """
+    out = {"legacy_500kbps": 0, "cck": False, "mcs": None, "ht40": False}
+
+    if code < 0x80:
+        out["legacy_500kbps"] = RATE_CODE_TO_500KBPS.get(code, 0)
+        out["cck"] = code in CCK_RATE_CODES
+        return out
+
+    if code < 0xA0:
+        # HT: bit 4 selects HT40, bit 3 selects NSS 2, which in
+        # radiotap's MCS numbering is simply MCS + 8.
+        out["mcs"] = (code & 0x07) + (8 if code & 0x08 else 0)
+        out["ht40"] = bool(code & 0x10)
+        return out
+
+    # VHT/HE. radiotap has fields for these, but the medium's rate codes
+    # do not carry enough to fill them honestly (no GI, no coding, and
+    # NSS only by inference), so report nothing rather than a guess.
+    return out
 
 
 def build_radiotap_header(tsf_lo, tsf_hi, rate_code, rssi_dbm,
@@ -154,68 +205,84 @@ def build_radiotap_header(tsf_lo, tsf_hi, rate_code, rssi_dbm,
     """
     Build a radiotap header for one captured frame.
 
-    Returns bytes of the complete radiotap header.
+    The field set is not fixed: radiotap requires present fields to
+    appear in bit order and at their natural alignment, so the header is
+    assembled incrementally. Fields we cannot fill honestly are left
+    out -- a rate code the medium uses for an HT MCS has no legacy
+    equivalent, and emitting "6 Mbps" for it would put a number in
+    Wireshark that no one would think to doubt.
 
-    Layout (must respect radiotap alignment rules):
-      offset 0:  u8  version (0)
-      offset 1:  u8  pad (0)
-      offset 2:  u16 length (total header length, LE)
-      offset 4:  u32 present flags (LE)
-      -- present fields follow, in order of bit position --
-      offset 8:  u64 TSFT (bit 0) — 8-byte aligned
-      offset 16: u8  rate (bit 2) — 500kbps units
-      offset 17: u8  pad for channel alignment
-      offset 18: u16 channel freq (bit 3)
-      offset 20: u16 channel flags (bit 3)
-      offset 22: s8  antenna signal dBm (bit 5)
-      offset 23: u8  antenna index (bit 11)
-      Total: 24 bytes
+    Layout, when everything is present:
+      0   u8  version          8   u64 TSFT      (bit 0, 8-aligned)
+      1   u8  pad             16   u8  flags     (bit 1)
+      2   u16 length          17   u8  rate      (bit 2)
+      4   u32 present         18   u16 chan freq (bit 3, 2-aligned)
+                              20   u16 chan flags
+                              22   s8  signal    (bit 5)
+                              23   u8  antenna   (bit 11)
+                              24   u8  mcs known (bit 19, 1-aligned)
+                              25   u8  mcs flags
+                              26   u8  mcs index
     """
-    present = (RADIOTAP_TSFT | RADIOTAP_RATE |
-               RADIOTAP_CHANNEL | RADIOTAP_DBM_ANTSIGNAL |
-               RADIOTAP_ANTENNA)
+    ri = decode_rate(rate_code)
 
-    # TSF as 64-bit microsecond counter
-    tsf = (tsf_hi << 32) | tsf_lo
+    present = RADIOTAP_TSFT | RADIOTAP_FLAGS | RADIOTAP_CHANNEL
+    present |= RADIOTAP_DBM_ANTSIGNAL | RADIOTAP_ANTENNA
+    if ri["legacy_500kbps"]:
+        present |= RADIOTAP_RATE
+    if ri["mcs"] is not None:
+        present |= RADIOTAP_MCS
 
-    # Rate in 500kbps units
-    rate_500k = RATE_CODE_TO_500KBPS.get(rate_code, 12)  # default 6 Mbps
+    body = b""
 
-    # Channel frequency and flags
-    if channel_freq == 0:
-        channel_freq = 2412  # default channel 1
-    chan_flags = RADIOTAP_CHAN_2GHZ if channel_freq < 5000 else RADIOTAP_CHAN_5GHZ
-    if rate_is_ofdm(rate_code):
-        chan_flags |= RADIOTAP_CHAN_OFDM
-    else:
-        chan_flags |= RADIOTAP_CHAN_CCK
+    # TSFT — 8-byte aligned, and it is the first field, so offset 8.
+    body += struct.pack("<Q", (tsf_hi << 32) | tsf_lo)
 
-    # Clamp RSSI
-    rssi = max(-128, min(127, rssi_dbm))
+    # Flags. Deliberately NOT setting RADIOTAP_F_FCS: frames on this
+    # medium carry no FCS, and claiming one points Wireshark at four
+    # bytes of payload and makes it report a checksum error.
+    body += struct.pack("<B", 0)
 
-    # Pack: version(1) + pad(1) + len(2) + present(4) +
-    #        tsft(8) + rate(1) + pad(1) + chan_freq(2) + chan_flags(2) +
-    #        signal(1) + antenna(1) = 24 bytes
-    hdr = struct.pack('<BBhI',
-                      RADIOTAP_HEADER_REVISION,  # version
-                      0,                          # pad
-                      24,                         # length
-                      present)                    # present flags
-    hdr += struct.pack('<Q', tsf)                 # TSFT (8 bytes, aligned)
-    hdr += struct.pack('<B', rate_500k)           # rate
-    hdr += struct.pack('<x')                      # pad for channel alignment
-    hdr += struct.pack('<Hh', channel_freq, chan_flags)  # channel
-    hdr += struct.pack('<bB', rssi, 0)            # signal + antenna
+    if ri["legacy_500kbps"]:
+        body += struct.pack("<B", ri["legacy_500kbps"])
 
-    assert len(hdr) == 24
-    return hdr
+    # Channel — 2-byte aligned.
+    if len(body) % 2:
+        body += b"\x00"
+    freq = channel_freq or 2412
+    chan_flags = RADIOTAP_CHAN_2GHZ if freq < 5000 else RADIOTAP_CHAN_5GHZ
+    chan_flags |= RADIOTAP_CHAN_CCK if ri["cck"] else RADIOTAP_CHAN_OFDM
+    body += struct.pack("<HH", freq, chan_flags)
+
+    body += struct.pack("<b", max(-128, min(127, rssi_dbm)))   # signal
+    body += struct.pack("<B", 0)                               # antenna
+
+    if ri["mcs"] is not None:
+        # known: bandwidth (0x01) + MCS index (0x02)
+        mcs_flags = 0x01 if ri["ht40"] else 0x00     # 0 = 20 MHz, 1 = 40
+        body += struct.pack("<BBB", 0x03, mcs_flags, ri["mcs"])
+
+    hdr = struct.pack("<BBHI", RADIOTAP_HEADER_REVISION, 0,
+                      8 + len(body), present)
+    return hdr + body
 
 
 class PcapWriter:
-    """Write pcap file with radiotap link type."""
+    """Write a pcap stream with the radiotap link type.
 
-    def __init__(self, filename):
-        self.f = open(filename, 'wb')
+    Every record is flushed. The point of this tool is watching a live
+    medium, and a capture that only becomes readable when the process
+    exits cannot be piped into Wireshark or tailed while a bug is
+    happening.
+    """
+
+    def __init__(self, filename, stream=None):
+        if stream is not None:
+            self.f = stream
+            self.own_fd = False
+        else:
+            self.f = open(filename, 'wb')
+            self.own_fd = True
         # Write global header
         self.f.write(struct.pack('<IHHiIII',
                                  PCAP_MAGIC,
@@ -242,7 +309,9 @@ class PcapWriter:
         self.f.flush()
 
     def close(self):
-        self.f.close()
+        self.f.flush()
+        if self.own_fd:
+            self.f.close()
 
 
 def main():
@@ -253,6 +322,8 @@ def main():
         print("  -v              Verbose (hex dump of each frame)")
         print("  -w <file.pcap>  Write captured frames to pcap file")
         print("                  (with radiotap headers for Wireshark)")
+        print("  -w -            Write the pcap to stdout, for piping:")
+        print("                    ... -w - | wireshark -k -i -")
         print()
         print("Examples:")
         print(f"  {sys.argv[0]} /tmp/vwifi.sock")
@@ -272,11 +343,20 @@ def main():
             pcap_file = sys.argv[i + 1]
             break
 
+    # With the pcap on stdout, every human-readable line has to go to
+    # stderr instead or it lands in the middle of the capture file.
+    # Grab the binary stream first: after the redirect, sys.stdout is
+    # stderr and its buffer is the wrong file.
+    pcap_stream = None
+    if pcap_file == "-":
+        pcap_stream = sys.stdout.buffer
+        sys.stdout = sys.stderr
+
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.connect(sock_path)
     print(f"Connected to {sock_path}")
     if pcap_file:
-        pcap_writer = PcapWriter(pcap_file)
+        pcap_writer = PcapWriter(pcap_file, pcap_stream)
         print(f"Writing pcap to {pcap_file} (radiotap + 802.11)")
     print(f"Listening for frames... (Ctrl+C to stop)\n")
 
@@ -293,7 +373,8 @@ def main():
 
             while len(buf) >= 4:
                 msg_len = struct.unpack("!I", buf[:4])[0]
-                if msg_len > 8192 + 64:
+                # VWIFI_MAX_MSG_SIZE from abi/vwifi.h: header + frame.
+                if msg_len > 40 + 8192:
                     print(f"ERROR: absurd msg_len {msg_len}, resetting")
                     buf = b""
                     break
@@ -333,7 +414,12 @@ def main():
                 else:
                     hdr_size = HDR_SIZE_V1
 
+                # Trust frame_len over "whatever is left": a peer that
+                # pads its message would otherwise get the padding
+                # written into the capture as part of the frame.
                 frame = msg[hdr_size:]
+                if frame_len <= len(frame):
+                    frame = frame[:frame_len]
                 frame_count += 1
 
                 tx_mac_str = ":".join(f"{b:02x}" for b in tx_mac)

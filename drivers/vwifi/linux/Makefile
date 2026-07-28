@@ -7,9 +7,26 @@
 #   make install             — install and depmod (requires root)
 #   sudo make dkms           — install via DKMS: rebuilds on kernel upgrade
 #   sudo make dkms-remove    — unregister from DKMS
+#   make dkms-check          — build the way DKMS does, without dkms or root
 #   make clean
-
-ifneq ($(KERNELRELEASE),)
+#
+# Deliberately NOT wrapped in "ifneq ($(KERNELRELEASE),)".
+#
+# That idiom assumes KERNELRELEASE is set only when kbuild is driving
+# the build. DKMS breaks the assumption: it runs
+#
+#     make -jN KERNELRELEASE=<version> KDIR=<tree>
+#
+# in the staged directory, which selects the kbuild half of a split
+# Makefile with no kbuild there to run it. make then finds nothing but
+# variable assignments and reports "No targets.  Stop." -- an error that
+# says nothing about the real problem, from a tree that builds perfectly
+# when invoked by hand.
+#
+# The flat form below works under either caller. kbuild always names an
+# explicit goal (modules / clean / modules_install), so the "all" target
+# here is never the one it picks, and obj-m is inert when make reads
+# this file directly.
 
 obj-m += vwifi.o
 vwifi-y := vwifi_main.o vwifi_cfg80211.o vwifi_net.o vwifi_monitor.o
@@ -24,14 +41,16 @@ vwifi-y := vwifi_main.o vwifi_cfg80211.o vwifi_net.o vwifi_monitor.o
 #
 # The quoted #include finds a sibling copy on its own, so the DKMS case
 # needs no -I at all; wildcard keeps us from passing an -I for a
-# directory that does not exist there.
+# directory that does not exist there. $(src) is set by kbuild and empty
+# otherwise, which makes this line inert outside a kbuild pass.
 ccflags-y += $(addprefix -I,$(wildcard $(src)/../../../abi))
 
-else
-
+# Recursively expanded on purpose: the shell runs only if something
+# actually expands KDIR, never during a kbuild pass over this file.
 KDIR ?= /lib/modules/$(shell uname -r)/build
 
-.PHONY: all install clean dkms dkms-remove
+.PHONY: all install clean dkms dkms-remove dkms-check
+
 all:
 	$(MAKE) -C $(KDIR) M=$(CURDIR) modules
 
@@ -51,4 +70,9 @@ dkms:
 dkms-remove:
 	./dkms-install.sh remove
 
-endif
+# Stage and build exactly as DKMS would, in a temp directory, needing
+# neither dkms nor root. "make dkms" has now failed twice for reasons a
+# plain "make" could not see -- both times in the gap between this
+# Makefile and the staged tree, which nothing else exercises.
+dkms-check:
+	./dkms-selftest.sh

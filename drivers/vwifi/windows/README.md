@@ -224,39 +224,52 @@ medium sees it as coming from whoever the injector claims to be.
 - **No FCS**: the medium doesn't carry an FCS; frames are indicated
   without one. Wireshark shows FCS as absent, not as failed.
 - **No HT/VHT MCS in radiotap**: `DOT11_EXTSTA_RECV_CONTEXT` has no
-  MCS field, so HT/VHT frames report a legacy-rate equivalent.
+  MCS field, so an HT/VHT frame reports a data rate of 0 rather than a
+  legacy-rate equivalent. A capture showing 0 Mb/s is obviously
+  incomplete; one showing 6 Mb/s for every 802.11n frame looks right
+  and gets believed.
 
-## What works in Phase 1
+## Status
 
-- Driver loads under test-signing, binds to `PCI\VEN_1AF4&DEV_0E00`
-- MmioMap BAR0, read `REG_SIGNATURE` and `REG_ABI_VERSION`
-- Allocate + program all four rings
-- Connect MSI-X interrupts (4 vectors)
-- Issue `VWIFI_OP_GET_CAPS` synchronously and parse the reply
-- Set the station MAC via `VWIFI_OP_SET_STA_MAC`
-- Medium link status reflected in `VWIFI_REG_STATUS`
-- `VwifiMiniportCheckForHangEx` probes the signature register
-- `VwifiMiniportReset` performs a ring re-init
-- All WDI handlers exist and return success; the Microsoft WLAN
-  component can drive the lifecycle without wedging
+The phase-by-phase plan in `docs/vwifi-virt-development-plan.md`
+describes the intended order of work. In this tree the source covers
+Phase 1 (bring-up), 1.5 (monitor), 2 (scan), 3 (connect) and 4 (keys) —
+`wdi_scan.c`, `wdi_connect.c`, `wdi_keys.c` and `monitor.c` are all
+implemented. What has **not** happened is a build against the WDK or a
+run in a Windows guest, so treat "implemented" as "written and
+reviewed", not "working".
 
-## What doesn't work yet
+## Parity with the Linux driver and the device
 
-- No scan → no BSS list in `netsh wlan show networks`
-- No connect → no data path
-- No RX indication (`VwifiRxDrain` logs the frame descriptor fields
-  and re-arms the slot; no NBLs are built)
-- No monitor mode (Phase 1.5)
-- No security / key install (Phase 4)
+The Linux driver and the QEMU device have moved since this driver was
+written. Changes made here to keep the two guests behaving the same:
 
-## Next steps per the plan
+| Change | Why it matters here |
+|---|---|
+| Arm the **whole** ctrl-rsp ring at init (`VwifiRingsArmCtrlRsp`) | The ring was armed one slot per outgoing request, at the request's index. The device picks slots with a producer index of its own that also advances for every asynchronous event, so a single `BSS_FOUND` desynchronised the two: some slots were unarmed when the device needed them (events dropped) and a later preload could overwrite a slot the device had already filled. Both failures are silent. |
+| Fill `channel_mask_5` from the device's capabilities | The TLV shim hardcoded "2.4 GHz only, the device has no 5 GHz yet". It does — a Windows guest simply never scanned above channel 14. |
+| Stale-scan backstop in `VwifiHandleTaskScan` | A lost `SCAN_COMPLETE` left the task `Active` forever, and every later scan was rejected. Linux arms a timer; here the next scan request completes the stale one first. |
+| Report data rate 0 for HT/VHT codes | See the monitor-mode caveat above. |
 
-Phase 1.5 (monitor mode): implement `VwifiRxDrain` for real — build
-NBLs with `DOT11_EXTSTA_RECV_CONTEXT` attached as media-specific
-info, indicate via `NdisMIndicateReceiveNetBufferLists`. Switch TX
-to accept raw 802.11 injection when op mode is monitor.
+Three changes needed nothing on this side, because they were fixed in
+the device where both drivers benefit:
 
-Phase 2 (scan): handle `OID_WDI_TASK_SCAN` in `VwifiOidRequest` by
-dispatching a `VWIFI_OP_SCAN` control request; collect BSS events
-from the ctrl-rsp ring; emit `NDIS_STATUS_WDI_INDICATION_BSS_ENTRY
-_LIST` and `_SCAN_COMPLETE` indications back up.
+- A **zero-length SSID** in a scan request is the wildcard, not a
+  literal empty name. WDI sends one in essentially every scan, exactly
+  as cfg80211 does, and the device used to match it literally — which
+  reported hidden APs only and looked like an empty medium.
+- Association Requests now carry a **Supported Rates** element. Without
+  it hostapd rejects the association with a bare `status=1`.
+- A connect request with **no channel** now resolves the channel from
+  the device's BSS table. WDI's connect parameters carry no channel at
+  all, so this was not an edge case on Windows — it was every connect.
+
+## Not done
+
+- No build against the WDK, and no run in a guest. Everything above is
+  unverified on Windows.
+- TX power reporting (`OID_WDI_TASK_SET_RADIO_STATE` and friends) has
+  no counterpart to the Linux driver's `get_tx_power`/`set_tx_power`.
+  Nothing has asked for it yet.
+- The scan request ignores WDI's `BandChannelList`; it scans everything
+  the device supports and lets the OS filter. Legal, just slower.

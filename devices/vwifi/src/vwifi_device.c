@@ -1740,7 +1740,30 @@ static int32_t op_connect(struct vwifi_dev *d, const void *in_buf, uint32_t in_l
                d->conn.req_ie_len);
     }
 
-    /* Tune to the target's channel for the exchange. */
+    /*
+     * Tune to the target's channel for the exchange.
+     *
+     * A driver that omits the channel is the common case, not an edge
+     * one: wpa_supplicant leaves it unset whenever it is willing to let
+     * the driver roam, and WDI's connect parameters do not carry one at
+     * all. Falling back to "whatever we are tuned to" is wrong there --
+     * after a scan that is the restored pre-scan channel, which on a
+     * radio that has never been tuned is nothing in particular.
+     *
+     * The device already knows the answer: it scanned this BSS and kept
+     * its channel. Use it, and leave the current channel as the last
+     * resort for a BSSID we have genuinely never heard.
+     */
+    if (!d->conn.channel_freq) {
+        struct vwifi_bss *b = bss_find(d, d->conn.bssid);
+
+        if (b && b->valid && b->channel_freq) {
+            d->conn.channel_freq = b->channel_freq;
+            VWIFI_TRACE(d, "conn: no channel given, using %u MHz from "
+                           "the BSS table", b->channel_freq);
+        }
+    }
+
     if (d->conn.channel_freq) {
         d->channel.primary_freq = d->conn.channel_freq;
     } else {

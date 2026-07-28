@@ -16,6 +16,7 @@ a real radio bridged in over the air, or a Python test.
 | `src/vwifi_medium.c` | The hub. Builds to `build/vwifi-medium` |
 | `tools/vwifi_phys_bridge.c` | Bridges a real WiFi interface in monitor mode into the medium |
 | `tools/vwifi_linkbench.c` | Throughput / loss benchmark against a running hub |
+| `tools/vwifi_dump.py` | Capture every frame on the medium to pcap for Wireshark |
 | `controller/` | Web UI and Python helpers for the control socket |
 | `tests/harness.py` | Regression harness — spawns a hub on temp sockets and drives it |
 | `legacy/` | The superseded `ath9k_medium` hubs, kept for reference |
@@ -72,6 +73,35 @@ Usage: ./build/vwifi-medium <unix-socket-path> [options]
 The data socket is created mode 0666 so any user can connect QEMU
 clients. The control socket is created mode 0600 because its
 commands are unauthenticated and include `SAVE_CONFIG`.
+
+## Capturing the medium
+
+`vwifi_dump.py` attaches to the hub and writes everything crossing it
+to a pcap, with radiotap headers Wireshark understands. It is the
+fastest way to answer "did that frame actually go out, and what was in
+it" without instrumenting either end of a link — which matters most for
+the Windows driver, where the guest side is hardest to see into.
+
+```bash
+python3 medium/tools/vwifi_dump.py /tmp/vwifi.sock -w capture.pcap
+python3 medium/tools/vwifi_dump.py /tmp/vwifi.sock -v          # decode to stdout
+python3 medium/tools/vwifi_dump.py /tmp/vwifi.sock -w - | wireshark -k -i -
+```
+
+It deliberately connects **anonymously**: no hello, and it never
+transmits. The hub learns a peer's channel from what that peer sends,
+so a silent peer keeps channel 0 and the channel filter treats it as
+"matches anything" — the capture sees every channel at once. Staying
+unbound to a node also keeps it out of the propagation model, so the
+tap never loses a frame the simulation decided was too weak. The cost
+is that the hub logs it as an unnamed `local-qemu` peer.
+
+Rates are reported honestly or not at all: a legacy rate code becomes a
+radiotap RATE field, an HT code becomes a radiotap MCS field, and
+anything else (VHT/HE, whose codes do not carry enough to fill the
+radiotap fields) yields neither rather than a plausible wrong number.
+No FCS flag is set, because [frames on this medium carry no
+FCS](../abi/vwifi.h).
 
 ## Bridging in a real radio
 

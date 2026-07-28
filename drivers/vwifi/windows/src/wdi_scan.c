@@ -52,6 +52,8 @@ typedef struct _VWIFI_SCAN_TASK
     ULONG     PendingCapacity;
 
     ULONGLONG LastIndicationTimeMs;
+    /* When this scan was started, for the stale-task backstop below. */
+    ULONGLONG StartedTimeMs;
 } VWIFI_SCAN_TASK, *PVWIFI_SCAN_TASK;
 
 /* From OID_WDI_TASK_SCAN: "the port should throttle indications and
@@ -60,6 +62,11 @@ typedef struct _VWIFI_SCAN_TASK
  * to the host for more than 500 milliseconds." */
 #define VWIFI_SCAN_BATCH_THRESHOLD   3
 #define VWIFI_SCAN_FLUSH_INTERVAL_MS 500
+
+/* How long a scan may stay active before the next scan request treats
+ * it as lost. A full sweep is 16 channels x 100 ms dwell; ten seconds
+ * is far enough past that to mean the completion is never coming. */
+#define VWIFI_SCAN_STALE_MS          10000
 
 /* ============================================================
  * Indicate the accumulated BSS entries
@@ -227,8 +234,32 @@ VwifiHandleTaskScan(_Inout_ PVWIFI_ADAPTER Adapter,
 
     if (!task) return NDIS_STATUS_RESOURCES;
     if (task->Active) {
-        VWIFI_WARN("scan task already active");
-        return NDIS_STATUS_REQUEST_ABORTED;
+        /*
+         * A scan that never completed must not wedge scanning forever.
+         *
+         * Active is cleared by SCAN_COMPLETE, so a lost event -- the
+         * device drops one when the response ring has no free slot --
+         * leaves it set with nothing left to clear it, and every scan
+         * from then on is rejected. The Linux driver arms a timer for
+         * this; here the check is lazy, because the moment that matters
+         * is precisely when the OS asks for the next scan.
+         *
+         * The bound is generous: the device dwells 100 ms on each of up
+         * to VWIFI_SCAN_MAX_CHANNELS channels, so a healthy scan is well
+         * under two seconds and anything past this is not merely slow.
+         */
+        ULONGLONG age = VwifiGetTickCountMs() - task->StartedTimeMs;
+
+        if (age < VWIFI_SCAN_STALE_MS) {
+            VWIFI_WARN("scan task already active (%llu ms)", age);
+            return NDIS_STATUS_REQUEST_ABORTED;
+        }
+
+        VWIFI_WARN("scan task active for %llu ms with no SCAN_COMPLETE -- "
+                   "completing it as failed and starting the new one", age);
+        /* Clears Active, and flushes any BSS entries staged by the
+         * scan that went missing so they are not lost silently. */
+        VwifiIndicateScanComplete(Adapter, NDIS_STATUS_FAILURE);
     }
 
     /* The OID buffer is [WDI_MESSAGE_HEADER][TLV blob]; the parser
@@ -251,17 +282,27 @@ VwifiHandleTaskScan(_Inout_ PVWIFI_ADAPTER Adapter,
     /* The OS may hand us a channel subset; scanning a superset is
      * always legal (a scan may report more than was asked for), so we
      * let the device sweep everything it supports and the OS filter.
-     * Honouring the subset is a clean optimisation for later. */
-    if (scanReq->channel_mask_24 == 0) {
+     * Honouring the subset is a clean optimisation for later.
+     *
+     * BOTH masks, and only when BOTH are empty. The device reads two
+     * zero masks as "everything you support" but a request naming only
+     * 5 GHz leaves channel_mask_24 at zero legitimately, and widening
+     * that one back to all of 2.4 GHz would silently change what was
+     * asked for. */
+    if (scanReq->channel_mask_24 == 0 && scanReq->channel_mask_5 == 0) {
         scanReq->channel_mask_24 = Adapter->CapsValid
                                  ? Adapter->Caps.supported_channels_24
                                  : 0x3FFE;
+        scanReq->channel_mask_5  = Adapter->CapsValid
+                                 ? Adapter->Caps.supported_channels_5
+                                 : 0;
     }
 
     task->Active               = TRUE;
     task->PortId               = Req->PortNumber;
     task->PendingCount         = 0;
     task->LastIndicationTimeMs = VwifiGetTickCountMs();
+    task->StartedTimeMs        = task->LastIndicationTimeMs;
 
     status = VwifiCtrlSendSync(Adapter, VWIFI_OP_SCAN,
                                scanReq, reqLen, NULL, &outLen);
@@ -271,9 +312,10 @@ VwifiHandleTaskScan(_Inout_ PVWIFI_ADAPTER Adapter,
         return status;
     }
 
-    VWIFI_INFO("scan started (mask24=0x%08x dwell=%u ms ssids=%u)",
-               scanReq->channel_mask_24, scanReq->dwell_ms,
-               scanReq->num_ssids);
+    VWIFI_INFO("scan started (mask24=0x%08x mask5=0x%llx dwell=%u ms ssids=%u)",
+               scanReq->channel_mask_24,
+               (unsigned long long)scanReq->channel_mask_5,
+               scanReq->dwell_ms, scanReq->num_ssids);
 
     /* WDI_SCAN_RESULTS (the M0) needs no TLV data — the header alone is
      * the "task started" acknowledgement. INDICATION_REQUIRED tells

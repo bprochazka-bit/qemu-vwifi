@@ -16,6 +16,7 @@
 #   make driver              — the vwifi-virt Linux guest driver
 #   sudo make dkms           — ... installed via DKMS (survives kernel upgrades)
 #   sudo make dkms-remove    — ... unregistered again
+#   make dkms-check          — ... built the way DKMS builds it, no root needed
 #   make module              — host kernel module against the running kernel
 #   make module KDIR=/path   — ... against a specific kernel source tree
 #   make install             — install the kernel module (requires root)
@@ -108,7 +109,7 @@ $(BUILD)/ath9k_medium_hub_scalable: medium/legacy/ath9k_medium_hub_scalable.c | 
 # gets upgraded -- a plain module is built for one kernel version and
 # stops loading after the next upgrade.
 
-.PHONY: driver dkms dkms-remove
+.PHONY: driver dkms dkms-remove dkms-check
 driver:
 	$(MAKE) -C drivers/vwifi/linux KDIR=$(KDIR)
 
@@ -117,6 +118,12 @@ dkms:
 
 dkms-remove:
 	$(MAKE) -C drivers/vwifi/linux dkms-remove
+
+# Build the staged tree the way DKMS does, without dkms or root. A
+# plain "make driver" does not exercise that path and has twice stayed
+# green while "make dkms" was broken.
+dkms-check:
+	$(MAKE) -C drivers/vwifi/linux dkms-check
 
 # ---------- Host kernel module ----------
 
