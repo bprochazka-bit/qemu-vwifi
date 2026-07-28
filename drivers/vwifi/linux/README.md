@@ -10,13 +10,39 @@ WPA2, and passes traffic.
 |---|---|
 | Compiles | **Yes** — clean at `W=1` against kernel 6.8 headers |
 | Run in a guest | **Not yet.** Never loaded, never bound to a live device |
-| STA mode: scan, connect, WPA2, data | Implemented |
-| Monitor mode | Mode switch works; RX frames are dropped (no radiotap path) |
+| Reviewed | Yes — an adversarial pass found 15 issues; the real ones are fixed |
+| STA mode: scan, connect, WPA2 (CCMP), data | Implemented |
+| Monitor mode | **Not offered.** The device supports it; this driver has no radiotap path, so advertising it would hand you a silent interface |
 | SoftAP | Not implemented — the device supports it, the driver does not |
 
-Treat "compiles" as what it is. Every ring interaction below is written
-against the device's actual implementation rather than guessed at, but
-the first `insmod` is still the first time any of it executes.
+Treat "compiles" as what it is. Every ring interaction is written
+against the device's actual implementation rather than guessed at, and
+a review pass caught three memory-safety bugs before anyone ran it —
+but the first `insmod` is still the first time any of it executes.
+
+### Things the review caught, worth knowing about
+
+Not history for its own sake — each of these is a trap the next person
+to touch this code could fall back into.
+
+- **The device controls `payload_len` on every control response.**
+  Clamping it to the ring buffer is not enough; the destination is the
+  caller's buffer, which is smaller. `ctrl_rsp_cap` now bounds the copy.
+  That is the trust boundary, and it is the one place a hostile or buggy
+  device gets a memory-corruption primitive.
+- **`CTRL_ENABLE` is edge-triggered on the device side.** Ring base
+  addresses are latched only on a 0→1 transition, so a driver attaching
+  to an already-enabled device (kexec, re-bind, a predecessor that died)
+  would have its rings ignored while the device kept DMAing into the
+  previous incarnation's memory. Probe now resets first.
+- **`free_irq()` does not flush work an interrupt already queued.**
+  Both the probe error path and `remove()` have to `cancel_work_sync()`,
+  and `remove()` has to quiesce *before* `unregister_netdev()` frees the
+  netdev that the work and the RX path both dereference.
+- **Do not advertise what the device rejects.** It accepts only
+  CCMP-128 keys. Offering WEP/TKIP lets a supplicant negotiate a cipher
+  that fails at `.add_key` mid-handshake, leaving an associated but
+  unkeyed link and a deauth loop.
 
 ## Why full-MAC, not mac80211
 

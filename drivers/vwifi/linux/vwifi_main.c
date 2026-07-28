@@ -95,12 +95,12 @@ int vwifi_rings_alloc(struct vwifi_priv *p)
 	int ret;
 
 	ret = ring_alloc(p, &p->ctrl_req, sizeof(struct vwifi_ctrl_req_desc),
-			 VWIFI_CTRL_REQ_RING_ENTRIES, VWIFI_CTRL_PAYLOAD_SIZE);
+			 VWIFI_CTRL_REQ_RING_ENTRIES, VWIFI_CTRL_REQ_PAYLOAD_SIZE);
 	if (ret)
 		return ret;
 
 	ret = ring_alloc(p, &p->ctrl_rsp, sizeof(struct vwifi_ctrl_rsp_desc),
-			 VWIFI_CTRL_RSP_RING_ENTRIES, VWIFI_CTRL_PAYLOAD_SIZE);
+			 VWIFI_CTRL_RSP_RING_ENTRIES, VWIFI_CTRL_RSP_PAYLOAD_SIZE);
 	if (ret)
 		goto err_rsp;
 
@@ -150,6 +150,7 @@ void vwifi_rings_arm(struct vwifi_priv *p)
 		d->payload_len  = p->ctrl_rsp.buf_size;
 		d->flags        = VWIFI_DESC_F_OWN;
 	}
+
 
 	for (i = 0; i < p->rx.entries; i++) {
 		struct vwifi_rx_desc *d = ring_desc(&p->rx, i);
@@ -205,7 +206,7 @@ static void rsp_ring_process(struct vwifi_priv *p)
 	while (guard--) {
 		struct vwifi_ctrl_rsp_desc *d;
 		u16 opcode, flags;
-		u32 payload_len, idx;
+		u32 payload_len, idx, req_id;
 		s32 status;
 		void *payload;
 
@@ -214,12 +215,18 @@ static void rsp_ring_process(struct vwifi_priv *p)
 
 		/* Device clears OWN when it fills a slot. Still set means
 		 * nothing new here. */
-		if (d->flags & VWIFI_DESC_F_OWN)
+		if (READ_ONCE(d->flags) & VWIFI_DESC_F_OWN)
 			break;
+
+		/* Do not let the rest of the descriptor, or the payload, be
+		 * read before the OWN bit that publishes them. Coherent
+		 * memory guarantees visibility, not ordering. */
+		dma_rmb();
 
 		opcode      = d->opcode;
 		flags       = d->flags;
 		status      = d->status;
+		req_id      = d->req_id;
 		payload_len = d->payload_len;
 		payload     = ring_buf(&p->ctrl_rsp, idx);
 
@@ -228,18 +235,42 @@ static void rsp_ring_process(struct vwifi_priv *p)
 
 		if (flags & VWIFI_RSP_F_EVENT) {
 			vwifi_handle_event(p, opcode, payload, payload_len);
-		} else if (d->req_id && d->req_id == p->ctrl_pending_id) {
-			p->ctrl_status  = status;
-			p->ctrl_rsp_len = payload_len;
-			if (p->ctrl_rsp_buf && payload_len)
-				memcpy(p->ctrl_rsp_buf, payload, payload_len);
-			/* Publish before waking the submitter. */
-			smp_wmb();
-			complete(&p->ctrl_done);
 		} else {
-			dev_dbg(p->dev,
-				"unmatched ctrl response op=0x%04x req=%u\n",
-				opcode, d->req_id);
+			bool matched = false;
+			unsigned long lflags;
+			u32 copy;
+
+			/*
+			 * The submitter publishes the pending id and its
+			 * destination buffer under ring_lock; match and copy
+			 * under the same lock so a request that has already
+			 * timed out cannot have its buffer written after the
+			 * submitter walked away from it.
+			 */
+			spin_lock_irqsave(&p->ring_lock, lflags);
+			if (req_id && req_id == p->ctrl_pending_id) {
+				matched = true;
+				p->ctrl_status  = status;
+				p->ctrl_rsp_len = payload_len;
+				/*
+				 * payload_len is device-controlled. Clamping
+				 * it to the ring buffer is not enough: the
+				 * destination is the CALLER's buffer, which
+				 * is usually much smaller. Without this the
+				 * device can overrun it at will.
+				 */
+				copy = min(payload_len, p->ctrl_rsp_cap);
+				if (p->ctrl_rsp_buf && copy)
+					memcpy(p->ctrl_rsp_buf, payload, copy);
+			}
+			spin_unlock_irqrestore(&p->ring_lock, lflags);
+
+			if (matched)
+				complete(&p->ctrl_done);
+			else
+				dev_dbg(p->dev,
+					"unmatched ctrl response op=0x%04x req=%u\n",
+					opcode, req_id);
 		}
 
 		/* Re-arm: the device will not reuse a slot whose OWN is
@@ -247,7 +278,10 @@ static void rsp_ring_process(struct vwifi_priv *p)
 		memset(d, 0, sizeof(*d));
 		d->payload_addr = ring_buf_dma(&p->ctrl_rsp, idx);
 		d->payload_len  = p->ctrl_rsp.buf_size;
-		d->flags        = VWIFI_DESC_F_OWN;
+		/* Buffer address and length must land before OWN hands the
+		 * slot back, or the device can DMA to a half-written one. */
+		dma_wmb();
+		WRITE_ONCE(d->flags, VWIFI_DESC_F_OWN);
 
 		p->ctrl_rsp.head++;
 		vwifi_wr(p, VWIFI_REG_CTRL_RSP_RING_HEAD,
@@ -278,9 +312,10 @@ int vwifi_ctrl_cmd(struct vwifi_priv *p, u16 opcode,
 		   void *rsp_out, u32 rsp_cap, u32 *rsp_len)
 {
 	struct vwifi_ctrl_req_desc *d;
-	unsigned long remaining;
+	unsigned long remaining, lflags;
 	u32 idx;
 	int ret = 0;
+	s32 status;
 
 	if (payload_len > p->ctrl_req.buf_size)
 		return -EINVAL;
@@ -300,17 +335,22 @@ int vwifi_ctrl_cmd(struct vwifi_priv *p, u16 opcode,
 	 * before the write returns, so the response can be processed the
 	 * instant we ring — arming afterwards would race and hang. */
 	reinit_completion(&p->ctrl_done);
+
+	spin_lock_irqsave(&p->ring_lock, lflags);
 	p->ctrl_pending_id = ++p->ctrl_req_id;
 	p->ctrl_rsp_buf    = rsp_out;
+	p->ctrl_rsp_cap    = rsp_out ? rsp_cap : 0;
 	p->ctrl_status     = 0;
 	p->ctrl_rsp_len    = 0;
+	spin_unlock_irqrestore(&p->ring_lock, lflags);
 
 	memset(d, 0, sizeof(*d));
 	d->opcode       = opcode;
 	d->req_id       = p->ctrl_pending_id;
 	d->payload_addr = payload_len ? ring_buf_dma(&p->ctrl_req, idx) : 0;
 	d->payload_len  = payload_len;
-	d->flags        = VWIFI_DESC_F_OWN;
+	dma_wmb();	/* descriptor body before the OWN that publishes it */
+	WRITE_ONCE(d->flags, VWIFI_DESC_F_OWN);
 
 	wmb();	/* descriptor complete before the doorbell */
 	p->ctrl_req.head++;
@@ -333,17 +373,27 @@ int vwifi_ctrl_cmd(struct vwifi_priv *p, u16 opcode,
 		goto out;
 	}
 
-	smp_rmb();
-	if (p->ctrl_status < 0) {
-		ret = -EIO;
-		goto out;
-	}
+	spin_lock_irqsave(&p->ring_lock, lflags);
+	status = p->ctrl_status;
 	if (rsp_len)
 		*rsp_len = min(p->ctrl_rsp_len, rsp_cap);
+	spin_unlock_irqrestore(&p->ring_lock, lflags);
+
+	/*
+	 * Pass the device's errno through rather than flattening it. The
+	 * device returns -EBUSY for "a scan or connect is already in
+	 * flight", which is the difference between a supplicant retrying
+	 * and giving up.
+	 */
+	if (status < 0)
+		ret = status;
 
 out:
+	spin_lock_irqsave(&p->ring_lock, lflags);
 	p->ctrl_pending_id = 0;
 	p->ctrl_rsp_buf    = NULL;
+	p->ctrl_rsp_cap    = 0;
+	spin_unlock_irqrestore(&p->ring_lock, lflags);
 	mutex_unlock(&p->ctrl_lock);
 	return ret;
 }
@@ -362,9 +412,10 @@ void vwifi_rx_poll(struct vwifi_priv *p)
 		struct vwifi_rx_desc snapshot;
 
 		d = ring_desc(&p->rx, idx);
-		if (d->flags & VWIFI_DESC_F_OWN)
+		if (READ_ONCE(d->flags) & VWIFI_DESC_F_OWN)
 			break;
 
+		dma_rmb();	/* descriptor and frame after the OWN test */
 		snapshot = *d;
 		if (snapshot.frame_len && snapshot.frame_len <= p->rx.buf_size)
 			vwifi_rx_frame(p, &snapshot, ring_buf(&p->rx, idx));
@@ -373,7 +424,8 @@ void vwifi_rx_poll(struct vwifi_priv *p)
 		memset(d, 0, sizeof(*d));
 		d->frame_addr = ring_buf_dma(&p->rx, idx);
 		d->buffer_len = p->rx.buf_size;
-		d->flags      = VWIFI_DESC_F_OWN;
+		dma_wmb();	/* address and length before OWN */
+		WRITE_ONCE(d->flags, VWIFI_DESC_F_OWN);
 
 		p->rx.head++;
 		vwifi_wr(p, VWIFI_REG_RX_RING_HEAD, p->rx.head & p->rx.mask);
@@ -502,6 +554,7 @@ static int vwifi_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	spin_lock_init(&p->ring_lock);
 	init_completion(&p->ctrl_done);
 	INIT_WORK(&p->rsp_work, rsp_work_fn);
+	INIT_DELAYED_WORK(&p->scan_timeout, vwifi_scan_timeout_fn);
 
 	ret = pcim_iomap_regions(pdev, BIT(0), VWIFI_DRV_NAME);
 	if (ret) {
@@ -536,6 +589,20 @@ static int vwifi_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		goto err_wiphy;
 	}
 
+	/*
+	 * Put the device back to a known state before programming rings.
+	 *
+	 * The device latches the ring base addresses only on a 0->1
+	 * transition of CTRL_ENABLE. If it is already enabled when we
+	 * attach -- kexec, a re-bind, a previous driver that died without
+	 * calling remove() -- writing ENABLE again is not an edge, the new
+	 * bases are never read, and the device keeps DMAing into the
+	 * previous incarnation's physical addresses. Which are now
+	 * somebody else's memory.
+	 */
+	vwifi_wr(p, VWIFI_REG_CTRL, 0);
+	vwifi_wr(p, VWIFI_REG_RESET, 1);
+
 	ret = vwifi_rings_alloc(p);
 	if (ret)
 		goto err_wiphy;
@@ -545,6 +612,16 @@ static int vwifi_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		goto err_rings;
 
 	vwifi_rings_arm(p);
+
+	/* enable_rings() on the device side can reject a ring and carry on
+	 * with it disabled; READY is how it says the rings took. */
+	if (!(vwifi_rd(p, VWIFI_REG_STATUS) & VWIFI_STATUS_READY)) {
+		dev_err(&pdev->dev,
+			"device did not report READY after enable (status 0x%08x)\n",
+			vwifi_rd(p, VWIFI_REG_STATUS));
+		ret = -EIO;
+		goto err_irq;
+	}
 
 	ret = vwifi_cfg80211_init(p);
 	if (ret)
@@ -562,6 +639,11 @@ err_irq:
 	vwifi_wr(p, VWIFI_REG_CTRL, 0);
 	p->rings_enabled = false;
 	vwifi_free_irqs(p);
+	/* free_irq() stops new handlers; it does not flush work one of
+	 * them already queued. Without this, rsp_work_fn runs against a
+	 * freed vwifi_priv and an unmapped BAR. */
+	cancel_work_sync(&p->rsp_work);
+	cancel_delayed_work_sync(&p->scan_timeout);
 err_rings:
 	vwifi_rings_free(p);
 err_wiphy:
@@ -578,12 +660,26 @@ static void vwifi_remove(struct pci_dev *pdev)
 	if (!p)
 		return;
 
+	/*
+	 * Order matters. unregister_netdev() frees the netdev
+	 * (needs_free_netdev), and both the response work and the RX
+	 * interrupt dereference p->ndev. Quiesce every producer FIRST,
+	 * then tear down.
+	 *
+	 * Disabling the device does not close the window on its own: an
+	 * interrupt raised just before the write can still be pending, and
+	 * the work it queued still has to be flushed.
+	 */
 	vwifi_wr(p, VWIFI_REG_CTRL, 0);
 	p->rings_enabled = false;
 
-	vwifi_cfg80211_deinit(p);
 	vwifi_free_irqs(p);
 	cancel_work_sync(&p->rsp_work);
+	cancel_delayed_work_sync(&p->scan_timeout);
+
+	/* Safe now: any .disconnect cfg80211 issues during unregister
+	 * short-circuits on !rings_enabled. */
+	vwifi_cfg80211_deinit(p);
 	vwifi_rings_free(p);
 	mutex_destroy(&p->rsp_lock);
 	mutex_destroy(&p->ctrl_lock);

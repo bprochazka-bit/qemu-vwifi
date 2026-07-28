@@ -19,6 +19,10 @@
 
 #include "vwifi_drv.h"
 
+/* struct vwifi_scan_req carries at most four trailing SSID entries. */
+#define VWIFI_MAX_SCAN_SSIDS	4
+#define VWIFI_SCAN_TIMEOUT_MS	10000
+
 /* ============================================================
  * Channel tables
  * ============================================================ */
@@ -186,6 +190,46 @@ static u16 vwifi_auth_from_nl(enum nl80211_auth_type t)
 }
 
 /* ============================================================
+ * Scan bookkeeping
+ *
+ * p->scan_req is touched from the cfg80211 ops (under the wiphy lock)
+ * and from the response workqueue (which is NOT under it), so every
+ * transition goes through ring_lock. Claiming rather than reading means
+ * exactly one context can ever complete a given request -- completing
+ * one twice is a use-after-free, since cfg80211 owns the memory.
+ * ============================================================ */
+
+struct cfg80211_scan_request *vwifi_scan_claim(struct vwifi_priv *p)
+{
+	struct cfg80211_scan_request *req;
+	unsigned long flags;
+
+	spin_lock_irqsave(&p->ring_lock, flags);
+	req = p->scan_req;
+	p->scan_req = NULL;
+	spin_unlock_irqrestore(&p->ring_lock, flags);
+	return req;
+}
+
+/*
+ * If SCAN_COMPLETE is ever lost, scan_req would stay set and every
+ * later scan would fail with -EBUSY for the lifetime of the module.
+ */
+void vwifi_scan_timeout_fn(struct work_struct *work)
+{
+	struct vwifi_priv *p = container_of(to_delayed_work(work),
+					    struct vwifi_priv, scan_timeout);
+	struct cfg80211_scan_request *req = vwifi_scan_claim(p);
+	struct cfg80211_scan_info info = { .aborted = true };
+
+	if (!req)
+		return;
+
+	dev_warn(p->dev, "scan timed out with no SCAN_COMPLETE\n");
+	cfg80211_scan_done(req, &info);
+}
+
+/* ============================================================
  * cfg80211 operations
  * ============================================================ */
 
@@ -196,10 +240,15 @@ static int vwifi_op_scan(struct wiphy *wiphy,
 	u8 buf[sizeof(struct vwifi_scan_req) + 4 * 34];
 	struct vwifi_scan_req *req = (void *)buf;
 	u32 len = sizeof(*req);
+	unsigned long irqflags;
 	unsigned int i, j;
+	bool busy;
 	int ret;
 
-	if (p->scan_req)
+	spin_lock_irqsave(&p->ring_lock, irqflags);
+	busy = p->scan_req != NULL;
+	spin_unlock_irqrestore(&p->ring_lock, irqflags);
+	if (busy)
 		return -EBUSY;
 
 	memset(buf, 0, sizeof(buf));
@@ -228,10 +277,7 @@ static int vwifi_op_scan(struct wiphy *wiphy,
 	}
 
 	/* Directed SSIDs, capped at what the device advertised. */
-	req->num_ssids = min_t(u16, request->n_ssids,
-			       p->caps.max_scan_ssids ?: 4);
-	if (req->num_ssids > 4)
-		req->num_ssids = 4;
+	req->num_ssids = min_t(u16, request->n_ssids, VWIFI_MAX_SCAN_SSIDS);
 
 	for (i = 0; i < req->num_ssids; i++) {
 		u8 *entry = buf + sizeof(*req) + i * 34;
@@ -242,13 +288,22 @@ static int vwifi_op_scan(struct wiphy *wiphy,
 		len += 34;
 	}
 
-	p->scan_req = request;
-
+	/*
+	 * Submit BEFORE publishing the request. vwifi_ctrl_cmd() drains
+	 * the response ring inline, so publishing first would let a stale
+	 * SCAN_COMPLETE from the previous scan complete this brand-new
+	 * one -- cfg80211 warns, and the new scan then hangs forever.
+	 */
 	ret = vwifi_ctrl_cmd(p, VWIFI_OP_SCAN, buf, len, NULL, 0, NULL);
-	if (ret) {
-		p->scan_req = NULL;
+	if (ret)
 		return ret;
-	}
+
+	spin_lock_irqsave(&p->ring_lock, irqflags);
+	p->scan_req = request;
+	spin_unlock_irqrestore(&p->ring_lock, irqflags);
+
+	schedule_delayed_work(&p->scan_timeout,
+			      msecs_to_jiffies(VWIFI_SCAN_TIMEOUT_MS));
 	return 0;
 }
 
@@ -296,13 +351,14 @@ static int vwifi_op_connect(struct wiphy *wiphy, struct net_device *ndev,
 	ret = vwifi_ctrl_cmd(p, VWIFI_OP_CONNECT, buf, len, NULL, 0, NULL);
 	kfree(buf);
 
-	if (ret) {
-		/* cfg80211 requires a result for every connect() it issues,
-		 * even one that failed before reaching the air. */
-		cfg80211_connect_result(ndev, sme->bssid, NULL, 0, NULL, 0,
-					WLAN_STATUS_UNSPECIFIED_FAILURE,
-					GFP_KERNEL);
-	}
+	/*
+	 * Return the error and report NOTHING. A non-zero return from
+	 * .connect means the attempt never started, and cfg80211 tears its
+	 * own state down and answers userspace with the errno. Calling
+	 * cfg80211_connect_result() as well would fire a CONNECT event at
+	 * a wdev that has just been reset, after userspace already saw the
+	 * failure -- which desynchronizes wpa_supplicant's state machine.
+	 */
 	return ret;
 }
 
@@ -394,23 +450,18 @@ static int vwifi_op_change_iface(struct wiphy *wiphy, struct net_device *ndev,
 	struct vwifi_priv *p = wiphy_priv(wiphy);
 	struct vwifi_op_mode mode;
 
-	switch (type) {
-	case NL80211_IFTYPE_STATION:
-		mode.mode = VWIFI_MODE_STA;
-		break;
-	case NL80211_IFTYPE_MONITOR:
-		mode.mode = VWIFI_MODE_MONITOR;
-		break;
-	default:
+	/*
+	 * STA is the only mode this driver can actually deliver. Monitor
+	 * would need a radiotap path that does not exist yet; accepting
+	 * the switch would stop the device doing 802.11 framing and leave
+	 * the interface silent with no way back short of a reload.
+	 */
+	if (type != NL80211_IFTYPE_STATION)
 		return -EOPNOTSUPP;
-	}
+	mode.mode = VWIFI_MODE_STA;
 
-	if (vwifi_ctrl_cmd(p, VWIFI_OP_SET_OP_MODE, &mode, sizeof(mode),
-			   NULL, 0, NULL))
-		return -EIO;
-
-	ndev->ieee80211_ptr->iftype = type;
-	return 0;
+	return vwifi_ctrl_cmd(p, VWIFI_OP_SET_OP_MODE, &mode, sizeof(mode),
+			      NULL, 0, NULL);
 }
 
 static const struct cfg80211_ops vwifi_cfg80211_ops = {
@@ -477,15 +528,19 @@ static void handle_scan_complete(struct vwifi_priv *p,
 				 const void *payload, u32 len)
 {
 	struct cfg80211_scan_info info = {};
+	struct cfg80211_scan_request *req = vwifi_scan_claim(p);
 
-	if (!p->scan_req)
+	/* No claim means no scan of ours is outstanding -- a stale
+	 * completion from a previous one, or the timeout beat us here. */
+	if (!req)
 		return;
+
+	cancel_delayed_work(&p->scan_timeout);
 
 	if (len >= sizeof(s32))
 		info.aborted = (*(const s32 *)payload) != 0;
 
-	cfg80211_scan_done(p->scan_req, &info);
-	p->scan_req = NULL;
+	cfg80211_scan_done(req, &info);
 }
 
 static void handle_assoc_result(struct vwifi_priv *p,
@@ -596,8 +651,7 @@ void vwifi_handle_event(struct vwifi_priv *p, u16 event,
 static const struct ieee80211_iface_limit vwifi_iface_limits[] = {
 	{
 		.max = 1,
-		.types = BIT(NL80211_IFTYPE_STATION) |
-			 BIT(NL80211_IFTYPE_MONITOR),
+		.types = BIT(NL80211_IFTYPE_STATION),
 	},
 };
 
@@ -610,13 +664,19 @@ static const struct ieee80211_iface_combination vwifi_iface_combos[] = {
 	},
 };
 
+/*
+ * CCMP only. The device's SET_KEY accepts VWIFI_CIPHER_CCMP128 with a
+ * 16-byte key and rejects everything else outright, so advertising
+ * WEP/TKIP/GCMP would let wpa_supplicant negotiate a cipher that then
+ * fails at .add_key -- mid-four-way-handshake, leaving an associated
+ * but unkeyed link and a deauth loop. GCMP-256 is appended only if the
+ * device claims WPA3.
+ */
 static const u32 vwifi_cipher_suites[] = {
-	WLAN_CIPHER_SUITE_WEP40,
-	WLAN_CIPHER_SUITE_WEP104,
-	WLAN_CIPHER_SUITE_TKIP,
 	WLAN_CIPHER_SUITE_CCMP,
-	WLAN_CIPHER_SUITE_GCMP_256,
+	WLAN_CIPHER_SUITE_GCMP_256,	/* only exposed with VWIFI_CAP_WPA3 */
 };
+#define VWIFI_N_CIPHERS_BASE 1
 
 int vwifi_cfg80211_init(struct vwifi_priv *p)
 {
@@ -641,16 +701,27 @@ int vwifi_cfg80211_init(struct vwifi_priv *p)
 	if (ret)
 		return ret;
 
-	p->wiphy->max_scan_ssids = p->caps.max_scan_ssids ?: 4;
-	p->wiphy->max_scan_ie_len = 256;
+	/* Clamp to what vwifi_op_scan can actually encode -- the scan
+	 * request carries at most four SSIDs. Advertising the device's
+	 * number unchecked would also truncate into wiphy's u8. */
+	p->wiphy->max_scan_ssids = min_t(u16, p->caps.max_scan_ssids ?: 4,
+					 VWIFI_MAX_SCAN_SSIDS);
+	/* struct vwifi_scan_req has nowhere to put probe-request IEs, so
+	 * claiming support for them would be a lie. */
+	p->wiphy->max_scan_ie_len = 0;
 	p->wiphy->signal_type = CFG80211_SIGNAL_TYPE_MBM;
+	/*
+	 * STA only. The device supports monitor mode, but this driver has
+	 * no radiotap path and drops every RX_F_RAW frame, so offering
+	 * NL80211_IFTYPE_MONITOR would give userspace an interface that
+	 * switches successfully and then goes permanently silent.
+	 */
 	p->wiphy->interface_modes = BIT(NL80211_IFTYPE_STATION);
-	if (p->caps.caps & VWIFI_CAP_MONITOR)
-		p->wiphy->interface_modes |= BIT(NL80211_IFTYPE_MONITOR);
 	p->wiphy->iface_combinations = vwifi_iface_combos;
 	p->wiphy->n_iface_combinations = ARRAY_SIZE(vwifi_iface_combos);
 	p->wiphy->cipher_suites = vwifi_cipher_suites;
-	p->wiphy->n_cipher_suites = ARRAY_SIZE(vwifi_cipher_suites);
+	p->wiphy->n_cipher_suites = (p->caps.caps & VWIFI_CAP_WPA3) ?
+		ARRAY_SIZE(vwifi_cipher_suites) : VWIFI_N_CIPHERS_BASE;
 
 	ret = wiphy_register(p->wiphy);
 	if (ret) {
@@ -674,7 +745,16 @@ int vwifi_cfg80211_init(struct vwifi_priv *p)
 	p->wdev.iftype = NL80211_IFTYPE_STATION;
 	ndev->ieee80211_ptr = &p->wdev;
 
-	eth_hw_addr_set(ndev, p->caps.default_mac);
+	/* An all-zero or multicast MAC from the device would register fine
+	 * and then fail eth_validate_addr() at every ip-link-up, which is
+	 * an opaque way to be broken. */
+	if (is_valid_ether_addr(p->caps.default_mac))
+		eth_hw_addr_set(ndev, p->caps.default_mac);
+	else {
+		dev_warn(p->dev,
+			 "device reported an invalid MAC; using a random one\n");
+		eth_hw_addr_random(ndev);
+	}
 
 	ret = register_netdev(ndev);
 	if (ret) {

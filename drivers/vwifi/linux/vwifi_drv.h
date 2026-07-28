@@ -32,16 +32,25 @@
  */
 #define VWIFI_CTRL_REQ_RING_ENTRIES  16
 #define VWIFI_CTRL_RSP_RING_ENTRIES  32
-#define VWIFI_TX_RING_ENTRIES        128
-#define VWIFI_RX_RING_ENTRIES        128
+/* 64 x 2048 = 128 KiB of coherent memory per data ring. Larger rings
+ * mean larger contiguous allocations, which start failing on a
+ * fragmented long-lived guest; this is already far more than a single
+ * STA data path keeps in flight. */
+#define VWIFI_TX_RING_ENTRIES        64
+#define VWIFI_RX_RING_ENTRIES        64
 
 /*
  * Per-slot buffer sizes.
  *
- * A BSS_FOUND event carries a whole beacon, not just its IE tail, so
- * the response payload has to be frame-sized rather than struct-sized.
+ * Request and response are sized differently on purpose. The device
+ * reads a control request into a 2048-byte stack buffer and rejects
+ * anything larger outright, so offering more would only produce
+ * requests it refuses. Responses have no such limit and a BSS_FOUND
+ * event carries a whole beacon rather than just its IE tail, so the
+ * response slot is frame-sized.
  */
-#define VWIFI_CTRL_PAYLOAD_SIZE      4096
+#define VWIFI_CTRL_REQ_PAYLOAD_SIZE  2048	/* must match the device */
+#define VWIFI_CTRL_RSP_PAYLOAD_SIZE  4096
 #define VWIFI_TX_BUF_SIZE            2048
 #define VWIFI_RX_BUF_SIZE            2048
 
@@ -91,10 +100,15 @@ struct vwifi_priv {
 	spinlock_t		 ring_lock;	/* guards ring indices vs IRQ */
 	struct completion	 ctrl_done;
 	u32			 ctrl_req_id;	/* next id to issue */
+	/* The handshake fields below are written by the submitter and read
+	 * by whichever context drains the response ring, so they are
+	 * guarded by ring_lock rather than by ctrl_lock -- those are
+	 * different locks and ctrl_lock alone excludes nothing here. */
 	u32			 ctrl_pending_id;	/* id we are waiting on */
-	s32			 ctrl_status;		/* result, once done */
-	u32			 ctrl_rsp_len;		/* payload bytes */
-	void			*ctrl_rsp_buf;		/* copy of the payload */
+	s32			 ctrl_status;		/* device status, once done */
+	u32			 ctrl_rsp_len;		/* payload bytes reported */
+	void			*ctrl_rsp_buf;		/* where to copy payload */
+	u32			 ctrl_rsp_cap;		/* ...and how much fits */
 
 	struct work_struct	 rsp_work;	/* rsp ring -> process context */
 
@@ -107,9 +121,17 @@ struct vwifi_priv {
 	struct ieee80211_supported_band band_2ghz;
 	struct ieee80211_supported_band band_5ghz;
 
-	/* Scan in progress, if any. Owned by the rsp work / cfg80211
-	 * callbacks, both of which run under the wiphy lock. */
+	/*
+	 * Scan in progress, if any. Guarded by ring_lock: the response
+	 * work runs on the system workqueue and does NOT hold the wiphy
+	 * lock, so it is not serialized against the cfg80211 callbacks.
+	 * Always take it via vwifi_scan_claim() so exactly one context
+	 * can complete a given request.
+	 */
 	struct cfg80211_scan_request *scan_req;
+	/* Backstop: if SCAN_COMPLETE is ever lost, scan_req would stay set
+	 * and every future scan would return -EBUSY forever. */
+	struct delayed_work	 scan_timeout;
 
 	/* Connection state, for cfg80211_connect_result / _disconnected. */
 	bool			 connected;
@@ -141,6 +163,8 @@ void vwifi_rings_arm(struct vwifi_priv *p);
 
 /* vwifi_cfg80211.c */
 const struct cfg80211_ops *vwifi_cfg80211_ops_get(void);
+struct cfg80211_scan_request *vwifi_scan_claim(struct vwifi_priv *p);
+void vwifi_scan_timeout_fn(struct work_struct *work);
 int  vwifi_cfg80211_init(struct vwifi_priv *p);
 void vwifi_cfg80211_deinit(struct vwifi_priv *p);
 void vwifi_handle_event(struct vwifi_priv *p, u16 event,
