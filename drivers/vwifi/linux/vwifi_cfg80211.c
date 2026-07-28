@@ -346,8 +346,18 @@ static int vwifi_op_connect(struct wiphy *wiphy, struct net_device *ndev,
 		ether_addr_copy(req->bssid, sme->bssid);
 	req->ssid_len = sme->ssid_len;
 	memcpy(req->ssid, sme->ssid, sme->ssid_len);
+	/*
+	 * Take a channel from either source cfg80211 offers. wpa_supplicant
+	 * leaves ->channel NULL when it is willing to let the driver roam
+	 * and only fills ->channel_hint from the BSS it picked; without the
+	 * hint the device would associate on whatever it was last tuned to,
+	 * which after a scan is the pre-scan channel -- nothing in
+	 * particular on a radio that has never been tuned.
+	 */
 	if (sme->channel)
 		req->channel_freq = sme->channel->center_freq;
+	else if (sme->channel_hint)
+		req->channel_freq = sme->channel_hint->center_freq;
 
 	req->auth_algo = vwifi_auth_from_nl(sme->auth_type);
 	req->cipher_pairwise = sme->crypto.n_ciphers_pairwise ?

@@ -406,6 +406,61 @@ int main(void)
     assert(!mock_backend_timer_armed(g_mock));
     printf("  scan abort restores idle state: PASS\n");
 
+    /* ---- 9. Wildcard SSID entry reports named networks ----
+     *
+     * cfg80211 puts a single zero-length SSID in almost every scan it
+     * issues -- `iw dev wlan0 scan` and NetworkManager both do -- and a
+     * zero-length SSID is 802.11's wildcard, not a literal empty name.
+     * Comparing it literally matches only hidden APs and drops every
+     * named network, which presents as an empty scan on a busy medium.
+     * Steps 1-8 all use num_ssids = 0, so only this case covers it. */
+    {
+        uint8_t req[sizeof(struct vwifi_scan_req) + 34] = { 0 };
+        struct vwifi_scan_req *sw = (struct vwifi_scan_req *)req;
+
+        sw->channel_mask_24 = (1u << 1);
+        sw->dwell_ms        = 100;
+        sw->num_ssids       = 1;
+        req[sizeof(*sw)]    = 0;          /* SSID length 0 = wildcard */
+
+        drain_rsp_ring();
+        assert(ctrl_send(VWIFI_OP_SCAN, req, sizeof(req)) == 0);
+
+        blen = build_beacon(beacon, ap1, "vwifi-test",
+                            0x0123456789ABCDEFULL, 100, 0x0431);
+        medium_rx(beacon, blen, 2412, -55, ap1);
+
+        n = collect_events(VWIFI_EV_BSS_FOUND, evs, 8);
+        assert(n == 1);
+        assert(ctrl_send(VWIFI_OP_SCAN_ABORT, NULL, 0) == 0);
+        printf("  wildcard SSID entry still reports named BSS: PASS\n");
+    }
+
+    /* ---- 10. ...but a directed scan still filters ---- */
+    {
+        uint8_t req[sizeof(struct vwifi_scan_req) + 34] = { 0 };
+        struct vwifi_scan_req *sd = (struct vwifi_scan_req *)req;
+        const char *want = "not-on-the-air";
+
+        sd->channel_mask_24 = (1u << 1);
+        sd->dwell_ms        = 100;
+        sd->num_ssids       = 1;
+        req[sizeof(*sd)]    = (uint8_t)strlen(want);
+        memcpy(req + sizeof(*sd) + 1, want, strlen(want));
+
+        drain_rsp_ring();
+        assert(ctrl_send(VWIFI_OP_SCAN, req, sizeof(req)) == 0);
+
+        blen = build_beacon(beacon, ap1, "vwifi-test",
+                            0x0123456789ABCDEFULL, 100, 0x0431);
+        medium_rx(beacon, blen, 2412, -55, ap1);
+
+        n = collect_events(VWIFI_EV_BSS_FOUND, evs, 8);
+        assert(n == 0);
+        assert(ctrl_send(VWIFI_OP_SCAN_ABORT, NULL, 0) == 0);
+        printf("  directed scan for an absent SSID reports nothing: PASS\n");
+    }
+
     printf("scan: PASS\n");
     free(g_dev);
     mock_backend_free(g_mock);

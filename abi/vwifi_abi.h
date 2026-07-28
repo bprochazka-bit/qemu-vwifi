@@ -329,7 +329,17 @@ struct vwifi_scan_req {
     uint64_t channel_mask_5;
     uint16_t dwell_ms;              /* per-channel dwell time */
     uint16_t num_ssids;             /* 0 = broadcast probe */
-    /* followed by num_ssids × { uint8 len; uint8 ssid[33]; } */
+    /*
+     * followed by num_ssids × { uint8 len; uint8 ssid[33]; }
+     *
+     * An entry with len == 0 is the 802.11 wildcard SSID, not a literal
+     * empty name: it makes the device probe with a zero-length SSID IE
+     * AND report every BSS it hears, exactly as num_ssids == 0 does.
+     * This is not a nicety -- cfg80211 puts one zero-length SSID in
+     * essentially every scan request, so a device that compares it
+     * literally reports only hidden APs and looks like it is sitting on
+     * a dead medium.
+     */
 } __attribute__((packed));
 
 /* Set in vwifi_bss_entry.capability_info bit 16 to tell the driver

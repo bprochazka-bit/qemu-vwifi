@@ -978,13 +978,29 @@ static void bss_emit(struct vwifi_dev *d, const struct vwifi_bss *b)
     vwifi_post_event(d, VWIFI_EV_BSS_FOUND, payload, total);
 }
 
-/* Does this BSS match the scan's directed-SSID list? A scan with no
- * SSIDs specified matches everything (broadcast scan). */
+/*
+ * Does this BSS match the scan's SSID list?
+ *
+ * Two things count as "match everything":
+ *
+ *   - an empty list (num_ssids == 0), and
+ *   - a zero-length SSID *entry*.
+ *
+ * The second is the wildcard SSID of 802.11, and getting it wrong is
+ * expensive: cfg80211 puts one zero-length SSID in essentially every
+ * scan request it issues, so `iw dev wlan0 scan` and NetworkManager
+ * both arrive here with num_ssids = 1, ssid_len[0] = 0. Comparing that
+ * literally -- ssid_len[i] == b->ssid_len -- matches only a hidden AP
+ * and silently discards every named network on the air. The scan still
+ * tunes each channel, still probes, still fills the BSS table; it just
+ * reports nothing, which looks exactly like an empty medium.
+ */
 static bool bss_matches_scan_ssids(const struct vwifi_dev *d,
                                    const struct vwifi_bss *b)
 {
     if (d->scan.num_ssids == 0) return true;
     for (unsigned i = 0; i < d->scan.num_ssids; i++) {
+        if (d->scan.ssid_len[i] == 0) return true;      /* wildcard */
         if (d->scan.ssid_len[i] == b->ssid_len &&
             memcmp(d->scan.ssids[i], b->ssid, b->ssid_len) == 0) {
             return true;
