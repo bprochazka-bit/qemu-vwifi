@@ -21,6 +21,7 @@
 
 /* struct vwifi_scan_req carries at most four trailing SSID entries. */
 #define VWIFI_MAX_SCAN_SSIDS	4
+#define VWIFI_DEFAULT_TX_POWER_DBM	20
 #define VWIFI_SCAN_TIMEOUT_MS	10000
 
 /* ============================================================
@@ -295,8 +296,24 @@ static int vwifi_op_scan(struct wiphy *wiphy,
 	 * one -- cfg80211 warns, and the new scan then hangs forever.
 	 */
 	ret = vwifi_ctrl_cmd(p, VWIFI_OP_SCAN, buf, len, NULL, 0, NULL);
-	if (ret)
+	if (ret) {
+		dev_warn(p->dev, "SCAN rejected by device: %d\n", ret);
 		return ret;
+	}
+
+	/*
+	 * An empty scan is the hardest thing to debug from userspace,
+	 * because "no networks" looks the same whether nothing was on the
+	 * air, the device never scanned, or the driver dropped what came
+	 * back. Log what was actually asked for so the next line in dmesg
+	 * can be compared against it.
+	 */
+	p->scan_bss_count = 0;
+	dev_dbg(p->dev,
+		"scan: %u chan requested -> mask24=0x%04x mask5=0x%llx, %u ssid(s), dwell %u ms\n",
+		request->n_channels, req->channel_mask_24,
+		(unsigned long long)req->channel_mask_5,
+		req->num_ssids, req->dwell_ms);
 
 	spin_lock_irqsave(&p->ring_lock, irqflags);
 	p->scan_req = request;
@@ -424,6 +441,45 @@ static int vwifi_op_set_default_key(struct wiphy *wiphy,
 	return 0;
 }
 
+/*
+ * TX power. Without these, "iw dev <dev> info" simply omits the txpower
+ * line -- nl80211 has nothing to report, because it asks the driver.
+ *
+ * The value is advertised, not enforced: the medium's propagation model
+ * uses per-node TX power set on the hub's control socket (SET_TXPOWER),
+ * not anything the guest asks for. Accepting the set and reporting it
+ * back is honest about that -- it is what the radio claims, and the
+ * medium is free to disagree.
+ */
+static int vwifi_op_set_tx_power(struct wiphy *wiphy, struct wireless_dev *wdev,
+				 enum nl80211_tx_power_setting type, int mbm)
+{
+	struct vwifi_priv *p = wiphy_priv(wiphy);
+
+	switch (type) {
+	case NL80211_TX_POWER_AUTOMATIC:
+		p->tx_power_dbm = VWIFI_DEFAULT_TX_POWER_DBM;
+		return 0;
+	case NL80211_TX_POWER_LIMITED:
+	case NL80211_TX_POWER_FIXED:
+		if (mbm < 0)
+			return -EINVAL;
+		p->tx_power_dbm = MBM_TO_DBM(mbm);
+		return 0;
+	default:
+		return -EINVAL;
+	}
+}
+
+static int vwifi_op_get_tx_power(struct wiphy *wiphy, struct wireless_dev *wdev,
+				 int *dbm)
+{
+	struct vwifi_priv *p = wiphy_priv(wiphy);
+
+	*dbm = p->tx_power_dbm;
+	return 0;
+}
+
 static int vwifi_op_get_station(struct wiphy *wiphy, struct net_device *ndev,
 				const u8 *mac, struct station_info *sinfo)
 {
@@ -491,6 +547,8 @@ static const struct cfg80211_ops vwifi_cfg80211_ops = {
 	.del_key		= vwifi_op_del_key,
 	.set_default_key	= vwifi_op_set_default_key,
 	.get_station		= vwifi_op_get_station,
+	.set_tx_power		= vwifi_op_set_tx_power,
+	.get_tx_power		= vwifi_op_get_tx_power,
 	.change_virtual_intf	= vwifi_op_change_iface,
 	.set_monitor_channel	= vwifi_op_set_monitor_channel,
 };
@@ -513,17 +571,34 @@ static void handle_bss_found(struct vwifi_priv *p, const void *payload, u32 len)
 	struct cfg80211_bss *cbss;
 	u32 frame_len;
 
-	if (len < sizeof(*bss))
+	if (len < sizeof(*bss)) {
+		dev_warn(p->dev, "BSS_FOUND truncated: %u < %zu\n",
+			 len, sizeof(*bss));
 		return;
+	}
 
 	frame_len = bss->ie_len;
 	if (frame_len < offsetof(struct ieee80211_mgmt, u.beacon.variable) ||
-	    sizeof(*bss) + frame_len > len)
+	    sizeof(*bss) + frame_len > len) {
+		dev_warn(p->dev,
+			 "BSS_FOUND %pM: bad frame length %u (payload %u)\n",
+			 bss->bssid, frame_len, len);
 		return;
+	}
 
+	/*
+	 * A frequency the wiphy does not know about is the most likely
+	 * reason for a silently empty scan: the device reports a channel
+	 * outside the set built from GET_CAPS, and cfg80211 has nowhere to
+	 * file the result. Worth a warning rather than a silent drop.
+	 */
 	chan = ieee80211_get_channel(p->wiphy, bss->channel_freq);
-	if (!chan)
+	if (!chan) {
+		dev_warn(p->dev,
+			 "BSS_FOUND %pM on unknown freq %u MHz -- dropped\n",
+			 bss->bssid, bss->channel_freq);
 		return;
+	}
 
 	data.chan   = chan;
 	data.signal = bss->rssi * 100;	/* dBm -> mBm */
@@ -540,8 +615,16 @@ static void handle_bss_found(struct vwifi_priv *p, const void *payload, u32 len)
 	cbss = cfg80211_inform_bss_frame_data(p->wiphy, &data,
 					      (struct ieee80211_mgmt *)mgmt,
 					      frame_len, GFP_KERNEL);
-	if (cbss)
-		cfg80211_put_bss(p->wiphy, cbss);
+	if (!cbss) {
+		dev_warn(p->dev, "cfg80211 rejected BSS %pM (%u MHz, %u byte frame)\n",
+			 bss->bssid, bss->channel_freq, frame_len);
+		return;
+	}
+
+	p->scan_bss_count++;
+	dev_dbg(p->dev, "BSS %pM %u MHz %d dBm, %u byte frame\n",
+		bss->bssid, bss->channel_freq, bss->rssi, frame_len);
+	cfg80211_put_bss(p->wiphy, cbss);
 }
 
 static void handle_scan_complete(struct vwifi_priv *p,
@@ -559,6 +642,20 @@ static void handle_scan_complete(struct vwifi_priv *p,
 
 	if (len >= sizeof(s32))
 		info.aborted = (*(const s32 *)payload) != 0;
+
+	/*
+	 * The one number worth having when a scan comes back empty: zero
+	 * here means nothing reached the driver, so the question is on the
+	 * device or the medium, not in this file. Run QEMU's device with
+	 * verbose=on to see whether it observed any beacons at all.
+	 */
+	if (p->scan_bss_count == 0)
+		dev_info(p->dev,
+			 "scan complete%s: no BSS reported by the device\n",
+			 info.aborted ? " (aborted)" : "");
+	else
+		dev_dbg(p->dev, "scan complete%s: %u BSS\n",
+			info.aborted ? " (aborted)" : "", p->scan_bss_count);
 
 	cfg80211_scan_done(req, &info);
 }
@@ -724,6 +821,7 @@ int vwifi_cfg80211_init(struct vwifi_priv *p)
 	 * claiming support for them would be a lie. */
 	p->wiphy->max_scan_ie_len = 0;
 	p->wiphy->signal_type = CFG80211_SIGNAL_TYPE_MBM;
+	p->tx_power_dbm = VWIFI_DEFAULT_TX_POWER_DBM;
 	p->wiphy->interface_modes = BIT(NL80211_IFTYPE_STATION);
 	/* Only offered if the device actually implements it -- monitor RX
 	 * and injection both go through the device's raw path. */

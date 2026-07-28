@@ -141,6 +141,15 @@ struct vwifi_priv {
 	bool			 connected;
 	u8			 bssid[ETH_ALEN];
 
+	/* Advertised TX power, in dBm. The medium models path loss from
+	 * node positions and per-node TX power set on the hub's control
+	 * socket, so this is what the radio *reports*, not a knob that
+	 * changes propagation. Kept so cfg80211 has an answer. */
+	int			 tx_power_dbm;
+	/* BSSes handed to cfg80211 during the current scan -- the number
+	 * that matters when a scan comes back empty. */
+	unsigned int		 scan_bss_count;
+
 	struct vwifi_caps	 caps;
 	bool			 rings_enabled;
 	/* Monitor mode: changes the netdev link type and the meaning of

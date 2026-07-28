@@ -187,6 +187,54 @@ decoding) and an ABI mismatch (device and driver built from different
 versions of `vwifi_abi.h`), both of which refuse to bind rather than
 limp along.
 
+## Debugging an empty scan
+
+`iw dev wlan0 scan` returning nothing has three possible causes, and the
+point of the logging below is to tell them apart in one run rather than
+three.
+
+Turn on both sides:
+
+```bash
+# host: let the DEVICE say what it sees on the medium
+-device vwifi-virt,chardev=medium,node_id=virt-guest,verbose=on
+
+# guest: let the DRIVER say what it did with it
+echo 'module vwifi +p' | sudo tee /sys/kernel/debug/dynamic_debug/control
+sudo iw dev wlan0 scan
+dmesg | tail -20
+```
+
+Then read it in this order:
+
+| What you see | Where the problem is |
+|---|---|
+| QEMU log has no `BSS_FOUND` lines | The device never saw a beacon. Nothing is transmitting on the scanned channel, or the hub is not delivering to this peer — check `LIST_PEERS` on the hub's control socket for a second node, and that it shows `mode=AP` on a channel the scan covers |
+| QEMU logs `BSS_FOUND`, dmesg says `no BSS reported by the device` | The events are not reaching the driver — a control-response ring problem |
+| dmesg says `on unknown freq N MHz -- dropped` | The device is reporting a channel the wiphy does not have. The channel list is built from `GET_CAPS`; compare against `vwifi-probe` output |
+| dmesg says `cfg80211 rejected BSS` | The frame reached cfg80211 and it did not like it — usually a malformed beacon |
+| `scan complete: no BSS reported` and nothing else | The scan ran and the air was genuinely empty |
+
+The most common answer by far is the first row: **a medium with only one
+peer on it has nothing to find.** Something has to be beaconing — the
+host radio running hostapd, or another guest in SoftAP mode. See
+[`../../../docs/testing-guests.md`](../../../docs/testing-guests.md)
+Part 2.
+
+## About `iw dev <dev> info`
+
+**No `txpower` line** was a missing `.get_tx_power` — nl80211 asks the
+driver, and a driver that does not implement it gets the field omitted.
+Implemented now. Note it is advertised, not enforced: the medium models
+propagation from node positions and per-node TX power set on the hub's
+control socket, so what the guest asks for does not change how far its
+frames actually reach.
+
+**No `TXQ` lines** is correct and will not change. Those come from
+mac80211's intermediate software queues, and this is a full-MAC driver —
+there is no mac80211 in the path to have them. `ath9k` shows them
+because it is a mac80211 driver; this one never will.
+
 ## What to do first when it misbehaves
 
 Reach for `devices/vwifi/tools/vwifi-probe` before the kernel debugger.
