@@ -73,6 +73,25 @@ qemu-system-x86_64 ... \
 Properties: `chardev` (the hub socket), `node_id` (name in the hub's
 peer list), `mac`, `verbose`.
 
+## Testing it in a guest
+
+There is no Linux driver yet, so a guest cannot give you a `wlan0`. It
+can still prove the device works: `tools/vwifi-probe` maps BAR0 from
+sysfs and reads the identity, status and diagnostic registers, so a
+guest with nothing bound to the device still shows whether MMIO reaches
+the model, whether the hub link is up, and whether frames are crossing
+the medium.
+
+```bash
+make probe                # -> build/vwifi-probe
+# copy into a guest, then:
+sudo ./vwifi-probe        # one shot
+sudo ./vwifi-probe -w     # poll, watch the counters move
+```
+
+Full walkthrough, both guests:
+[`../../docs/testing-guests.md`](../../docs/testing-guests.md).
+
 ## The abstraction seam
 
 Every operation the device logic performs against its host environment

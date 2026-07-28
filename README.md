@@ -189,6 +189,7 @@ qemu-system-x86_64 -machine q35 -m 2048 -drive file=vm.qcow2,format=qcow2 \
 
 | You want to | Read |
 |---|---|
+| Boot a Linux or Windows guest on the medium and test a device | [`docs/testing-guests.md`](docs/testing-guests.md) |
 | Run the hub, drive it at runtime, bridge hosts or a real radio | [`medium/README.md`](medium/README.md) |
 | Give the host machine its own radios | [`host/README.md`](host/README.md) |
 | Build the Linux (AR9285) device | [`devices/ath9k/README.md`](devices/ath9k/README.md) |

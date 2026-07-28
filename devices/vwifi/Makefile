@@ -34,6 +34,7 @@ help:
 	@echo "  build      Build QEMU with the device"
 	@echo "  install    Install the built QEMU, but not over an existing install"
 	@echo "  upgrade    Install, overwriting an existing install"
+	@echo "  probe      Build tools/vwifi-probe (guest-side smoke test)"
 	@echo "  clean      Remove test binaries"
 	@echo ""
 	@echo "Required for integrate/configure/build:"
@@ -61,7 +62,7 @@ test:
 
 # ---- QEMU integration ---------------------------------------------
 
-.PHONY: integrate configure build install upgrade clean
+.PHONY: integrate configure build install upgrade probe clean
 integrate: check-qemu-src
 	@echo "=== Integrating vwifi-virt sources into QEMU ==="
 	./scripts/integrate.sh "$(QEMU_SRC)"
@@ -107,5 +108,14 @@ upgrade: check-qemu-src
 	$(MAKE) -C "$(QEMU_BUILD_DIR)" install
 	@echo "   Installed $(INSTALLED_BINARY)"
 
+# Guest-side smoke test. Build it, then copy the binary into a VM: it
+# reads the device's registers straight from sysfs, so it works in a
+# guest with no driver bound -- which is every Linux guest today.
+probe: build/vwifi-probe
+build/vwifi-probe: tools/vwifi-probe.c ../../abi/vwifi_abi.h
+	@mkdir -p build
+	$(CC) -Wall -Wextra -O2 -I../../abi -o $@ $<
+	@echo "   built $@ — copy it into a guest and run as root"
+
 clean:
-	rm -rf tests/build
+	rm -rf tests/build build
