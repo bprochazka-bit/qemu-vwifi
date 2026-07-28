@@ -606,4 +606,5 @@ static struct pci_driver vwifi_pci_driver = {
 module_pci_driver(vwifi_pci_driver);
 
 MODULE_DESCRIPTION("Full-MAC cfg80211 driver for the vwifi-virt QEMU device");
+MODULE_VERSION(VWIFI_DRV_VERSION);
 MODULE_LICENSE("GPL");

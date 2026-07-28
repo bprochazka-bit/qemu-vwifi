@@ -210,9 +210,14 @@ no guest driver involved at all.
 ### 4d. Load the driver
 
 ```bash
-sudo apt install linux-headers-$(uname -r)      # in the guest
-make -C drivers/vwifi/linux                      # or build on the host
-sudo insmod vwifi.ko
+# In the guest. DKMS so the module survives kernel upgrades:
+sudo apt install dkms linux-headers-$(uname -r)
+sudo make -C drivers/vwifi/linux dkms
+sudo modprobe vwifi
+
+# Or, for a one-off test against the running kernel only:
+#   make -C drivers/vwifi/linux && sudo insmod drivers/vwifi/linux/vwifi.ko
+
 dmesg | tail
 ```
 

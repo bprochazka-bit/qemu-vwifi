@@ -81,6 +81,43 @@ sudo make install           # modules_install + depmod
 Build it in the guest, or on a host with matching headers and copy
 `vwifi.ko` in.
 
+## Installing with DKMS (recommended in a guest)
+
+```bash
+sudo apt install dkms linux-headers-$(uname -r)
+sudo make dkms              # stage, add, build, install
+sudo modprobe vwifi
+
+sudo make dkms-remove       # unregister and clean /usr/src
+```
+
+Use this rather than `make install` in any guest whose kernel gets
+updated. A plain `make install` module is built for exactly one kernel
+version and silently stops loading after the next upgrade — which
+presents as "the Wi-Fi disappeared", with nothing obviously to blame.
+DKMS rebuilds it as part of the upgrade.
+
+### The one wrinkle: the shared ABI header
+
+DKMS copies exactly one directory into `/usr/src`, and these sources are
+not self-contained — they include `abi/vwifi_abi.h` from the top of the
+repository, the same file the QEMU device and the Windows driver compile
+against. A plain `dkms add .` would stage a tree that cannot build.
+
+`dkms-install.sh` therefore stages the sources *and* drops a copy of that
+header beside them, with a note saying what it is. The copy is a build
+artifact of packaging, exactly like the headers `integrate.sh` puts into
+a QEMU tree: generated, never edited, replaced on every install. The one
+authoritative copy stays in `abi/`.
+
+The Makefile works in both layouts — it adds `-I../../../abi` only when
+that directory exists, and the quoted `#include` finds a sibling copy on
+its own in the DKMS tree.
+
+The version lives in `dkms.conf`, and `dkms-install.sh` refuses to stage
+if it disagrees with `VWIFI_DRV_VERSION` in `vwifi_drv.h`. Two files that
+must agree, with nothing else to enforce it.
+
 ## Using it
 
 Start a hub and a peer to talk to first — see
