@@ -336,3 +336,9 @@ MACs for scanning by default. `nmcli device show wlan0` reports both the
 permanent and the in-use address; `wifi.cloned-mac-address=permanent`
 pins it. If the first two are all-zero, the driver predates this being
 published — rebuild it.
+
+The same randomization is why a node's address in `LIST_PEERS` may not
+be the one you configured: the hub learns what it sees on the air. It
+reports the address a node is currently using and counts the rest —
+`DUMP_MACS` shows them, `FORGET_MACS` clears them. See "Learned
+addresses" in [`../medium/README.md`](../medium/README.md).

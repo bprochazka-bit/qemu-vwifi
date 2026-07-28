@@ -138,6 +138,8 @@ SET_TXPOWER <node-id> <dBm>                      # set node TX power
 SET_SNR <mac-a> <mac-b> <snr-db>                 # pin a per-link SNR override
 CLEAR_SNR <mac-a> <mac-b>                        # release the override
 SURVEY [RESET]                                   # per-channel utilisation
+DUMP_MACS [<node-id>]                            # every address a node has used
+FORGET_MACS <node-id|all>                        # drop learned addresses
 STATS                                            # global counters
 SAVE_CONFIG <path>                               # snapshot current config
 LOAD_CONFIG <path>                               # replay commands from a file
@@ -165,6 +167,57 @@ fields:
   last transmitted with (`chan=-` if it has only ever sent v1 frames).
   The channel is remembered across disconnect, so an `offline` node
   still shows the channel it last used.
+
+### Learned addresses
+
+The hub learns a node's MAC by watching the transmitter address on the
+frames it sends. `LIST_PEERS` shows **one** — the address the node is
+currently using — plus `nmacs`, how many it has on file:
+
+```
+  client-a     online mode=STA chan=6 ... macs=[52:54:00:4e:ca:0c] nmacs=3 ...
+```
+
+That is a deliberate summary, because a guest can churn through
+addresses fast. Scanning stations randomize the transmitter address on
+their probe requests — NetworkManager does it by default — so a node
+that sits and scans would otherwise contribute a fresh address every
+scan round. The hub keeps at most **one** such provisional address per
+node, replaced by each new one, and marks it `probe`. An address seen in
+a frame that asserts identity (auth, assoc, data, beacon) is `confirmed`
+and kept. When the 16-entry table is full the least recently seen entry
+is evicted, so a node's current address is always learnable and always
+resolves in `SET_POS` / `SET_SNR` / `SET_TXPOWER`.
+
+`DUMP_MACS` prints the whole table, newest first:
+
+```
+$ echo "DUMP_MACS client-a" | socat - UNIX-CONNECT:/tmp/vwifi.ctl
+OK 3 MAC(s) on 1 node(s)
+  client-a     52:54:00:4e:ca:0c kind=confirmed age=2 primary=yes
+  client-a     8a:31:c0:9d:11:04 kind=probe     age=17 primary=no
+  client-a     52:54:00:4e:ca:0d kind=confirmed age=903 primary=no
+```
+
+`FORGET_MACS <node|all>` clears the learned addresses for a node without
+disturbing anything an operator set — position, TX power and the link
+overrides all stay, which a hub restart would have taken with it. The
+node relearns from its next frame.
+
+**Stopping the churn at the guest.** If you control the guest and want
+its address stable, turn the randomization off there:
+
+```bash
+nmcli connection modify <name> wifi.cloned-mac-address permanent
+nmcli connection modify <name> wifi.mac-address-randomization 1   # never
+# system-wide, for scanning:
+printf '[device]\nwifi.scan-rand-mac-address=no\n' \
+  | sudo tee /etc/NetworkManager/conf.d/no-rand-mac.conf
+```
+
+wpa_supplicant has its own knobs (`mac_addr`, `preassoc_mac_addr`);
+both default to off, so a guest driving wpa_supplicant directly does not
+randomize at all.
 
 ### Site survey (channel utilisation)
 
