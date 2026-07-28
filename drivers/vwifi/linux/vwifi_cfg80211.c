@@ -319,8 +319,18 @@ static int vwifi_op_scan(struct wiphy *wiphy,
 	p->scan_req = request;
 	spin_unlock_irqrestore(&p->ring_lock, irqflags);
 
-	schedule_delayed_work(&p->scan_timeout,
-			      msecs_to_jiffies(VWIFI_SCAN_TIMEOUT_MS));
+	/*
+	 * mod_delayed_work(), not schedule_delayed_work(): the latter is a
+	 * no-op when the work is already pending, and it can be. If a scan
+	 * loses its SCAN_COMPLETE, this backstop fires and is briefly
+	 * queued; a scan starting in that window would silently get no
+	 * backstop of its own, and if it also lost its completion nothing
+	 * would ever call cfg80211_scan_done(). `iw scan` then blocks until
+	 * its netlink socket overflows -- which reports as ENOBUFS several
+	 * minutes later and says nothing about scanning at all.
+	 */
+	mod_delayed_work(system_wq, &p->scan_timeout,
+			 msecs_to_jiffies(VWIFI_SCAN_TIMEOUT_MS));
 	return 0;
 }
 

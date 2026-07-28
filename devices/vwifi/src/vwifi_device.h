@@ -52,8 +52,11 @@ void   vwifi_medium_hello(struct vwifi_dev *d);
  * dwell progression. */
 void vwifi_timer_expired(struct vwifi_dev *d);
 
-/* Async event helper used by later phases (SCAN, CONNECT results). */
-void vwifi_post_event(struct vwifi_dev *d, uint16_t event_code,
+/* Async event helper used by later phases (SCAN, CONNECT results).
+ * Returns false if the event could not be queued because the driver
+ * has no free control-response slot -- callers emitting a burst should
+ * stop there rather than pushing into a full ring. */
+bool vwifi_post_event(struct vwifi_dev *d, uint16_t event_code,
                       const void *payload, uint32_t payload_len);
 
 #endif /* VWIFI_DEVICE_H */

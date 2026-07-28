@@ -461,6 +461,63 @@ int main(void)
         printf("  directed scan for an absent SSID reports nothing: PASS\n");
     }
 
+    /* ---- 11. A scan that hears nothing still reports the table ----
+     *
+     * A 100 TU beacon interval is 102.4 ms and a dwell is 100 ms, so
+     * the two drift against each other: an AP the device has known
+     * about for minutes falls outside one scan's window and lands
+     * inside the next one's. Reporting only live sightings turns that
+     * into scan results that blink on and off. */
+    {
+        struct vwifi_scan_req s2 = { 0 };
+        s2.channel_mask_24 = (1u << 1) | (1u << 6);
+        s2.dwell_ms        = 100;
+        s2.num_ssids       = 0;
+
+        drain_rsp_ring();
+        arm_all_rsp_slots();
+        mock_backend_clear_events(g_mock);
+        assert(ctrl_send(VWIFI_OP_SCAN, &s2, sizeof(s2)) == 0);
+
+        /* Deliberately feed nothing. Walk ch1 -> ch6 -> off the end. */
+        assert(mock_backend_advance_to_timer(g_mock));
+        vwifi_timer_expired(g_dev);
+        assert(mock_backend_advance_to_timer(g_mock));
+        vwifi_timer_expired(g_dev);
+
+        n = collect_events(VWIFI_EV_BSS_FOUND, evs, 8);
+        assert(n == 2);          /* both APs, from the table */
+        assert(collect_events(VWIFI_EV_SCAN_COMPLETE, evs, 8) == 1);
+        printf("  silent scan still reports both cached BSSes: PASS\n");
+    }
+
+    /* ---- 12. ...but not a BSS on a channel the scan skipped ---- */
+    {
+        struct vwifi_scan_req s3 = { 0 };
+        s3.channel_mask_24 = (1u << 6);     /* ch6 only; ap1 is on ch1 */
+        s3.dwell_ms        = 100;
+        s3.num_ssids       = 0;
+
+        drain_rsp_ring();
+        arm_all_rsp_slots();
+        mock_backend_clear_events(g_mock);
+        assert(ctrl_send(VWIFI_OP_SCAN, &s3, sizeof(s3)) == 0);
+
+        assert(mock_backend_advance_to_timer(g_mock));
+        vwifi_timer_expired(g_dev);
+
+        n = collect_events(VWIFI_EV_BSS_FOUND, evs, 8);
+        assert(n == 1);
+        {
+            uint32_t slot = (uint32_t)((evs[0]->payload_addr - g_ram
+                                        - RSP_PAYLOAD_OFFSET) / RSP_PAYLOAD_STRIDE);
+            struct vwifi_bss_entry *e = (struct vwifi_bss_entry *)
+                (g_ram_va + RSP_PAYLOAD_OFFSET + (uint64_t)slot * RSP_PAYLOAD_STRIDE);
+            assert(memcmp(e->bssid, ap2, 6) == 0);
+        }
+        printf("  cached report honours the requested channel list: PASS\n");
+    }
+
     printf("scan: PASS\n");
     free(g_dev);
     mock_backend_free(g_mock);

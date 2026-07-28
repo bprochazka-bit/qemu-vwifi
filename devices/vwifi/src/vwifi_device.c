@@ -339,7 +339,7 @@ struct vwifi_dev {
 };
 
 static void vwifi_raise_irq(struct vwifi_dev *d, unsigned vec);
-static void post_rsp(struct vwifi_dev *d,
+static bool post_rsp(struct vwifi_dev *d,
                      const struct vwifi_ctrl_rsp_desc *rsp,
                      const void *payload, uint32_t payload_len);
 static bool frame_is_beacon_or_probe_resp(const uint8_t *frame, uint16_t len);
@@ -993,7 +993,7 @@ static struct vwifi_bss *bss_alloc(struct vwifi_dev *d, uint64_t now_us)
 
 /* Emit a BSS_FOUND event for one table entry. The payload is a
  * vwifi_bss_entry followed by ie_len bytes of raw IEs. */
-static void bss_emit(struct vwifi_dev *d, const struct vwifi_bss *b)
+static bool bss_emit(struct vwifi_dev *d, const struct vwifi_bss *b)
 {
     uint8_t payload[sizeof(struct vwifi_bss_entry) + VWIFI_BSS_FRAME_MAX];
     struct vwifi_bss_entry *e = (struct vwifi_bss_entry *)payload;
@@ -1025,7 +1025,7 @@ static void bss_emit(struct vwifi_dev *d, const struct vwifi_bss *b)
                 b->channel_freq, b->rssi, b->frame_len,
                 b->is_beacon ? "beacon" : "probe-resp");
 
-    vwifi_post_event(d, VWIFI_EV_BSS_FOUND, payload, total);
+    return vwifi_post_event(d, VWIFI_EV_BSS_FOUND, payload, total);
 }
 
 /*
@@ -1195,8 +1195,77 @@ static void scan_send_probe_req(struct vwifi_dev *d, unsigned ssid_idx)
 
     len = ie_put_supp_rates(frame, len, d->channel.primary_freq);
 
+    /* Traced because the alternative is guessing. If these appear and no
+     * probe response ever comes back, active scanning is not working and
+     * the scan is relying on catching a beacon inside its dwell -- which
+     * is visible here as results that come and go between scans. */
+    VWIFI_TRACE(d, "scan: -> probe req (ssid='%s', %u bytes) on %u MHz",
+                ssid_len ? (const char *)ssid : "<wildcard>", len,
+                d->channel.primary_freq);
+
     medium_send_frame(d, frame, len, 0, d->channel.primary_freq,
                       d->ops->now_us(d->be), false);
+}
+
+/*
+ * Report BSSes the scan visited the channel for but did not hear from
+ * during its dwell.
+ *
+ * Without this, a scan reports only what happened to transmit inside a
+ * 100 ms window. That is a lottery: a beacon interval of 100 TU is
+ * 102.4 ms, so the beacon and the dwell drift against each other and an
+ * AP the device has known about for minutes drops out of one scan and
+ * reappears in the next for no reason the user can see. Active probing
+ * is meant to cover the gap, but it only helps if the AP answers.
+ *
+ * Real full-MAC firmware reports its table at scan end and cfg80211
+ * expects exactly that -- it keeps its own 30-second expiry, which is
+ * also what VWIFI_BSS_TTL_US is set to, so an entry we still consider
+ * live is one cfg80211 would still be holding.
+ */
+static void scan_report_cached(struct vwifi_dev *d)
+{
+    uint64_t now = d->ops->now_us(d->be);
+    unsigned reported = 0, skipped = 0;
+    /* Leave half the response ring for SCAN_COMPLETE and for whatever
+     * else the device needs to tell the driver while it drains this
+     * burst. The driver cannot run concurrently with us, so everything
+     * posted here lands before it gets a chance to free a slot. */
+    unsigned budget = (d->ctrl_rsp.mask + 1) / 2;
+
+    for (unsigned i = 0; i < VWIFI_BSS_MAX; i++) {
+        struct vwifi_bss *b = &d->bss[i];
+        bool scanned_here = false;
+
+        if (!b->valid || b->reported_this_scan) continue;
+        if (now - b->last_seen_us > VWIFI_BSS_TTL_US) continue;
+        if (!bss_matches_scan_ssids(d, b)) continue;
+
+        /* Only report what this scan actually looked for. A BSS on a
+         * channel the request excluded is not this scan's result. */
+        for (unsigned c = 0; c < d->scan.num_channels; c++) {
+            if (d->scan.channels[c] == b->channel_freq) {
+                scanned_here = true;
+                break;
+            }
+        }
+        if (!scanned_here) continue;
+
+        /* Never silently truncate: anything the budget or a full ring
+         * costs us gets counted and logged. A short scan that looks
+         * complete is the bug this function exists to fix. */
+        if (reported >= budget || !bss_emit(d, b)) {
+            skipped++;
+            continue;
+        }
+        b->reported_this_scan = true;
+        reported++;
+    }
+
+    if (reported || skipped) {
+        VWIFI_TRACE(d, "scan: reported %u cached BSS, %u withheld",
+                    reported, skipped);
+    }
 }
 
 static void scan_finish(struct vwifi_dev *d, int32_t status)
@@ -1204,6 +1273,14 @@ static void scan_finish(struct vwifi_dev *d, int32_t status)
     int32_t st = status;
 
     timer_clear(d, &d->timers.scan_us);
+
+    /* Anything still only in the table is this scan's result too. Do
+     * this before the state goes IDLE so the SSID filter and channel
+     * list still describe the scan being finished. */
+    if (status == 0) {
+        scan_report_cached(d);
+    }
+
     d->scan.state = VWIFI_SCAN_IDLE;
 
     /* Restore the pre-scan channel. */
@@ -2308,7 +2385,7 @@ static int32_t op_del_key(struct vwifi_dev *d, const void *in_buf, uint32_t in_l
     return 0;
 }
 
-static void post_rsp(struct vwifi_dev *d,
+static bool post_rsp(struct vwifi_dev *d,
                      const struct vwifi_ctrl_rsp_desc *rsp,
                      const void *payload, uint32_t payload_len)
 {
@@ -2316,18 +2393,18 @@ static void post_rsp(struct vwifi_dev *d,
     uint64_t desc_gpa;
     uint32_t idx;
 
-    if (!d->ctrl_rsp.enabled) return;
+    if (!d->ctrl_rsp.enabled) return false;
 
     idx = d->ctrl_rsp.next_idx;
     desc_gpa = ring_desc_gpa(&d->ctrl_rsp, idx);
 
-    if (d->ops->dma_read(d->be, desc_gpa, &out, sizeof(out)) != 0) return;
+    if (d->ops->dma_read(d->be, desc_gpa, &out, sizeof(out)) != 0) return false;
     if (!(out.flags & VWIFI_DESC_F_OWN)) {
         VWIFI_ERR(d, "no free ctrl-rsp slot at idx %u (opcode 0x%04x)",
                   idx, rsp->opcode);
         d->drops++;
         d->regs[VWIFI_REG_DIAG_DROPS / 4] = d->drops;
-        return;
+        return false;
     }
 
     if (payload && payload_len) {
@@ -2347,10 +2424,11 @@ static void post_rsp(struct vwifi_dev *d,
     d->regs[VWIFI_REG_CTRL_RSP_RING_TAIL / 4] = d->ctrl_rsp.next_idx;
 
     vwifi_raise_irq(d, VWIFI_VEC_CTRL_RSP);
+    return true;
 }
 
 /* Public helper for the phase-2+ event stream. */
-void vwifi_post_event(struct vwifi_dev *d, uint16_t event_code,
+bool vwifi_post_event(struct vwifi_dev *d, uint16_t event_code,
                       const void *payload, uint32_t payload_len)
 {
     struct vwifi_ctrl_rsp_desc rsp = {
@@ -2360,7 +2438,7 @@ void vwifi_post_event(struct vwifi_dev *d, uint16_t event_code,
         .status      = 0,
         .payload_len = payload_len,
     };
-    post_rsp(d, &rsp, payload, payload_len);
+    return post_rsp(d, &rsp, payload, payload_len);
 }
 
 static int32_t op_get_caps(struct vwifi_dev *d, void *out_buf, uint32_t *out_len)
