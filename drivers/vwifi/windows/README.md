@@ -166,12 +166,21 @@ Recorded here because each one is a trap the next WDI driver hits too:
   `ASSOCIATION_RESULT` (76) and `CONNECT_COMPLETE` (64); the connect
   sequence is those two. `WDI_INDICATION_ASSOCIATION_START_PARAMETERS`
   in `wditypes.hpp` is a container inside the result, not a message.
-- **There are two `WDI_OPERATION_MODE` enums.** `dot11wdi.h`'s lists
-  STA and the P2P roles; the TLV library's in `wditypes.hpp` is what
-  travels in `WDI_TLV_OPERATION_MODE` and includes `NETWORK_MONITOR`.
-  Only the second describes the wire, and it is not visible from a C
-  file — which is why `VwifiTlvParseOperationMode` returns a
-  `VWIFI_MODE_*` value instead of leaking either enum across the shim.
+- **WDI has no monitor mode.** `WDI_OPERATION_MODE` covers STA and the
+  three P2P roles; the string "monitor" appears nowhere in
+  `dot11wdi.h`, `wditypes.hpp` or `WABIModel.xml`. So
+  `OID_WDI_TASK_CHANGE_OPERATION_MODE` can only ever ask for STA, and
+  the Native 802.11 `OID_DOT11_CURRENT_OPERATION_MODE` — a plain NDIS
+  set request carrying `DOT11_OPERATION_MODE_NETWORK_MONITOR` from
+  `windot11.h` — is the only route left. Whether the Microsoft WLAN
+  component forwards that OID down to a WDI miniport at all is the open
+  question for Phase 1.5; both paths are wired up in `oids.c` so the
+  debug log will say which one fires.
+- **The generated TLV headers are split across two folders.**
+  `dot11wdi.h` and `wditypes.hpp` are on the kit's default include
+  path; `TlvGeneratorParser.hpp` and the `TlvGenerated_.hpp` it
+  includes are not. `build.cmd` finds them and passes the folder as
+  `WdiTlvIncludeDir`.
 
 ## Test-signing and installation
 

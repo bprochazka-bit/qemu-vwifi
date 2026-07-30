@@ -150,21 +150,22 @@ VwifiIndicateConnectComplete(_Inout_ PVWIFI_ADAPTER Adapter,
 }
 
 static VOID
-VwifiIndicateDisassociation(_Inout_ PVWIFI_ADAPTER Adapter, _In_ USHORT Reason)
+VwifiIndicateDisassociation(_Inout_ PVWIFI_ADAPTER Adapter, _In_ BOOLEAN Local)
 {
     PVWIFI_CONNECT_TASK task = Adapter->ConnectTask;
     PVOID tlv = NULL;
     ULONG tlvLen = 0;
 
     if (VwifiTlvGenerateDisassociation(Adapter->WdiPeerVersion,
-                                       Adapter->Bssid, Reason,
+                                       Adapter->Bssid, Local,
                                        &tlv, &tlvLen)
             != NDIS_STATUS_SUCCESS) {
         VWIFI_ERR("DISASSOCIATION TLV generate failed");
         return;
     }
 
-    VWIFI_INFO("indicating DISASSOCIATION reason=%u", Reason);
+    VWIFI_INFO("indicating DISASSOCIATION (%s-initiated)",
+               Local ? "locally" : "peer");
     VwifiSendWdiIndication(Adapter,
                            task ? task->PortId : NDIS_DEFAULT_PORT_NUMBER,
                            NDIS_STATUS_WDI_INDICATION_DISASSOCIATION,
@@ -250,10 +251,10 @@ VwifiConnectOnDisconnected(_Inout_ PVWIFI_ADAPTER Adapter,
                            _In_ ULONG PayloadLen)
 {
     const struct vwifi_disconnect_ev *ev = Payload;
-    USHORT reason = 0;
+    BOOLEAN local = FALSE;
     PVWIFI_CONNECT_TASK task = Adapter->ConnectTask;
 
-    if (PayloadLen >= sizeof(*ev)) reason = ev->reason_code;
+    if (PayloadLen >= sizeof(*ev)) local = ev->local ? TRUE : FALSE;
 
     Adapter->Associated = FALSE;
     RtlZeroMemory(Adapter->Bssid, 6);
@@ -264,7 +265,7 @@ VwifiConnectOnDisconnected(_Inout_ PVWIFI_ADAPTER Adapter,
         VwifiIndicateConnectComplete(Adapter, NDIS_STATUS_FAILURE);
     }
 
-    VwifiIndicateDisassociation(Adapter, reason);
+    VwifiIndicateDisassociation(Adapter, local);
     VwifiIndicateLinkState(Adapter, FALSE);
 }
 

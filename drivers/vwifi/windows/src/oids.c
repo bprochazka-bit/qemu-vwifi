@@ -7,6 +7,8 @@
  * Microsoft WLAN component surfaces to our miniport:
  *
  *   OID_DOT11_CURRENT_OPERATION_MODE  (set) -> op mode NETWORK_MONITOR
+ *                                     (the only route to monitor mode:
+ *                                      WDI itself has no such op mode)
  *   OID_DOT11_CURRENT_CHANNEL         (set) -> channel number (2.4 GHz)
  *   OID_DOT11_CURRENT_FREQUENCY       (set) -> channel for 5 GHz
  *   OID_GEN_CURRENT_PACKET_FILTER     (set) -> raw data/mgmt bits
@@ -142,12 +144,14 @@ VwifiOidRequest(
         oid = OidRequest->DATA.SET_INFORMATION.Oid;
 
         switch (oid) {
-        /* NOTE: OID_DOT11_CURRENT_OPERATION_MODE is NOT how operation
-         * mode reaches a WDI miniport. Per WABIModel.xml the OS sends
-         * OID_WDI_TASK_CHANGE_OPERATION_MODE (a method request carrying
-         * WDI_TLV_OPERATION_MODE) — the Microsoft WLAN component
-         * translates Npcap's Native 802.11 OID into that task before it
-         * gets to us. Handled in the NdisRequestMethod arm below. */
+        /* Both op-mode routes are handled, because they carry different
+         * modes. OID_WDI_TASK_CHANGE_OPERATION_MODE (NdisRequestMethod,
+         * below) can only ever ask for STA — WDI_OPERATION_MODE has no
+         * monitor mode. The Native 802.11 OID here is the only one that
+         * can carry DOT11_OPERATION_MODE_NETWORK_MONITOR, so if monitor
+         * mode works at all it works through this case. */
+        case OID_DOT11_CURRENT_OPERATION_MODE:
+            return VwifiHandleSetOpMode(adapter, OidRequest);
         case OID_DOT11_CURRENT_CHANNEL:
             return VwifiHandleSetChannel(adapter, OidRequest);
         case OID_DOT11_CURRENT_FREQUENCY:
@@ -222,16 +226,19 @@ VwifiOidRequest(
  *            description="No TLV data needed, header is sufficient"
  *            direction="FromIhv" />
  *
- * This is the path Npcap's monitor-mode request actually takes: Npcap
- * asks Native 802.11 for dot11_operation_mode_network_monitor, and the
- * Microsoft WLAN component turns that into this task.
+ * This is NOT the path Npcap's monitor-mode request takes, contrary to
+ * what this file used to assume. WDI_OPERATION_MODE covers STA and the
+ * three P2P roles; there is no network-monitor mode, and the string
+ * "monitor" appears nowhere in dot11wdi.h, wditypes.hpp or
+ * WABIModel.xml. So the only mode that can arrive here is STA, and the
+ * shim rejects anything else.
  *
- * The mode arrives as a WDI_OPERATION_MODE bitmask — but note there are
- * two enums by that name, dot11wdi.h's (STA and the P2P roles only) and
- * the TLV library's in wditypes.hpp (which carries NETWORK_MONITOR).
- * Only the second one describes what is in the TLV, and it is not
- * visible from a C file. So the shim resolves it and returns a
- * VWIFI_MODE_* value; do not reach for either WDI enum here.
+ * Monitor mode therefore has to come through the Native 802.11 OID
+ * surface above (OID_DOT11_CURRENT_OPERATION_MODE with
+ * DOT11_OPERATION_MODE_NETWORK_MONITOR, from windot11.h), which is a
+ * plain NDIS set request rather than a WDI task. Whether the Microsoft
+ * WLAN component actually forwards that OID to a WDI miniport is the
+ * open question for Phase 1.5 — see the README.
  * ============================================================ */
 NDIS_STATUS
 VwifiHandleTaskChangeOpMode(_Inout_ PVWIFI_ADAPTER Adapter,
@@ -252,8 +259,7 @@ VwifiHandleTaskChangeOpMode(_Inout_ PVWIFI_ADAPTER Adapter,
         return status;
     }
 
-    VWIFI_INFO("op mode -> %s",
-               devMode == VWIFI_MODE_MONITOR ? "NETWORK_MONITOR" : "STA");
+    VWIFI_INFO("op mode -> STA");
 
     status = VwifiSetOpMode(Adapter, devMode);
     if (status != NDIS_STATUS_SUCCESS) return status;

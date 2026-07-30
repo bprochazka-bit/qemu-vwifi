@@ -24,24 +24,13 @@
  * provided so Parse<X> means ToIhv and Generate<X> means FromIhv,
  * which is precisely what an IHV miniport wants. We use the aliases.
  *
- * ============================================================
- * VERIFY-AGAINST-WDK CHECKLIST
- * ============================================================
- * The API *shape* below is documented and solid. The exact member
- * names inside the WDI_* parameter structures are the part I could
- * not verify without the WDK installed. When you first build:
- *
- *   1. Open %WDKContentRoot%\Include\wdf\... no — the WDI headers are
- *      at Include\<ver>\km\dot11wdi.h, wditypes.hpp,
- *      TlvGeneratorParser.hpp.
- *   2. Search TlvGeneratorParser.hpp for "ParseWdiTaskScan" to get
- *      the true signature and the WDI_TASK_SCAN_PARAMETERS layout.
- *   3. Fix the member names flagged with [MEMBER?] below.
- *
- * Everything else — context setup, PeerVersion threading, cleanup
- * discipline, error mapping — is correct as written.
- * ============================================================
- */
+ * The parameter structures come from TlvGenerated_.hpp, which
+ * TlvGeneratorParser.hpp includes; the leaf value types (WDI_MAC_ADDRESS,
+ * WDI_BAND_ID, WDI_ASSOC_STATUS, the cipher enums) come from
+ * dot11wdi.h and wditypes.hpp. Note that dot11wdi.h and wditypes.hpp sit
+ * in the kit's normal include path but TlvGenerated_.hpp does not — see
+ * WdiTlvIncludeDir in vwifi.vcxproj.
+ * */
 
 extern "C" {
 #include <ndis.h>
@@ -84,7 +73,6 @@ static WDI_CHANNEL_NUMBER VwifiFreqToChannel(USHORT FreqMhz)
 
 static WDI_BAND_ID VwifiFreqToBandId(USHORT FreqMhz)
 {
-    /* [VERIFY] enumerator names against wditypes.hpp. */
     return (FreqMhz >= 5000) ? WDI_BAND_ID_5000 : WDI_BAND_ID_2400;
 }
 
@@ -199,7 +187,7 @@ VwifiTlvGenerateBssEntryList(
          * come out of the raw frame below. What the container adds is the
          * receive-side metadata the frame cannot carry — signal, channel,
          * and when we saw it. */
-        RtlCopyMemory(&w->BSSID, e->bssid, 6);
+        RtlCopyMemory(w->BSSID.Address, e->bssid, 6);
 
         w->SignalInfo.RSSI        = e->rssi;
         w->SignalInfo.LinkQuality = 0;
@@ -419,11 +407,8 @@ VwifiTlvGenerateAssociationResult(
 
     /* The indication is a *list* of association results, one per port,
      * even though a STA only ever reports one. */
-    RtlCopyMemory(&entry.BSSID, Result->bssid, 6);
+    RtlCopyMemory(entry.BSSID.Address, Result->bssid, 6);
 
-    /* [VERIFY] WDI_ASSOC_STATUS / WDI_CIPHER_ALGORITHM enumerator names
-     * against wditypes.hpp. The structure members below are confirmed
-     * against TlvGenerated_.hpp. */
     entry.AssociationResultParameters.AssociationStatus =
         (Result->status_code == 0) ? WDI_ASSOC_STATUS_SUCCESS
                                    : WDI_ASSOC_STATUS_FAILURE;
@@ -456,7 +441,7 @@ NDIS_STATUS
 VwifiTlvGenerateDisassociation(
     ULONG PeerVersion,
     const UCHAR *Bssid,
-    USHORT ReasonCode,
+    BOOLEAN Local,
     VOID **Buffer,
     PULONG BufferLen)
 {
@@ -468,9 +453,17 @@ VwifiTlvGenerateDisassociation(
     /* Neither BSSID nor a reason code sits at the top level: both live
      * in the nested DisconnectIndicationParameters, and the reason is a
      * WDI_ASSOC_STATUS rather than an 802.11 reason code. */
-    RtlCopyMemory(&params.DisconnectIndicationParameters.MacAddress, Bssid, 6);
+    RtlCopyMemory(params.DisconnectIndicationParameters.MacAddress.Address,
+                  Bssid, 6);
+    /* WDI_ASSOC_STATUS is not the 802.11 reason-code space. Casting a
+     * reason code straight in lands on unrelated enumerators — reason 2,
+     * "previous authentication no longer valid", would arrive as
+     * WDI_ASSOC_STATUS_UNREACHABLE. The distinction WDI actually draws
+     * here is who initiated the disconnect, which the device tells us
+     * directly in vwifi_disconnect_ev.local. */
     params.DisconnectIndicationParameters.DisassociationWABIReason =
-        (WDI_ASSOC_STATUS)ReasonCode;   /* [VERIFY] mapping, wditypes.hpp */
+        Local ? WDI_ASSOC_STATUS_DISASSOCIATED_BY_HOST
+              : WDI_ASSOC_STATUS_PEER_DISASSOCIATED;
 
     NDIS_STATUS st = GenerateWdiIndicationDisassociation(
         &params, kHeaderReserve, &ctx, &outLen, &pOut);
@@ -504,11 +497,11 @@ VwifiTlvParseAddCipherKeys(
                                   &ctx, &parsed);
     if (st != NDIS_STATUS_SUCCESS) return st;
 
-    /* [MEMBER?] parsed.CipherKeys — list of WDI_CIPHER_KEY. */
     for (ULONG i = 0;
          i < parsed.SetCipherKey.ElementCount && n < KeysCap;
          i++) {
-        const WDI_CIPHER_KEY *ck = &parsed.SetCipherKey.pElements[i];
+        const WDI_SET_ADD_CIPHER_KEYS_CONTAINER *ck =
+            &parsed.SetCipherKey.pElements[i];
         VWIFI_TLV_KEY *k = &Keys[n];
 
         RtlZeroMemory(k, sizeof(*k));
@@ -516,19 +509,28 @@ VwifiTlvParseAddCipherKeys(
         /* PAIRWISE vs GROUP. Get this wrong and the first data frame
          * decrypts to garbage with no obvious cause: the device keeps
          * separate slots and separate PN spaces for each. */
-        k->Pairwise = (ck->CipherKeyInfo.KeyType ==
-                       WDI_CIPHER_KEY_TYPE_PAIRWISE) ? TRUE : FALSE;
-        k->KeyIndex = static_cast<UCHAR>(ck->CipherKeyInfo.KeyIndex);
-        k->Cipher   = WdiCipherToVwifi(ck->CipherKeyInfo.CipherAlgo);
+        k->Pairwise = (ck->CipherKeyTypeInfo.KeyType ==
+                       WDI_CIPHER_KEY_TYPE_PAIRWISE_KEY) ? TRUE : FALSE;
+        k->KeyIndex = static_cast<UCHAR>(ck->CipherKeyID.CipherKeyID);
+        k->Cipher   = WdiCipherToVwifi(ck->CipherKeyTypeInfo.CipherAlgorithm);
 
-        RtlCopyMemory(k->PeerMac, &ck->MacAddr, 6);
+        RtlCopyMemory(k->PeerMac, ck->PeerMacAddress.Address, 6);
 
-        ULONG klen = ck->KeyValue.ElementCount;
-        if (klen > sizeof(k->KeyValue)) klen = sizeof(k->KeyValue);
-        if (klen > 0 && ck->KeyValue.pElements != nullptr) {
-            RtlCopyMemory(k->KeyValue, ck->KeyValue.pElements, klen);
+        /* The key bytes live in a per-cipher blob, not one KeyValue
+         * field: CCMPKey, GCMPKey, GCMP_256Key, WEPKey and so on are
+         * separate optional TLVs and only the negotiated one is set. */
+        const WDI_PRIVATE_BYTE_BLOB *blob = nullptr;
+        if (ck->Optional.CCMPKey_IsPresent)          blob = &ck->CCMPKey;
+        else if (ck->Optional.GCMPKey_IsPresent)     blob = &ck->GCMPKey;
+        else if (ck->Optional.GCMP_256Key_IsPresent) blob = &ck->GCMP_256Key;
+        else if (ck->Optional.WEPKey_IsPresent)      blob = &ck->WEPKey;
+
+        if (blob != nullptr && blob->pElements != nullptr) {
+            ULONG klen = blob->ElementCount;
+            if (klen > sizeof(k->KeyValue)) klen = sizeof(k->KeyValue);
+            RtlCopyMemory(k->KeyValue, blob->pElements, klen);
+            k->KeyLength = klen;
         }
-        k->KeyLength = klen;
         n++;
     }
 
@@ -557,16 +559,17 @@ VwifiTlvParseDeleteCipherKeys(
     if (st != NDIS_STATUS_SUCCESS) return st;
 
     for (ULONG i = 0;
-         i < parsed.SetCipherKey.ElementCount && n < KeysCap;
+         i < parsed.CipherKeyInfo.ElementCount && n < KeysCap;
          i++) {
-        const WDI_CIPHER_KEY_ID *ck = &parsed.SetCipherKey.pElements[i];
+        const WDI_SET_DELETE_CIPHER_KEYS_CONTAINER *ck =
+            &parsed.CipherKeyInfo.pElements[i];
         VWIFI_TLV_KEY *k = &Keys[n];
 
         RtlZeroMemory(k, sizeof(*k));
-        k->Pairwise = (ck->KeyType == WDI_CIPHER_KEY_TYPE_PAIRWISE)
-                    ? TRUE : FALSE;
-        k->KeyIndex = static_cast<UCHAR>(ck->KeyIndex);
-        RtlCopyMemory(k->PeerMac, &ck->MacAddr, 6);
+        k->Pairwise = (ck->CipherKeyTypeInfo.KeyType ==
+                       WDI_CIPHER_KEY_TYPE_PAIRWISE_KEY) ? TRUE : FALSE;
+        k->KeyIndex = static_cast<UCHAR>(ck->CipherKeyID.CipherKeyID);
+        RtlCopyMemory(k->PeerMac, ck->PeerMacAddress.Address, 6);
         n++;
     }
 
@@ -593,23 +596,61 @@ VwifiTlvGenerateAdapterCapabilities(
     UINT8 *pOut = nullptr;
     ULONG outLen = 0;
 
-    UNREFERENCED_PARAMETER(Mac);
-
-    /* [MEMBER?] The capabilities structure is the largest and fiddliest
-     * of the lot — PHY types, band/channel lists, cipher suites, auth
-     * algorithms, interface capabilities, op-mode support. Fill it out
-     * against wditypes.hpp.
+    /* WDI_GET_ADAPTER_CAPABILITIES_PARAMETERS is the largest structure
+     * in the interface. Most of its members are optional TLVs with
+     * presence bits; what is filled here is the mandatory core plus the
+     * station limits the OS uses to size its own requests.
      *
-     * Two entries matter beyond the obvious:
-     *   - NetMon must appear in the supported op modes, or Npcap can't
-     *     switch us into monitor mode (Phase 1.5 dies silently).
-     *   - The cipher list must include CCMP or WPA2 connect attempts
-     *     get rejected before they reach the device.
-     */
-    params.InterfaceAttributes.OpModeCapability =
-        WDI_OPERATION_MODE_STA | WDI_OPERATION_MODE_NETWORK_MONITOR;
+     * There is no op-mode capability field to set. WDI has no
+     * network-monitor mode at all — see VwifiTlvParseOperationMode. */
+    params.CommunicationAttributes.CommunicationCapabilities.MaxCommandSize =
+        VWIFI_CTRL_PAYLOAD_SIZE;
+    params.Optional.CommunicationAttributes_IsPresent = TRUE;
 
-    UNREFERENCED_PARAMETER(Caps);
+    {
+        WDI_INTERFACE_CAPABILITIES *ic =
+            &params.InterfaceAttributes.InterfaceCapabilities;
+
+        ic->MTUSize              = 1500;
+        ic->MaxMultiCastListSize = 32;
+        ic->BackFillSize         = 0;
+        RtlCopyMemory(ic->Address.Address, Mac, 6);
+        ic->MaxTxRate            = 54000;   /* kbps; ERP-OFDM ceiling */
+        ic->MaxRxRate            = 54000;
+        ic->HardwareRadioState   = TRUE;
+        ic->SoftwareRadioState   = TRUE;
+        ic->NumRxStreams         = 1;
+        ic->NumTxStreams         = 1;
+        ic->NumChannels          = 1;
+        ic->ActionFramesSupported = FALSE;
+    }
+
+    {
+        WDI_STATION_CAPABILITIES *sc =
+            &params.StationAttributes.StationCapabilities;
+
+        /* These are the sizes the OS sizes its own requests against, so
+         * they have to match what the device actually accepts rather
+         * than being aspirational. */
+        sc->ScanSSIDListSize       = Caps->max_scan_ssids;
+        sc->DesiredBSSIDListSize   = 1;
+        sc->DesiredSSIDListSize    = 1;
+        sc->KeyMappingTableSize    = 1;   /* one PTK */
+        sc->DefaultKeyTableSize    = 4;   /* four GTK slots */
+        sc->MaxNumPerSTA           = 1;
+        sc->MFPCapable             = 0;
+        sc->AutoPowerSaveMode      = FALSE;
+        sc->BSSListCachemanagement = FALSE;
+    }
+
+    /* Not filled: BandInfo, PhyInfo, the cipher/auth algorithm pair
+     * lists, and the country-region list. All are optional TLVs whose
+     * presence bits stay clear, so the message is well-formed without
+     * them — but the OS uses BandInfo to learn which channels exist, so
+     * a scan may be limited until they are supplied. That is the next
+     * piece of work on this function, and it needs the device's
+     * supported_channels_24 / _5 masks translated into
+     * WDI_BAND_INFO_CONTAINER entries. */
 
     NDIS_STATUS st = GenerateWdiGetAdapterCapabilities(
         &params, kHeaderReserve, &ctx, &outLen, &pOut);
@@ -623,13 +664,11 @@ VwifiTlvGenerateAdapterCapabilities(
 /* ============================================================
  * Operation mode
  *
- * Translation happens here rather than in oids.c on purpose. There are
- * two distinct WDI_OPERATION_MODE enumerations: dot11wdi.h's, which the
- * plain-C files see and which lists only STA and the P2P roles, and the
- * TLV library's in wditypes.hpp, which is what actually travels in
- * WDI_TLV_OPERATION_MODE and does include NETWORK_MONITOR. Returning a
- * device-side enum \(VWIFI_MODE_*\) keeps the ambiguity on this side of
- * the plain-C boundary, which is what this shim is for.
+ * WDI_OPERATION_MODE (dot11wdi.h) enumerates STA, P2P_DEVICE,
+ * P2P_CLIENT and P2P_GO. There is no network-monitor mode: the string
+ * "monitor" appears nowhere in dot11wdi.h, wditypes.hpp or
+ * WABIModel.xml. Anything other than STA is a mode this device does not
+ * implement, so it is rejected rather than silently mapped.
  * ============================================================ */
 
 extern "C"
@@ -647,10 +686,8 @@ VwifiTlvParseOperationMode(
 
     *DeviceMode = VWIFI_MODE_IDLE;
 
-    /* [VERIFY] entry-point and member names, against TlvGeneratorParser.hpp.
-     * The scan path's ParseWdiTaskScan / CleanupParsedWdiTaskScan pair is
-     * the naming precedent these follow. */
-    st = ParseWdiTaskChangeOperationMode(BufferLen, static_cast<const UINT8 *>(Buffer),
+    st = ParseWdiTaskChangeOperationMode(BufferLen,
+                                         static_cast<const UINT8 *>(Buffer),
                                          &ctx, &parsed);
     if (st != NDIS_STATUS_SUCCESS) {
         return st;
@@ -661,14 +698,11 @@ VwifiTlvParseOperationMode(
     mode = parsed.OperationMode;
     CleanupParsedWdiTaskChangeOperationMode(&parsed);
 
-    if (mode & WDI_OPERATION_MODE_NETWORK_MONITOR) {
-        *DeviceMode = VWIFI_MODE_MONITOR;
-    } else if (mode & WDI_OPERATION_MODE_STA) {
+    if (mode & WDI_OPERATION_MODE_STA) {
         *DeviceMode = VWIFI_MODE_STA;
-    } else {
-        return NDIS_STATUS_NOT_SUPPORTED;
+        return NDIS_STATUS_SUCCESS;
     }
-    return NDIS_STATUS_SUCCESS;
+    return NDIS_STATUS_NOT_SUPPORTED;
 }
 
 /* ============================================================
