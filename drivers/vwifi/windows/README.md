@@ -177,6 +177,15 @@ Recorded here because each one is a trap the next WDI driver hits too:
   component forwards that OID down to a WDI miniport at all is the open
   question for Phase 1.5; both paths are wired up in `oids.c` so the
   debug log will say which one fires.
+- **`AllocateAdapter` cannot allocate anything NDIS-managed.** It fills
+  in registration attributes that the WLAN component applies *after* it
+  returns, so during the call the adapter is not yet a registered
+  miniport. `NdisMAllocateSharedMemory` needs
+  `NDIS_MINIPORT_ATTRIBUTES_BUS_MASTER` to be in effect and fails with
+  `NDIS_STATUS_RESOURCES` otherwise — a 1536-byte ring allocation
+  failing on an idle machine is what that looks like, and it surfaces
+  as Code 10. Rings, NBL pools and interrupts belong in `VwifiHwStart`,
+  called from `OpenAdapter`.
 - **The generated TLV headers are split across two folders.**
   `dot11wdi.h` and `wditypes.hpp` are on the kit's default include
   path; `TlvGeneratorParser.hpp` and the `TlvGenerated_.hpp` it

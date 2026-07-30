@@ -43,15 +43,16 @@ MINIPORT_SHUTDOWN   VwifiMiniportShutdownEx;
  * PCI device. Here we:
  *   1. Allocate the adapter context
  *   2. Parse assigned PCI resources
- *   3. Map BAR0 (MMIO) into kernel VA
- *   4. Allocate and program the four rings
- *   5. Connect the interrupt
- *   6. Issue GET_CAPS to discover the device's default MAC & features
- *   7. Fill in the caller's registration attributes
+ *   3. Map BAR0 (MMIO) into kernel VA and check signature/ABI
+ *   4. Fill in the caller's registration attributes
  *
- * Step 7 is a fill-in, not a call: WDI hands us the attributes block
+ * Step 4 is a fill-in, not a call: WDI hands us the attributes block
  * to populate, where a plain NDIS miniport would call
- * NdisMSetMiniportAttributes itself.
+ * NdisMSetMiniportAttributes itself. Which is precisely why the rings,
+ * the interrupt and GET_CAPS are NOT here: none of the attributes are
+ * in effect until this function returns, so any NDIS allocation made
+ * here is made by an unregistered miniport and fails. They live in
+ * VwifiHwStart, called from OpenAdapter.
  * ==================================================================== */
 
 static VOID

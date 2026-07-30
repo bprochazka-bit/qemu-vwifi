@@ -121,15 +121,25 @@ VwifiWdiOpenAdapter(
     PNDIS_MINIPORT_INIT_PARAMETERS MiniportInitParameters)
 {
     PVWIFI_ADAPTER adapter = (PVWIFI_ADAPTER)MiniportAdapterContext;
+    NDIS_STATUS status;
 
     UNREFERENCED_PARAMETER(MiniportInitParameters);
     VWIFI_INFO("WdiOpenAdapter");
 
+    /* The rings, the NBL pool and the interrupt are allocated here
+     * rather than in AllocateAdapter because they need the registration
+     * attributes to be in effect, and those are only applied after
+     * AllocateAdapter returns. */
+    status = VwifiHwStart(adapter);
+    if (status != NDIS_STATUS_SUCCESS) {
+        VWIFI_ERR("WdiOpenAdapter: start failed 0x%08x", status);
+    }
+
     if (adapter->OpenAdapterCompleteHandler != NULL) {
         adapter->OpenAdapterCompleteHandler(adapter->MiniportAdapterHandle,
-                                            NDIS_STATUS_SUCCESS);
+                                            status);
     }
-    return NDIS_STATUS_SUCCESS;
+    return status;
 }
 
 _Use_decl_annotations_
@@ -139,6 +149,8 @@ VwifiWdiCloseAdapter(NDIS_HANDLE MiniportAdapterContext)
     PVWIFI_ADAPTER adapter = (PVWIFI_ADAPTER)MiniportAdapterContext;
 
     VWIFI_INFO("WdiCloseAdapter");
+
+    VwifiHwStop(adapter);
 
     if (adapter->CloseAdapterCompleteHandler != NULL) {
         adapter->CloseAdapterCompleteHandler(adapter->MiniportAdapterHandle,

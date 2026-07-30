@@ -139,22 +139,37 @@ VwifiMessageDpc(
 }
 
 /* ============================================================
- * VwifiHwInitialize — called from MiniportInitializeEx
+ * Bring-up is in two halves, and the split is not cosmetic.
+ *
+ * VwifiHwInitialize runs inside MiniportWdiAllocateAdapter. At that
+ * point the adapter is NOT yet a registered NDIS miniport: we are
+ * filling in the registration attributes that the WLAN component will
+ * apply *after* we return. So nothing here may call an NDIS routine
+ * that needs a registered adapter — above all NdisMAllocateSharedMemory,
+ * which needs NDIS_MINIPORT_ATTRIBUTES_BUS_MASTER to be in effect and
+ * otherwise fails with NDIS_STATUS_RESOURCES no matter how small the
+ * request. A 1536-byte ring allocation failing on an idle machine is
+ * what that looks like from the outside.
+ *
+ * VwifiHwStart runs from MiniportWdiOpenAdapter, by which time the
+ * attributes are live. Everything that touches NDIS-managed
+ * resources — DMA rings, NBL pools, interrupts — belongs there.
  * ============================================================ */
+
 NDIS_STATUS
 VwifiHwInitialize(
     _Inout_ PVWIFI_ADAPTER Adapter,
     _In_ PNDIS_MINIPORT_INIT_PARAMETERS InitParams)
 {
     NDIS_STATUS status;
-    NDIS_MINIPORT_INTERRUPT_CHARACTERISTICS irq_chars = { 0 };
     ULONG caps, sig, ver;
 
     status = VwifiParseResources(Adapter,
                                  InitParams->AllocatedResources);
     if (status != NDIS_STATUS_SUCCESS) return status;
 
-    /* Map BAR0 — MmNonCached because it's MMIO. */
+    /* Map BAR0 — MmNonCached because it's MMIO. MmMapIoSpace is a
+     * memory-manager call, not an NDIS one, so it is safe this early. */
     Adapter->MmioVirtualAddress = MmMapIoSpace(
         Adapter->MmioPhysicalAddress, Adapter->MmioLength, MmNonCached);
     if (!Adapter->MmioVirtualAddress) {
@@ -162,7 +177,9 @@ VwifiHwInitialize(
         return NDIS_STATUS_RESOURCES;
     }
 
-    /* Verify signature and ABI version. */
+    /* Verify signature and ABI version. Doing this here means a wrong
+     * or mismatched device is rejected before the WLAN component has
+     * committed to us. */
     sig = VwifiRead32(Adapter, VWIFI_REG_SIGNATURE);
     ver = VwifiRead32(Adapter, VWIFI_REG_ABI_VERSION);
     caps = VwifiRead32(Adapter, VWIFI_REG_CAPS);
@@ -180,13 +197,35 @@ VwifiHwInitialize(
         goto fail_mmio;
     }
 
-    /* Assert reset to start from a known state, then clear. */
+    /* Assert reset to start from a known state. */
     VwifiWrite32(Adapter, VWIFI_REG_RESET, 1);
-    /* Device reset is synchronous in our model — no need to poll. */
+
+    VWIFI_INFO("hardware probed; rings deferred to OpenAdapter");
+    return NDIS_STATUS_SUCCESS;
+
+fail_mmio:
+    MmUnmapIoSpace(Adapter->MmioVirtualAddress, Adapter->MmioLength);
+    Adapter->MmioVirtualAddress = NULL;
+    return status;
+}
+
+/* ============================================================
+ * VwifiHwStart — called from MiniportWdiOpenAdapter, once the
+ * registration attributes are in effect.
+ * ============================================================ */
+NDIS_STATUS
+VwifiHwStart(_Inout_ PVWIFI_ADAPTER Adapter)
+{
+    NDIS_STATUS status;
+    NDIS_MINIPORT_INTERRUPT_CHARACTERISTICS irq_chars = { 0 };
+
+    if (Adapter->Started) {
+        return NDIS_STATUS_SUCCESS;
+    }
 
     /* Allocate and program the four rings. */
     status = VwifiRingsAllocate(Adapter);
-    if (status != NDIS_STATUS_SUCCESS) goto fail_mmio;
+    if (status != NDIS_STATUS_SUCCESS) return status;
     VwifiRingsProgramMmio(Adapter);
     VwifiRingsArmCtrlRsp(Adapter);
     VwifiRingsPostRxBuffers(Adapter);
@@ -226,14 +265,16 @@ VwifiHwInitialize(
                  VWIFI_CTRL_ENABLE | VWIFI_CTRL_IRQ_ENABLE);
 
     /* GET_CAPS synchronously. Gives us the default MAC and feature
-     * bits before we report general attributes. */
+     * bits. This is the first round trip over the rings, so it is also
+     * the first proof the device is answering at all. */
     {
         ULONG out_len = sizeof(Adapter->Caps);
         status = VwifiCtrlSendSync(Adapter, VWIFI_OP_GET_CAPS,
                                    NULL, 0,
                                    &Adapter->Caps, &out_len);
         if (status != NDIS_STATUS_SUCCESS) {
-            VWIFI_ERR("GET_CAPS failed 0x%x", status);
+            VWIFI_ERR("GET_CAPS failed 0x%x — is the medium hub running?",
+                      status);
             goto fail_irq;
         }
         Adapter->CapsValid = TRUE;
@@ -253,6 +294,8 @@ VwifiHwInitialize(
                                 Adapter->CurrentMac, 6, NULL, &out_len);
     }
 
+    Adapter->Started = TRUE;
+    VWIFI_INFO("adapter started");
     return NDIS_STATUS_SUCCESS;
 
 fail_irq:
@@ -266,20 +309,22 @@ fail_nbl:
     VwifiRxNblPoolDestroy(Adapter);
 fail_rings:
     VwifiRingsFree(Adapter);
-fail_mmio:
-    MmUnmapIoSpace(Adapter->MmioVirtualAddress, Adapter->MmioLength);
-    Adapter->MmioVirtualAddress = NULL;
     return status;
 }
 
 /* ============================================================
- * VwifiHwShutdown
+ * VwifiHwStop — the mirror of VwifiHwStart, from CloseAdapter.
+ * Leaves the MMIO mapping alone; that belongs to Initialize.
  * ============================================================ */
 VOID
-VwifiHwShutdown(_Inout_ PVWIFI_ADAPTER Adapter)
+VwifiHwStop(_Inout_ PVWIFI_ADAPTER Adapter)
 {
+    if (!Adapter->Started) {
+        return;
+    }
+    Adapter->Started = FALSE;
+
     if (Adapter->MmioVirtualAddress) {
-        /* Quiesce the device before tearing down. */
         VwifiWrite32(Adapter, VWIFI_REG_CTRL, 0);
         VwifiWrite32(Adapter, VWIFI_REG_RESET, 1);
     }
@@ -293,6 +338,18 @@ VwifiHwShutdown(_Inout_ PVWIFI_ADAPTER Adapter)
     VwifiScanTaskDestroy(Adapter);
     VwifiRxNblPoolDestroy(Adapter);
     VwifiRingsFree(Adapter);
+}
+
+/* ============================================================
+ * VwifiHwShutdown
+ * ============================================================ */
+VOID
+VwifiHwShutdown(_Inout_ PVWIFI_ADAPTER Adapter)
+{
+    /* Safe whether or not OpenAdapter ever ran: HwStop is a no-op when
+     * the adapter was never started, which is exactly the path taken
+     * when AllocateAdapter succeeded but the start failed. */
+    VwifiHwStop(Adapter);
 
     if (Adapter->MmioVirtualAddress) {
         MmUnmapIoSpace(Adapter->MmioVirtualAddress, Adapter->MmioLength);

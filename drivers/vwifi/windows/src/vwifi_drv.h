@@ -200,6 +200,10 @@ typedef struct _VWIFI_ADAPTER
      * NBL's MediaSpecificInformation OOB pointer while in flight. */
     struct DOT11_EXTSTA_RECV_CONTEXT *RxRecvContext;
 
+    /* Set once VwifiHwStart has run. Adapter creation and adapter
+     * start are separate in the WDI model — see hardware.c. */
+    BOOLEAN             Started;
+
     /* Current operating mode + channel, mirrored to the device. */
     ULONG               OpMode;         /* enum vwifi_mode */
     ULONG               RawFilter;      /* VWIFI_RAW_F_* */
@@ -309,6 +313,10 @@ extern ULONG g_WdiPeerVersion;
 /* hardware.c */
 NDIS_STATUS VwifiHwInitialize(_Inout_ PVWIFI_ADAPTER Adapter,
                               _In_ PNDIS_MINIPORT_INIT_PARAMETERS InitParams);
+/* Everything that needs a *registered* miniport — DMA rings, NBL pools,
+ * interrupts — happens here, from OpenAdapter, not in Initialize. */
+NDIS_STATUS VwifiHwStart(_Inout_ PVWIFI_ADAPTER Adapter);
+VOID        VwifiHwStop(_Inout_ PVWIFI_ADAPTER Adapter);
 VOID        VwifiHwShutdown(_Inout_ PVWIFI_ADAPTER Adapter);
 NDIS_STATUS VwifiHwReset(_Inout_ PVWIFI_ADAPTER Adapter);
 BOOLEAN     VwifiHwInterruptDpc(_In_ PVWIFI_ADAPTER Adapter);
