@@ -1,0 +1,146 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  vwifi — Windows WDI miniport for the vwifi-virt QEMU device.
+
+  Builds with the EWDK (LaunchBuildEnv.cmd, then msbuild) or with
+  Visual Studio 2022 + the WDK. See README.md for the full procedure.
+
+  Debug|x64 is the configuration to use for bring-up: no optimisation,
+  full PDBs, DBG=1 so the driver's assertions and verbose logging are
+  compiled in, and no signing step (sign.cmd does that separately, so
+  a missing test certificate can't fail the build).
+-->
+<Project DefaultTargets="Build" ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{6B1F0A7C-9D4E-4A21-B3C8-5E2F7A0D9C14}</ProjectGuid>
+    <TemplateGuid>{497e31cb-056b-4f31-abb8-447fd55ee5a5}</TemplateGuid>
+    <RootNamespace>vwifi</RootNamespace>
+    <ConfigurationType>Driver</ConfigurationType>
+    <DriverType>WDM</DriverType>
+    <DriverTargetPlatform>Desktop</DriverTargetPlatform>
+    <TargetVersion>Windows10</TargetVersion>
+    <PlatformToolset>WindowsKernelModeDriver10.0</PlatformToolset>
+    <MinimumVisualStudioVersion>14.0</MinimumVisualStudioVersion>
+    <Platform Condition="'$(Platform)' == ''">x64</Platform>
+    <Configuration Condition="'$(Configuration)' == ''">Debug</Configuration>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="ExtensionSettings" />
+  <ImportGroup Label="PropertySheets">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props"
+            Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')"
+            Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <PropertyGroup Label="UserMacros" />
+
+  <PropertyGroup>
+    <TargetName>vwifi</TargetName>
+    <!-- Sign as a separate, explicit step (sign.cmd). A build that
+         silently depends on a certificate in the local store is a
+         build that works on one machine. -->
+    <SignMode>Off</SignMode>
+    <EnableInf2Cat>false</EnableInf2Cat>
+    <!-- Spectre-mitigated runtime libs are an optional EWDK/VS component.
+         Requiring them would fail the build on a stock EWDK mount for no
+         benefit to a virtual device used for testing. -->
+    <SpectreMitigation>false</SpectreMitigation>
+    <!-- Code analysis and Static Driver Verifier are worth running, but
+         not on every incremental bring-up build. Run them explicitly:
+           msbuild /p:RunCodeAnalysis=true ... -->
+    <RunCodeAnalysis>false</RunCodeAnalysis>
+    <EnablePREfast>false</EnablePREfast>
+  </PropertyGroup>
+
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <!-- The ABI header is shared verbatim with the QEMU device and
+           lives once at the top of the repo. Never copy it here. -->
+      <AdditionalIncludeDirectories>$(MSBuildThisFileDirectory)src;$(MSBuildThisFileDirectory)..\..\..\abi;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <!-- WDI requires NDIS 6.50, which is what driver.c registers with. -->
+      <PreprocessorDefinitions>NDIS_MINIPORT_DRIVER;NDIS650_MINIPORT=1;NDIS_WDM=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <WarningLevel>Level4</WarningLevel>
+      <!-- Off for bring-up so one warning doesn't hide the other fifty.
+           Turn it back on once the driver builds clean. -->
+      <TreatWarningAsError>false</TreatWarningAsError>
+      <ExceptionHandling>false</ExceptionHandling>
+      <RuntimeTypeInfo>false</RuntimeTypeInfo>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
+    </ClCompile>
+    <Link>
+      <AdditionalDependencies>$(DDK_LIB_PATH)ndis.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+    <Inf>
+      <TimeStamp>1.0.0.0</TimeStamp>
+    </Inf>
+  </ItemDefinitionGroup>
+
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <ClCompile>
+      <Optimization>Disabled</Optimization>
+      <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
+      <PreprocessorDefinitions>DBG=1;DEPRECATE_DDK_FUNCTIONS=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <Link>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+    </Link>
+  </ItemDefinitionGroup>
+
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <ClCompile>
+      <Optimization>MaxSpeed</Optimization>
+      <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
+    </ClCompile>
+    <Link>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+    </Link>
+  </ItemDefinitionGroup>
+
+  <ItemGroup>
+    <ClCompile Include="src\data.c" />
+    <ClCompile Include="src\driver.c" />
+    <ClCompile Include="src\hardware.c" />
+    <ClCompile Include="src\monitor.c" />
+    <ClCompile Include="src\oids.c" />
+    <ClCompile Include="src\rings.c" />
+    <ClCompile Include="src\wdi_common.c" />
+    <ClCompile Include="src\wdi_connect.c" />
+    <ClCompile Include="src\wdi_keys.c" />
+    <ClCompile Include="src\wdi_ops.c" />
+    <ClCompile Include="src\wdi_scan.c" />
+    <!-- The WDI TLV generator/parser is C++ templates. These two
+         translation units are the only C++ in the driver; everything
+         else reaches them through tlv_shim.h's plain-C boundary. -->
+    <ClCompile Include="src\tlv_mem.cpp">
+      <CompileAs>CompileAsCpp</CompileAs>
+    </ClCompile>
+    <ClCompile Include="src\tlv_shim.cpp">
+      <CompileAs>CompileAsCpp</CompileAs>
+    </ClCompile>
+  </ItemGroup>
+
+  <ItemGroup>
+    <ClInclude Include="src\tlv_shim.h" />
+    <ClInclude Include="src\vwifi_drv.h" />
+    <ClInclude Include="..\..\..\abi\vwifi_abi.h" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Inf Include="inf\vwifi.inx" />
+  </ItemGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets" />
+</Project>

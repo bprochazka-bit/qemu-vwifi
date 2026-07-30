@@ -17,6 +17,11 @@ sits in this directory). Keeping two copies is how they drift; see
 [`../../../abi/README.md`](../../../abi/README.md).
 
 ```
+vwifi.sln           solution — one project, Debug|x64 and Release|x64
+vwifi.vcxproj       MSBuild driver project (EWDK or VS 2022 + WDK)
+build.cmd           debug build wrapper; writes build-Debug.{log,err,wrn}
+sign.cmd            creates a test cert if needed, catalogs, signs
+guest-debug-setup.ps1  run in the guest: test-signing, cert, print filter
 src/
   vwifi_drv.h       driver-private header; adapter context
   driver.c          DriverEntry + NDIS miniport handlers + send path
@@ -32,95 +37,120 @@ inf/
 
 ## Build environment
 
-You have two options. Both work; pick based on preference.
+The project files are checked in, so there is nothing to generate.
 
 ### Option A — Enterprise WDK (EWDK), no Visual Studio install
 
-The EWDK is a command-line, self-contained WDK. Good when you just
-want to build the driver from a fresh Windows VM without installing
-VS Community.
+The EWDK is a command-line, self-contained WDK: one ISO, no installer.
 
-1. Download the EWDK ISO matching your target Windows version from
-   Microsoft's WDK downloads page.
-2. Mount the ISO. Run `LaunchBuildEnv.cmd` to get a shell with the
-   build environment set up.
-3. From that shell:
+1. Mount the EWDK ISO (right-click → Mount, or `Mount-DiskImage`).
+   Use an EWDK for Windows 11 22H2 (10.0.22621) or later — `tlv_mem.cpp`
+   calls `ExAllocatePool2`, which older kits don't have.
+2. From a normal `cmd.exe`, launch the build environment. This sets
+   `PATH`, `DDK_LIB_PATH` and the rest, and it **must** be a `cmd`
+   shell, not PowerShell:
    ```
-   cd path\to\vwifi-driver
-   msbuild /p:Configuration=Debug /p:Platform=x64 vwifi.sln
+   D:\LaunchBuildEnv.cmd
+   ```
+3. In that shell:
+   ```
+   cd C:\src\qemu-vwifi\drivers\vwifi\windows
+   build.cmd
    ```
 
-You'll need a `vwifi.vcxproj` and `vwifi.sln`. Rather than check
-those into the repo (they're opinionated and bulky), generate them
-fresh in the next step:
+`build.cmd` builds `Debug|x64` and writes three logs beside itself:
+`build-Debug.log` (everything), `build-Debug.err` (errors only) and
+`build-Debug.wrn` (warnings only). On failure it prints the error log
+and exits non-zero — `build-Debug.err` is the file to paste when
+reporting a broken build.
 
-### Option B — Visual Studio 2022 + WDK (recommended for first build)
+Output lands in `x64\Debug\vwifi\`: `vwifi.sys`, `vwifi.inf`,
+`vwifi.pdb` (and `vwifi.cat` once you run `sign.cmd`).
 
-1. Install **Visual Studio 2022 Community** with the "Desktop
-   development with C++" and "Windows kernel mode driver
-   development tools" workloads.
-2. Install the **WDK** matching Visual Studio (10.0.22621 or later).
-   The installer also registers the MSBuild driver templates.
-3. In Visual Studio, create a new project:
-   - Template: **Kernel Mode Driver, Empty (KMDF)** → no, pick
-     **NDIS Miniport** if it's in your installed samples, otherwise
-     **Empty WDM Driver** and we'll flip it to NDIS.
-4. Remove the template's `.c` file. Right-click the project →
-   Add → Existing Item, then add all of `src/*.c` and `src/*.h`.
-5. Right-click project → Properties. Set:
-   - **Configuration Properties → General → Target OS Version**: Windows 10
-   - **Configuration Properties → General → Target Platform**: Desktop
-   - **Configuration Properties → Driver Settings → General → Target OS Version**: Windows 10
-   - **Configuration Properties → Driver Settings → General → Target Platform**: Desktop
-   - **C/C++ → General → Additional Include Directories**: `$(WDKContentRoot)\Include\wdf\kmdf\$(Version_Number);` — you likely also want to add the Native Wi-Fi headers, but they're in the default include path once WDK is installed.
-   - **Linker → Input → Additional Dependencies**: add `ndis.lib`.
-6. Add `inf/vwifi.inx` to the project as a Driver Install File.
-7. Build.
+### Option B — Visual Studio 2022 + WDK
+
+1. Install **Visual Studio 2022** with the "Desktop development with
+   C++" workload, then the **WDK** matching it (10.0.22621 or later);
+   the WDK installer registers the MSBuild driver targets.
+2. Open `vwifi.sln`, pick **Debug | x64**, Build.
+
+Either way the same `vwifi.vcxproj` is used, so the two produce the
+same binary.
+
+### What the Debug configuration turns on
+
+| Setting | Effect |
+|---|---|
+| `Optimization=Disabled` | locals aren't elided; stepping matches the source |
+| `DBG=1` | `NT_ASSERT` and `ASSERT` are live |
+| `DebugInformationFormat=ProgramDatabase` | full `vwifi.pdb` next to the `.sys` |
+| `TreatWarningAsError=false` | one warning doesn't hide the next fifty on a first build |
+| `SignMode=Off` | signing is `sign.cmd`'s job, so a missing cert isn't a build failure |
+| `SpectreMitigation=false` | the Spectre-mitigated libs are an optional EWDK component |
+| `RunCodeAnalysis=false` | run it deliberately: `msbuild /p:RunCodeAnalysis=true vwifi.sln` |
+
+Turn `TreatWarningAsError` back on (`/p:TreatWarningAsError=true`) once
+it builds clean — `/W4` on a kernel driver catches real bugs.
+
+### Signing
+
+```
+sign.cmd
+```
+
+Creates `CN=vwifi-test-cert` in `Cert:\CurrentUser\My` the first time
+(reused after that), exports it to `vwifi-test-cert.cer`, runs
+`Inf2Cat`, and signs both `vwifi.cat` and `vwifi.sys`. Copy the `.cer`
+to the guest along with the driver package.
+
+### If the first build fails
+
+This driver has never been compiled — it was written and reviewed
+against the WDK headers, not built against them. Expect errors, and
+expect most of them to be shallow. The ones worth recognising:
+
+| Symptom | Cause and fix |
+|---|---|
+| `msbuild is not recognized` | `LaunchBuildEnv.cmd` wasn't run, or it was run from PowerShell. It only sets up a `cmd.exe` environment. |
+| `Cannot open include file: 'vwifi_abi.h'` | the project was copied out of the repo; the include path is `..\..\..\abi`, relative to the `.vcxproj`. |
+| `Cannot open include file: 'dot11wdi.h'` / `'wditypes.hpp'` / `'TlvGeneratorParser.hpp'` | the mounted kit is too old or is an SDK rather than a WDK. WDI headers ship in the WDK's `Include\<ver>\shared`. |
+| `ExAllocatePool2: identifier not found` | kit older than 10.0.20348. Either mount a newer EWDK, or follow the comment in `tlv_mem.cpp` and swap to `ExAllocatePoolWithTag(NonPagedPoolNx, ...)` + `RtlZeroMemory`. |
+| `NDIS version not defined` / `NDIS_SUPPORT_NDIS650` errors | the `NDIS650_MINIPORT=1` define didn't take. Check the `PreprocessorDefinitions` in `vwifi.vcxproj` survived any local edit. |
+| Redefinition storms from `ntddk.h` / `ntifs.h` | `vwifi_drv.h` includes `<ntifs.h>` before `<ndis.h>`, and `ndis.h` pulls in `ntddk.h`. The driver uses nothing that `ntddk.h` lacks, so dropping the `ntifs.h` include is the fix if your kit doesn't tolerate the pairing. |
+| `unresolved external symbol Ndis*` | `ndis.lib` isn't being linked — check `$(DDK_LIB_PATH)` resolved (it's set by `LaunchBuildEnv.cmd`). |
+| `unresolved external symbol "void * __cdecl operator new"` | the TLV library wants an overload `tlv_mem.cpp` doesn't provide yet; add it there, matching the existing ones. |
+| `Inf2Cat` reports a signability error | the INF, not the code. `%windir%\inf\setupapi.dev.log` and the Inf2Cat message name the offending directive. |
+
+Warnings are not errors here (`TreatWarningAsError` is off), but read
+`build-Debug.wrn` anyway — on a first kernel build `/W4` warnings about
+truncation, uninitialised locals and signedness are usually real.
 
 ## Test-signing and installation
 
-Inside the Windows VM where you want to run the driver:
+Copy the signed package (`vwifi.sys`, `vwifi.inf`, `vwifi.cat`,
+`vwifi.pdb`) and `vwifi-test-cert.cer` into the guest, then, in an
+**elevated PowerShell** there:
 
 ```powershell
-# ONE-TIME SETUP (requires reboot)
-bcdedit /set testsigning on
-# Disable memory integrity if enabled:
-#   Windows Security → Device Security → Core Isolation → Memory Integrity → Off
-# Reboot
-
-# INSTALL (as admin, after copying vwifi.sys / vwifi.inf / vwifi.cat)
+.\guest-debug-setup.ps1 -CertPath .\vwifi-test-cert.cer -KernelDebug
+# reboot
 pnputil /add-driver vwifi.inf /install
 ```
 
-For the driver to be signed at all, the build produces an
-unsigned `.sys`. Sign it with a self-created test cert:
+`guest-debug-setup.ps1` enables test-signing, imports the certificate
+into both Root and TrustedPublisher, raises the `IHVNETWORK` debug
+print filter so the driver's logging is actually emitted, and (with
+`-KernelDebug`) turns on kernel debugging over COM1. Add `-Verifier`
+to enable Driver Verifier's standard checks against `vwifi.sys` —
+worth it for the first few boots, since it converts silent corruption
+into an attributable bugcheck.
 
-```powershell
-# On your build machine, one-time cert creation:
-$cert = New-SelfSignedCertificate -Type CodeSigningCert `
-    -Subject "CN=vwifi-test-cert" `
-    -KeyUsage DigitalSignature `
-    -CertStoreLocation "Cert:\CurrentUser\My" `
-    -HashAlgorithm sha256
+Two prerequisites the script cannot set for you, both of which will
+otherwise block a test-signed driver:
 
-# Export it so the VM can trust it:
-Export-Certificate -Cert $cert -FilePath vwifi-test-cert.cer
-
-# Sign the driver + inf catalog:
-Inf2Cat /driver:. /os:10_x64,Server10_x64
-signtool sign /v /fd sha256 /s my /n "vwifi-test-cert" /t http://timestamp.digicert.com vwifi.cat
-signtool sign /v /fd sha256 /s my /n "vwifi-test-cert" /t http://timestamp.digicert.com vwifi.sys
-```
-
-On the Windows VM, import the cert into both the Trusted Root CAs
-*and* the Trusted Publishers stores:
-
-```powershell
-certutil -addstore Root       vwifi-test-cert.cer
-certutil -addstore TrustedPublisher vwifi-test-cert.cer
-```
-
-Then `pnputil /add-driver` will install cleanly without prompting.
+- **Secure Boot** must be off in the VM firmware.
+- **Memory integrity** (Windows Security → Device security → Core
+  isolation) must be off.
 
 ## Running it
 
@@ -148,9 +178,25 @@ Then `pnputil /add-driver` will install cleanly without prompting.
 Two approaches, both useful:
 
 ### DbgPrint viewing with DebugView
-All `VWIFI_INFO/WARN/ERR` output goes to the kernel debug output
-and can be captured live with Sysinternals DebugView running as
-admin with `Capture → Capture Kernel` enabled.
+
+All `VWIFI_INFO/WARN/ERR` output goes to the kernel debug output and
+can be captured live with Sysinternals DebugView running as admin with
+`Capture → Capture Kernel` (and `Capture → Enable Verbose Kernel
+Output`) enabled.
+
+**The output is filtered off by default.** `VWIFI_DBG` calls
+`DbgPrintEx(DPFLTR_IHVNETWORK_ID, ...)`, and every component mask
+except `DEFAULT` starts at zero — so the INFO and WARN lines are
+emitted and then dropped before anything can see them. A driver that
+appears completely mute is almost always this, not a driver that never
+ran. `guest-debug-setup.ps1` sets the mask; to do it by hand:
+
+```powershell
+$k = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Debug Print Filter'
+New-Item -Path $k -Force | Out-Null
+New-ItemProperty -Path $k -Name IHVNETWORK -Value 0xFFFFFFFF -PropertyType DWord -Force
+# reboot, or from a live kernel debugger: ed nt!Kd_IHVNETWORK_Mask 0xFFFFFFFF
+```
 
 ### Kernel debugging with WinDbg over a QEMU named pipe
 
@@ -158,7 +204,8 @@ Add to the QEMU command line:
 ```
 -serial pipe:\\.\pipe\windbg-vwifi
 ```
-Inside the Windows VM, enable kernel debugging over COM1:
+Inside the Windows VM, enable kernel debugging over COM1 (this is what
+`guest-debug-setup.ps1 -KernelDebug` does):
 ```
 bcdedit /debug on
 bcdedit /dbgsettings SERIAL DEBUGPORT:1 BAUDRATE:115200
@@ -167,9 +214,51 @@ Reboot. Then on the host:
 ```
 windbg -k com:pipe,port=\\.\pipe\windbg-vwifi,resets=0,reconnect
 ```
-Set breakpoints in `VwifiMiniportInitializeEx`, `VwifiCtrlSendSync`,
-`VwifiMessageIsr` — the lifecycle is linear enough that stepping
-through once shows you everything.
+
+Point the debugger at your build so symbols and source resolve:
+```
+.sympath+ C:\src\qemu-vwifi\drivers\vwifi\windows\x64\Debug\vwifi
+.srcpath+ C:\src\qemu-vwifi\drivers\vwifi\windows\src
+.reload /f vwifi.sys
+```
+
+Break in before the driver initialises — the interesting failures all
+happen during `MiniportInitializeEx`, which runs too early to catch by
+hand:
+```
+sxe ld vwifi.sys          ; break when the image loads
+bp vwifi!VwifiMiniportInitializeEx
+bp vwifi!VwifiCtrlSendSync
+bp vwifi!VwifiMessageIsr
+```
+The lifecycle is linear enough that stepping through those three once
+shows you everything.
+
+Useful commands once it's loaded:
+
+| Command | What it tells you |
+|---|---|
+| `!ndiskd.miniports` | is the miniport registered, and in what state |
+| `!ndiskd.miniport <handle>` | its NDIS state, and why it halted |
+| `lm m vwifi` | did the image load, and did symbols resolve |
+| `!poolused 4 fiWv` | driver allocations by tag (`'fiWv'` = `VWIFI_POOL_TAG`) |
+| `!analyze -v` | after a bugcheck, before anything else |
+
+### Reading a failed load
+
+If Device Manager shows a yellow bang instead of the adapter, the
+error code narrows it fast:
+
+| Code | Meaning | Usual cause |
+|---|---|---|
+| 52 | signature not verified | test-signing off, Secure Boot on, or memory integrity on |
+| 39 | driver corrupt or missing | `.sys` not copied to `System32\drivers`, or unsigned `.cat` |
+| 31 | device not working properly | `DriverEntry` or `MiniportInitializeEx` returned a failure status — check the debug output |
+| 10 | device cannot start | resource assignment failed; look at `hardware.c`'s BAR/MSI-X parsing |
+
+`%windir%\inf\setupapi.dev.log` records what PnP did with the INF and
+why it rejected it, which covers the install-time failures that never
+reach the driver at all.
 
 ## Phase 1.5 — monitor mode with Wireshark + Npcap
 

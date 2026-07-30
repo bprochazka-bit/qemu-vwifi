@@ -33,11 +33,41 @@
  * <stdint.h> does not exist. The kernel's <linux/types.h> supplies the
  * whole fixed-width set this header uses -- signed included -- so the
  * struct definitions below need no other conditionals.
+ *
+ * The third consumer is the Windows WDI miniport, built with MSVC in
+ * kernel mode. There <stdint.h> lives in the UCRT, which is not on the
+ * kernel-mode include path, so the compiler's own sized types stand in.
+ * Define VWIFI_ABI_HAVE_STDINT to skip the shim if some future MSVC
+ * consumer does have <stdint.h> in scope.
  */
 #ifdef __KERNEL__
 #include <linux/types.h>
+#elif defined(_MSC_VER) && !defined(VWIFI_ABI_HAVE_STDINT)
+typedef unsigned __int8  uint8_t;
+typedef unsigned __int16 uint16_t;
+typedef unsigned __int32 uint32_t;
+typedef unsigned __int64 uint64_t;
+typedef signed   __int8  int8_t;
+typedef signed   __int16 int16_t;
+typedef signed   __int32 int32_t;
+typedef signed   __int64 int64_t;
 #else
 #include <stdint.h>
+#endif
+
+/*
+ * Structure packing. Every struct in this file is wire format shared
+ * verbatim with the QEMU device, so all of them are byte-packed --
+ * there is no unpacked struct here for a blanket #pragma pack to
+ * silently reinterpret. GCC/Clang keep the per-struct attribute so
+ * their layout is bit-identical to what it has always been; MSVC has
+ * no such attribute and takes the pragma instead.
+ */
+#if defined(_MSC_VER)
+#define VWIFI_PACKED
+#pragma pack(push, 1)
+#else
+#define VWIFI_PACKED __attribute__((packed))
 #endif
 
 /* ================================================================
@@ -184,7 +214,7 @@ struct vwifi_ctrl_req_desc {
     uint64_t payload_addr;   /* guest physical addr of payload buffer */
     uint32_t payload_len;    /* payload length in bytes */
     uint32_t _reserved;
-} __attribute__((packed));
+} VWIFI_PACKED;
 
 /* ---- Control response descriptor ---- */
 
@@ -197,7 +227,7 @@ struct vwifi_ctrl_rsp_desc {
     uint64_t payload_addr;   /* same buffer the request used (for sync)
                               * OR device-owned for async events */
     uint64_t _reserved;
-} __attribute__((packed));
+} VWIFI_PACKED;
 
 /* ---- TX data descriptor ---- */
 
@@ -210,7 +240,7 @@ struct vwifi_tx_desc {
     uint8_t  rate_code;      /* ath9k rate code, 0 = device default */
     uint8_t  tid;            /* 802.11 TID 0-15, 0 for non-QoS */
     uint32_t _reserved1;
-} __attribute__((packed));
+} VWIFI_PACKED;
 
 /* ---- RX data descriptor ---- */
 
@@ -225,7 +255,7 @@ struct vwifi_rx_desc {
     uint32_t buffer_len;     /* size of the RX buffer (set by driver) */
     uint64_t tsf;            /* 64-bit TSF timestamp at reception */
     uint32_t _reserved;
-} __attribute__((packed));
+} VWIFI_PACKED;
 
 /* Common descriptor flag bits (all rings) */
 #define VWIFI_DESC_F_OWN        (1u << 0)  /* owner bit; producer sets, consumer clears */
@@ -292,7 +322,7 @@ struct vwifi_caps {
     uint16_t max_scan_ssids;
     uint16_t max_bss_entries;
     uint32_t _reserved1;
-} __attribute__((packed));
+} VWIFI_PACKED;
 
 enum vwifi_mode {
     VWIFI_MODE_IDLE     = 0,
@@ -303,7 +333,7 @@ enum vwifi_mode {
 
 struct vwifi_op_mode {
     uint32_t mode;                  /* enum vwifi_mode */
-} __attribute__((packed));
+} VWIFI_PACKED;
 
 struct vwifi_channel {
     uint16_t primary_freq;          /* MHz */
@@ -312,11 +342,11 @@ struct vwifi_channel {
     uint16_t center_freq1;          /* VHT center freq of primary segment */
     uint16_t center_freq2;          /* VHT80+80 center of secondary, 0 if none */
     uint16_t _reserved;
-} __attribute__((packed));
+} VWIFI_PACKED;
 
 struct vwifi_raw_filter {
     uint32_t mask;                  /* VWIFI_RAW_F_* */
-} __attribute__((packed));
+} VWIFI_PACKED;
 
 #define VWIFI_RAW_F_DATA         (1u << 0)  /* raw data MPDUs */
 #define VWIFI_RAW_F_MGMT         (1u << 1)  /* raw mgmt MPDUs */
@@ -340,7 +370,7 @@ struct vwifi_scan_req {
      * literally reports only hidden APs and looks like it is sitting on
      * a dead medium.
      */
-} __attribute__((packed));
+} VWIFI_PACKED;
 
 /* Set in vwifi_bss_entry.capability_info bit 16 to tell the driver
  * whether the attached frame is a Beacon or a Probe Response — WDI has
@@ -367,7 +397,7 @@ struct vwifi_bss_entry {
     uint8_t  ssid[33];
     uint8_t  _reserved2[3];
     /* followed by ie_len bytes of raw IEs copied from the beacon/probe-resp */
-} __attribute__((packed));
+} VWIFI_PACKED;
 
 struct vwifi_connect_req {
     uint8_t  bssid[6];              /* specific AP to target */
@@ -382,7 +412,7 @@ struct vwifi_connect_req {
     uint16_t assoc_ie_len;
     uint16_t _reserved1;
     /* followed by assoc_ie_len bytes of IEs to include in assoc request */
-} __attribute__((packed));
+} VWIFI_PACKED;
 
 enum {
     VWIFI_AUTH_OPEN          = 0,
@@ -409,7 +439,7 @@ enum {
 struct vwifi_disconnect_req {
     uint16_t reason_code;           /* 802.11 reason code */
     uint16_t _reserved;
-} __attribute__((packed));
+} VWIFI_PACKED;
 
 struct vwifi_assoc_result {
     uint8_t  bssid[6];
@@ -419,13 +449,13 @@ struct vwifi_assoc_result {
     uint16_t ie_len;                /* assoc response IEs */
     uint16_t _reserved1;
     /* followed by ie_len bytes of AP's assoc response IEs */
-} __attribute__((packed));
+} VWIFI_PACKED;
 
 struct vwifi_disconnect_ev {
     uint16_t reason_code;
     uint8_t  local;                 /* 1 = locally initiated */
     uint8_t  _reserved;
-} __attribute__((packed));
+} VWIFI_PACKED;
 
 struct vwifi_mgmt_rx {
     uint16_t frame_len;
@@ -434,20 +464,20 @@ struct vwifi_mgmt_rx {
     uint16_t channel_freq;
     uint16_t _reserved1;
     /* followed by frame_len bytes of raw 802.11 management frame */
-} __attribute__((packed));
+} VWIFI_PACKED;
 
 struct vwifi_key_id {
     uint8_t  mac[6];                /* peer MAC; all-zero = group key */
     uint8_t  key_idx;               /* 0..3 */
     uint8_t  pairwise;              /* 1 = pairwise, 0 = group */
-} __attribute__((packed));
+} VWIFI_PACKED;
 
 struct vwifi_key {
     struct vwifi_key_id id;
     uint16_t cipher;                /* VWIFI_CIPHER_* */
     uint16_t key_len;               /* 16 for CCMP128, 32 for GCMP256 */
     uint8_t  key[32];
-} __attribute__((packed));
+} VWIFI_PACKED;
 
 struct vwifi_ap_config {
     uint16_t ssid_len;
@@ -459,6 +489,10 @@ struct vwifi_ap_config {
     uint16_t ie_len;                /* beacon/probe-resp IEs */
     uint16_t _reserved1;
     /* followed by ie_len bytes of IEs */
-} __attribute__((packed));
+} VWIFI_PACKED;
+
+#if defined(_MSC_VER)
+#pragma pack(pop)
+#endif
 
 #endif /* VWIFI_ABI_H */

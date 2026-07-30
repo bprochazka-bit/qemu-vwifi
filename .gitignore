@@ -25,6 +25,15 @@ x64/
 Debug/
 Release/
 .vs/
+*.vcxproj.user
+build-Debug.log
+build-Debug.err
+build-Debug.wrn
+build-Release.log
+build-Release.err
+build-Release.wrn
+# Test-signing certificate exported by sign.cmd — machine-local, never shared
+vwifi-test-cert.cer
 
 # Python bytecode cache (medium/controller, medium/tests)
 __pycache__/
