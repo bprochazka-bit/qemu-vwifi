@@ -216,7 +216,7 @@ VwifiHwInitialize(
         &Adapter->InterruptHandle);
     if (status != NDIS_STATUS_SUCCESS) {
         VWIFI_ERR("NdisMRegisterInterruptEx failed 0x%x", status);
-        goto fail_rings;
+        goto fail_connect;
     }
     Adapter->MessageInfo = irq_chars.MessageInfoTable;
 
@@ -258,6 +258,7 @@ VwifiHwInitialize(
 fail_irq:
     NdisMDeregisterInterruptEx(Adapter->InterruptHandle);
     Adapter->InterruptHandle = NULL;
+fail_connect:
     VwifiConnectTaskDestroy(Adapter);
 fail_scan:
     VwifiScanTaskDestroy(Adapter);

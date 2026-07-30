@@ -72,6 +72,11 @@ VwifiWdiAllocateAdapter(
     status = VwifiAdapterCreate(NdisMiniportHandle, MiniportInitParameters,
                                 RegistrationAttributes);
     if (status != NDIS_STATUS_SUCCESS) {
+        /* This is what PnP reports as Code 10, "device cannot start".
+         * Log it at the boundary so the failing status is visible even
+         * when the specific step below it did not log one. */
+        VWIFI_ERR("WdiAllocateAdapter failing with 0x%08x — "
+                  "device will not start", status);
         return status;
     }
 
