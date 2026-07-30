@@ -87,11 +87,12 @@ NDIS_STATUS VwifiTlvGenerateBssEntryList(
 
 /* Parse an OID_WDI_TASK_CONNECT M1 into a device connect request.
  *
- * `ReqBuf` must have room for sizeof(struct vwifi_connect_req) plus
- * the association IEs the OS supplied (the RSN element for WPA2).
- * Those IEs are copied verbatim — the AP validates them against the
- * 4-way handshake, so they must survive unmodified.
- */
+ * `ReqBuf` must have room for sizeof(struct vwifi_connect_req) plus any
+ * association IEs. Note that WDI supplies only vendor-specific elements
+ * here — there is no RSN element in a connect request and nowhere to put
+ * one. The OS states the security it wants through the auth and cipher
+ * algorithm lists, and the device builds RSN from those. An empty
+ * assoc_ie_len is the normal case, not a parse failure. */
 NDIS_STATUS VwifiTlvParseConnectRequest(
     _In_ ULONG PeerVersion,
     _In_reads_bytes_(BufferLen) const VOID *Buffer,

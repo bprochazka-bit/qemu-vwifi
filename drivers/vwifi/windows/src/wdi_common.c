@@ -22,6 +22,12 @@
 
 #include "vwifi_drv.h"
 
+/* The capabilities message advertises a maximum command size to the OS.
+ * tlv_shim.cpp cannot include this header (it is C-only), so it carries
+ * its own copy of the value; this is the tie that keeps the two from
+ * drifting into a buffer overrun. */
+C_ASSERT(VWIFI_CTRL_PAYLOAD_SIZE >= 2048);
+
 /* ============================================================
  * TLV payload extraction
  * ============================================================ */

@@ -71,10 +71,24 @@ static WDI_CHANNEL_NUMBER VwifiFreqToChannel(USHORT FreqMhz)
     return 0;
 }
 
+/* ...and the inverse, for the channel WDI reports in a connect request. */
+static USHORT VwifiChannelToFreq(WDI_CHANNEL_NUMBER Channel, WDI_BAND_ID Band)
+{
+    if (Channel == 0) return 0;
+    if (Band == WDI_BAND_ID_5000) return (USHORT)(5000 + Channel * 5);
+    if (Channel == 14)            return 2484;
+    if (Channel <= 13)            return (USHORT)(2407 + Channel * 5);
+    return 0;
+}
+
 static WDI_BAND_ID VwifiFreqToBandId(USHORT FreqMhz)
 {
     return (FreqMhz >= 5000) ? WDI_BAND_ID_5000 : WDI_BAND_ID_2400;
 }
+
+/* Largest command we tell the OS it may send us. Kept in step with
+ * VWIFI_CTRL_PAYLOAD_SIZE by a C_ASSERT on the C side. */
+#define VWIFI_TLV_MAX_COMMAND_SIZE 2048
 
 /* The generator reserves this much space at the front of the blob for
  * the message header. The caller (NdisMIndicateStatusEx path) does not
@@ -335,29 +349,52 @@ VwifiTlvParseConnectRequest(
 
     RtlZeroMemory(ReqBuf, sizeof(*ReqBuf));
 
-    /* The nesting here is documented: the special-members topic shows
-     * pConnectTaskParameters->ConnectParameters.MulticastCipherAlgorithms
-     * so ConnectParameters is a sub-struct. [MEMBER?] on the leaves. */
-    const WDI_CONNECT_PARAMETERS *cp = &parsed.ConnectParameters;
+    /* WDI_CONNECT_PARAMETERS_CONTAINER holds the security selections and
+     * the SSID list; the BSS to join comes from the task's separate
+     * PreferredBSSEntryList. Every security field is a *list*, because
+     * the OS may accept more than one — we take the first, which is the
+     * OS's preference order. */
+    const WDI_CONNECT_PARAMETERS_CONTAINER *cp = &parsed.ConnectParameters;
 
-    RtlCopyMemory(ReqBuf->bssid, &cp->BSSID, 6);
+    if (cp->SSIDList.ElementCount > 0 && cp->SSIDList.pElements != nullptr) {
+        const WDI_SSID *ssid = &cp->SSIDList.pElements[0];
+        ULONG ssidLen = ssid->ElementCount;
+        if (ssidLen > 32) ssidLen = 32;
+        ReqBuf->ssid_len = static_cast<USHORT>(ssidLen);
+        if (ssidLen > 0 && ssid->pElements != nullptr) {
+            RtlCopyMemory(ReqBuf->ssid, ssid->pElements, ssidLen);
+        }
+    }
 
-    ULONG ssidLen = cp->SSID.SSIDLength;
-    if (ssidLen > 32) ssidLen = 32;
-    ReqBuf->ssid_len = static_cast<USHORT>(ssidLen);
-    RtlCopyMemory(ReqBuf->ssid, cp->SSID.SSID, ssidLen);
+    /* The BSSID, and — usefully — the channel. The earlier note in this
+     * file that "WDI's connect parameters carry no channel" was right
+     * about ConnectParameters and wrong about the request as a whole:
+     * each preferred BSS entry carries a ChannelInfo. Use it when it is
+     * there and leave zero otherwise, which still lets the device
+     * resolve the channel from its own BSS table. */
+    if (parsed.PreferredBSSEntryList.ElementCount > 0 &&
+        parsed.PreferredBSSEntryList.pElements != nullptr) {
+        const WDI_CONNECT_BSS_ENTRY_CONTAINER *bss =
+            &parsed.PreferredBSSEntryList.pElements[0];
 
-    /* WDI's connect parameters carry no channel, so this stays zero and
-     * the device resolves it: it looks the BSSID up in the BSS table it
-     * filled while scanning. Before that fallback existed, zero meant
-     * "use whatever channel we happen to be tuned to", which after a
-     * scan is the restored pre-scan channel. */
-    ReqBuf->channel_freq = 0;
+        RtlCopyMemory(ReqBuf->bssid, bss->BSSID.Address, 6);
+        ReqBuf->channel_freq =
+            VwifiChannelToFreq(bss->ChannelInfo.ChannelNumber,
+                               bss->ChannelInfo.BandId);
+    }
 
-    WdiAuthToVwifi(cp->AuthAlgo, &ReqBuf->auth_algo, &ReqBuf->akm_suite);
-    ReqBuf->cipher_pairwise = WdiCipherToVwifi(cp->UnicastCipherAlgo);
+    if (cp->AuthenticationAlgorithms.ElementCount > 0 &&
+        cp->AuthenticationAlgorithms.pElements != nullptr) {
+        WdiAuthToVwifi(cp->AuthenticationAlgorithms.pElements[0],
+                       &ReqBuf->auth_algo, &ReqBuf->akm_suite);
+    }
 
-    /* Multicast cipher arrives as a list; take the first. */
+    if (cp->UnicastCipherAlgorithms.ElementCount > 0 &&
+        cp->UnicastCipherAlgorithms.pElements != nullptr) {
+        ReqBuf->cipher_pairwise =
+            WdiCipherToVwifi(cp->UnicastCipherAlgorithms.pElements[0]);
+    }
+
     if (cp->MulticastCipherAlgorithms.ElementCount > 0 &&
         cp->MulticastCipherAlgorithms.pElements != nullptr) {
         ReqBuf->cipher_group =
@@ -366,16 +403,23 @@ VwifiTlvParseConnectRequest(
         ReqBuf->cipher_group = ReqBuf->cipher_pairwise;
     }
 
-    /* Association-request IEs. NOT optional for WPA2: the OS builds
-     * the RSN element here and the AP cross-checks it against the
-     * 4-way handshake. A mismatch surfaces as a MIC failure, which
-     * is a miserable thing to debug. Copy verbatim. */
-    ULONG ieLen = cp->AssocRequestIEs.ElementCount;
-    ULONG ieRoom = ReqCap - sizeof(*ReqBuf);
-    if (ieLen > ieRoom) ieLen = ieRoom;
-    if (ieLen > 0 && cp->AssocRequestIEs.pElements != nullptr) {
+    /* Association-request IEs.
+     *
+     * WDI hands over only AssociationRequestVendorIE — vendor-specific
+     * elements. There is no RSN element here and no field to put one in:
+     * the OS describes the security it wants through the auth and cipher
+     * lists above and expects the driver (or, here, the device) to build
+     * the RSN element from them. So an empty assoc_ie_len is normal on
+     * this path, not a parse failure, and WPA2 depends on the device
+     * constructing RSN from auth_algo/akm_suite/cipher_*. */
+    ULONG ieLen = 0;
+    if (cp->Optional.AssociationRequestVendorIE_IsPresent &&
+        cp->AssociationRequestVendorIE.pElements != nullptr) {
+        ULONG ieRoom = ReqCap - sizeof(*ReqBuf);
+        ieLen = cp->AssociationRequestVendorIE.ElementCount;
+        if (ieLen > ieRoom) ieLen = ieRoom;
         RtlCopyMemory(reinterpret_cast<UCHAR *>(ReqBuf) + sizeof(*ReqBuf),
-                      cp->AssocRequestIEs.pElements, ieLen);
+                      cp->AssociationRequestVendorIE.pElements, ieLen);
     }
     ReqBuf->assoc_ie_len = static_cast<USHORT>(ieLen);
     *ReqLen = sizeof(*ReqBuf) + ieLen;
@@ -603,8 +647,12 @@ VwifiTlvGenerateAdapterCapabilities(
      *
      * There is no op-mode capability field to set. WDI has no
      * network-monitor mode at all — see VwifiTlvParseOperationMode. */
+    /* Must not exceed the driver's ctrl payload scratch buffer
+     * (VWIFI_CTRL_PAYLOAD_SIZE in vwifi_drv.h). That header is C-only
+     * and cannot be included here, so the value is asserted against
+     * instead of shared — see the C_ASSERT in wdi_common.c. */
     params.CommunicationAttributes.CommunicationCapabilities.MaxCommandSize =
-        VWIFI_CTRL_PAYLOAD_SIZE;
+        VWIFI_TLV_MAX_COMMAND_SIZE;
     params.Optional.CommunicationAttributes_IsPresent = TRUE;
 
     {
