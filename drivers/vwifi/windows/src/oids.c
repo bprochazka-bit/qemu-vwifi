@@ -225,13 +225,19 @@ VwifiOidRequest(
  * This is the path Npcap's monitor-mode request actually takes: Npcap
  * asks Native 802.11 for dot11_operation_mode_network_monitor, and the
  * Microsoft WLAN component turns that into this task.
+ *
+ * The mode arrives as a WDI_OPERATION_MODE bitmask — but note there are
+ * two enums by that name, dot11wdi.h's (STA and the P2P roles only) and
+ * the TLV library's in wditypes.hpp (which carries NETWORK_MONITOR).
+ * Only the second one describes what is in the TLV, and it is not
+ * visible from a C file. So the shim resolves it and returns a
+ * VWIFI_MODE_* value; do not reach for either WDI enum here.
  * ============================================================ */
 NDIS_STATUS
 VwifiHandleTaskChangeOpMode(_Inout_ PVWIFI_ADAPTER Adapter,
                             _In_ PNDIS_OID_REQUEST Req)
 {
-    ULONG opMode = 0;
-    ULONG devMode;
+    ULONG devMode = 0;
     NDIS_STATUS status;
     PVOID tlvBuf;
     ULONG tlvLen;
@@ -240,24 +246,14 @@ VwifiHandleTaskChangeOpMode(_Inout_ PVWIFI_ADAPTER Adapter,
     if (status != NDIS_STATUS_SUCCESS) return status;
 
     status = VwifiTlvParseOperationMode(Adapter->WdiPeerVersion,
-                                        tlvBuf, tlvLen, &opMode);
+                                        tlvBuf, tlvLen, &devMode);
     if (status != NDIS_STATUS_SUCCESS) {
         VWIFI_ERR("operation mode parse failed 0x%x", status);
         return status;
     }
 
-    /* WDI_OPERATION_MODE is a bitmask of the same DOT11_OPERATION_MODE_*
-     * values the Native interface uses. */
-    if (opMode & DOT11_OPERATION_MODE_NETWORK_MONITOR) {
-        devMode = VWIFI_MODE_MONITOR;
-        VWIFI_INFO("op mode -> NETWORK_MONITOR");
-    } else if (opMode & DOT11_OPERATION_MODE_EXTENSIBLE_STATION) {
-        devMode = VWIFI_MODE_STA;
-        VWIFI_INFO("op mode -> ExtSTA");
-    } else {
-        VWIFI_WARN("unsupported operation mode 0x%08x", opMode);
-        return NDIS_STATUS_NOT_SUPPORTED;
-    }
+    VWIFI_INFO("op mode -> %s",
+               devMode == VWIFI_MODE_MONITOR ? "NETWORK_MONITOR" : "STA");
 
     status = VwifiSetOpMode(Adapter, devMode);
     if (status != NDIS_STATUS_SUCCESS) return status;
@@ -267,6 +263,7 @@ VwifiHandleTaskChangeOpMode(_Inout_ PVWIFI_ADAPTER Adapter,
      * none. */
     VwifiSendWdiIndication(Adapter, Req->PortNumber,
                            NDIS_STATUS_WDI_INDICATION_CHANGE_OPERATION_MODE_COMPLETE,
+                           VwifiGetWdiTransactionId(Req),
                            NULL, 0);
     return NDIS_STATUS_SUCCESS;
 }

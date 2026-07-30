@@ -2,40 +2,43 @@
  * vwifi — wdi_ops.c
  * SPDX-License-Identifier: GPL-2.0-or-later
  *
- * WDI control-path callback implementations. In Phase 1 these
- * are minimal: we accept the Microsoft WLAN component's lifecycle
- * calls and plumb them to our own adapter state without actually
- * doing per-port work (ports, peers, roaming, scans come in later
- * phases).
+ * WDI control-path callback implementations.
+ *
+ * These are the handlers listed in NDIS_MINIPORT_DRIVER_WDI_CHARACTERISTICS.
+ * Their signatures come from dot11wdi.h and are not what the WDI
+ * documentation's prose suggests — in particular AllocateAdapter is the
+ * WDI model's MiniportInitializeEx. It receives the NDIS miniport
+ * handle, the PnP init parameters and an _Inout_ registration
+ * attributes block to fill in; the WLAN component owns the real
+ * MiniportInitializeEx and calls us from inside it. That is why adapter
+ * creation lives here and not in driver.c's NDIS handler table.
  */
 
 #include "vwifi_drv.h"
 
-/* AllocateAdapter runs before MiniportInitializeEx, so there's no
- * adapter context to store the peer version in yet. Park it here and
- * have MiniportInitializeEx copy it into the adapter. Single-threaded
- * per PnP start, so no locking needed. */
+/* AllocateAdapter runs before there is an adapter context to store the
+ * peer version in. Park it here and have VwifiAdapterCreate copy it into
+ * the adapter. Single-threaded per PnP start, so no locking needed. */
 ULONG g_WdiPeerVersion = 0;
 
 /* ============================================================
  * AllocateAdapter / FreeAdapter
  *
- * Invoked once per adapter, BEFORE MiniportInitializeEx on the
- * same device. This is the WDI model's split: Allocate creates
- * the context; Initialize binds it to NDIS; OpenAdapter starts it.
- *
- * Because our driver's MiniportInitializeEx does all the hard
- * work, these handlers are effectively no-ops that just pass the
- * context through.
+ * Allocate is called once per adapter, in place of
+ * MiniportInitializeEx. Free is its mirror, in place of
+ * MiniportHaltEx.
  * ============================================================ */
 _Use_decl_annotations_
 NDIS_STATUS
 VwifiWdiAllocateAdapter(
+    NDIS_HANDLE NdisMiniportHandle,
     NDIS_HANDLE MiniportDriverContext,
-    PNDIS_WDI_INIT_PARAMETERS InitParams,
-    NDIS_HANDLE *MiniportWdiAdapterContext,
-    PWDI_ADAPTER_ATTRIBUTES *AdapterAttributes)
+    PNDIS_MINIPORT_INIT_PARAMETERS MiniportInitParameters,
+    PNDIS_WDI_INIT_PARAMETERS NdisWdiInitParameters,
+    PNDIS_MINIPORT_ADAPTER_REGISTRATION_ATTRIBUTES RegistrationAttributes)
 {
+    NDIS_STATUS status;
+
     UNREFERENCED_PARAMETER(MiniportDriverContext);
 
     VWIFI_INFO("WdiAllocateAdapter");
@@ -54,45 +57,45 @@ VwifiWdiAllocateAdapter(
      * every TLV_CONTEXT.PeerVersion. The library then emits an older
      * byte stream when running on older WDI, and consumes older
      * streams on parse. That's the whole single-binary story.
-     *
-     * [VERIFY] The exact field name on NDIS_WDI_INIT_PARAMETERS needs
-     * checking against dot11wdi.h — it's the WDI version the OS
-     * reports. If the struct doesn't carry it, the fallback is to
-     * take it from the WdiVersion echoed back after
-     * NdisMRegisterWdiMiniportDriver returns.
      * ============================================================ */
-    if (InitParams != NULL) {
-        /* [VERIFY] field name */
-        g_WdiPeerVersion = InitParams->WdiVersion;
+    if (NdisWdiInitParameters != NULL) {
+        g_WdiPeerVersion = NdisWdiInitParameters->WdiVersion;
         VWIFI_INFO("WDI peer version: 0x%08x", g_WdiPeerVersion);
     } else {
         /* Defensive: assume the version we compiled against rather
          * than 0, which the library rejects with
          * NDIS_STATUS_NOT_SUPPORTED_REVISION. */
         g_WdiPeerVersion = WDI_VERSION_LATEST;
-        VWIFI_WARN("no init params; assuming WDI_VERSION_LATEST");
+        VWIFI_WARN("no WDI init params; assuming WDI_VERSION_LATEST");
     }
 
-    /* We defer all real work to MiniportInitializeEx, which runs
-     * right after this call. Just hand back a NULL context for now;
-     * the real PVWIFI_ADAPTER gets installed via
-     * NdisMSetMiniportAttributes during Initialize. */
-    *MiniportWdiAdapterContext = NULL;
+    status = VwifiAdapterCreate(NdisMiniportHandle, MiniportInitParameters,
+                                RegistrationAttributes);
+    if (status != NDIS_STATUS_SUCCESS) {
+        return status;
+    }
 
-    /* Fill in minimal adapter attributes for the WLAN component.
-     * Detailed capabilities come through OID handlers (later). */
-    static WDI_ADAPTER_ATTRIBUTES attrs = { 0 };
-    *AdapterAttributes = &attrs;
+    /* Stash the OS completion routines now that the adapter exists.
+     * OpenAdapter/CloseAdapter are asynchronous and are only finished
+     * when we call these back. */
+    if (NdisWdiInitParameters != NULL) {
+        PVWIFI_ADAPTER adapter =
+            (PVWIFI_ADAPTER)RegistrationAttributes->MiniportAdapterContext;
+        adapter->OpenAdapterCompleteHandler =
+            NdisWdiInitParameters->OpenAdapterCompleteHandler;
+        adapter->CloseAdapterCompleteHandler =
+            NdisWdiInitParameters->CloseAdapterCompleteHandler;
+    }
 
     return NDIS_STATUS_SUCCESS;
 }
 
 _Use_decl_annotations_
 VOID
-VwifiWdiFreeAdapter(NDIS_HANDLE MiniportWdiAdapterContext)
+VwifiWdiFreeAdapter(NDIS_HANDLE MiniportAdapterContext)
 {
-    UNREFERENCED_PARAMETER(MiniportWdiAdapterContext);
     VWIFI_INFO("WdiFreeAdapter");
+    VwifiAdapterDestroy(MiniportAdapterContext);
 }
 
 /* ============================================================
@@ -101,33 +104,49 @@ VwifiWdiFreeAdapter(NDIS_HANDLE MiniportWdiAdapterContext)
  * OpenAdapter is where the WLAN component declares "I'm ready to
  * start issuing tasks." Real drivers use this to download firmware
  * and wire up data-path resources. We have none of that, so we
- * just succeed.
+ * complete immediately — but we must still *call* the completion
+ * routine, because these are asynchronous operations. Returning
+ * success without completing leaves the WLAN component waiting
+ * forever, with nothing logged anywhere.
  * ============================================================ */
 _Use_decl_annotations_
 NDIS_STATUS
 VwifiWdiOpenAdapter(
     NDIS_HANDLE MiniportAdapterContext,
-    PWDI_OPEN_ADAPTER_PARAMETERS OpenParameters)
+    PNDIS_MINIPORT_INIT_PARAMETERS MiniportInitParameters)
 {
-    UNREFERENCED_PARAMETER(MiniportAdapterContext);
-    UNREFERENCED_PARAMETER(OpenParameters);
+    PVWIFI_ADAPTER adapter = (PVWIFI_ADAPTER)MiniportAdapterContext;
+
+    UNREFERENCED_PARAMETER(MiniportInitParameters);
     VWIFI_INFO("WdiOpenAdapter");
+
+    if (adapter->OpenAdapterCompleteHandler != NULL) {
+        adapter->OpenAdapterCompleteHandler(adapter->MiniportAdapterHandle,
+                                            NDIS_STATUS_SUCCESS);
+    }
     return NDIS_STATUS_SUCCESS;
 }
 
 _Use_decl_annotations_
-VOID
+NDIS_STATUS
 VwifiWdiCloseAdapter(NDIS_HANDLE MiniportAdapterContext)
 {
-    UNREFERENCED_PARAMETER(MiniportAdapterContext);
+    PVWIFI_ADAPTER adapter = (PVWIFI_ADAPTER)MiniportAdapterContext;
+
     VWIFI_INFO("WdiCloseAdapter");
+
+    if (adapter->CloseAdapterCompleteHandler != NULL) {
+        adapter->CloseAdapterCompleteHandler(adapter->MiniportAdapterHandle,
+                                             NDIS_STATUS_SUCCESS);
+    }
+    return NDIS_STATUS_SUCCESS;
 }
 
 /* ============================================================
  * Start / Stop operation
  *
  * These bracket one or more WDI tasks (scan, connect, etc.).
- * Placeholders in Phase 1.
+ * Placeholders in Phase 1. Note Stop returns void, not a status.
  * ============================================================ */
 _Use_decl_annotations_
 NDIS_STATUS
@@ -138,11 +157,10 @@ VwifiWdiStartOperation(NDIS_HANDLE MiniportAdapterContext)
 }
 
 _Use_decl_annotations_
-NDIS_STATUS
+VOID
 VwifiWdiStopOperation(NDIS_HANDLE MiniportAdapterContext)
 {
     UNREFERENCED_PARAMETER(MiniportAdapterContext);
-    return NDIS_STATUS_SUCCESS;
 }
 
 /* ============================================================
@@ -150,13 +168,18 @@ VwifiWdiStopOperation(NDIS_HANDLE MiniportAdapterContext)
  *
  * Called after the WLAN component has finished its own
  * pause/restart work on the data path. The IHV can use these to
- * reclaim per-peer resources or re-prime queues.
+ * reclaim per-peer resources or re-prime queues. Both take the
+ * corresponding NDIS parameters block and return a status.
  * ============================================================ */
 _Use_decl_annotations_
-VOID
-VwifiWdiPostPause(NDIS_HANDLE MiniportAdapterContext)
+NDIS_STATUS
+VwifiWdiPostPause(
+    NDIS_HANDLE MiniportAdapterContext,
+    PNDIS_MINIPORT_PAUSE_PARAMETERS PauseParameters)
 {
     UNREFERENCED_PARAMETER(MiniportAdapterContext);
+    UNREFERENCED_PARAMETER(PauseParameters);
+    return NDIS_STATUS_SUCCESS;
 }
 
 _Use_decl_annotations_
@@ -172,25 +195,35 @@ VwifiWdiPostRestart(
 
 /* ============================================================
  * HangDiagnose — WDI's cousin of MiniportCheckForHang.
- * Return a simple failure code; NDIS will convert this into a
- * reset request if the WLAN component agrees we're hung.
+ *
+ * Note the first argument is the *driver* context, not the adapter
+ * context, and the contract is to fill a caller-supplied blob that
+ * ends up in a LiveKD dump. We have no firmware to dump; write the
+ * two device registers that say whether the device is alive at all,
+ * which is the only thing worth having post-mortem here.
  * ============================================================ */
 _Use_decl_annotations_
-VOID
+NDIS_STATUS
 VwifiWdiHangDiagnose(
-    NDIS_HANDLE MiniportAdapterContext,
-    PWDI_HANG_DIAGNOSTICS_BUFFER DiagnosticsBuffer)
+    NDIS_HANDLE MiniportDriverContext,
+    eDiagnoseLevel DiagnoseLevel,
+    UINT32 BufferSize,
+    UINT8 *FirmwareBlob,
+    UINT32 *pOutputSize)
 {
-    PVWIFI_ADAPTER adapter = (PVWIFI_ADAPTER)MiniportAdapterContext;
-    UNREFERENCED_PARAMETER(DiagnosticsBuffer);
+    UNREFERENCED_PARAMETER(MiniportDriverContext);
+    UNREFERENCED_PARAMETER(DiagnoseLevel);
 
-    /* Phase 1: nothing meaningful to diagnose. A later phase can
-     * record last-seen ring indices and pending-request stats. */
-    if (adapter && adapter->MmioVirtualAddress) {
-        ULONG sig = VwifiRead32(adapter, VWIFI_REG_SIGNATURE);
-        ULONG sts = VwifiRead32(adapter, VWIFI_REG_STATUS);
-        VWIFI_WARN("HangDiagnose: sig=0x%08x status=0x%08x", sig, sts);
+    *pOutputSize = 0;
+
+    if (FirmwareBlob == NULL || BufferSize == 0) {
+        return NDIS_STATUS_SUCCESS;
     }
+
+    /* Phase 1: nothing to dump. A later phase can record the last-seen
+     * ring indices and pending-request stats here — that is the state
+     * that actually explains a wedge. */
+    return NDIS_STATUS_SUCCESS;
 }
 
 /* ============================================================
@@ -205,35 +238,43 @@ _Use_decl_annotations_
 NDIS_STATUS
 VwifiWdiTalTxRxInitialize(
     NDIS_HANDLE MiniportAdapterContext,
-    TAL_TXRX_HANDLE *TalTxRxHandle)
+    NDIS_HANDLE NdisMiniportDataPathHandle,
+    PNDIS_WDI_DATA_API NdisWdiDataPathApi,
+    PTAL_TXRX_HANDLE pMiniportTalTxRxContext,
+    PNDIS_MINIPORT_WDI_DATA_HANDLERS pMiniportDataHandlers,
+    UINT32 *pMiniportWdiFrameMetadataExtraSpace)
 {
-    UNREFERENCED_PARAMETER(MiniportAdapterContext);
+    UNREFERENCED_PARAMETER(NdisMiniportDataPathHandle);
+    UNREFERENCED_PARAMETER(NdisWdiDataPathApi);
+    UNREFERENCED_PARAMETER(pMiniportDataHandlers);
+
     /* Return our adapter pointer as the TAL handle so later callbacks
      * can find us. */
-    *TalTxRxHandle = (TAL_TXRX_HANDLE)MiniportAdapterContext;
+    *pMiniportTalTxRxContext = (TAL_TXRX_HANDLE)MiniportAdapterContext;
+    *pMiniportWdiFrameMetadataExtraSpace = 0;
     return NDIS_STATUS_SUCCESS;
 }
 
 _Use_decl_annotations_
 VOID
-VwifiWdiTalTxRxDeinitialize(TAL_TXRX_HANDLE TalTxRxHandle)
+VwifiWdiTalTxRxDeinitialize(TAL_TXRX_HANDLE MiniportTalTxRxContext)
 {
-    UNREFERENCED_PARAMETER(TalTxRxHandle);
+    UNREFERENCED_PARAMETER(MiniportTalTxRxContext);
 }
 
 /* ============================================================
- * Low-energy idle notification (runtime D3 power hint). Not
- * relevant for a virtual device; just succeed so the WLAN
+ * Low-energy idle notification (USB selective suspend). Not
+ * relevant for a virtual PCI device; just succeed so the WLAN
  * component's power management doesn't get wedged.
  * ============================================================ */
 _Use_decl_annotations_
 NDIS_STATUS
 VwifiWdiLeIdleNotification(
     NDIS_HANDLE MiniportAdapterContext,
-    PNDIS_WDI_IDLE_NOTIFICATION_INFO IdleNotification)
+    BOOLEAN ForceIdle)
 {
     UNREFERENCED_PARAMETER(MiniportAdapterContext);
-    UNREFERENCED_PARAMETER(IdleNotification);
+    UNREFERENCED_PARAMETER(ForceIdle);
     return NDIS_STATUS_SUCCESS;
 }
 

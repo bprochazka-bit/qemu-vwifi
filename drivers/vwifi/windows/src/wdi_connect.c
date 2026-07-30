@@ -7,7 +7,6 @@
  * Flow:
  *   OS wants to join a network
  *     -> OID_WDI_TASK_CONNECT
- *     -> we indicate ASSOCIATION_START
  *     -> submit VWIFI_OP_CONNECT to the device
  *     -> device runs Auth/Assoc on the medium
  *     -> VWIFI_EV_ASSOC_RESULT arrives
@@ -50,6 +49,7 @@ typedef struct _VWIFI_CONNECT_TASK
 {
     BOOLEAN Active;
     ULONG   PortId;
+    UINT32  TransactionId;     /* echoed by CONNECT_COMPLETE */
     UCHAR   TargetBssid[6];
     UCHAR   TargetSsid[33];
     USHORT  TargetSsidLen;
@@ -99,37 +99,13 @@ VwifiParseConnectParameters(
  * WDI indications
  * ============================================================ */
 
-static VOID
-VwifiIndicateAssociationStart(_Inout_ PVWIFI_ADAPTER Adapter)
-{
-    PVWIFI_CONNECT_TASK task = Adapter->ConnectTask;
-    NDIS_STATUS_INDICATION ind = { 0 };
-    PVOID tlv = NULL;
-    ULONG tlvLen = 0;
-
-    if (VwifiTlvGenerateAssociationStart(Adapter->WdiPeerVersion,
-                                         task->TargetBssid,
-                                         task->TargetSsid,
-                                         task->TargetSsidLen,
-                                         &tlv, &tlvLen)
-            != NDIS_STATUS_SUCCESS) {
-        VWIFI_ERR("ASSOCIATION_START TLV generate failed");
-        return;
-    }
-
-    ind.Header.Type      = NDIS_OBJECT_TYPE_STATUS_INDICATION;
-    ind.Header.Revision  = NDIS_STATUS_INDICATION_REVISION_1;
-    ind.Header.Size      = NDIS_SIZEOF_STATUS_INDICATION_REVISION_1;
-    ind.SourceHandle     = Adapter->MiniportAdapterHandle;
-    ind.PortNumber       = (NDIS_PORT_NUMBER)task->PortId;
-    ind.StatusCode       = NDIS_STATUS_WDI_INDICATION_ASSOCIATION_START;
-    ind.StatusBuffer     = tlv;
-    ind.StatusBufferSize = tlvLen;
-
-    VWIFI_INFO("indicating ASSOCIATION_START");
-    NdisMIndicateStatusEx(Adapter->MiniportAdapterHandle, &ind);
-    VwifiTlvFreeGenerated(tlv);
-}
+/* WDI has no ASSOCIATION_START indication -- dot11wdi.h defines
+ * ASSOCIATION_RESULT (76) and CONNECT_COMPLETE (64) for this flow, and
+ * ASSOCIATION_PARAMETERS_REQUEST (98) for the unrelated case where the
+ * OS supplies association parameters. The driver used to indicate a
+ * NDIS_STATUS_WDI_INDICATION_ASSOCIATION_START that does not exist, so
+ * the sequence is now just result-then-complete.
+ * ============================================================ */
 
 static VOID
 VwifiIndicateAssociationResult(_Inout_ PVWIFI_ADAPTER Adapter,
@@ -137,8 +113,7 @@ VwifiIndicateAssociationResult(_Inout_ PVWIFI_ADAPTER Adapter,
                                _In_reads_bytes_(Result->ie_len) const UCHAR *Ies)
 {
     PVWIFI_CONNECT_TASK task = Adapter->ConnectTask;
-    NDIS_STATUS_INDICATION ind = { 0 };
-    PVOID tlv = NULL;
+        PVOID tlv = NULL;
     ULONG tlvLen = 0;
 
     if (VwifiTlvGenerateAssociationResult(Adapter->WdiPeerVersion,
@@ -148,18 +123,11 @@ VwifiIndicateAssociationResult(_Inout_ PVWIFI_ADAPTER Adapter,
         return;
     }
 
-    ind.Header.Type      = NDIS_OBJECT_TYPE_STATUS_INDICATION;
-    ind.Header.Revision  = NDIS_STATUS_INDICATION_REVISION_1;
-    ind.Header.Size      = NDIS_SIZEOF_STATUS_INDICATION_REVISION_1;
-    ind.SourceHandle     = Adapter->MiniportAdapterHandle;
-    ind.PortNumber       = (NDIS_PORT_NUMBER)task->PortId;
-    ind.StatusCode       = NDIS_STATUS_WDI_INDICATION_ASSOCIATION_RESULT;
-    ind.StatusBuffer     = tlv;
-    ind.StatusBufferSize = tlvLen;
-
     VWIFI_INFO("indicating ASSOCIATION_RESULT status=%u aid=%u ies=%u",
                Result->status_code, Result->aid, Result->ie_len);
-    NdisMIndicateStatusEx(Adapter->MiniportAdapterHandle, &ind);
+    VwifiSendWdiIndication(Adapter, task->PortId,
+                           NDIS_STATUS_WDI_INDICATION_ASSOCIATION_RESULT,
+                           WDI_TRANSACTION_ID_UNSOLICIT, tlv, tlvLen);
     VwifiTlvFreeGenerated(tlv);
 }
 
@@ -168,8 +136,7 @@ VwifiIndicateConnectComplete(_Inout_ PVWIFI_ADAPTER Adapter,
                              _In_ NDIS_STATUS Status)
 {
     PVWIFI_CONNECT_TASK task = Adapter->ConnectTask;
-    NDIS_STATUS_INDICATION ind = { 0 };
-    PVOID tlv = NULL;
+        PVOID tlv = NULL;
     ULONG tlvLen = 0;
 
     if (VwifiTlvGenerateConnectComplete(Adapter->WdiPeerVersion,
@@ -181,17 +148,10 @@ VwifiIndicateConnectComplete(_Inout_ PVWIFI_ADAPTER Adapter,
         return;
     }
 
-    ind.Header.Type      = NDIS_OBJECT_TYPE_STATUS_INDICATION;
-    ind.Header.Revision  = NDIS_STATUS_INDICATION_REVISION_1;
-    ind.Header.Size      = NDIS_SIZEOF_STATUS_INDICATION_REVISION_1;
-    ind.SourceHandle     = Adapter->MiniportAdapterHandle;
-    ind.PortNumber       = (NDIS_PORT_NUMBER)task->PortId;
-    ind.StatusCode       = NDIS_STATUS_WDI_INDICATION_CONNECT_COMPLETE;
-    ind.StatusBuffer     = tlv;
-    ind.StatusBufferSize = tlvLen;
-
     VWIFI_INFO("indicating CONNECT_COMPLETE (0x%x)", Status);
-    NdisMIndicateStatusEx(Adapter->MiniportAdapterHandle, &ind);
+    VwifiSendWdiIndication(Adapter, task->PortId,
+                           NDIS_STATUS_WDI_INDICATION_CONNECT_COMPLETE,
+                           task->TransactionId, tlv, tlvLen);
     VwifiTlvFreeGenerated(tlv);
 
     task->Active = FALSE;
@@ -201,8 +161,7 @@ static VOID
 VwifiIndicateDisassociation(_Inout_ PVWIFI_ADAPTER Adapter, _In_ USHORT Reason)
 {
     PVWIFI_CONNECT_TASK task = Adapter->ConnectTask;
-    NDIS_STATUS_INDICATION ind = { 0 };
-    PVOID tlv = NULL;
+        PVOID tlv = NULL;
     ULONG tlvLen = 0;
 
     if (VwifiTlvGenerateDisassociation(Adapter->WdiPeerVersion,
@@ -213,18 +172,11 @@ VwifiIndicateDisassociation(_Inout_ PVWIFI_ADAPTER Adapter, _In_ USHORT Reason)
         return;
     }
 
-    ind.Header.Type      = NDIS_OBJECT_TYPE_STATUS_INDICATION;
-    ind.Header.Revision  = NDIS_STATUS_INDICATION_REVISION_1;
-    ind.Header.Size      = NDIS_SIZEOF_STATUS_INDICATION_REVISION_1;
-    ind.SourceHandle     = Adapter->MiniportAdapterHandle;
-    ind.PortNumber       = task ? (NDIS_PORT_NUMBER)task->PortId
-                                : NDIS_DEFAULT_PORT_NUMBER;
-    ind.StatusCode       = NDIS_STATUS_WDI_INDICATION_DISASSOCIATION;
-    ind.StatusBuffer     = tlv;
-    ind.StatusBufferSize = tlvLen;
-
     VWIFI_INFO("indicating DISASSOCIATION reason=%u", Reason);
-    NdisMIndicateStatusEx(Adapter->MiniportAdapterHandle, &ind);
+    VwifiSendWdiIndication(Adapter,
+                           task ? task->PortId : NDIS_DEFAULT_PORT_NUMBER,
+                           NDIS_STATUS_WDI_INDICATION_DISASSOCIATION,
+                           WDI_TRANSACTION_ID_UNSOLICIT, tlv, tlvLen);
     VwifiTlvFreeGenerated(tlv);
 }
 
@@ -354,6 +306,7 @@ VwifiHandleTaskConnect(_Inout_ PVWIFI_ADAPTER Adapter,
     task->Active     = TRUE;
     task->Associated = FALSE;
     task->PortId     = Req->PortNumber;
+    task->TransactionId = VwifiGetWdiTransactionId(Req);
 
     /* Stash the target so the indications can report it. */
     RtlCopyMemory(task->TargetBssid, creq->bssid, 6);
@@ -361,7 +314,6 @@ VwifiHandleTaskConnect(_Inout_ PVWIFI_ADAPTER Adapter,
     RtlCopyMemory(task->TargetSsid, creq->ssid, sizeof(task->TargetSsid));
 
     /* Indicate the attempt is starting before we kick the device. */
-    VwifiIndicateAssociationStart(Adapter);
 
     status = VwifiCtrlSendSync(Adapter, VWIFI_OP_CONNECT,
                               creq, reqLen, NULL, &outLen);

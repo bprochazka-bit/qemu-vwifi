@@ -153,6 +153,15 @@ typedef struct _VWIFI_ADAPTER
     NDIS_HANDLE         DriverContext;
     PDEVICE_OBJECT      PhysicalDeviceObject;
 
+    /* Completion routines the OS handed us in NDIS_WDI_INIT_PARAMETERS.
+     * OpenAdapter and CloseAdapter are asynchronous in WDI: the handler
+     * returns NDIS_STATUS_PENDING (or SUCCESS) and the operation is only
+     * finished when we call the matching complete routine. Dropping
+     * these on the floor wedges the WLAN component at start-up with no
+     * error anywhere. */
+    NDIS_WDI_OPEN_ADAPTER_COMPLETE_HANDLER  OpenAdapterCompleteHandler;
+    NDIS_WDI_CLOSE_ADAPTER_COMPLETE_HANDLER CloseAdapterCompleteHandler;
+
     /* The WDI version the running OS gave us at init. Threaded into
      * every TLV_CONTEXT so the parser/generator emits and consumes a
      * byte stream matching this peer. This is the mechanism that lets
@@ -253,25 +262,49 @@ VwifiWrite32(_In_ PVWIFI_ADAPTER Adapter, _In_ ULONG Offset, _In_ ULONG Value)
  * Function prototypes
  * ============================================================ */
 
-/* driver.c */
+/* driver.c
+ *
+ * MINIPORT_UNLOAD is the function type; MINIPORT_DRIVER_UNLOAD is the
+ * *pointer* typedef that NDIS_MINIPORT_DRIVER_CHARACTERISTICS holds.
+ * Using the pointer here declares a data variable, which then collides
+ * with the definition in driver.c. Same trap for every NDIS role type. */
 DRIVER_INITIALIZE DriverEntry;
-MINIPORT_DRIVER_UNLOAD VwifiDriverUnload;
+MINIPORT_UNLOAD VwifiDriverUnload;
 MINIPORT_OID_REQUEST VwifiOidRequest;
 
-/* wdi_ops.c — WDI handler table */
-MINIPORT_WDI_ALLOCATE_ADAPTER    VwifiWdiAllocateAdapter;
-MINIPORT_WDI_FREE_ADAPTER        VwifiWdiFreeAdapter;
-MINIPORT_WDI_OPEN_ADAPTER        VwifiWdiOpenAdapter;
-MINIPORT_WDI_CLOSE_ADAPTER       VwifiWdiCloseAdapter;
-MINIPORT_WDI_START_OPERATION     VwifiWdiStartOperation;
-MINIPORT_WDI_STOP_OPERATION      VwifiWdiStopOperation;
-MINIPORT_WDI_POST_PAUSE          VwifiWdiPostPause;
-MINIPORT_WDI_POST_RESTART        VwifiWdiPostRestart;
-MINIPORT_WDI_HANG_DIAGNOSE       VwifiWdiHangDiagnose;
-MINIPORT_WDI_TAL_TXRX_INITIALIZE VwifiWdiTalTxRxInitialize;
-MINIPORT_WDI_TAL_TXRX_DEINITIALIZE VwifiWdiTalTxRxDeinitialize;
-MINIPORT_WDI_IDLE_NOTIFICATION   VwifiWdiLeIdleNotification;
-MINIPORT_WDI_CANCEL_IDLE_NOTIFICATION VwifiWdiLeCancelIdleNotification;
+/* Adapter lifetime. In the WDI model these are driven by the WDI
+ * control-path handlers below, not by MiniportInitializeEx: the WLAN
+ * component owns MiniportInitializeEx and calls AllocateAdapter in its
+ * place, handing us the registration attributes to fill in. */
+NDIS_STATUS VwifiAdapterCreate(
+    _In_ NDIS_HANDLE NdisMiniportHandle,
+    _In_ PNDIS_MINIPORT_INIT_PARAMETERS InitParameters,
+    _Inout_ PNDIS_MINIPORT_ADAPTER_REGISTRATION_ATTRIBUTES RegistrationAttributes);
+VOID VwifiAdapterDestroy(_In_ NDIS_HANDLE MiniportAdapterContext);
+
+/* wdi_ops.c — WDI handler table.
+ *
+ * Note the role-type names: the handler for StartOperationHandler is
+ * MINIPORT_WDI_START_ADAPTER_OPERATION, not MINIPORT_WDI_START_OPERATION
+ * (that name exists only with a _HANDLER suffix, as the pointer). Four
+ * others follow the same "_ADAPTER_" pattern. */
+MINIPORT_WDI_ALLOCATE_ADAPTER          VwifiWdiAllocateAdapter;
+MINIPORT_WDI_FREE_ADAPTER              VwifiWdiFreeAdapter;
+MINIPORT_WDI_OPEN_ADAPTER              VwifiWdiOpenAdapter;
+MINIPORT_WDI_CLOSE_ADAPTER             VwifiWdiCloseAdapter;
+MINIPORT_WDI_START_ADAPTER_OPERATION   VwifiWdiStartOperation;
+MINIPORT_WDI_STOP_ADAPTER_OPERATION    VwifiWdiStopOperation;
+MINIPORT_WDI_POST_ADAPTER_PAUSE        VwifiWdiPostPause;
+MINIPORT_WDI_POST_ADAPTER_RESTART      VwifiWdiPostRestart;
+MINIPORT_WDI_ADAPTER_HANG_DIAGNOSE     VwifiWdiHangDiagnose;
+MINIPORT_WDI_TAL_TXRX_INITIALIZE       VwifiWdiTalTxRxInitialize;
+MINIPORT_WDI_TAL_TXRX_DEINITIALIZE     VwifiWdiTalTxRxDeinitialize;
+MINIPORT_WDI_IDLE_NOTIFICATION         VwifiWdiLeIdleNotification;
+MINIPORT_WDI_CANCEL_IDLE_NOTIFICATION  VwifiWdiLeCancelIdleNotification;
+
+/* Set from NDIS_WDI_INIT_PARAMETERS.WdiVersion in AllocateAdapter,
+ * which runs before there is an adapter context to store it in. */
+extern ULONG g_WdiPeerVersion;
 
 /* hardware.c */
 NDIS_STATUS VwifiHwInitialize(_Inout_ PVWIFI_ADAPTER Adapter,
@@ -317,16 +350,19 @@ NDIS_STATUS VwifiSetOpMode(_Inout_ PVWIFI_ADAPTER Adapter, ULONG Mode);
 NDIS_STATUS VwifiSetChannel(_Inout_ PVWIFI_ADAPTER Adapter, USHORT FreqMhz);
 NDIS_STATUS VwifiSetRawFilter(_Inout_ PVWIFI_ADAPTER Adapter, ULONG Mask);
 
-/* wdi_ops.c — peer WDI version captured during AllocateAdapter. */
-ULONG VwifiGetAllocatedWdiVersion(VOID);
-
 /* wdi_common.c — shared WDI plumbing. */
 NDIS_STATUS VwifiGetTlvPayload(_In_ PNDIS_OID_REQUEST Req,
                                _Outptr_ PVOID *TlvBuffer,
                                _Out_ PULONG TlvLength);
+UINT32      VwifiGetWdiTransactionId(_In_ PNDIS_OID_REQUEST Req);
+/* TransactionId must echo the originating OID request's transaction id
+ * for a task-completion indication; WDI_TRANSACTION_ID_UNSOLICIT is the
+ * right value for an unsolicited event. The OS matches completions by
+ * this field, so a wrong one looks like a task that never finished. */
 VOID        VwifiSendWdiIndication(_Inout_ PVWIFI_ADAPTER Adapter,
                                    _In_ ULONG PortId,
                                    _In_ NDIS_STATUS StatusCode,
+                                   _In_ UINT32 TransactionId,
                                    _In_reads_bytes_opt_(TlvLength) PVOID TlvBuffer,
                                    _In_ ULONG TlvLength);
 ULONG       VwifiRssiToLinkQuality(_In_ CHAR Rssi);

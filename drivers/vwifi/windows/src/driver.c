@@ -7,8 +7,14 @@
  * Driver. Per the WDI IHV driver interfaces doc, most NDIS miniport
  * handlers are optional for WDI because the Microsoft WLAN component
  * provides them; only OidRequestHandler and DriverUnload are required.
- * We additionally hook MiniportInitializeEx/HaltEx for PCI resource
- * setup, since those aren't provided by the WLAN component.
+ *
+ * MiniportInitializeEx/HaltEx are among the ones the WLAN component
+ * provides. Adapter creation happens in MiniportWdiAllocateAdapter
+ * instead — see its signature in dot11wdi.h, which takes the NDIS
+ * miniport handle, the PnP init parameters and the registration
+ * attributes to fill in. Those are exactly MiniportInitializeEx's
+ * inputs, because AllocateAdapter is what the component calls from
+ * inside its own MiniportInitializeEx.
  */
 
 #include "vwifi_drv.h"
@@ -20,8 +26,6 @@ static NDIS_HANDLE g_DriverHandle = NULL;
  * NDIS miniport handlers required beyond what WLAN component provides
  * ==================================================================== */
 
-MINIPORT_INITIALIZE VwifiMiniportInitializeEx;
-MINIPORT_HALT       VwifiMiniportHaltEx;
 MINIPORT_PAUSE      VwifiMiniportPause;
 MINIPORT_RESTART    VwifiMiniportRestart;
 MINIPORT_RETURN_NET_BUFFER_LISTS VwifiMiniportReturnNetBufferLists;
@@ -33,49 +37,49 @@ MINIPORT_DEVICE_PNP_EVENT_NOTIFY VwifiMiniportDevicePnPEventNotify;
 MINIPORT_SHUTDOWN   VwifiMiniportShutdownEx;
 
 /* ====================================================================
- * MiniportInitializeEx
+ * VwifiAdapterCreate — the WDI model's MiniportInitializeEx
  *
- * Called by NDIS after PnP has claimed the PCI device. Here we:
+ * Called from MiniportWdiAllocateAdapter after PnP has claimed the
+ * PCI device. Here we:
  *   1. Allocate the adapter context
  *   2. Parse assigned PCI resources
  *   3. Map BAR0 (MMIO) into kernel VA
  *   4. Allocate and program the four rings
  *   5. Connect the interrupt
  *   6. Issue GET_CAPS to discover the device's default MAC & features
- *   7. Register our registration & general attributes with NDIS
+ *   7. Fill in the caller's registration attributes
+ *
+ * Step 7 is a fill-in, not a call: WDI hands us the attributes block
+ * to populate, where a plain NDIS miniport would call
+ * NdisMSetMiniportAttributes itself.
  * ==================================================================== */
 
-static NDIS_STATUS
-VwifiSetRegistrationAttributes(_Inout_ PVWIFI_ADAPTER Adapter)
+static VOID
+VwifiFillRegistrationAttributes(
+    _In_ PVWIFI_ADAPTER Adapter,
+    _Inout_ PNDIS_MINIPORT_ADAPTER_REGISTRATION_ATTRIBUTES Reg)
 {
-    NDIS_MINIPORT_ADAPTER_REGISTRATION_ATTRIBUTES reg = { 0 };
-    reg.Header.Type = NDIS_OBJECT_TYPE_MINIPORT_ADAPTER_REGISTRATION_ATTRIBUTES;
-    reg.Header.Revision = NDIS_MINIPORT_ADAPTER_REGISTRATION_ATTRIBUTES_REVISION_2;
-    reg.Header.Size = NDIS_SIZEOF_MINIPORT_ADAPTER_REGISTRATION_ATTRIBUTES_REVISION_2;
-    reg.MiniportAdapterContext = (NDIS_HANDLE)Adapter;
-    reg.AttributeFlags = NDIS_MINIPORT_ATTRIBUTES_BUS_MASTER |
-                         NDIS_MINIPORT_ATTRIBUTES_HARDWARE_DEVICE;
-    reg.CheckForHangTimeInSeconds = 4;
-    reg.InterfaceType = NdisInterfacePci;
-
-    return NdisMSetMiniportAttributes(
-        Adapter->MiniportAdapterHandle,
-        (PNDIS_MINIPORT_ADAPTER_ATTRIBUTES)&reg);
+    Reg->Header.Type = NDIS_OBJECT_TYPE_MINIPORT_ADAPTER_REGISTRATION_ATTRIBUTES;
+    Reg->Header.Revision = NDIS_MINIPORT_ADAPTER_REGISTRATION_ATTRIBUTES_REVISION_2;
+    Reg->Header.Size = NDIS_SIZEOF_MINIPORT_ADAPTER_REGISTRATION_ATTRIBUTES_REVISION_2;
+    Reg->MiniportAdapterContext = (NDIS_HANDLE)Adapter;
+    Reg->AttributeFlags = NDIS_MINIPORT_ATTRIBUTES_BUS_MASTER |
+                          NDIS_MINIPORT_ATTRIBUTES_HARDWARE_DEVICE;
+    Reg->CheckForHangTimeInSeconds = 4;
+    Reg->InterfaceType = NdisInterfacePci;
 }
 
 _Use_decl_annotations_
 NDIS_STATUS
-VwifiMiniportInitializeEx(
+VwifiAdapterCreate(
     NDIS_HANDLE MiniportAdapterHandle,
-    NDIS_HANDLE MiniportDriverContext,
-    PNDIS_MINIPORT_INIT_PARAMETERS MiniportInitParameters)
+    PNDIS_MINIPORT_INIT_PARAMETERS MiniportInitParameters,
+    PNDIS_MINIPORT_ADAPTER_REGISTRATION_ATTRIBUTES RegistrationAttributes)
 {
     PVWIFI_ADAPTER adapter;
     NDIS_STATUS status;
 
-    UNREFERENCED_PARAMETER(MiniportDriverContext);
-
-    VWIFI_INFO("MiniportInitializeEx entry");
+    VWIFI_INFO("VwifiAdapterCreate entry");
 
     adapter = NdisAllocateMemoryWithTagPriority(
         MiniportAdapterHandle, sizeof(*adapter),
@@ -88,23 +92,15 @@ VwifiMiniportInitializeEx(
     InitializeListHead(&adapter->PendingReqList);
     KeInitializeSpinLock(&adapter->PendingReqLock);
 
-    /* Inherit the WDI version the OS reported to AllocateAdapter, which
-     * ran just before us. Every TLV_CONTEXT carries this. Getting it
-     * wrong means the parser returns NDIS_STATUS_UNSUPPORTED_REVISION
+    /* Pick up the WDI version the OS reported in AllocateAdapter, which
+     * ran immediately before us. Every TLV_CONTEXT carries this. Getting
+     * it wrong means the parser returns NDIS_STATUS_UNSUPPORTED_REVISION
      * (PeerVersion below WDI_VERSION_MIN_SUPPORTED) or, worse, silently
      * mis-encodes. */
-    adapter->WdiPeerVersion = VwifiGetAllocatedWdiVersion();
-    VWIFI_INFO("adapter peer WDI version = 0x%08x", adapter->WdiPeerVersion);
-
-    /* Pick up the WDI version the OS reported in AllocateAdapter.
-     * Every TLV_CONTEXT we build uses this. */
     adapter->WdiPeerVersion = g_WdiPeerVersion;
     VWIFI_INFO("adapter WDI peer version 0x%08x", adapter->WdiPeerVersion);
 
-    status = VwifiSetRegistrationAttributes(adapter);
-    if (status != NDIS_STATUS_SUCCESS) {
-        goto fail;
-    }
+    VwifiFillRegistrationAttributes(adapter, RegistrationAttributes);
 
     status = VwifiHwInitialize(adapter, MiniportInitParameters);
     if (status != NDIS_STATUS_SUCCESS) {
@@ -123,18 +119,20 @@ fail:
 }
 
 /* ====================================================================
- * MiniportHaltEx
+ * VwifiAdapterDestroy — the WDI model's MiniportHaltEx, called from
+ * MiniportWdiFreeAdapter.
  * ==================================================================== */
 _Use_decl_annotations_
 VOID
-VwifiMiniportHaltEx(
-    NDIS_HANDLE MiniportAdapterContext,
-    NDIS_HALT_ACTION HaltAction)
+VwifiAdapterDestroy(NDIS_HANDLE MiniportAdapterContext)
 {
     PVWIFI_ADAPTER adapter = (PVWIFI_ADAPTER)MiniportAdapterContext;
-    UNREFERENCED_PARAMETER(HaltAction);
 
-    VWIFI_INFO("MiniportHaltEx");
+    if (adapter == NULL) {
+        return;
+    }
+
+    VWIFI_INFO("VwifiAdapterDestroy");
     VwifiHwShutdown(adapter);
     NdisFreeMemoryWithTagPriority(adapter->MiniportAdapterHandle, adapter,
                                   VWIFI_POOL_TAG);
@@ -353,7 +351,9 @@ VwifiDriverUnload(PDRIVER_OBJECT DriverObject)
     UNREFERENCED_PARAMETER(DriverObject);
     VWIFI_INFO("DriverUnload");
     if (g_DriverHandle) {
-        NdisMDeregisterMiniportDriver(g_DriverHandle);
+        /* Registered with NdisMRegisterWdiMiniportDriver, so it must be
+         * torn down with the WDI counterpart, not the plain one. */
+        NdisMDeregisterWdiMiniportDriver(g_DriverHandle);
         g_DriverHandle = NULL;
     }
 }
@@ -384,8 +384,8 @@ DriverEntry(
     m.MinorNdisVersion    = VWIFI_NDIS_MINOR_VERSION;
     m.MajorDriverVersion  = 1;
     m.MinorDriverVersion  = 0;
-    m.InitializeHandlerEx          = VwifiMiniportInitializeEx;
-    m.HaltHandlerEx                = VwifiMiniportHaltEx;
+    /* No InitializeHandlerEx/HaltEx: the WLAN component supplies those
+     * and routes them to our AllocateAdapter/FreeAdapter handlers. */
     m.PauseHandler                 = VwifiMiniportPause;
     m.RestartHandler               = VwifiMiniportRestart;
     m.OidRequestHandler            = VwifiOidRequest;
@@ -402,7 +402,7 @@ DriverEntry(
      * miniport must register. Data-path handlers come separately
      * later (in OpenAdapter or via TalTxRxInitialize). */
     w.Header.Type     = NDIS_OBJECT_TYPE_MINIPORT_WDI_CHARACTERISTICS;
-    w.Header.Revision = NDIS_MINIPORT_WDI_CHARACTERISTICS_REVISION_1;
+    w.Header.Revision = NDIS_MINIPORT_DRIVER_WDI_CHARACTERISTICS_REVISION_1;
     w.Header.Size     = NDIS_SIZEOF_MINIPORT_WDI_CHARACTERISTICS_REVISION_1;
     w.WdiVersion      = WDI_VERSION_LATEST;
     w.AllocateAdapterHandler         = VwifiWdiAllocateAdapter;

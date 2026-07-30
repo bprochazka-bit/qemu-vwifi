@@ -103,14 +103,6 @@ NDIS_STATUS VwifiTlvParseConnectRequest(
     _In_ ULONG ReqCap,
     _Out_ PULONG ReqLen);
 
-NDIS_STATUS VwifiTlvGenerateAssociationStart(
-    _In_ ULONG PeerVersion,
-    _In_reads_bytes_(6) const UCHAR *Bssid,
-    _In_reads_bytes_(SsidLen) const UCHAR *Ssid,
-    _In_ ULONG SsidLen,
-    _Outptr_result_bytebuffer_(*BufferLen) VOID **Buffer,
-    _Out_ PULONG BufferLen);
-
 NDIS_STATUS VwifiTlvGenerateAssociationResult(
     _In_ ULONG PeerVersion,
     _In_ const struct vwifi_assoc_result *Result,
@@ -186,6 +178,21 @@ NDIS_STATUS VwifiTlvGenerateAdapterCapabilities(
  * ============================================================ */
 
 VOID VwifiTlvFreeGenerated(_In_opt_ VOID *Buffer);
+
+/* ============================================================
+ * Operation mode
+ * ============================================================ */
+
+/* Parse an OID_WDI_TASK_CHANGE_OPERATION_MODE M1 and hand back the
+ * device-side mode (VWIFI_MODE_*), not a WDI enum. Two different
+ * WDI_OPERATION_MODE enumerations exist — dot11wdi.h's and the TLV
+ * library's — and only the latter carries NETWORK_MONITOR, so the
+ * mapping belongs on the C++ side where that one is in scope. */
+NDIS_STATUS VwifiTlvParseOperationMode(
+    _In_ ULONG PeerVersion,
+    _In_reads_bytes_(BufferLen) const VOID *Buffer,
+    _In_ ULONG BufferLen,
+    _Out_ PULONG DeviceMode);
 
 #ifdef __cplusplus
 }

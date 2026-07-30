@@ -383,34 +383,11 @@ VwifiTlvParseConnectRequest(
     return NDIS_STATUS_SUCCESS;
 }
 
-extern "C"
-NDIS_STATUS
-VwifiTlvGenerateAssociationStart(
-    ULONG PeerVersion,
-    const UCHAR *Bssid,
-    const UCHAR *Ssid,
-    ULONG SsidLen,
-    VOID **Buffer,
-    PULONG BufferLen)
-{
-    TLV_CONTEXT ctx = MakeCtx(PeerVersion);
-    WDI_INDICATION_ASSOCIATION_START_PARAMETERS params = {};
-    PVOID pOut = nullptr;
-    ULONG outLen = 0;
-
-    RtlCopyMemory(&params.BSSID, Bssid, 6);       /* [MEMBER?] */
-    if (SsidLen > 32) SsidLen = 32;
-    params.SSID.SSIDLength = SsidLen;             /* [MEMBER?] */
-    RtlCopyMemory(params.SSID.SSID, Ssid, SsidLen);
-
-    NDIS_STATUS st = GenerateWdiIndicationAssociationStart(
-        &params, kHeaderReserve, &ctx, &outLen, &pOut);
-    if (st != NDIS_STATUS_SUCCESS) return st;
-
-    *Buffer    = pOut;
-    *BufferLen = outLen;
-    return NDIS_STATUS_SUCCESS;
-}
+/* No VwifiTlvGenerateAssociationStart: dot11wdi.h has no
+ * ASSOCIATION_START message id and no matching NDIS_STATUS, so there is
+ * nothing to indicate it as. wditypes.hpp's
+ * WDI_INDICATION_ASSOCIATION_START_PARAMETERS is a container carried
+ * inside the association result, not a standalone message. */
 
 extern "C"
 NDIS_STATUS
@@ -638,6 +615,55 @@ VwifiTlvGenerateAdapterCapabilities(
 
     *Buffer    = pOut;
     *BufferLen = outLen;
+    return NDIS_STATUS_SUCCESS;
+}
+
+/* ============================================================
+ * Operation mode
+ *
+ * Translation happens here rather than in oids.c on purpose. There are
+ * two distinct WDI_OPERATION_MODE enumerations: dot11wdi.h's, which the
+ * plain-C files see and which lists only STA and the P2P roles, and the
+ * TLV library's in wditypes.hpp, which is what actually travels in
+ * WDI_TLV_OPERATION_MODE and does include NETWORK_MONITOR. Returning a
+ * device-side enum \(VWIFI_MODE_*\) keeps the ambiguity on this side of
+ * the plain-C boundary, which is what this shim is for.
+ * ============================================================ */
+
+extern "C"
+NDIS_STATUS
+VwifiTlvParseOperationMode(
+    ULONG PeerVersion,
+    const VOID *Buffer,
+    ULONG BufferLen,
+    PULONG DeviceMode)
+{
+    TLV_CONTEXT ctx = MakeCtx(PeerVersion);
+    WDI_TASK_CHANGE_OPERATION_MODE_PARAMETERS parsed = {};
+    NDIS_STATUS st;
+    ULONG mode;
+
+    *DeviceMode = VWIFI_MODE_IDLE;
+
+    /* [VERIFY] entry-point and member names, against TlvGeneratorParser.hpp.
+     * The scan path's ParseWdiTaskScan / CleanupParsedWdiTaskScan pair is
+     * the naming precedent these follow. */
+    st = ParseWdiTaskChangeOperationMode(BufferLen, const_cast<VOID *>(Buffer),
+                                         &ctx, &parsed);
+    if (st != NDIS_STATUS_SUCCESS) {
+        return st;
+    }
+
+    mode = parsed.OperationMode.OperationMode;   /* [MEMBER?] */
+    CleanupParsedWdiTaskChangeOperationMode(&parsed);
+
+    if (mode & WDI_OPERATION_MODE_NETWORK_MONITOR) {
+        *DeviceMode = VWIFI_MODE_MONITOR;
+    } else if (mode & WDI_OPERATION_MODE_STA) {
+        *DeviceMode = VWIFI_MODE_STA;
+    } else {
+        return NDIS_STATUS_NOT_SUPPORTED;
+    }
     return NDIS_STATUS_SUCCESS;
 }
 

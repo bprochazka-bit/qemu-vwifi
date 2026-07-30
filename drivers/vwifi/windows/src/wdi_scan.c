@@ -40,6 +40,7 @@ typedef struct _VWIFI_SCAN_TASK
 {
     BOOLEAN   Active;
     ULONG     PortId;
+    UINT32    TransactionId;   /* echoed by SCAN_COMPLETE */
     ULONG     PendingCount;
 
     /* BSS entries awaiting indication. We stage the device's own
@@ -101,8 +102,11 @@ VwifiIndicateBssEntryList(_Inout_ PVWIFI_ADAPTER Adapter)
         goto done;
     }
 
+    /* BSS_ENTRY_LIST is an event, not the scan task's completion, so it
+     * carries the unsolicited transaction id even mid-scan. */
     VwifiSendWdiIndication(Adapter, task->PortId,
                            NDIS_STATUS_WDI_INDICATION_BSS_ENTRY_LIST,
+                           WDI_TRANSACTION_ID_UNSOLICIT,
                            generated, generatedLen);
 
     VWIFI_INFO("indicated BSS_ENTRY_LIST: %u entries, %u bytes",
@@ -137,6 +141,7 @@ VwifiIndicateScanComplete(_Inout_ PVWIFI_ADAPTER Adapter, _In_ NDIS_STATUS Statu
             == NDIS_STATUS_SUCCESS) {
         VwifiSendWdiIndication(Adapter, task->PortId,
                                NDIS_STATUS_WDI_INDICATION_SCAN_COMPLETE,
+                               task->TransactionId,
                                generated, generatedLen);
         VwifiTlvFreeGenerated(generated);
     }
@@ -300,6 +305,7 @@ VwifiHandleTaskScan(_Inout_ PVWIFI_ADAPTER Adapter,
 
     task->Active               = TRUE;
     task->PortId               = Req->PortNumber;
+    task->TransactionId        = VwifiGetWdiTransactionId(Req);
     task->PendingCount         = 0;
     task->LastIndicationTimeMs = VwifiGetTickCountMs();
     task->StartedTimeMs        = task->LastIndicationTimeMs;

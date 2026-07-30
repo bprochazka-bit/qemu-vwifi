@@ -125,6 +125,53 @@ Warnings are not errors here (`TreatWarningAsError` is off), but read
 `build-Debug.wrn` anyway — on a first kernel build `/W4` warnings about
 truncation, uninitialised locals and signedness are usually real.
 
+### What the first real build turned up
+
+The driver was written against Microsoft's WDI documentation rather
+than against `dot11wdi.h`. The first compile found where the two differ.
+Recorded here because each one is a trap the next WDI driver hits too:
+
+- **Role types are not the names in the characteristics struct.** The
+  field is `StartOperationHandler` of type
+  `MINIPORT_WDI_START_OPERATION_HANDLER`, but the *function* type to
+  declare against is `MINIPORT_WDI_START_ADAPTER_OPERATION`. Same for
+  stop, post-pause, post-restart and hang-diagnose. Declaring against
+  the `_HANDLER` name silently declares a data variable, and the error
+  surfaces later as "redefinition; previous definition was 'data
+  variable'" at the function body — nowhere near the real mistake.
+  `MINIPORT_DRIVER_UNLOAD` vs `MINIPORT_UNLOAD` in `ndis.h` is the same
+  trap.
+- **AllocateAdapter is the WDI model's `MiniportInitializeEx`.** Its
+  real signature takes the NDIS miniport handle, the PnP init
+  parameters and an `_Inout_` registration attributes block to fill in
+  — not the "adapter attributes" pointer the docs imply. Adapter
+  creation therefore lives in `wdi_ops.c`, and `driver.c` no longer
+  registers `InitializeHandlerEx`/`HaltEx` at all.
+- **OpenAdapter and CloseAdapter are asynchronous.** The completion
+  routines arrive in `NDIS_WDI_INIT_PARAMETERS`. Returning success
+  without calling them leaves the WLAN component waiting forever, with
+  nothing logged.
+- **`WDI_MESSAGE_HEADER` has no message id and no length field.** It
+  carries `PortId`, `Status`, `TransactionId`, `IhvSpecificId`; the id
+  and length come from the NDIS status code and buffer size. Task
+  completions must echo the request's `TransactionId` or the OS never
+  matches them to the task.
+- **The TLV generator already reserves the message header.** Every
+  `Generate*` call passes `kHeaderReserve`, so the returned blob starts
+  with that many bytes for the driver to fill in and its length counts
+  them. Prepending another header produces a message with two, the
+  second one all zeroes.
+- **There is no `ASSOCIATION_START` indication.** `dot11wdi.h` has
+  `ASSOCIATION_RESULT` (76) and `CONNECT_COMPLETE` (64); the connect
+  sequence is those two. `WDI_INDICATION_ASSOCIATION_START_PARAMETERS`
+  in `wditypes.hpp` is a container inside the result, not a message.
+- **There are two `WDI_OPERATION_MODE` enums.** `dot11wdi.h`'s lists
+  STA and the P2P roles; the TLV library's in `wditypes.hpp` is what
+  travels in `WDI_TLV_OPERATION_MODE` and includes `NETWORK_MONITOR`.
+  Only the second describes the wire, and it is not visible from a C
+  file — which is why `VwifiTlvParseOperationMode` returns a
+  `VWIFI_MODE_*` value instead of leaking either enum across the shim.
+
 ## Test-signing and installation
 
 Copy the signed package (`vwifi.sys`, `vwifi.inf`, `vwifi.cat`,
