@@ -21,6 +21,7 @@ vwifi.sln           solution — one project, Debug|x64 and Release|x64
 vwifi.vcxproj       MSBuild driver project (EWDK or VS 2022 + WDK)
 build.cmd           debug build wrapper; writes build-Debug.{log,err,wrn}
 sign.cmd            creates a test cert if needed, catalogs, signs
+install.cmd         run in the guest: replaces any installed vwifi package
 guest-debug-setup.ps1  run in the guest: test-signing, cert, print filter
 src/
   vwifi_drv.h       driver-private header; adapter context
@@ -195,14 +196,59 @@ Recorded here because each one is a trap the next WDI driver hits too:
 ## Test-signing and installation
 
 Copy the signed package (`vwifi.sys`, `vwifi.inf`, `vwifi.cat`,
-`vwifi.pdb`) and `vwifi-test-cert.cer` into the guest, then, in an
-**elevated PowerShell** there:
+`vwifi.pdb`), `install.cmd` and `vwifi-test-cert.cer` into the guest,
+then, in an **elevated PowerShell** there:
 
 ```powershell
 .\guest-debug-setup.ps1 -CertPath .\vwifi-test-cert.cer -KernelDebug
 # reboot
-pnputil /add-driver vwifi.inf /install
+.\install.cmd
 ```
+
+### Replacing an already-installed build
+
+This is the loop you will run dozens of times, and it has one trap
+worth knowing about.
+
+`pnputil /add-driver vwifi.inf /install` on its own is **not** enough to
+replace a driver. PnP keeps the package already bound to the device
+unless the new one ranks better, and ranking is on `DriverVer`. stampinf
+writes that as `<date>,<version>` — a date, not a timestamp — so two
+builds on the same day with the same version are indistinguishable, the
+old package wins, and you spend an afternoon testing a `.sys` you
+thought you had replaced.
+
+Two things address it:
+
+- `build.cmd` now stamps a version derived from the build time
+  (`1.0.MMdd.HHmm`), so every build strictly supersedes the last.
+- `install.cmd` removes every previously installed vwifi package
+  (`pnputil /delete-driver oemNN.inf /uninstall /force`) before adding
+  the new one, rather than relying on ranking at all.
+
+So the full cycle, after any code change:
+
+```
+build.cmd  &&  sign.cmd          (on the build machine)
+```
+copy `vwifi.sys` / `.inf` / `.cat` / `.pdb` to the guest, then there:
+```
+install.cmd                       (elevated)
+```
+
+`install.cmd` finishes by printing the device's status and problem
+code, so you know immediately whether it started. Nothing needs a
+reboot — only the one-time `guest-debug-setup.ps1` does.
+
+Two things worth keeping straight while iterating:
+
+- **Re-run `sign.cmd` after every build.** `vwifi.cat` hashes
+  `vwifi.sys`; a rebuilt `.sys` with the old catalog is a signature
+  mismatch, which PnP reports as Code 52 rather than anything about
+  staleness.
+- **Copy the `.pdb` too, and keep it beside the `.sys`.** Not needed to
+  install, but WinDbg resolves symbols from it and a stale one is worse
+  than none.
 
 `guest-debug-setup.ps1` enables test-signing, imports the certificate
 into both Root and TrustedPublisher, raises the `IHVNETWORK` debug

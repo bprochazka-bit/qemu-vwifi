@@ -79,6 +79,18 @@ if not defined WdiTlvLib (
     echo   WDI TLV library:        %WdiTlvLib%
 )
 
+rem --- a strictly increasing INF version ------------------------------
+rem  stampinf writes DriverVer as <date>,<version>. Two builds on the
+rem  same day with the same version are indistinguishable to Windows,
+rem  which then keeps running the driver already installed. Derive the
+rem  version from the build time so every build supersedes the last.
+if not defined VwifiInfVersion (
+    for /f "usebackq delims=" %%V in (`powershell -NoProfile -Command ^
+        "$n = Get-Date; '1.0.{0}.{1}' -f ($n.ToString('MMdd')), ($n.ToString('HHmm'))"`) ^
+        do set "VwifiInfVersion=%%V"
+)
+echo   INF DriverVer version:  %VwifiInfVersion%
+
 echo Building vwifi %CFG%^|x64 ...
 msbuild "%~dp0vwifi.sln" ^
     /t:Build ^
@@ -86,6 +98,7 @@ msbuild "%~dp0vwifi.sln" ^
     /p:Platform=x64 ^
     /p:WdiTlvIncludeDir="%WdiTlvIncludeDir%" ^
     /p:WdiTlvLib="%WdiTlvLib%" ^
+    /p:VwifiInfVersion="%VwifiInfVersion%" ^
     /m ^
     /v:minimal ^
     /nologo ^

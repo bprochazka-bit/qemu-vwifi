@@ -97,7 +97,14 @@
       <AdditionalDependencies>$(DDK_LIB_PATH)ndis.lib;$(WdiTlvLib);%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <Inf>
-      <TimeStamp>1.0.0.0</TimeStamp>
+      <!-- stampinf writes DriverVer as <date>,<TimeStamp>, and the date
+           is only a date. A fixed version therefore produces an
+           identical DriverVer for every build on the same day, and
+           Windows has no reason to prefer the new package over the
+           installed one — you reinstall and keep testing the old .sys.
+           build.cmd passes a version derived from the build time so
+           each build strictly supersedes the last. -->
+      <TimeStamp>$(VwifiInfVersion)</TimeStamp>
     </Inf>
   </ItemDefinitionGroup>
 
