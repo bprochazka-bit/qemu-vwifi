@@ -1,0 +1,104 @@
+# qemu-vwifi regression harness
+
+`harness.py` is a self-contained Python test runner for the medium hub.
+It spawns `build/vwifi-medium` against temporary sockets and exercises
+everything that can be verified in userspace — no kernel module, no QEMU
+VM, no guest image required.
+
+Point it at a different binary with `VWIFI_MEDIUM=/path/to/vwifi-medium`.
+
+## Run
+
+```
+make                # builds every userspace binary into build/
+make test-medium    # runs python3 medium/tests/harness.py
+```
+
+Exit code is `0` on all-pass, `1` if any test fails, `2` for setup
+errors. Failed tests print the assertion context plus the path to
+the hub's stderr log in the temp directory.
+
+## What's covered (userspace only)
+
+| Test                    | Fix       | What it proves                                            |
+|-------------------------|-----------|-----------------------------------------------------------|
+| socket permissions      | C4        | control 0600, data 0666                                   |
+| LIST_PEERS empty        | -         | hub starts clean                                          |
+| tx_drop column          | L6        | new column rendered                                       |
+| LIST_PEERS MAC field    | C3        | one address per node + nmacs count                        |
+| scan-address churn      | MAC1      | randomized probe MACs collapse to one provisional slot    |
+| full MAC table          | MAC2      | evicts least-recently-seen instead of freezing            |
+| FORGET_MACS             | MAC3      | drops learned addresses, keeps position/SNR               |
+| LOAD_CONFIG recursion   | C2        | self-referential config refused, hub survives             |
+| QUIT in LOAD_CONFIG     | H5        | -1 propagates, post-QUIT lines skipped                    |
+| large LIST_PEERS        | H5-orig   | 120-node dump arrives intact (POLLOUT drain)              |
+| channel mismatch (HT20) | C1        | ch1 sender to ch11 receiver -> dropped                    |
+| channel match (HT20)    | C1        | ch1 -> ch1 delivered                                      |
+| V1 broadcast            | C1        | channel_freq=0 still broadcasts                           |
+| HT40+ vs HT40- same ch  | C1        | both bonded, different bond pair -> dropped               |
+| HT40+ to HT20 deliver   | C1        | one HT40 + one HT20 same primary -> delivered (mixed bw)  |
+| HT40+ match             | C1        | matching primary+bond -> delivered                        |
+| 5-peer fanout           | C1        | sender on ch1 reaches only the ch1 receiver of 4          |
+| VHT80 center mismatch   | C1        | same primary, different center_freq1 -> dropped           |
+| VHT80 center match      | C1        | matching primary+center_freq1 -> delivered                |
+| VHT80 mixed bond match  | A         | VM-style (bond set) + bridge-style (bond=0) -> delivered  |
+| VHT80 mixed bond miss   | A         | mixed bond but different center_freq1 -> still dropped     |
+| HE80 center match       | C1        | matching primary+center_freq1 -> delivered                |
+| HE80 center mismatch    | C1        | same primary, different center_freq1 -> dropped           |
+| HE40 to HE20 deliver    | C1        | HE40+ frame IS delivered to HE20 receiver (mixed bw)      |
+| VHT160 center match     | C1        | matching primary+center_freq1 -> delivered                |
+| VHT160 center mismatch  | C1        | same primary, different center_freq1 -> dropped           |
+| VHT80+80 center2 match  | C1        | matching primary+center1+center2 -> delivered             |
+| VHT80+80 center2 miss   | C1        | matching center1 but different center2 -> dropped         |
+| HE MCS thresholds       | M3        | SNR=20 dB: MCS0 delivers ~all, MCS9/MCS11 drop every frame |
+| bridge trunk no filter  | B         | TCP bridge receives off-channel frames (trunk, not radio) |
+| channel change          | C1        | peer is reachable again after switching channels          |
+| node recycling          | H1+H2/H7  | 100 connect/disconnect cycles leave 0 online              |
+| garbage tolerance       | -         | bad length / truncated frames don't kill hub              |
+
+## What's NOT covered (needs a real kernel + VM)
+
+These three fixes touch the kernel driver or relay's chardev interaction
+and can't be exercised from userspace alone:
+
+**H2 — driver accepts V1 headers.** The hub already emits V2; only an
+older V1 sender (or a forced `VWIFI_VERSION=1` build) triggers
+the original bug. To validate:
+
+```
+sudo insmod vwifi_host.ko
+./vwifi-host-relay /tmp/medium.sock /dev/vwifi
+# Run a V1-emitting peer (or patch the hub to downgrade outgoing
+# headers); confirm dmesg has no "rx: short message" warnings and
+# that the VM still receives frames.
+```
+
+**H3 — driver locking.** Needs the module loaded with
+`CONFIG_PROVE_LOCKING=y` (and ideally `CONFIG_KASAN=y`). Repeatedly
+attach/detach the relay while TX is hot:
+
+```
+for i in $(seq 1 50); do
+  killall vwifi-host-relay
+  ./vwifi-host-relay /tmp/medium.sock &
+  sleep 0.5
+done
+sudo dmesg | grep -iE "BUG|lockdep|kasan"   # should be empty
+```
+
+**H6 — relay buffer sizing for jumbo AMSDU.** Needs the kernel module
+plus a peer that can emit max-size frames (~8 KB). With the previous
+buffer sizing, a max-size frame caused `chrdev_read` to return
+`-EMSGSIZE` and `kfree_skb` it silently. With the fix, the relay
+should forward it and the receiver should see it.
+
+## Extending the harness
+
+Each test is a top-level function `test_*` that takes a `Harness`. To
+add one, append it to the `TESTS` list at the bottom of `harness.py`.
+The harness handles hub lifecycle (start/restart/cleanup), control-
+socket commands (`h.ctl_cmd`), data-socket clients (`h.data_conn`),
+and assertion bookkeeping (`h.expect`).
+
+`make_frame()` builds wire-format V2 frames; the existing channel-
+filter tests are templates for any new data-path assertion.

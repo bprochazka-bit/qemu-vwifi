@@ -1,0 +1,115 @@
+;
+; vwifi.inf — install file for the vwifi-virt WDI miniport.
+;
+; Hardware ID: PCI\VEN_1AF4&DEV_0E00  (must match vwifi_abi.h constants)
+;
+; Targets Windows 10 (WDI) and Windows 11 (WDI still supported in
+; maintenance mode). Requires test-signing enabled during development
+; or an EV-signed + attestation-signed .sys for distribution.
+;
+
+[Version]
+Signature       = "$Windows NT$"
+Class           = Net
+ClassGUID       = {4d36e972-e325-11ce-bfc1-08002be10318}
+Provider        = %ProviderName%
+CatalogFile     = vwifi.cat
+DriverVer       = 04/17/2026,1.0.0.0
+PnpLockDown     = 1
+
+[ControlFlags]
+ExcludeFromSelect = *
+
+[Manufacturer]
+%ProviderName% = Vwifi,NT$ARCH$.10.0...19041
+
+[Vwifi.NT$ARCH$.10.0...19041]
+%Vwifi.DeviceDesc% = Vwifi.ndi, PCI\VEN_1AF4&DEV_0E00
+
+;-----------------------------------------------------------------
+; Driver install section
+;-----------------------------------------------------------------
+
+[Vwifi.ndi.NT]
+Characteristics  = 0x84          ; NCF_PHYSICAL | NCF_HAS_UI
+BusType          = 5             ; PCI
+*IfType          = 71            ; IF_TYPE_IEEE80211
+*MediaType       = 16            ; NdisMediumNative802_11
+*PhysicalMediaType = 9           ; NdisPhysicalMediumNative802_11
+AddReg           = Vwifi.Reg
+CopyFiles        = Vwifi.CopyFiles
+
+[Vwifi.ndi.NT.Services]
+AddService = vwifi, 2, Vwifi.Service, Vwifi.EventLog
+
+;-----------------------------------------------------------------
+; Parameters (registry)
+;-----------------------------------------------------------------
+
+[Vwifi.Reg]
+HKR, Ndi,                  Service,     0, vwifi
+HKR, Ndi\Interfaces,       UpperRange,  0, "ndis5"
+HKR, Ndi\Interfaces,       LowerRange,  0, "wlan"
+
+HKR, ,                     *IfType,                 0x00010001, 71
+HKR, ,                     *MediaType,              0x00010001, 16
+HKR, ,                     *PhysicalMediaType,      0x00010001, 9
+
+; Friendly knobs the user can tweak in Device Manager → Properties → Advanced
+HKR, Ndi\Params\NetworkAddress,       ParamDesc, 0, %NetAddr.Desc%
+HKR, Ndi\Params\NetworkAddress,       Type,      0, "edit"
+HKR, Ndi\Params\NetworkAddress,       LimitText, 0, "12"
+HKR, Ndi\Params\NetworkAddress,       UpperCase, 0, "1"
+HKR, Ndi\Params\NetworkAddress,       Default,   0, ""
+HKR, Ndi\Params\NetworkAddress,       Optional,  0, "1"
+
+;-----------------------------------------------------------------
+; File list
+;-----------------------------------------------------------------
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+vwifi.sys = 1,,
+
+[DestinationDirs]
+DefaultDestDir    = 12            ; %windir%\System32\drivers
+Vwifi.CopyFiles   = 12
+
+[Vwifi.CopyFiles]
+vwifi.sys,,,2
+
+;-----------------------------------------------------------------
+; Service
+;-----------------------------------------------------------------
+
+[Vwifi.Service]
+DisplayName    = %Vwifi.Service.DispName%
+ServiceType    = 1                 ; SERVICE_KERNEL_DRIVER
+StartType      = 3                 ; SERVICE_DEMAND_START
+ErrorControl   = 1                 ; SERVICE_ERROR_NORMAL
+ServiceBinary  = %12%\vwifi.sys
+LoadOrderGroup = NDIS
+AddReg         = Vwifi.Service.AddReg
+
+[Vwifi.Service.AddReg]
+; Any service-level parameters go here.
+
+[Vwifi.EventLog]
+AddReg = Vwifi.EventLog.AddReg
+
+[Vwifi.EventLog.AddReg]
+HKR, , EventMessageFile, 0x00020000, "%%SystemRoot%%\System32\netevent.dll"
+HKR, , TypesSupported,   0x00010001, 7
+
+;-----------------------------------------------------------------
+; Strings
+;-----------------------------------------------------------------
+
+[Strings]
+ProviderName           = "vwifi project"
+DiskName               = "vwifi virtual Wi-Fi installation disk"
+Vwifi.DeviceDesc       = "vwifi virtual Wi-Fi adapter"
+Vwifi.Service.DispName = "vwifi virtual Wi-Fi driver"
+NetAddr.Desc           = "Network address"
