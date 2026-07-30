@@ -25,7 +25,10 @@ the hub's stderr log in the temp directory.
 | socket permissions      | C4        | control 0600, data 0666                                   |
 | LIST_PEERS empty        | -         | hub starts clean                                          |
 | tx_drop column          | L6        | new column rendered                                       |
-| maclist capacity        | C3        | MAC list block isn't truncated                            |
+| LIST_PEERS MAC field    | C3        | one address per node + nmacs count                        |
+| scan-address churn      | MAC1      | randomized probe MACs collapse to one provisional slot    |
+| full MAC table          | MAC2      | evicts least-recently-seen instead of freezing            |
+| FORGET_MACS             | MAC3      | drops learned addresses, keeps position/SNR               |
 | LOAD_CONFIG recursion   | C2        | self-referential config refused, hub survives             |
 | QUIT in LOAD_CONFIG     | H5        | -1 propagates, post-QUIT lines skipped                    |
 | large LIST_PEERS        | H5-orig   | 120-node dump arrives intact (POLLOUT drain)              |

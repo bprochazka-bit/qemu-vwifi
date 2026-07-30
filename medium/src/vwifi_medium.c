@@ -400,6 +400,14 @@ static int parse_mac(const char *str, uint8_t *mac)
     return 0;
 }
 
+/* Monotonic microseconds since an arbitrary epoch. */
+static uint64_t mono_us(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull;
+}
+
 /* -------------------------------------------------------------------
  *  Node table -- persistent physical identity
  *
@@ -407,9 +415,24 @@ static int parse_mac(const char *str, uint8_t *mac)
  *  (position, tx_power) is retained when its peer disconnects, and
  *  reattached when it reconnects with the same node_id.
  * ------------------------------------------------------------------- */
+/*
+ * One address observed transmitting as this node.
+ *
+ * `probe_only` marks an address seen solely as the transmitter of a
+ * probe request. Scanning stations randomize that address — it is
+ * NetworkManager's default — so those are not real identities and must
+ * not be allowed to fill the table.
+ */
+struct node_mac {
+    uint8_t     addr[6];
+    uint64_t    last_seen_us;   /* mono_us(), so bursts order correctly and
+                                 * a wall-clock step cannot reorder them */
+    bool        probe_only;
+};
+
 struct node_phys {
     char        node_id[NODE_ID_LEN];
-    uint8_t     macs[MAX_MACS_PER_NODE][6];
+    struct node_mac macs[MAX_MACS_PER_NODE];
     int         num_macs;
     double      pos_x, pos_y, pos_z;
     bool        pos_set;
@@ -475,22 +498,89 @@ static struct node_phys *find_node_by_mac(const uint8_t *mac)
     for (int i = 0; i < num_nodes; i++) {
         if (!nodes[i].active) continue;
         for (int m = 0; m < nodes[i].num_macs; m++)
-            if (memcmp(nodes[i].macs[m], mac, 6) == 0)
+            if (memcmp(nodes[i].macs[m].addr, mac, 6) == 0)
                 return &nodes[i];
     }
     return NULL;
 }
 
-static void node_add_mac(struct node_phys *nd, const uint8_t *mac)
+/*
+ * The address a node is currently using: the most recently seen, with a
+ * confirmed address always preferred over a provisional scan one. This
+ * is what LIST_PEERS reports, so the common case stays one address wide
+ * however much a guest randomizes behind it.
+ */
+static const struct node_mac *node_primary_mac(const struct node_phys *nd)
 {
-    for (int m = 0; m < nd->num_macs; m++)
-        if (memcmp(nd->macs[m], mac, 6) == 0) return;
-    if (nd->num_macs >= MAX_MACS_PER_NODE) return;
-    memcpy(nd->macs[nd->num_macs], mac, 6);
-    nd->num_macs++;
-    char ms[20]; mac_to_str(mac, ms, sizeof(ms));
-    fprintf(stderr, "hub: node %s: learned MAC %s (%d total)\n",
-            nd->node_id, ms, nd->num_macs);
+    const struct node_mac *best = NULL;
+    for (int m = 0; m < nd->num_macs; m++) {
+        const struct node_mac *c = &nd->macs[m];
+        if (!best) {
+            best = c;
+        } else if (best->probe_only != c->probe_only) {
+            if (best->probe_only) best = c;
+        } else if (c->last_seen_us > best->last_seen_us) {
+            best = c;
+        }
+    }
+    return best;
+}
+
+/*
+ * Fold one observed transmitter address into a node's MAC table.
+ *
+ * `probe` marks an address seen only as the transmitter of a probe
+ * request, which scanning stations randomize. Those get a single
+ * provisional slot that each new one replaces: a scanning guest would
+ * otherwise contribute a fresh address every scan round, and the table
+ * would be nothing but discarded ones. An address that later appears in
+ * a frame asserting identity (auth, assoc, data, beacon) is promoted
+ * and kept.
+ *
+ * When the table is full the least recently seen entry goes. Refusing
+ * to learn once full — which is what this did — freezes the table on
+ * whatever a node happened to transmit first and makes its current
+ * address permanently unlearnable, so every by-MAC lookup for that node
+ * (SET_SNR, SET_POS, resolve_node) stops resolving.
+ */
+static void node_add_mac(struct node_phys *nd, const uint8_t *mac, bool probe)
+{
+    uint64_t now = mono_us();
+
+    for (int m = 0; m < nd->num_macs; m++) {
+        if (memcmp(nd->macs[m].addr, mac, 6) != 0) continue;
+        nd->macs[m].last_seen_us = now;
+        if (!probe) nd->macs[m].probe_only = false;
+        return;
+    }
+
+    struct node_mac *slot = NULL;
+    if (probe) {
+        for (int m = 0; m < nd->num_macs; m++) {
+            if (nd->macs[m].probe_only) { slot = &nd->macs[m]; break; }
+        }
+    }
+    if (!slot && nd->num_macs < MAX_MACS_PER_NODE)
+        slot = &nd->macs[nd->num_macs++];
+    if (!slot) {
+        slot = &nd->macs[0];
+        for (int m = 1; m < nd->num_macs; m++) {
+            if (nd->macs[m].last_seen_us < slot->last_seen_us)
+                slot = &nd->macs[m];
+        }
+    }
+
+    memcpy(slot->addr, mac, 6);
+    slot->last_seen_us = now;
+    slot->probe_only   = probe;
+
+    /* Provisional churn is expected and uninteresting; logging it would
+     * bury the arrivals that mean something. */
+    if (!probe) {
+        char ms[20]; mac_to_str(mac, ms, sizeof(ms));
+        fprintf(stderr, "hub: node %s: learned MAC %s (%d total)\n",
+                nd->node_id, ms, nd->num_macs);
+    }
 }
 
 static struct node_phys *resolve_node(const char *ident)
@@ -860,7 +950,23 @@ static void remove_peer(int idx)
     num_peers--;
 }
 
-static void learn_peer_mac(int pidx, const uint8_t *payload)
+/*
+ * Is this frame a probe request? Its transmitter address is the one a
+ * scanning station randomizes, so the answer decides whether the
+ * address is treated as an identity or as provisional.
+ */
+static bool frame_is_probe_request(const uint8_t *payload, uint32_t payload_len)
+{
+    uint32_t hdr_sz = (payload_len >= VWIFI_HDR_SIZE)
+                    ? VWIFI_HDR_SIZE : VWIFI_HDR_SIZE_V1;
+    if (payload_len < hdr_sz + 1) return false;
+    uint8_t b0 = payload[hdr_sz];
+    return ((b0 >> 2) & 0x3) == 0        /* management */
+        && ((b0 >> 4) & 0xF) == 4;       /* subtype 4 = probe request */
+}
+
+static void learn_peer_mac(int pidx, const uint8_t *payload,
+                           uint32_t payload_len)
 {
     const uint8_t *mac = payload + HDR_OFF_TX_MAC;
     static const uint8_t zero[6] = {0};
@@ -872,15 +978,16 @@ static void learn_peer_mac(int pidx, const uint8_t *payload)
     struct node_phys *prev = find_node_by_mac(mac);
     if (prev && prev != &nodes[ni]) {
         for (int m = 0; m < prev->num_macs; m++) {
-            if (memcmp(prev->macs[m], mac, 6) == 0) {
+            if (memcmp(prev->macs[m].addr, mac, 6) == 0) {
                 prev->num_macs--;
                 if (m < prev->num_macs)
-                    memcpy(prev->macs[m], prev->macs[prev->num_macs], 6);
+                    prev->macs[m] = prev->macs[prev->num_macs];
                 break;
             }
         }
     }
-    node_add_mac(&nodes[ni], mac);
+    node_add_mac(&nodes[ni], mac,
+                 frame_is_probe_request(payload, payload_len));
 }
 
 /* Hello message handling */
@@ -1178,14 +1285,6 @@ struct chan_survey {
 static struct chan_survey surveys[MAX_SURVEY_CHANS];
 static struct timespec survey_start;   /* window start (CLOCK_MONOTONIC)  */
 
-/* Monotonic microseconds since an arbitrary epoch. */
-static uint64_t mono_us(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull;
-}
-
 /* Find (or, if room, create) the survey bucket for a primary frequency. */
 static struct chan_survey *survey_bucket(uint16_t freq)
 {
@@ -1275,7 +1374,7 @@ static void forward_message(int sender_idx, const uint8_t *msg,
 
     /* Learn MAC from this frame */
     if (!sender_is_bridge)
-        learn_peer_mac(sender_idx, tmp + 4);
+        learn_peer_mac(sender_idx, tmp + 4, payload_len);
 
     int sender_ni = peer_node[sender_idx];
     if (sender_ni >= 0) nodes[sender_ni].tx_frames++;
@@ -1722,27 +1821,24 @@ static int ctl_process_command(int fd, char *line)
 
     /* ---- LIST_PEERS ---- */
     if (strncasecmp(cmd, "LIST_PEERS", 10) == 0) {
-        /* Sized for MAX_MACS_PER_NODE (16) entries of 17 chars + 1
-         * separator each, plus the "(none)" placeholder, with comfortable
-         * headroom so output never silently truncates. */
-        char maclist[512];
+        /*
+         * One address per node, not the whole table: a guest that
+         * randomizes its scan address contributes a new one every scan
+         * round, and dumping all of them made this output — and every UI
+         * built on it — unreadable. `nmacs` says how many are on file;
+         * DUMP_MACS prints them.
+         */
+        char maclist[24];
         ctl_respond(fd, "OK %d nodes (%d peers online)\n",
                     num_nodes, num_peers);
         for (int ni = 0; ni < num_nodes; ni++) {
             struct node_phys *nd = &nodes[ni];
             if (!nd->active) continue;
 
-            maclist[0] = '\0';
-            size_t mused = 0;
-            for (int m = 0; m < nd->num_macs; m++) {
-                char ms[20];
-                mac_to_str(nd->macs[m], ms, sizeof(ms));
-                int w = snprintf(maclist + mused, sizeof(maclist) - mused,
-                                 "%s%s", (m > 0) ? "," : "", ms);
-                if (w < 0 || (size_t)w >= sizeof(maclist) - mused) break;
-                mused += (size_t)w;
-            }
-            if (nd->num_macs == 0)
+            const struct node_mac *primary = node_primary_mac(nd);
+            if (primary)
+                mac_to_str(primary->addr, maclist, sizeof(maclist));
+            else
                 snprintf(maclist, sizeof(maclist), "(none)");
 
             const char *st = (nd->peer_idx >= 0) ? "online" : "offline";
@@ -1767,18 +1863,21 @@ static int ctl_process_command(int fd, char *line)
             }
 
             if (nd->pos_set)
-                ctl_respond(fd, "  %-12s %s %s macs=[%s] pos=(%.1f,%.1f,%.1f) "
+                ctl_respond(fd, "  %-12s %s %s macs=[%s] nmacs=%d "
+                    "pos=(%.1f,%.1f,%.1f) "
                     "txpow=%.1f tx=%" PRIu64 " rx=%" PRIu64
                     " rx_drop=%" PRIu64 " tx_drop=%" PRIu64 "\n",
-                    nd->node_id, st, meta, maclist,
+                    nd->node_id, st, meta, maclist, nd->num_macs,
                     nd->pos_x, nd->pos_y, nd->pos_z,
                     nd->tx_power_dbm, nd->tx_frames, nd->rx_frames,
                     nd->rx_dropped, txd);
             else
-                ctl_respond(fd, "  %-12s %s %s macs=[%s] pos=none txpow=%.1f "
+                ctl_respond(fd, "  %-12s %s %s macs=[%s] nmacs=%d "
+                    "pos=none txpow=%.1f "
                     "tx=%" PRIu64 " rx=%" PRIu64
                     " rx_drop=%" PRIu64 " tx_drop=%" PRIu64 "\n",
-                    nd->node_id, st, meta, maclist, nd->tx_power_dbm,
+                    nd->node_id, st, meta, maclist, nd->num_macs,
+                    nd->tx_power_dbm,
                     nd->tx_frames, nd->rx_frames,
                     nd->rx_dropped, txd);
         }
@@ -1998,6 +2097,99 @@ static int ctl_process_command(int fd, char *line)
                 }
             }
         }
+        return 0;
+    }
+
+    /* ---- DUMP_MACS [node_or_mac] ---- the detail LIST_PEERS omits ---- */
+    if (strncasecmp(cmd, "DUMP_MACS", 9) == 0) {
+        char ident[64] = "";
+        struct node_phys *only = NULL;
+        if (sscanf(cmd + 9, "%63s", ident) == 1) {
+            only = resolve_node(ident);
+            if (!only) {
+                ctl_respond(fd, "ERR unknown node or MAC: %s\n", ident);
+                return 0;
+            }
+        }
+
+        uint64_t now = mono_us();
+        int total = 0, counted = 0;
+        for (int ni = 0; ni < num_nodes; ni++) {
+            if (!nodes[ni].active) continue;
+            if (only && &nodes[ni] != only) continue;
+            total += nodes[ni].num_macs;
+            counted++;
+        }
+        ctl_respond(fd, "OK %d MAC(s) on %d node(s)\n", total, counted);
+
+        for (int ni = 0; ni < num_nodes; ni++) {
+            struct node_phys *nd = &nodes[ni];
+            if (!nd->active) continue;
+            if (only && nd != only) continue;
+            const struct node_mac *primary = node_primary_mac(nd);
+
+            /* Most recent first, so the address a node is using now is
+             * the one you read first. The table is 16 entries; a
+             * selection pass over it costs nothing. */
+            bool shown[MAX_MACS_PER_NODE] = { false };
+            for (int printed = 0; printed < nd->num_macs; printed++) {
+                int best = -1;
+                for (int m = 0; m < nd->num_macs; m++) {
+                    if (shown[m]) continue;
+                    if (best < 0 ||
+                        nd->macs[m].last_seen_us > nd->macs[best].last_seen_us)
+                        best = m;
+                }
+                if (best < 0) break;
+                shown[best] = true;
+
+                const struct node_mac *nm = &nd->macs[best];
+                char ms[20];
+                mac_to_str(nm->addr, ms, sizeof(ms));
+                uint64_t age = (now > nm->last_seen_us)
+                             ? (now - nm->last_seen_us) / 1000000ull : 0;
+                ctl_respond(fd, "  %-12s %s kind=%s age=%" PRIu64
+                            " primary=%s\n",
+                            nd->node_id, ms,
+                            nm->probe_only ? "probe" : "confirmed",
+                            age, (nm == primary) ? "yes" : "no");
+            }
+        }
+        return 0;
+    }
+
+    /* ---- FORGET_MACS <node_or_mac|all> ---- */
+    if (strncasecmp(cmd, "FORGET_MACS", 11) == 0) {
+        char ident[64] = "";
+        if (sscanf(cmd + 11, "%63s", ident) != 1) {
+            ctl_respond(fd, "ERR usage: FORGET_MACS <node|mac|all>\n");
+            return 0;
+        }
+
+        int forgotten = 0, touched = 0;
+        if (strcasecmp(ident, "all") == 0) {
+            for (int ni = 0; ni < num_nodes; ni++) {
+                if (!nodes[ni].active || nodes[ni].num_macs == 0) continue;
+                forgotten += nodes[ni].num_macs;
+                nodes[ni].num_macs = 0;
+                touched++;
+            }
+        } else {
+            struct node_phys *nd = resolve_node(ident);
+            if (!nd) {
+                ctl_respond(fd, "ERR unknown node or MAC: %s\n", ident);
+                return 0;
+            }
+            forgotten = nd->num_macs;
+            nd->num_macs = 0;
+            touched = 1;
+        }
+        /* Only the learned addresses go: position, tx power and the link
+         * overrides are the operator's, not something inferred from
+         * traffic, and a hub restart is the blunt instrument that would
+         * have taken those too. The node relearns from its next frame. */
+        ctl_respond(fd, "OK forgot %d MAC(s) on %d node(s)\n",
+                    forgotten, touched);
         return 0;
     }
 
@@ -2225,6 +2417,8 @@ static int ctl_process_command(int fd, char *line)
             "  GET_MODEL                            Show model + params\n"
             "  SET_NOISE_FLOOR <dBm>                Set noise floor\n"
             "  DUMP_LINKS                           Show all link info\n"
+            "  DUMP_MACS [node]                     Every learned MAC, newest first\n"
+            "  FORGET_MACS <node|all>               Drop learned MACs (keeps pos/SNR)\n"
             "  STATS                                Global counters\n"
             "  LOAD_CONFIG <path>                   Run commands from file\n"
             "  SAVE_CONFIG <path>                   Dump state to file\n"

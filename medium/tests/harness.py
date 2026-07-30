@@ -295,18 +295,146 @@ def test_l6_tx_drop_column(h: Harness):
     h.expect('testnode' in r, 'testnode visible after SET_POS', repr(r[:200]))
 
 
+# 802.11 frame-control bytes for the bodies these tests send. A probe
+# request is the frame a scanning station randomizes its address on; a
+# ToDS data frame asserts a real identity.
+FC_PROBE_REQ = b'\x40\x00'
+FC_DATA_TODS = b'\x08\x01'
+
+
+def _body(fc: bytes) -> bytes:
+    return fc + b'\x00' * 30
+
+
+def _peer_line(r: str, node: str) -> str:
+    for line in r.splitlines():
+        if line.strip().startswith(node):
+            return line
+    return ''
+
+
 def test_c3_maclist_capacity(h: Harness):
-    h.section('C3: maclist holds many MACs without truncation')
-    # We can't easily force 16 MACs onto one node without a long-running
-    # data session, so just check the buffer accepts a typical-width line.
-    # A node with one MAC should render the macs=[xx:xx:..] block fully.
-    # (The buffer was 256 bytes / max 16 MACs * 18 = 288, now 512.)
+    h.section('C3: LIST_PEERS reports one address per node')
     r = h.ctl_cmd('LIST_PEERS')
     if 'testnode' in r:
-        line = next(l for l in r.splitlines() if 'testnode' in l)
+        line = _peer_line(r, 'testnode')
         h.expect('macs=[' in line and ']' in line,
                  'maclist brackets present and closed',
                  line[:200])
+        h.expect('nmacs=' in line,
+                 'nmacs count present alongside the primary address',
+                 line[:200])
+
+
+def test_mac1_scan_randomization_does_not_fill_the_table(h: Harness):
+    h.section('MAC1: randomized probe addresses collapse to one slot')
+    h.restart_hub()
+    a = h.data_conn()
+    try:
+        a.sendall(make_hello('scanner'))
+        time.sleep(0.2)
+        # One real address, then a scan's worth of randomized ones.
+        a.sendall(make_frame(b'\x52\x54\x00\xab\xcd\xef',
+                             channel_freq=CH1, payload=_body(FC_DATA_TODS)))
+        time.sleep(0.15)
+        for i in range(40):
+            a.sendall(make_frame(bytes.fromhex('aabbcc0000%02x' % i),
+                                 channel_freq=CH1,
+                                 payload=_body(FC_PROBE_REQ)))
+        time.sleep(0.4)
+
+        line = _peer_line(h.ctl_cmd('LIST_PEERS'), 'scanner')
+        h.expect('macs=[52:54:00:ab:cd:ef]' in line,
+                 'LIST_PEERS shows the confirmed address, not a scan one',
+                 line[:200])
+        h.expect('nmacs=2' in line,
+                 '41 observed addresses collapse to 2 entries',
+                 line[:200])
+
+        d = h.ctl_cmd('DUMP_MACS scanner')
+        h.expect(d.count('kind=probe') == 1,
+                 'only the newest probe address is held',
+                 repr(d[:300]))
+        h.expect('52:54:00:ab:cd:ef kind=confirmed' in d.replace('  ', ' ')
+                 or 'kind=confirmed' in d,
+                 'the confirmed address is still on file',
+                 repr(d[:300]))
+    finally:
+        a.close()
+
+
+def test_mac2_full_table_still_learns_the_current_address(h: Harness):
+    h.section('MAC2: a full MAC table evicts, it does not freeze')
+    h.restart_hub()
+    a = h.data_conn()
+    try:
+        a.sendall(make_hello('churn'))
+        time.sleep(0.2)
+        # More confirmed addresses than the 16-entry table holds.
+        for i in range(20):
+            a.sendall(make_frame(bytes.fromhex('5254000000%02x' % i),
+                                 channel_freq=CH1,
+                                 payload=_body(FC_DATA_TODS)))
+            time.sleep(0.03)
+        time.sleep(0.3)
+
+        # The one it is using now must resolve; before eviction the table
+        # froze at the first 16 and this address was never learned.
+        r = h.ctl_cmd('SET_TXPOWER 52:54:00:00:00:13 9')
+        h.expect(r.startswith('OK'),
+                 'the most recent address resolves by MAC',
+                 repr(r[:120]))
+        r = h.ctl_cmd('GET_TXPOWER 52:54:00:00:00:00')
+        h.expect(r.startswith('ERR'),
+                 'the least recently seen address was evicted',
+                 repr(r[:120]))
+
+        d = h.ctl_cmd('DUMP_MACS churn')
+        h.expect('OK 16 MAC(s)' in d, 'table stays at its 16-entry cap',
+                 repr(d[:120]))
+        h.expect('52:54:00:00:00:13 kind=confirmed age=0 primary=yes'
+                 in ' '.join(d.split()),
+                 'newest address is reported first and marked primary',
+                 repr(d[:300]))
+    finally:
+        a.close()
+
+
+def test_mac3_forget_macs_keeps_physical_state(h: Harness):
+    h.section('MAC3: FORGET_MACS drops addresses, not position')
+    h.restart_hub()
+    a = h.data_conn()
+    try:
+        a.sendall(make_hello('forgetful'))
+        time.sleep(0.2)
+        a.sendall(make_frame(b'\x52\x54\x00\x00\xbe\xef',
+                             channel_freq=CH1, payload=_body(FC_DATA_TODS)))
+        time.sleep(0.3)
+        h.ctl_cmd('SET_POS forgetful 4 5 6')
+
+        r = h.ctl_cmd('FORGET_MACS forgetful')
+        h.expect(r.startswith('OK forgot 1 MAC(s)'),
+                 'FORGET_MACS reports what it dropped', repr(r[:120]))
+
+        line = _peer_line(h.ctl_cmd('LIST_PEERS'), 'forgetful')
+        h.expect('macs=[(none)]' in line and 'nmacs=0' in line,
+                 'the learned addresses are gone', line[:200])
+        h.expect('pos=(4.0,5.0,6.0)' in line,
+                 'position survives — it is the operator\'s, not learned',
+                 line[:200])
+
+        # And the node relearns from its next frame.
+        a.sendall(make_frame(b'\x52\x54\x00\x00\xbe\xef',
+                             channel_freq=CH1, payload=_body(FC_DATA_TODS)))
+        time.sleep(0.3)
+        line = _peer_line(h.ctl_cmd('LIST_PEERS'), 'forgetful')
+        h.expect('macs=[52:54:00:00:be:ef]' in line,
+                 'the node relearns from its next frame', line[:200])
+
+        r = h.ctl_cmd('FORGET_MACS nosuchnode')
+        h.expect(r.startswith('ERR'), 'unknown node is refused', repr(r[:120]))
+    finally:
+        a.close()
 
 
 def test_c2_load_config_recursion(h: Harness):
@@ -1374,6 +1502,9 @@ TESTS = [
     test_list_peers_empty,
     test_l6_tx_drop_column,
     test_c3_maclist_capacity,
+    test_mac1_scan_randomization_does_not_fill_the_table,
+    test_mac2_full_table_still_learns_the_current_address,
+    test_mac3_forget_macs_keeps_physical_state,
     test_c2_load_config_recursion,
     test_h5_quit_in_load_config,
     test_h5_orig_large_response,

@@ -813,6 +813,8 @@ int vwifi_cfg80211_init(struct vwifi_priv *p)
 {
 	struct net_device *ndev;
 	struct vwifi_op_mode mode;
+	u8 addr[ETH_ALEN];
+	bool addr_is_random = false;
 	u32 rsp_len = 0;
 	int ret;
 
@@ -851,6 +853,34 @@ int vwifi_cfg80211_init(struct vwifi_priv *p)
 	p->wiphy->n_cipher_suites = (p->caps.caps & VWIFI_CAP_WPA3) ?
 		ARRAY_SIZE(vwifi_cipher_suites) : VWIFI_N_CIPHERS_BASE;
 
+	/*
+	 * Settle the station address BEFORE registering the wiphy.
+	 *
+	 * `-device vwifi-virt,mac=...` arrives here as caps.default_mac and
+	 * nowhere else, and it is not enough to put it on the netdev: the
+	 * address a wireless device reports as *permanent* is what userspace
+	 * treats as the real one. NetworkManager randomizes a Wi-Fi MAC for
+	 * scanning by default (wifi.scan-rand-mac-address) and restores the
+	 * permanent address afterwards; with no permanent address to restore
+	 * the interface simply keeps a random one, and the MAC the user
+	 * configured never sticks. So it goes in three places that must
+	 * agree: wiphy->perm_addr (what nl80211 reports), ndev->perm_addr
+	 * (what ethtool reports), and the netdev's current address.
+	 *
+	 * An all-zero or multicast MAC from the device would register fine
+	 * and then fail eth_validate_addr() at every ip-link-up, which is
+	 * an opaque way to be broken.
+	 */
+	if (is_valid_ether_addr(p->caps.default_mac)) {
+		memcpy(addr, p->caps.default_mac, ETH_ALEN);
+	} else {
+		dev_warn(p->dev,
+			 "device reported an invalid MAC; using a random one\n");
+		eth_random_addr(addr);
+		addr_is_random = true;
+	}
+	memcpy(p->wiphy->perm_addr, addr, ETH_ALEN);
+
 	ret = wiphy_register(p->wiphy);
 	if (ret) {
 		dev_err(p->dev, "wiphy_register failed: %d\n", ret);
@@ -873,16 +903,12 @@ int vwifi_cfg80211_init(struct vwifi_priv *p)
 	p->wdev.iftype = NL80211_IFTYPE_STATION;
 	ndev->ieee80211_ptr = &p->wdev;
 
-	/* An all-zero or multicast MAC from the device would register fine
-	 * and then fail eth_validate_addr() at every ip-link-up, which is
-	 * an opaque way to be broken. */
-	if (is_valid_ether_addr(p->caps.default_mac))
-		eth_hw_addr_set(ndev, p->caps.default_mac);
-	else {
-		dev_warn(p->dev,
-			 "device reported an invalid MAC; using a random one\n");
-		eth_hw_addr_random(ndev);
-	}
+	eth_hw_addr_set(ndev, addr);
+	memcpy(ndev->perm_addr, addr, ETH_ALEN);
+	/* Say so when we made the address up, rather than letting userspace
+	 * treat an invention as the hardware's own. */
+	if (addr_is_random)
+		ndev->addr_assign_type = NET_ADDR_RANDOM;
 
 	ret = register_netdev(ndev);
 	if (ret) {
