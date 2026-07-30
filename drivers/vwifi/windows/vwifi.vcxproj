@@ -111,18 +111,30 @@
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <ClCompile>
       <Optimization>Disabled</Optimization>
-      <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
+      <!-- OldStyle (/Z7) puts debug info in the .obj files instead of a
+           shared compiler PDB. The linker still emits a full vwifi.pdb,
+           which is what WinDbg wants, but nothing depends on vc145.pdb
+           existing and being findable at link time. That dependency is
+           fragile — mspdbsrv writing a shared PDB across a mapped or
+           network drive is enough to lose it, and the loss shows up as
+           LNK4099 at link, long after the compile "succeeded". -->
+      <DebugInformationFormat>OldStyle</DebugInformationFormat>
       <PreprocessorDefinitions>DBG=1;DEPRECATE_DDK_FUNCTIONS=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <Link>
       <GenerateDebugInformation>true</GenerateDebugInformation>
+      <!-- The driver targets pass /WX to the *linker* as well, and
+           TreatWarningAsError above only governs the compiler. A link
+           warning is not a good reason to produce no binary during
+           bring-up. Turn this back on with the compiler's. -->
+      <TreatLinkerWarningAsErrors>false</TreatLinkerWarningAsErrors>
     </Link>
   </ItemDefinitionGroup>
 
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <ClCompile>
       <Optimization>MaxSpeed</Optimization>
-      <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
+      <DebugInformationFormat>OldStyle</DebugInformationFormat>
     </ClCompile>
     <Link>
       <GenerateDebugInformation>true</GenerateDebugInformation>

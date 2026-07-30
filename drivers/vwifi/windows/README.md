@@ -91,8 +91,9 @@ same binary.
 |---|---|
 | `Optimization=Disabled` | locals aren't elided; stepping matches the source |
 | `DBG=1` | `NT_ASSERT` and `ASSERT` are live |
-| `DebugInformationFormat=ProgramDatabase` | full `vwifi.pdb` next to the `.sys` |
+| `DebugInformationFormat=OldStyle` | debug info in the `.obj`s; the linker still emits a full `vwifi.pdb`, but nothing depends on a shared `vc145.pdb` surviving to link time |
 | `TreatWarningAsError=false` | one warning doesn't hide the next fifty on a first build |
+| `TreatLinkerWarningAsErrors=false` | the driver targets pass `/WX` to the linker too, and it is governed separately from the compiler's |
 | `SignMode=Off` | signing is `sign.cmd`'s job, so a missing cert isn't a build failure |
 | `SpectreMitigation=false` | the Spectre-mitigated libs are an optional EWDK component |
 | `RunCodeAnalysis=false` | run it deliberately: `msbuild /p:RunCodeAnalysis=true vwifi.sln` |
@@ -130,6 +131,7 @@ expect most of them to be shallow. The ones worth recognising:
 | `unresolved external symbol Ndis*` | `ndis.lib` isn't being linked — check `$(DDK_LIB_PATH)` resolved (it's set by `LaunchBuildEnv.cmd`). |
 | `LNK2019: unresolved external symbol ParseWdiTaskScanToIhv` (and the other `ParseWdi*` / `GenerateWdi*` / `FreeGenerated`) | the WDI TLV static library isn't linked. `TlvGenerated_.hpp` only *declares* these; the code ships in a `.lib` in the kit's Lib tree. `build.cmd` searches for it and passes it as `WdiTlvLib`; if the search comes up empty, find it with <code>dir /s /b "%ProgramFiles(x86)%\Windows Kits\10\Lib\*.lib" \| findstr /i wlan</code> and re-run as `set WdiTlvLib=<full path> && build.cmd`. |
 | `unresolved external symbol "void * __cdecl operator new"` | the TLV library wants an overload `tlv_mem.cpp` doesn't provide yet; add it there, matching the existing ones. |
+| `LNK4099: PDB 'vc145.pdb' was not found` then `LNK1218` | the shared compiler PDB didn't survive to link time — common when building from a mapped or network drive. The project uses `/Z7` (`OldStyle`) so there is no shared PDB to lose; if you see this, something has overridden `DebugInformationFormat`. |
 | `Inf2Cat` reports a signability error | the INF, not the code. `%windir%\inf\setupapi.dev.log` and the Inf2Cat message name the offending directive. |
 
 Warnings are not errors here (`TreatWarningAsError` is off), but read
