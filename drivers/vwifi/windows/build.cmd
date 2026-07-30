@@ -54,12 +54,38 @@ if not defined WdiTlvIncludeDir (
     echo   TlvGeneratorParser.hpp: %WdiTlvIncludeDir%
 )
 
+rem --- locate the WDI TLV static library ------------------------------
+rem  TlvGenerated_.hpp only declares ParseWdi*/GenerateWdi*; the code is
+rem  in a static library that ships beside it in the kit's Lib tree.
+rem  Set WdiTlvLib yourself to skip the search.
+if not defined WdiTlvLib (
+    echo Locating the WDI TLV library ...
+    for /f "usebackq delims=" %%L in (`powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+        "$roots = @($env:WindowsSdkDir, ${env:ProgramFiles(x86)} + '\Windows Kits\10', $env:WDKContentRoot) | Where-Object { $_ -and (Test-Path $_) };" ^
+        "foreach ($r in $roots) {" ^
+        "  $libs = Get-ChildItem -Path $r -Filter '*.lib' -Recurse -File -ErrorAction SilentlyContinue |" ^
+        "          Where-Object { $_.FullName -match '\\x64\\' -and ($_.FullName -match 'wlan' -or $_.Name -match 'wditlv|tlvgen') };" ^
+        "  if ($libs) { ($libs | Select-Object -First 1).FullName; break } }"`) do set "WdiTlvLib=%%L"
+)
+
+if not defined WdiTlvLib (
+    echo.
+    echo WARNING: no WDI TLV library found. The link will fail with
+    echo   LNK2019 on ParseWdiTaskScanToIhv and friends. Find it with:
+    echo     dir /s /b "%%ProgramFiles(x86)%%\Windows Kits\10\Lib\*.lib" ^| findstr /i wlan
+    echo   then re-run as:  set WdiTlvLib=^<full path to .lib^> ^&^& build.cmd
+    echo.
+) else (
+    echo   WDI TLV library:        %WdiTlvLib%
+)
+
 echo Building vwifi %CFG%^|x64 ...
 msbuild "%~dp0vwifi.sln" ^
     /t:Build ^
     /p:Configuration=%CFG% ^
     /p:Platform=x64 ^
     /p:WdiTlvIncludeDir="%WdiTlvIncludeDir%" ^
+    /p:WdiTlvLib="%WdiTlvLib%" ^
     /m ^
     /v:minimal ^
     /nologo ^

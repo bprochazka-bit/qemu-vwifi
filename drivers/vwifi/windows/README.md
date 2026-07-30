@@ -119,6 +119,7 @@ expect most of them to be shallow. The ones worth recognising:
 | `NDIS version not defined` / `NDIS_SUPPORT_NDIS650` errors | the `NDIS650_MINIPORT=1` define didn't take. Check the `PreprocessorDefinitions` in `vwifi.vcxproj` survived any local edit. |
 | Redefinition storms from `ntddk.h` / `ntifs.h` | `vwifi_drv.h` includes `<ntifs.h>` before `<ndis.h>`, and `ndis.h` pulls in `ntddk.h`. The driver uses nothing that `ntddk.h` lacks, so dropping the `ntifs.h` include is the fix if your kit doesn't tolerate the pairing. |
 | `unresolved external symbol Ndis*` | `ndis.lib` isn't being linked — check `$(DDK_LIB_PATH)` resolved (it's set by `LaunchBuildEnv.cmd`). |
+| `LNK2019: unresolved external symbol ParseWdiTaskScanToIhv` (and the other `ParseWdi*` / `GenerateWdi*` / `FreeGenerated`) | the WDI TLV static library isn't linked. `TlvGenerated_.hpp` only *declares* these; the code ships in a `.lib` in the kit's Lib tree. `build.cmd` searches for it and passes it as `WdiTlvLib`; if the search comes up empty, find it with <code>dir /s /b "%ProgramFiles(x86)%\Windows Kits\10\Lib\*.lib" \| findstr /i wlan</code> and re-run as `set WdiTlvLib=<full path> && build.cmd`. |
 | `unresolved external symbol "void * __cdecl operator new"` | the TLV library wants an overload `tlv_mem.cpp` doesn't provide yet; add it there, matching the existing ones. |
 | `Inf2Cat` reports a signability error | the INF, not the code. `%windir%\inf\setupapi.dev.log` and the Inf2Cat message name the offending directive. |
 

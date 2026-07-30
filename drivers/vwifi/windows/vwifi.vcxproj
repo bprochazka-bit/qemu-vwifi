@@ -86,7 +86,15 @@
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
     </ClCompile>
     <Link>
-      <AdditionalDependencies>$(DDK_LIB_PATH)ndis.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <!-- The WDI TLV generator/parser is a static library, not the
+           header-only template pack it looks like: TlvGenerated_.hpp
+           declares ParseWdi*/GenerateWdi*/FreeGenerated and defines
+           none of them. tlv_mem.cpp's own comment says as much —
+           "consumers of the library must provide overloaded operator
+           implementations of these APIs when linking to the library".
+           build.cmd locates it; override with /p:WdiTlvLib=<path>.
+           An empty entry is harmless. -->
+      <AdditionalDependencies>$(DDK_LIB_PATH)ndis.lib;$(WdiTlvLib);%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <Inf>
       <TimeStamp>1.0.0.0</TimeStamp>
