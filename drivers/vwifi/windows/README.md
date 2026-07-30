@@ -22,6 +22,8 @@ vwifi.vcxproj       MSBuild driver project (EWDK or VS 2022 + WDK)
 build.cmd           debug build wrapper; writes build-Debug.{log,err,wrn}
 sign.cmd            creates a test cert if needed, catalogs, signs
 install.cmd         run in the guest: replaces any installed vwifi package
+install.ps1         what install.cmd actually runs
+find-wdk-file.ps1   locates the WDI TLV header and library for build.cmd
 guest-debug-setup.ps1  run in the guest: test-signing, cert, print filter
 src/
   vwifi_drv.h       driver-private header; adapter context
