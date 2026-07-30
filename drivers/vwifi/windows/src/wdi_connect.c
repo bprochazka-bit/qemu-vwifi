@@ -113,7 +113,7 @@ VwifiIndicateAssociationResult(_Inout_ PVWIFI_ADAPTER Adapter,
                                _In_reads_bytes_(Result->ie_len) const UCHAR *Ies)
 {
     PVWIFI_CONNECT_TASK task = Adapter->ConnectTask;
-        PVOID tlv = NULL;
+    PVOID tlv = NULL;
     ULONG tlvLen = 0;
 
     if (VwifiTlvGenerateAssociationResult(Adapter->WdiPeerVersion,
@@ -127,6 +127,7 @@ VwifiIndicateAssociationResult(_Inout_ PVWIFI_ADAPTER Adapter,
                Result->status_code, Result->aid, Result->ie_len);
     VwifiSendWdiIndication(Adapter, task->PortId,
                            NDIS_STATUS_WDI_INDICATION_ASSOCIATION_RESULT,
+                           NDIS_STATUS_SUCCESS,
                            WDI_TRANSACTION_ID_UNSOLICIT, tlv, tlvLen);
     VwifiTlvFreeGenerated(tlv);
 }
@@ -136,23 +137,14 @@ VwifiIndicateConnectComplete(_Inout_ PVWIFI_ADAPTER Adapter,
                              _In_ NDIS_STATUS Status)
 {
     PVWIFI_CONNECT_TASK task = Adapter->ConnectTask;
-        PVOID tlv = NULL;
-    ULONG tlvLen = 0;
 
-    if (VwifiTlvGenerateConnectComplete(Adapter->WdiPeerVersion,
-                                        Status, task->TargetBssid,
-                                        &tlv, &tlvLen)
-            != NDIS_STATUS_SUCCESS) {
-        VWIFI_ERR("CONNECT_COMPLETE TLV generate failed");
-        task->Active = FALSE;
-        return;
-    }
-
+    /* CONNECT_COMPLETE carries no TLVs — not the BSSID, not the status.
+     * The outcome rides in the message header's Status field, and the OS
+     * already knows which BSS it asked us to join. */
     VWIFI_INFO("indicating CONNECT_COMPLETE (0x%x)", Status);
     VwifiSendWdiIndication(Adapter, task->PortId,
                            NDIS_STATUS_WDI_INDICATION_CONNECT_COMPLETE,
-                           task->TransactionId, tlv, tlvLen);
-    VwifiTlvFreeGenerated(tlv);
+                           Status, task->TransactionId, NULL, 0);
 
     task->Active = FALSE;
 }
@@ -161,7 +153,7 @@ static VOID
 VwifiIndicateDisassociation(_Inout_ PVWIFI_ADAPTER Adapter, _In_ USHORT Reason)
 {
     PVWIFI_CONNECT_TASK task = Adapter->ConnectTask;
-        PVOID tlv = NULL;
+    PVOID tlv = NULL;
     ULONG tlvLen = 0;
 
     if (VwifiTlvGenerateDisassociation(Adapter->WdiPeerVersion,
@@ -176,6 +168,7 @@ VwifiIndicateDisassociation(_Inout_ PVWIFI_ADAPTER Adapter, _In_ USHORT Reason)
     VwifiSendWdiIndication(Adapter,
                            task ? task->PortId : NDIS_DEFAULT_PORT_NUMBER,
                            NDIS_STATUS_WDI_INDICATION_DISASSOCIATION,
+                           NDIS_STATUS_SUCCESS,
                            WDI_TRANSACTION_ID_UNSOLICIT, tlv, tlvLen);
     VwifiTlvFreeGenerated(tlv);
 }

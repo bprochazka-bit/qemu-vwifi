@@ -97,7 +97,7 @@ VwifiTlvParseScanRequest(
 
     if (ReqCap < sizeof(*ReqBuf)) return NDIS_STATUS_BUFFER_TOO_SHORT;
 
-    st = ParseWdiTaskScan(BufferLen, const_cast<VOID *>(Buffer), &ctx, &parsed);
+    st = ParseWdiTaskScan(BufferLen, static_cast<const UINT8 *>(Buffer), &ctx, &parsed);
     if (st != NDIS_STATUS_SUCCESS) {
         return st;
     }
@@ -129,12 +129,13 @@ VwifiTlvParseScanRequest(
         ULONG maxSsid = (ReqCap - sizeof(*ReqBuf)) / 34;
 
         for (ULONG i = 0; i < parsed.SSIDList.ElementCount && i < maxSsid; i++) {
+            /* WDI_SSID is ArrayOfElements<UINT8> — a length-counted
+             * byte array, not a struct with SSIDLength/SSID members. */
             const WDI_SSID *s = &parsed.SSIDList.pElements[i];
-            /* [MEMBER?] s->SSIDLength / s->SSID */
             UCHAR len = static_cast<UCHAR>(
-                s->SSIDLength > 32 ? 32 : s->SSIDLength);
+                s->ElementCount > 32 ? 32 : s->ElementCount);
             trail[i * 34] = len;
-            RtlCopyMemory(&trail[i * 34 + 1], s->SSID, len);
+            RtlCopyMemory(&trail[i * 34 + 1], s->pElements, len);
             RtlZeroMemory(&trail[i * 34 + 1 + len], 33 - len);
             nssid++;
         }
@@ -158,7 +159,7 @@ VwifiTlvGenerateBssEntryList(
     TLV_CONTEXT ctx = MakeCtx(PeerVersion);
     WDI_INDICATION_BSS_ENTRY_LIST_PARAMETERS params = {};
     NDIS_STATUS st;
-    PVOID pOut = nullptr;
+    UINT8 *pOut = nullptr;
     ULONG outLen = 0;
 
     if (Count == 0) return NDIS_STATUS_INVALID_PARAMETER;
@@ -231,29 +232,15 @@ VwifiTlvGenerateBssEntryList(
     return NDIS_STATUS_SUCCESS;
 }
 
-extern "C"
-NDIS_STATUS
-VwifiTlvGenerateScanComplete(
-    ULONG PeerVersion,
-    NDIS_STATUS ScanStatus,
-    VOID **Buffer,
-    PULONG BufferLen)
-{
-    TLV_CONTEXT ctx = MakeCtx(PeerVersion);
-    WDI_INDICATION_SCAN_COMPLETE_PARAMETERS params = {};
-    PVOID pOut = nullptr;
-    ULONG outLen = 0;
-
-    params.ScanCompleteStatus = ScanStatus;   /* [MEMBER?] */
-
-    NDIS_STATUS st = GenerateWdiIndicationScanComplete(
-        &params, kHeaderReserve, &ctx, &outLen, &pOut);
-    if (st != NDIS_STATUS_SUCCESS) return st;
-
-    *Buffer    = pOut;
-    *BufferLen = outLen;
-    return NDIS_STATUS_SUCCESS;
-}
+/* No VwifiTlvGenerateScanComplete / VwifiTlvGenerateConnectComplete.
+ * Both WDI_INDICATION_SCAN_COMPLETE_PARAMETERS and
+ * WDI_INDICATION_CONNECT_COMPLETE_PARAMETERS are typedefs of
+ * EmptyMessageStructureType: these messages carry no TLVs whatsoever,
+ * which is what WABIModel means by "No TLV data needed, header is
+ * sufficient". The completion status travels in WDI_MESSAGE_HEADER's
+ * Status field, so wdi_common.c sends them header-only. Generating a
+ * body for them was inventing a payload the OS does not read.
+ */
 
 /* ============================================================
  * Connect
@@ -328,7 +315,7 @@ VwifiTlvParseConnectRequest(
 
     if (ReqCap < sizeof(*ReqBuf)) return NDIS_STATUS_BUFFER_TOO_SHORT;
 
-    st = ParseWdiTaskConnect(BufferLen, const_cast<VOID *>(Buffer),
+    st = ParseWdiTaskConnect(BufferLen, static_cast<const UINT8 *>(Buffer),
                              &ctx, &parsed);
     if (st != NDIS_STATUS_SUCCESS) return st;
 
@@ -400,7 +387,7 @@ VwifiTlvGenerateAssociationResult(
 {
     TLV_CONTEXT ctx = MakeCtx(PeerVersion);
     WDI_INDICATION_ASSOCIATION_RESULT_PARAMETERS params = {};
-    PVOID pOut = nullptr;
+    UINT8 *pOut = nullptr;
     ULONG outLen = 0;
 
     RtlCopyMemory(&params.BSSID, Result->bssid, 6);          /* [MEMBER?] */
@@ -429,32 +416,6 @@ VwifiTlvGenerateAssociationResult(
 
 extern "C"
 NDIS_STATUS
-VwifiTlvGenerateConnectComplete(
-    ULONG PeerVersion,
-    NDIS_STATUS ConnectStatus,
-    const UCHAR *Bssid,
-    VOID **Buffer,
-    PULONG BufferLen)
-{
-    TLV_CONTEXT ctx = MakeCtx(PeerVersion);
-    WDI_INDICATION_CONNECT_COMPLETE_PARAMETERS params = {};
-    PVOID pOut = nullptr;
-    ULONG outLen = 0;
-
-    params.Status = ConnectStatus;                 /* [MEMBER?] */
-    RtlCopyMemory(&params.BSSID, Bssid, 6);
-
-    NDIS_STATUS st = GenerateWdiIndicationConnectComplete(
-        &params, kHeaderReserve, &ctx, &outLen, &pOut);
-    if (st != NDIS_STATUS_SUCCESS) return st;
-
-    *Buffer    = pOut;
-    *BufferLen = outLen;
-    return NDIS_STATUS_SUCCESS;
-}
-
-extern "C"
-NDIS_STATUS
 VwifiTlvGenerateDisassociation(
     ULONG PeerVersion,
     const UCHAR *Bssid,
@@ -464,7 +425,7 @@ VwifiTlvGenerateDisassociation(
 {
     TLV_CONTEXT ctx = MakeCtx(PeerVersion);
     WDI_INDICATION_DISASSOCIATION_PARAMETERS params = {};
-    PVOID pOut = nullptr;
+    UINT8 *pOut = nullptr;
     ULONG outLen = 0;
 
     RtlCopyMemory(&params.BSSID, Bssid, 6);        /* [MEMBER?] */
@@ -498,7 +459,7 @@ VwifiTlvParseAddCipherKeys(
     NDIS_STATUS st;
     ULONG n = 0;
 
-    st = ParseWdiSetAddCipherKeys(BufferLen, const_cast<VOID *>(Buffer),
+    st = ParseWdiSetAddCipherKeys(BufferLen, static_cast<const UINT8 *>(Buffer),
                                   &ctx, &parsed);
     if (st != NDIS_STATUS_SUCCESS) return st;
 
@@ -550,7 +511,7 @@ VwifiTlvParseDeleteCipherKeys(
     NDIS_STATUS st;
     ULONG n = 0;
 
-    st = ParseWdiSetDeleteCipherKeys(BufferLen, const_cast<VOID *>(Buffer),
+    st = ParseWdiSetDeleteCipherKeys(BufferLen, static_cast<const UINT8 *>(Buffer),
                                      &ctx, &parsed);
     if (st != NDIS_STATUS_SUCCESS) return st;
 
@@ -588,7 +549,7 @@ VwifiTlvGenerateAdapterCapabilities(
 {
     TLV_CONTEXT ctx = MakeCtx(PeerVersion);
     WDI_GET_ADAPTER_CAPABILITIES_PARAMETERS params = {};
-    PVOID pOut = nullptr;
+    UINT8 *pOut = nullptr;
     ULONG outLen = 0;
 
     UNREFERENCED_PARAMETER(Mac);
@@ -648,7 +609,7 @@ VwifiTlvParseOperationMode(
     /* [VERIFY] entry-point and member names, against TlvGeneratorParser.hpp.
      * The scan path's ParseWdiTaskScan / CleanupParsedWdiTaskScan pair is
      * the naming precedent these follow. */
-    st = ParseWdiTaskChangeOperationMode(BufferLen, const_cast<VOID *>(Buffer),
+    st = ParseWdiTaskChangeOperationMode(BufferLen, static_cast<const UINT8 *>(Buffer),
                                          &ctx, &parsed);
     if (st != NDIS_STATUS_SUCCESS) {
         return st;
@@ -676,6 +637,6 @@ VOID
 VwifiTlvFreeGenerated(VOID *Buffer)
 {
     if (Buffer != nullptr) {
-        FreeGenerated(Buffer);
+        FreeGenerated(static_cast<UINT8 *>(Buffer));
     }
 }

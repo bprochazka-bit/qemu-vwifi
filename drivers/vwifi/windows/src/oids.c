@@ -263,6 +263,7 @@ VwifiHandleTaskChangeOpMode(_Inout_ PVWIFI_ADAPTER Adapter,
      * none. */
     VwifiSendWdiIndication(Adapter, Req->PortNumber,
                            NDIS_STATUS_WDI_INDICATION_CHANGE_OPERATION_MODE_COMPLETE,
+                           NDIS_STATUS_SUCCESS,
                            VwifiGetWdiTransactionId(Req),
                            NULL, 0);
     return NDIS_STATUS_SUCCESS;

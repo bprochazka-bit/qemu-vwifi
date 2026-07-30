@@ -106,6 +106,7 @@ VwifiIndicateBssEntryList(_Inout_ PVWIFI_ADAPTER Adapter)
      * carries the unsolicited transaction id even mid-scan. */
     VwifiSendWdiIndication(Adapter, task->PortId,
                            NDIS_STATUS_WDI_INDICATION_BSS_ENTRY_LIST,
+                           NDIS_STATUS_SUCCESS,
                            WDI_TRANSACTION_ID_UNSOLICIT,
                            generated, generatedLen);
 
@@ -128,23 +129,17 @@ static VOID
 VwifiIndicateScanComplete(_Inout_ PVWIFI_ADAPTER Adapter, _In_ NDIS_STATUS Status)
 {
     PVWIFI_SCAN_TASK task = Adapter->ScanTask;
-    PVOID generated = NULL;
-    ULONG generatedLen = 0;
 
     if (!task || !task->Active) return;
 
     /* Flush anything still staged before completing the task. */
     VwifiIndicateBssEntryList(Adapter);
 
-    if (VwifiTlvGenerateScanComplete(Adapter->WdiPeerVersion, Status,
-                                     &generated, &generatedLen)
-            == NDIS_STATUS_SUCCESS) {
-        VwifiSendWdiIndication(Adapter, task->PortId,
-                               NDIS_STATUS_WDI_INDICATION_SCAN_COMPLETE,
-                               task->TransactionId,
-                               generated, generatedLen);
-        VwifiTlvFreeGenerated(generated);
-    }
+    /* SCAN_COMPLETE carries no TLVs at all — the scan's outcome rides in
+     * the message header's Status field. */
+    VwifiSendWdiIndication(Adapter, task->PortId,
+                           NDIS_STATUS_WDI_INDICATION_SCAN_COMPLETE,
+                           Status, task->TransactionId, NULL, 0);
 
     VWIFI_INFO("indicated SCAN_COMPLETE (0x%x)", Status);
     task->Active = FALSE;

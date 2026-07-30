@@ -77,12 +77,9 @@ NDIS_STATUS VwifiTlvGenerateBssEntryList(
     _Outptr_result_bytebuffer_(*BufferLen) VOID **Buffer,
     _Out_ PULONG BufferLen);
 
-/* Generate an NDIS_STATUS_WDI_INDICATION_SCAN_COMPLETE payload. */
-NDIS_STATUS VwifiTlvGenerateScanComplete(
-    _In_ ULONG PeerVersion,
-    _In_ NDIS_STATUS ScanStatus,
-    _Outptr_result_bytebuffer_(*BufferLen) VOID **Buffer,
-    _Out_ PULONG BufferLen);
+/* No generator for SCAN_COMPLETE or CONNECT_COMPLETE: both are empty
+ * messages (EmptyMessageStructureType) that carry no TLVs. Their status
+ * goes in WDI_MESSAGE_HEADER.Status — see VwifiSendWdiIndication. */
 
 /* ============================================================
  * Connect
@@ -107,13 +104,6 @@ NDIS_STATUS VwifiTlvGenerateAssociationResult(
     _In_ ULONG PeerVersion,
     _In_ const struct vwifi_assoc_result *Result,
     _In_reads_bytes_opt_(Result->ie_len) const UCHAR *Ies,
-    _Outptr_result_bytebuffer_(*BufferLen) VOID **Buffer,
-    _Out_ PULONG BufferLen);
-
-NDIS_STATUS VwifiTlvGenerateConnectComplete(
-    _In_ ULONG PeerVersion,
-    _In_ NDIS_STATUS ConnectStatus,
-    _In_reads_bytes_(6) const UCHAR *Bssid,
     _Outptr_result_bytebuffer_(*BufferLen) VOID **Buffer,
     _Out_ PULONG BufferLen);
 

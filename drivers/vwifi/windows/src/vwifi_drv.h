@@ -358,10 +358,16 @@ UINT32      VwifiGetWdiTransactionId(_In_ PNDIS_OID_REQUEST Req);
 /* TransactionId must echo the originating OID request's transaction id
  * for a task-completion indication; WDI_TRANSACTION_ID_UNSOLICIT is the
  * right value for an unsolicited event. The OS matches completions by
- * this field, so a wrong one looks like a task that never finished. */
+ * this field, so a wrong one looks like a task that never finished.
+ *
+ * MessageStatus is the operation's result, carried in the message
+ * header rather than in a TLV. For the empty messages — SCAN_COMPLETE,
+ * CONNECT_COMPLETE — it is the only place the outcome appears at all;
+ * everything else passes NDIS_STATUS_SUCCESS. */
 VOID        VwifiSendWdiIndication(_Inout_ PVWIFI_ADAPTER Adapter,
                                    _In_ ULONG PortId,
                                    _In_ NDIS_STATUS StatusCode,
+                                   _In_ NDIS_STATUS MessageStatus,
                                    _In_ UINT32 TransactionId,
                                    _In_reads_bytes_opt_(TlvLength) PVOID TlvBuffer,
                                    _In_ ULONG TlvLength);

@@ -93,6 +93,7 @@ VOID
 VwifiSendWdiIndication(_Inout_ PVWIFI_ADAPTER Adapter,
                        _In_ ULONG PortId,
                        _In_ NDIS_STATUS StatusCode,
+                       _In_ NDIS_STATUS MessageStatus,
                        _In_ UINT32 TransactionId,
                        _In_reads_bytes_opt_(TlvLength) PVOID TlvBuffer,
                        _In_ ULONG TlvLength)
@@ -132,7 +133,7 @@ VwifiSendWdiIndication(_Inout_ PVWIFI_ADAPTER Adapter,
     hdr = (WDI_MESSAGE_HEADER *)msg;
     RtlZeroMemory(hdr, sizeof(*hdr));
     hdr->PortId        = (WDI_PORT_ID)PortId;
-    hdr->Status        = NDIS_STATUS_SUCCESS;
+    hdr->Status        = MessageStatus;
     hdr->TransactionId = TransactionId;
     hdr->IhvSpecificId = 0;
 
