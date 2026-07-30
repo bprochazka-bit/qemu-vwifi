@@ -65,8 +65,13 @@ The EWDK is a command-line, self-contained WDK: one ISO, no installer.
 and exits non-zero — `build-Debug.err` is the file to paste when
 reporting a broken build.
 
-Output lands in `x64\Debug\vwifi\`: `vwifi.sys`, `vwifi.inf`,
-`vwifi.pdb` (and `vwifi.cat` once you run `sign.cmd`).
+Output lands flat in `x64\Debug\`: `vwifi.sys`, `vwifi.inf`,
+`vwifi.pdb`. Note there is no `vwifi\` subfolder at this point —
+MSBuild only creates the driver-package folder as part of its own
+signing step, which this project turns off so a missing certificate
+cannot fail a build. `sign.cmd` assembles `x64\Debug\vwifi\` itself,
+because `Inf2Cat` catalogs a directory rather than a file list. **That
+subfolder is the thing you copy to the guest.**
 
 ### Option B — Visual Studio 2022 + WDK
 
@@ -99,10 +104,11 @@ it builds clean — `/W4` on a kernel driver catches real bugs.
 sign.cmd
 ```
 
-Creates `CN=vwifi-test-cert` in `Cert:\CurrentUser\My` the first time
-(reused after that), exports it to `vwifi-test-cert.cer`, runs
-`Inf2Cat`, and signs both `vwifi.cat` and `vwifi.sys`. Copy the `.cer`
-to the guest along with the driver package.
+Assembles `x64\Debug\vwifi\` from the build output, creates
+`CN=vwifi-test-cert` in `Cert:\CurrentUser\My` the first time (reused
+after that), exports it to `vwifi-test-cert.cer`, runs `Inf2Cat` over
+the package folder, and signs both `vwifi.cat` and `vwifi.sys`. Copy
+the `.cer` to the guest along with the package.
 
 ### If the first build fails
 

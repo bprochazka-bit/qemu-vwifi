@@ -117,9 +117,13 @@ if errorlevel 1 (
 )
 
 echo.
-echo Build OK. Driver package:
-echo   %~dp0x64\%CFG%\vwifi\
-dir /b "%~dp0x64\%CFG%\vwifi" 2>nul
+echo Build OK. Output:
+echo   %~dp0x64\%CFG%\
+dir /b "%~dp0x64\%CFG%\vwifi.sys" "%~dp0x64\%CFG%\vwifi.inf" 2>nul
+echo.
+echo   The build output is flat here, not in a vwifi\ subfolder: MSBuild
+echo   only creates the package folder as part of its own signing step,
+echo   which this project turns off. sign.cmd assembles it.
 echo.
 echo Warnings (review these^): %~dp0build-%CFG%.wrn
 echo Next: sign.cmd %CFG%

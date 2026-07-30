@@ -19,14 +19,34 @@ setlocal
 set CFG=%~1
 if "%CFG%"=="" set CFG=Debug
 
-set PKG=%~dp0x64\%CFG%\vwifi
+set OUT=%~dp0x64\%CFG%
+set PKG=%OUT%\vwifi
 set CERTNAME=vwifi-test-cert
 set CERTFILE=%~dp0%CERTNAME%.cer
 
-if not exist "%PKG%\vwifi.sys" (
-    echo ERROR: %PKG%\vwifi.sys not found. Run build.cmd %CFG% first.
+if not exist "%OUT%\vwifi.sys" (
+    echo ERROR: %OUT%\vwifi.sys not found. Run build.cmd %CFG% first.
     exit /b 1
 )
+
+rem --- assemble the driver package ------------------------------------
+rem  MSBuild only creates the x64\<cfg>\vwifi\ package folder as part of
+rem  its own signing step, which the project turns off (SignMode=Off) so
+rem  that a missing certificate cannot fail a build. The build output is
+rem  therefore flat in x64\<cfg>. Inf2Cat catalogs a *directory*, so
+rem  gather the three files that belong in the package here.
+echo Assembling %PKG% ...
+if not exist "%PKG%" mkdir "%PKG%"
+copy /y "%OUT%\vwifi.sys" "%PKG%\" >nul
+if errorlevel 1 exit /b 1
+copy /y "%OUT%\vwifi.inf" "%PKG%\" >nul
+if errorlevel 1 (
+    echo ERROR: %OUT%\vwifi.inf not found — did StampInf run?
+    exit /b 1
+)
+rem  The .pdb is not part of the catalog, but it travels with the .sys:
+rem  WinDbg wants them side by side.
+if exist "%OUT%\vwifi.pdb" copy /y "%OUT%\vwifi.pdb" "%PKG%\" >nul
 
 rem --- certificate: create once, reuse thereafter -----------------
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
