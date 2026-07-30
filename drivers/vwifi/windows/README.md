@@ -20,7 +20,8 @@ sits in this directory). Keeping two copies is how they drift; see
 vwifi.sln           solution — one project, Debug|x64 and Release|x64
 vwifi.vcxproj       MSBuild driver project (EWDK or VS 2022 + WDK)
 build.cmd           debug build wrapper; writes build-Debug.{log,err,wrn}
-sign.cmd            creates a test cert if needed, catalogs, signs
+sign.cmd            assembles the package, catalogs, test-signs
+sign.ps1            what sign.cmd actually runs
 install.cmd         run in the guest: replaces any installed vwifi package
 install.ps1         what install.cmd actually runs
 find-wdk-file.ps1   locates the WDI TLV header and library for build.cmd
@@ -132,7 +133,7 @@ expect most of them to be shallow. The ones worth recognising:
 | `LNK2019: unresolved external symbol ParseWdiTaskScanToIhv` (and the other `ParseWdi*` / `GenerateWdi*` / `FreeGenerated`) | the WDI TLV static library isn't linked. `TlvGenerated_.hpp` only *declares* these; the code ships in a `.lib` in the kit's Lib tree. `build.cmd` searches for it and passes it as `WdiTlvLib`; if the search comes up empty, find it with <code>dir /s /b "%ProgramFiles(x86)%\Windows Kits\10\Lib\*.lib" \| findstr /i wlan</code> and re-run as `set WdiTlvLib=<full path> && build.cmd`. |
 | `unresolved external symbol "void * __cdecl operator new"` | the TLV library wants an overload `tlv_mem.cpp` doesn't provide yet; add it there, matching the existing ones. |
 | `LNK4099: PDB 'vc145.pdb' was not found` then `LNK1218` | the shared compiler PDB didn't survive to link time — common when building from a mapped or network drive. The project uses `/Z7` (`OldStyle`) so there is no shared PDB to lose; if you see this, something has overridden `DebugInformationFormat`. |
-| `Inf2Cat` reports a signability error | the INF, not the code. `%windir%\inf\setupapi.dev.log` and the Inf2Cat message name the offending directive. |
+| `Inf2Cat` reports a signability error | the INF, not the code — `setupapi.dev.log` isn't involved yet. Its message names the offending directive. Note Inf2Cat exits 0 even when it fails, so `sign.ps1` checks whether the catalog actually appeared rather than trusting the exit code. |
 
 Warnings are not errors here (`TreatWarningAsError` is off), but read
 `build-Debug.wrn` anyway — on a first kernel build `/W4` warnings about
