@@ -8,7 +8,7 @@
  * "WDI TLV generator interface overview"):
  *
  *   Caller-allocation parse (we use this — stack local, no heap):
- *     WDI_TASK_SCAN_PARAMETERS parsed;
+ *     WDI_SCAN_PARAMETERS parsed;
  *     st = ParseWdiTaskScan(len, buf, &ctx, &parsed);
  *     ... use parsed ...
  *     CleanupParsedWdiTaskScan(&parsed);
@@ -72,6 +72,22 @@ static inline TLV_CONTEXT MakeCtx(ULONG PeerVersion)
     return ctx;
 }
 
+/* WDI_BSS_ENTRY_CHANNEL_INFO wants a channel number and a band id, not
+ * the centre frequency the device reports. */
+static WDI_CHANNEL_NUMBER VwifiFreqToChannel(USHORT FreqMhz)
+{
+    if (FreqMhz == 2484)                        return 14;
+    if (FreqMhz >= 2412 && FreqMhz <= 2472)     return (WDI_CHANNEL_NUMBER)((FreqMhz - 2407) / 5);
+    if (FreqMhz >= 5160 && FreqMhz <= 5885)     return (WDI_CHANNEL_NUMBER)((FreqMhz - 5000) / 5);
+    return 0;
+}
+
+static WDI_BAND_ID VwifiFreqToBandId(USHORT FreqMhz)
+{
+    /* [VERIFY] enumerator names against wditypes.hpp. */
+    return (FreqMhz >= 5000) ? WDI_BAND_ID_5000 : WDI_BAND_ID_2400;
+}
+
 /* The generator reserves this much space at the front of the blob for
  * the message header. The caller (NdisMIndicateStatusEx path) does not
  * prepend anything itself, so we ask for the WDI message header. */
@@ -92,7 +108,7 @@ VwifiTlvParseScanRequest(
     PULONG ReqLen)
 {
     TLV_CONTEXT ctx = MakeCtx(PeerVersion);
-    WDI_TASK_SCAN_PARAMETERS parsed = {};
+    WDI_SCAN_PARAMETERS parsed = {};
     NDIS_STATUS st;
 
     if (ReqCap < sizeof(*ReqBuf)) return NDIS_STATUS_BUFFER_TOO_SHORT;
@@ -120,9 +136,8 @@ VwifiTlvParseScanRequest(
     ReqBuf->dwell_ms        = 100;
     ReqBuf->flags           = 0;
 
-    /* Directed SSID list. [MEMBER?] parsed.SSIDList — check the true
-     * name; the pElements/ElementCount shape is documented in
-     * "WDI TLV generator/parser special members". */
+    /* Directed SSID list. ArrayOfElements<WDI_SSID>, and WDI_SSID is
+     * itself ArrayOfElements<UINT8>. */
     ULONG nssid = 0;
     if (parsed.SSIDList.ElementCount > 0 && parsed.SSIDList.pElements != nullptr) {
         UCHAR *trail = reinterpret_cast<UCHAR *>(ReqBuf) + sizeof(*ReqBuf);
@@ -167,28 +182,34 @@ VwifiTlvGenerateBssEntryList(
     /* Build the BSS entry array. The library takes the list as
      * pElements/ElementCount; we own this array, it owns the copy it
      * makes during generation. */
-    WDI_BSS_ENTRY *entries = static_cast<WDI_BSS_ENTRY *>(
+    WDI_BSS_ENTRY_CONTAINER *entries = static_cast<WDI_BSS_ENTRY_CONTAINER *>(
         ExAllocatePool2(POOL_FLAG_NON_PAGED,
-                        sizeof(WDI_BSS_ENTRY) * Count, 'eBvw'));
+                        sizeof(WDI_BSS_ENTRY_CONTAINER) * Count, 'eBvw'));
     if (entries == nullptr) return NDIS_STATUS_RESOURCES;
 
     for (ULONG i = 0; i < Count; i++) {
         const struct vwifi_bss_entry *e = Items[i].Entry;
-        WDI_BSS_ENTRY *w = &entries[i];
+        WDI_BSS_ENTRY_CONTAINER *w = &entries[i];
 
         RtlZeroMemory(w, sizeof(*w));
 
-        /* [MEMBER?] verify each of these against wditypes.hpp. */
+        /* WDI_BSS_ENTRY_CONTAINER carries far less than a beacon does,
+         * because the OS parses the frame itself. There is no BSSType,
+         * BeaconInterval, Capability or PhyType field to fill: those all
+         * come out of the raw frame below. What the container adds is the
+         * receive-side metadata the frame cannot carry — signal, channel,
+         * and when we saw it. */
         RtlCopyMemory(&w->BSSID, e->bssid, 6);
-        w->BSSType       = WDI_BSS_TYPE_INFRASTRUCTURE;
-        w->BeaconInterval = static_cast<USHORT>(e->beacon_period_tu);
-        w->Capability    = static_cast<USHORT>(e->capability_info & 0xFFFF);
-        w->RSSI          = e->rssi;
-        w->LinkQuality   = 0;
-        w->ChannelCenterFrequency = e->channel_freq;
-        w->HostTimestamp = e->tsf;
-        w->BSSTimestamp  = e->tsf;
-        w->PhyType       = WDI_PHY_TYPE_ERP;
+
+        w->SignalInfo.RSSI        = e->rssi;
+        w->SignalInfo.LinkQuality = 0;
+
+        w->ChannelInfo.ChannelNumber = VwifiFreqToChannel(e->channel_freq);
+        w->ChannelInfo.BandId        = VwifiFreqToBandId(e->channel_freq);
+
+        w->EntryAgeInfo.HostTimeStamp     = e->tsf;
+        w->EntryAgeInfo.CachedInformation = FALSE;
+        w->Optional.EntryAgeInfo_IsPresent = TRUE;
 
         /* The WHOLE beacon / probe-response frame, verbatim.
          *
@@ -201,22 +222,27 @@ VwifiTlvGenerateBssEntryList(
          * The OS parses the IEs itself (SSID, RSN, rates, HT/VHT caps).
          * Handing over a reconstructed subset would silently lose
          * capabilities — which is exactly why the device keeps whole
-         * frames rather than just the IE tail. */
+         * frames rather than just the IE tail.
+         *
+         * WDI_BYTE_BLOB is ArrayOfElements<UINT8>: the bytes go directly
+         * in ElementCount/pElements, with no Payload indirection. */
         if (e->capability_info & VWIFI_BSS_F_BEACON) {
-            w->BeaconFrame.Payload.ElementCount = e->ie_len;
-            w->BeaconFrame.Payload.pElements =
-                const_cast<UINT8 *>(Items[i].Frame);
-            w->BeaconFrame_IsPresent = TRUE;
+            w->BeaconFrame.ElementCount = e->ie_len;
+            w->BeaconFrame.pElements    = const_cast<UINT8 *>(Items[i].Frame);
+            w->Optional.BeaconFrame_IsPresent = TRUE;
         } else {
-            w->ProbeResponseFrame.Payload.ElementCount = e->ie_len;
-            w->ProbeResponseFrame.Payload.pElements =
+            w->ProbeResponseFrame.ElementCount = e->ie_len;
+            w->ProbeResponseFrame.pElements =
                 const_cast<UINT8 *>(Items[i].Frame);
-            w->ProbeResponseFrame_IsPresent = TRUE;
+            w->Optional.ProbeResponseFrame_IsPresent = TRUE;
         }
     }
 
-    params.BSSEntries.ElementCount = Count;
-    params.BSSEntries.pElements    = entries;
+    /* The list member is called DeviceDescriptor, not BSSEntries, and it
+     * is one of the optional TLVs. */
+    params.DeviceDescriptor.ElementCount = Count;
+    params.DeviceDescriptor.pElements    = entries;
+    params.Optional.DeviceDescriptor_IsPresent = TRUE;
 
     st = GenerateWdiIndicationBssEntryList(&params, kHeaderReserve,
                                            &ctx, &outLen, &pOut);
@@ -386,24 +412,35 @@ VwifiTlvGenerateAssociationResult(
     PULONG BufferLen)
 {
     TLV_CONTEXT ctx = MakeCtx(PeerVersion);
-    WDI_INDICATION_ASSOCIATION_RESULT_PARAMETERS params = {};
+    WDI_INDICATION_ASSOCIATION_RESULT_LIST params = {};
+    WDI_ASSOCIATION_RESULT_CONTAINER entry = {};
     UINT8 *pOut = nullptr;
     ULONG outLen = 0;
 
-    RtlCopyMemory(&params.BSSID, Result->bssid, 6);          /* [MEMBER?] */
-    params.ScanResult = 0;
-    params.AssocStatus = (Result->status_code == 0)
-                       ? WDI_ASSOC_STATUS_SUCCESS
-                       : WDI_ASSOC_STATUS_FAILURE;
-    params.AssocResponseStatus = Result->status_code;
-    params.AssociationID = Result->aid;
+    /* The indication is a *list* of association results, one per port,
+     * even though a STA only ever reports one. */
+    RtlCopyMemory(&entry.BSSID, Result->bssid, 6);
 
-    /* The AP's association-response IEs. The OS reads the negotiated
-     * cipher suite out of these, so they have to be real. */
+    /* [VERIFY] WDI_ASSOC_STATUS / WDI_CIPHER_ALGORITHM enumerator names
+     * against wditypes.hpp. The structure members below are confirmed
+     * against TlvGenerated_.hpp. */
+    entry.AssociationResultParameters.AssociationStatus =
+        (Result->status_code == 0) ? WDI_ASSOC_STATUS_SUCCESS
+                                   : WDI_ASSOC_STATUS_FAILURE;
+    entry.AssociationResultParameters.StatusCode    = Result->status_code;
+    entry.AssociationResultParameters.ReAssociation = FALSE;
+    entry.AssociationResultParameters.PortAuthorized = FALSE;
+
+    /* The AP's association-response frame, verbatim. The OS reads the
+     * negotiated cipher suite out of its IEs, so it has to be real. */
     if (Ies != nullptr && Result->ie_len > 0) {
-        params.AssocResponseIEs.ElementCount = Result->ie_len;
-        params.AssocResponseIEs.pElements = const_cast<UINT8 *>(Ies);
+        entry.AssociationResponseFrame.ElementCount = Result->ie_len;
+        entry.AssociationResponseFrame.pElements = const_cast<UINT8 *>(Ies);
+        entry.Optional.AssociationResponseFrame_IsPresent = TRUE;
     }
+
+    params.AssociationResults.ElementCount = 1;
+    params.AssociationResults.pElements    = &entry;
 
     NDIS_STATUS st = GenerateWdiIndicationAssociationResult(
         &params, kHeaderReserve, &ctx, &outLen, &pOut);
@@ -428,8 +465,12 @@ VwifiTlvGenerateDisassociation(
     UINT8 *pOut = nullptr;
     ULONG outLen = 0;
 
-    RtlCopyMemory(&params.BSSID, Bssid, 6);        /* [MEMBER?] */
-    params.DisassocReason = ReasonCode;
+    /* Neither BSSID nor a reason code sits at the top level: both live
+     * in the nested DisconnectIndicationParameters, and the reason is a
+     * WDI_ASSOC_STATUS rather than an 802.11 reason code. */
+    RtlCopyMemory(&params.DisconnectIndicationParameters.MacAddress, Bssid, 6);
+    params.DisconnectIndicationParameters.DisassociationWABIReason =
+        (WDI_ASSOC_STATUS)ReasonCode;   /* [VERIFY] mapping, wditypes.hpp */
 
     NDIS_STATUS st = GenerateWdiIndicationDisassociation(
         &params, kHeaderReserve, &ctx, &outLen, &pOut);
@@ -465,9 +506,9 @@ VwifiTlvParseAddCipherKeys(
 
     /* [MEMBER?] parsed.CipherKeys — list of WDI_CIPHER_KEY. */
     for (ULONG i = 0;
-         i < parsed.CipherKeys.ElementCount && n < KeysCap;
+         i < parsed.SetCipherKey.ElementCount && n < KeysCap;
          i++) {
-        const WDI_CIPHER_KEY *ck = &parsed.CipherKeys.pElements[i];
+        const WDI_CIPHER_KEY *ck = &parsed.SetCipherKey.pElements[i];
         VWIFI_TLV_KEY *k = &Keys[n];
 
         RtlZeroMemory(k, sizeof(*k));
@@ -516,9 +557,9 @@ VwifiTlvParseDeleteCipherKeys(
     if (st != NDIS_STATUS_SUCCESS) return st;
 
     for (ULONG i = 0;
-         i < parsed.CipherKeys.ElementCount && n < KeysCap;
+         i < parsed.SetCipherKey.ElementCount && n < KeysCap;
          i++) {
-        const WDI_CIPHER_KEY_ID *ck = &parsed.CipherKeys.pElements[i];
+        const WDI_CIPHER_KEY_ID *ck = &parsed.SetCipherKey.pElements[i];
         VWIFI_TLV_KEY *k = &Keys[n];
 
         RtlZeroMemory(k, sizeof(*k));
@@ -615,7 +656,9 @@ VwifiTlvParseOperationMode(
         return st;
     }
 
-    mode = parsed.OperationMode.OperationMode;   /* [MEMBER?] */
+    /* WDI_OPERATION_MODE_CONTAINER is a plain typedef of
+     * WDI_OPERATION_MODE — the member is the value, not a sub-struct. */
+    mode = parsed.OperationMode;
     CleanupParsedWdiTaskChangeOperationMode(&parsed);
 
     if (mode & WDI_OPERATION_MODE_NETWORK_MONITOR) {
