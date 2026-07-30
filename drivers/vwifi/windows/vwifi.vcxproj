@@ -67,8 +67,14 @@
   <ItemDefinitionGroup>
     <ClCompile>
       <!-- The ABI header is shared verbatim with the QEMU device and
-           lives once at the top of the repo. Never copy it here. -->
-      <AdditionalIncludeDirectories>$(MSBuildThisFileDirectory)src;$(MSBuildThisFileDirectory)..\..\..\abi;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+           lives once at the top of the repo. Never copy it here.
+
+           WdiTlvIncludeDir is where TlvGeneratorParser.hpp lives. That
+           header is not in the kit's default include path the way
+           dot11wdi.h and wditypes.hpp are, so build.cmd locates it and
+           passes it in; override with /p:WdiTlvIncludeDir=<path> if
+           yours is somewhere else. Empty entries are harmless. -->
+      <AdditionalIncludeDirectories>$(MSBuildThisFileDirectory)src;$(MSBuildThisFileDirectory)..\..\..\abi;$(WdiTlvIncludeDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <!-- WDI requires NDIS 6.50, which is what driver.c registers with. -->
       <PreprocessorDefinitions>NDIS_MINIPORT_DRIVER;NDIS650_MINIPORT=1;NDIS_WDM=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <WarningLevel>Level4</WarningLevel>

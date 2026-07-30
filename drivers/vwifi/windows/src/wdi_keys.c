@@ -92,29 +92,50 @@ VwifiInstallOneKey(_Inout_ PVWIFI_ADAPTER Adapter,
     return NDIS_STATUS_SUCCESS;
 }
 
+/* Room for a PTK plus the three group-key slots. WDI never sends more
+ * than that in one request for a STA. */
+#define VWIFI_MAX_KEYS_PER_REQUEST 4
+
 NDIS_STATUS
 VwifiHandleAddCipherKeys(_Inout_ PVWIFI_ADAPTER Adapter,
                          _In_ PNDIS_OID_REQUEST Req)
 {
-    UNREFERENCED_PARAMETER(Req);
+    VWIFI_TLV_KEY keys[VWIFI_MAX_KEYS_PER_REQUEST];
+    ULONG count = 0;
+    ULONG i;
+    NDIS_STATUS status;
+    PVOID tlvBuf;
+    ULONG tlvLen;
 
-    /* Placeholder until the TLV parser is wired. The real loop is:
-     *
-     *   for (i = 0; i < p->CipherKeys.ElementCount; i++) {
-     *       WDI_CIPHER_KEY *ck = &p->CipherKeys.pElements[i];
-     *       BOOLEAN pairwise =
-     *           (ck->CipherKeyInfo.KeyType == WDI_CIPHER_KEY_TYPE_PAIRWISE);
-     *       status = VwifiInstallOneKey(Adapter, pairwise,
-     *                                   (UCHAR)ck->CipherKeyInfo.KeyIndex,
-     *                                   ck->MacAddr,
-     *                                   ck->KeyValue.pElements,
-     *                                   ck->KeyValue.ElementCount);
-     *       if (status != NDIS_STATUS_SUCCESS) return status;
-     *   }
-     */
+    status = VwifiGetTlvPayload(Req, &tlvBuf, &tlvLen);
+    if (status != NDIS_STATUS_SUCCESS) return status;
 
-    VWIFI_WARN("AddCipherKeys: TLV parse not yet wired; no keys installed");
-    return NDIS_STATUS_NOT_SUPPORTED;
+    status = VwifiTlvParseAddCipherKeys(Adapter->WdiPeerVersion,
+                                        tlvBuf, tlvLen,
+                                        keys, RTL_NUMBER_OF(keys), &count);
+    if (status != NDIS_STATUS_SUCCESS) {
+        VWIFI_ERR("cipher key TLV parse failed 0x%x", status);
+        return status;
+    }
+
+    for (i = 0; i < count; i++) {
+        status = VwifiInstallOneKey(Adapter,
+                                    keys[i].Pairwise,
+                                    keys[i].KeyIndex,
+                                    keys[i].PeerMac,
+                                    keys[i].KeyValue,
+                                    keys[i].KeyLength);
+        if (status != NDIS_STATUS_SUCCESS) {
+            RtlSecureZeroMemory(keys, sizeof(keys));
+            return status;
+        }
+    }
+
+    /* Key material has no business outliving this frame. */
+    RtlSecureZeroMemory(keys, sizeof(keys));
+
+    VWIFI_INFO("AddCipherKeys: installed %u key(s)", count);
+    return NDIS_STATUS_SUCCESS;
 }
 
 NDIS_STATUS

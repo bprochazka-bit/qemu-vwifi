@@ -32,7 +32,6 @@ VwifiRingAlloc(
     _In_ ULONG RegSize,
     _In_ ULONG RegDoorbell, _In_ ULONG RegHead)
 {
-    NDIS_STATUS status;
     ULONG size = NumDescs * DescSize;
 
     RtlZeroMemory(Ring, sizeof(*Ring));
@@ -461,8 +460,9 @@ VwifiCtrlRspDrain(_Inout_ PVWIFI_ADAPTER Adapter)
                 break;
             }
         } else {
-            /* Match to pending request by req_id. */
-            KIRQL old;
+            /* Match to pending request by req_id. Already at
+             * DISPATCH_LEVEL in the DPC, hence the *AtDpcLevel forms
+             * and no saved KIRQL. */
             PVWIFI_PENDING_REQ req;
             KeAcquireSpinLockAtDpcLevel(&Adapter->PendingReqLock);
             req = VwifiDequeuePendingReqLocked(Adapter, d->req_id);

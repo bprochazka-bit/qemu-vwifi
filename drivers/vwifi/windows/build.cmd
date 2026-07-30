@@ -30,11 +30,36 @@ if errorlevel 1 (
     exit /b 1
 )
 
+rem --- locate TlvGeneratorParser.hpp ------------------------------
+rem  Unlike dot11wdi.h and wditypes.hpp, this one is not on the kit's
+rem  default include path. Find it once and pass its directory in.
+rem  Set WdiTlvIncludeDir yourself to skip the search.
+if not defined WdiTlvIncludeDir (
+    echo Locating TlvGeneratorParser.hpp ...
+    for /f "usebackq delims=" %%D in (`powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+        "$roots = @($env:WindowsSdkDir, ${env:ProgramFiles(x86)} + '\Windows Kits\10', $env:WDKContentRoot) | Where-Object { $_ -and (Test-Path $_) };" ^
+        "foreach ($r in $roots) {" ^
+        "  $h = Get-ChildItem -Path $r -Filter 'TlvGeneratorParser.hpp' -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1;" ^
+        "  if ($h) { $h.DirectoryName; break } }"`) do set "WdiTlvIncludeDir=%%D"
+)
+
+if not defined WdiTlvIncludeDir (
+    echo.
+    echo WARNING: TlvGeneratorParser.hpp not found in the mounted kit.
+    echo   tlv_shim.cpp will fail with C1083. Find it with:
+    echo     dir /s /b "%%ProgramFiles(x86)%%\Windows Kits\10\TlvGeneratorParser.hpp"
+    echo   then re-run as:  set WdiTlvIncludeDir=^<its folder^> ^&^& build.cmd
+    echo.
+) else (
+    echo   TlvGeneratorParser.hpp: %WdiTlvIncludeDir%
+)
+
 echo Building vwifi %CFG%^|x64 ...
 msbuild "%~dp0vwifi.sln" ^
     /t:Build ^
     /p:Configuration=%CFG% ^
     /p:Platform=x64 ^
+    /p:WdiTlvIncludeDir="%WdiTlvIncludeDir%" ^
     /m ^
     /v:minimal ^
     /nologo ^
