@@ -8,7 +8,7 @@
 
     Replacing a driver is not the same as installing one.
     `pnputil /add-driver` adds a package, but PnP keeps the one already
-    bound to the device unless the new package ranks better — and
+    bound to the device unless the new package ranks better -- and
     ranking is on DriverVer, which stampinf writes as <date>,<version>.
     Two builds on the same day with the same version are
     indistinguishable, so the old package wins and you keep testing the
@@ -37,7 +37,7 @@ $cat = Join-Path $Path 'vwifi.cat'
 if (-not (Test-Path $inf)) { throw "vwifi.inf not found in $Path" }
 if (-not (Test-Path $sys)) { throw "vwifi.sys not found in $Path" }
 if (-not (Test-Path $cat)) {
-    Write-Warning 'No vwifi.cat — run sign.cmd. Without it the package is unsigned.'
+    Write-Warning 'No vwifi.cat -- run sign.cmd. Without it the package is unsigned.'
 }
 
 # The DriverVer actually being installed, so a stale package is obvious.
@@ -80,7 +80,7 @@ if ($LASTEXITCODE -ne 0) {
     Write-Host 'ERROR: pnputil failed. The usual causes:'
     Write-Host '  * test-signing off, or Secure Boot / memory integrity on'
     Write-Host '  * the test certificate not in Root AND TrustedPublisher'
-    Write-Host '  * vwifi.cat stale — re-run sign.cmd after every build'
+    Write-Host '  * vwifi.cat stale -- re-run sign.cmd after every build'
     Write-Host '  %windir%\inf\setupapi.dev.log records what PnP actually did.'
     exit 1
 }
@@ -95,7 +95,7 @@ Write-Host ''
 Write-Host '[4/4] Device status:'
 $dev = Get-PnpDevice -InstanceId 'PCI\VEN_1AF4&DEV_0E00*' -ErrorAction SilentlyContinue
 if (-not $dev) {
-    Write-Host '  no vwifi-virt device present — is -device vwifi-virt on the QEMU command line?'
+    Write-Host '  no vwifi-virt device present -- is -device vwifi-virt on the QEMU command line?'
 } else {
     foreach ($d in $dev) {
         Write-Host "  $($d.FriendlyName)"

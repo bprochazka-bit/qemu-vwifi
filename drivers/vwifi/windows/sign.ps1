@@ -51,7 +51,7 @@ if (-not (Test-Path $out)) {
 $need = @('vwifi.sys', 'vwifi.inf')
 $missing = $need | Where-Object { -not (Test-Path (Join-Path $out $_)) }
 if ($missing) {
-    Fail ("$out is missing: {0}`n       Run build.cmd $Configuration — a failed link leaves the .sys behind,`n       and a skipped StampInf leaves the .inf behind." -f ($missing -join ', '))
+    Fail ("$out is missing: {0}`n       Run build.cmd $Configuration -- a failed link leaves the .sys behind,`n       and a skipped StampInf leaves the .inf behind." -f ($missing -join ', '))
 }
 
 New-Item -ItemType Directory -Path $pkg -Force | Out-Null
@@ -106,7 +106,7 @@ if (-not (Test-Path $cat)) {
 Inf2Cat produced no catalog. Its own output is above; the usual causes:
   * a directive in the INF that is not signable for the target OS
   * the INF referencing a file that is not in the package folder
-%windir%\inf\setupapi.dev.log is not involved yet — this is purely the
+%windir%\inf\setupapi.dev.log is not involved yet -- this is purely the
 INF's own contents.
 "@
 }

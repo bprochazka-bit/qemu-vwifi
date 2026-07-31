@@ -9,7 +9,7 @@
 
     Prints the single best match to stdout and nothing else, so the
     caller can capture it. Every candidate considered, and why it was
-    accepted or rejected, goes to stderr — so a wrong or empty result is
+    accepted or rejected, goes to stderr -- so a wrong or empty result is
     never silent.
 
     This lives in its own script rather than inline in build.cmd because
@@ -32,7 +32,7 @@
     them. This is load-bearing: a kit ships parallel copies of the WDI
     TLV files, and picking the wrong one produces a wall of errors
     inside the Microsoft header rather than anything pointing back here.
-    This driver needs the kernel-mode copy — under \km — matching the
+    This driver needs the kernel-mode copy -- under \km -- matching the
     dot11wdi.h it is written against.
 
 .PARAMETER MustNotContain
@@ -86,7 +86,7 @@ function Emit([string] $s) { [Console]::Out.WriteLine($s) }
 
 # Candidate kit roots, best first. WindowsSdkDir is set by
 # LaunchBuildEnv.cmd and by the VS developer prompt, and points at the
-# kit actually in use — not necessarily the one on C:.
+# kit actually in use -- not necessarily the one on C:.
 $roots = New-Object System.Collections.Generic.List[string]
 foreach ($r in @($env:WindowsSdkDir,
                  $env:WDKContentRoot,
