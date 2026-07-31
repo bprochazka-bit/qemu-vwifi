@@ -710,7 +710,7 @@ static const UINT16 kRatesOfdm[] = { 12, 18, 24, 36, 48, 72, 96, 108 };
 #define VWIFI_CAPS_MAX_CHAN_24  14
 #define VWIFI_CAPS_MAX_CHAN_5   RTL_NUMBER_OF(kUniiChannels)
 #define VWIFI_CAPS_MAX_RATES    8
-#define VWIFI_CAPS_MAX_ALGOS    2
+#define VWIFI_CAPS_MAX_ALGOS    16
 
 /* Backing store for every ArrayOfElements the capabilities message
  * points at. The library reads through those pointers during Generate,
@@ -1020,30 +1020,72 @@ VwifiTlvGenerateAdapterCapabilities(
 
     /* Which security this adapter can do.
      *
-     * Also optional, and also the sort of thing whose absence makes an
-     * adapter useless rather than merely limited: with no algorithm
-     * pairs the OS has no basis to offer any network, secured or not.
-     * The device advertises VWIFI_CAP_WPA2, and wdi_keys.c installs
-     * CCMP pairwise/group keys, so open and WPA2-PSK are what is
-     * honestly supported. */
+     * This list is what Windows matches a network's advertised security
+     * against before it will build a profile for it, so a pair missing
+     * here is a network the OS will not offer to connect to. It is also
+     * what `netsh wlan show drivers` prints as "Authentication and
+     * cipher supported in infrastructure mode".
+     *
+     * It used to hold exactly two pairs -- open/none and RSNA-PSK/CCMP.
+     * That is enough for the AP on the medium in principle, but it
+     * describes an adapter unlike any real one, and the cost of being
+     * complete here is a few lines.
+     *
+     * Bounded by what actually works, not by what would look
+     * impressive. The device's cipher enum runs to WEP40, WEP104,
+     * TKIP, CCMP128 and GCMP256, and its AKMs to PSK, SAE and 802.1X --
+     * but wdi_keys.c installs CCMP and nothing else, so TKIP and SAE
+     * are absent here. Advertising a cipher the key path cannot install
+     * would move the failure from "will not try" to "tries and fails
+     * during the handshake", which is worse.
+     */
     {
-        scratch->Algos[0].AuthAlgorithm   = WDI_AUTH_ALGO_80211_OPEN;
-        scratch->Algos[0].CipherAlgorithm = WDI_CIPHER_ALGO_NONE;
-        scratch->Algos[1].AuthAlgorithm   = WDI_AUTH_ALGO_RSNA_PSK;
-        scratch->Algos[1].CipherAlgorithm = WDI_CIPHER_ALGO_CCMP;
+        static const struct { WDI_AUTH_ALGORITHM Auth; WDI_CIPHER_ALGORITHM Cipher; }
+        kAlgoPairs[] = {
+            /* Open networks. */
+            { WDI_AUTH_ALGO_80211_OPEN,       WDI_CIPHER_ALGO_NONE    },
 
-        params.StationAttributes.UnicastAlgorithms.ElementCount = 2;
+            /* WEP, both authentications. Obsolete, and the device does
+             * carry the ciphers; listed because an adapter that claims
+             * no WEP at all is an unusual thing for the OS to see. */
+            { WDI_AUTH_ALGO_80211_OPEN,       WDI_CIPHER_ALGO_WEP40   },
+            { WDI_AUTH_ALGO_80211_OPEN,       WDI_CIPHER_ALGO_WEP104  },
+            { WDI_AUTH_ALGO_80211_SHARED_KEY, WDI_CIPHER_ALGO_WEP40   },
+            { WDI_AUTH_ALGO_80211_SHARED_KEY, WDI_CIPHER_ALGO_WEP104  },
+
+            /* WPA with AES. */
+            { WDI_AUTH_ALGO_WPA,              WDI_CIPHER_ALGO_CCMP    },
+            { WDI_AUTH_ALGO_WPA_PSK,          WDI_CIPHER_ALGO_CCMP    },
+
+            /* WPA2. RSNA_PSK/CCMP is WPA2-Personal with AES, which is
+             * what the AP on the medium runs and the pair this whole
+             * list exists to get accepted. */
+            { WDI_AUTH_ALGO_RSNA,             WDI_CIPHER_ALGO_CCMP    },
+            { WDI_AUTH_ALGO_RSNA_PSK,         WDI_CIPHER_ALGO_CCMP    },
+        };
+
+        for (ULONG i = 0; i < RTL_NUMBER_OF(kAlgoPairs); i++) {
+            scratch->Algos[i].AuthAlgorithm   = kAlgoPairs[i].Auth;
+            scratch->Algos[i].CipherAlgorithm = kAlgoPairs[i].Cipher;
+        }
+
+        params.StationAttributes.UnicastAlgorithms.ElementCount =
+            RTL_NUMBER_OF(kAlgoPairs);
         params.StationAttributes.UnicastAlgorithms.pElements = scratch->Algos;
         params.StationAttributes.Optional.UnicastAlgorithms_IsPresent = TRUE;
 
-        params.StationAttributes.MulticastDataAlgorithms.ElementCount = 2;
+        /* The group cipher list. Same pairs: a station accepts the same
+         * ciphers for group traffic as for its own. */
+        params.StationAttributes.MulticastDataAlgorithms.ElementCount =
+            RTL_NUMBER_OF(kAlgoPairs);
         params.StationAttributes.MulticastDataAlgorithms.pElements =
             scratch->Algos;
         params.StationAttributes.Optional.MulticastDataAlgorithms_IsPresent =
             TRUE;
 
-        /* MulticastManagementAlgorithms left absent: MFPCapable is 0,
-         * so there is no management-frame cipher to name. */
+        /* MulticastManagementAlgorithms stays absent, consistently with
+         * MFPCapable being 0: with no management-frame protection there
+         * is no management cipher to name. WPA2 does not require it. */
     }
 
     /* Datapath attributes. Marked optional="true" in WABIModel.xml and
