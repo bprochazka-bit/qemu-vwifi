@@ -28,6 +28,12 @@
  * drifting into a buffer overrun. */
 C_ASSERT(VWIFI_CTRL_PAYLOAD_SIZE >= 2048);
 
+/* Likewise for the TX slot size the datapath capabilities advertise as
+ * the per-frame allocation granularity: tlv_shim.cpp carries its own
+ * VWIFI_TLV_TX_SLOT_SIZE because it cannot include this header, and the
+ * value has to be what rings.c actually carves the TX pool into. */
+C_ASSERT(VWIFI_RX_BUFFER_SIZE == 4096);
+
 /* ============================================================
  * TLV payload extraction
  * ============================================================ */

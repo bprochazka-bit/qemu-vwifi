@@ -386,6 +386,59 @@ Useful commands once it's loaded:
 | `!poolused 4 fiWv` | driver allocations by tag (`'fiWv'` = `VWIFI_POOL_TAG`) |
 | `!analyze -v` | after a bugcheck, before anything else |
 
+### The WDI adapter bring-up sequence
+
+Worth having written down, because every failure so far has been a step
+in it going unanswered, and the failures look identical from outside:
+the adapter opens, a little happens, and it closes again.
+
+After `MiniportWdiOpenAdapter` completes, the Microsoft WLAN component
+does this, in this order:
+
+| Step | What it is |
+|---|---|
+| `MiniportWdiTalTxRxInitialize` | hand over the data-path handler table |
+| `OID_WDI_GET_ADAPTER_CAPABILITIES` | read what the radio can do |
+| `OID_WDI_SET_ADAPTER_CONFIGURATION` | push MAC and firmware settings down |
+| `OID_WDI_TASK_SET_RADIO_STATE` | *only if* the radio is not already in the expected state |
+| `MiniportWdiTalTxRxStart` | start the data path |
+| `OID_WDI_TASK_CREATE_PORT` | create the first port |
+
+`OID_WDI_TASK_OPEN` is always first, but it does not arrive as an OID —
+it is delivered as the `OpenAdapterHandler` callback. Beyond that, the
+order of the rest is not guaranteed.
+
+Two things follow from having this table:
+
+- **Where the trace stops is the diagnosis.** Stopping after
+  `SET_ADAPTER_CONFIGURATION` with `SET_RADIO_STATE` skipped means the
+  component could not get as far as starting the data path.
+- **`SET_RADIO_STATE` being absent is normal**, not a missing step, as
+  long as the capabilities report `HardwareRadioState` and
+  `SoftwareRadioState` as TRUE. Those are "is the radio *enabled*",
+  so TRUE means on and there is nothing for the OS to change.
+
+### "Optional" in WABIModel.xml does not mean optional
+
+The model file describes the wire format, not the requirements. A
+container marked `optional="true"` may be omitted and the message will
+still generate and parse cleanly — and the adapter will still not work.
+This has now cost two rounds:
+
+| Container | Marked | Actually |
+|---|---|---|
+| `BandInfo`, `PhyInfo` | optional | without them the adapter has no channels; the component reads the capabilities and closes |
+| `DatapathAttributes` | optional | without it there is no `MaxNumPeers` to build a `WDI_TXRX_TARGET_CONFIGURATION` from, so `MiniportWdiTalTxRxStart` is never called |
+
+`FirmwareVersion` is the opposite trap and easier to spot: genuinely
+mandatory, and leaving it as a zeroed `ArrayOfElements` fails the
+generate outright with `NDIS_STATUS_INVALID_DATA` (`0xc0010015`), which
+at least says something.
+
+The rule that actually holds: if a container describes something the
+adapter *is*, fill it in, whatever the model says. Only omit containers
+describing features the device genuinely does not have.
+
 ### Recovering a guest that hangs at boot
 
 Once the package is installed, PnP starts the driver during boot. If it

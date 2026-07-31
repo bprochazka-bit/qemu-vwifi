@@ -94,6 +94,14 @@ static WDI_BAND_ID VwifiFreqToBandId(USHORT FreqMhz)
  * VWIFI_CTRL_PAYLOAD_SIZE by a C_ASSERT on the C side. */
 #define VWIFI_TLV_MAX_COMMAND_SIZE 2048
 
+/* Per-frame TX slot size, reported as the datapath's allocation
+ * granularity. Must stay a power of two, and must match
+ * VWIFI_RX_BUFFER_SIZE in vwifi_drv.h, which is what rings.c carves the
+ * TX buffer pool into. That header is C-only and cannot be included
+ * here, hence the duplicate -- same arrangement, and same reason, as
+ * VWIFI_TLV_MAX_COMMAND_SIZE above. */
+#define VWIFI_TLV_TX_SLOT_SIZE 4096
+
 /* The generator reserves this much space at the front of the blob for
  * the message header. The caller (NdisMIndicateStatusEx path) does not
  * prepend anything itself, so we ask for the WDI message header. */
@@ -986,9 +994,75 @@ VwifiTlvGenerateAdapterCapabilities(
          * so there is no management-frame cipher to name. */
     }
 
-    /* Still not filled: the country-region list, PM capabilities,
-     * datapath, P2P, AP and virtualization attributes. All optional,
-     * and all describe things this device does not do. */
+    /* Datapath attributes. Marked optional="true" in WABIModel.xml and
+     * required in practice.
+     *
+     * This container is where the WLAN component gets the numbers it
+     * needs to build the WDI_TXRX_TARGET_CONFIGURATION it passes to
+     * MiniportWdiTalTxRxStart -- MaxNumPeers above all. Without it,
+     * there is nothing to start the data path with, so it never calls
+     * TalTxRxStart, never reaches OID_WDI_TASK_CREATE_PORT, and closes
+     * the adapter instead. The documented order is
+     *
+     *   TalTxRxInitialize -> GET_ADAPTER_CAPABILITIES ->
+     *   SET_ADAPTER_CONFIGURATION -> [TASK_SET_RADIO_STATE] ->
+     *   TalTxRxStart -> TASK_CREATE_PORT
+     *
+     * and the trace stopped dead between the third and the fifth, which
+     * is exactly the shape of this being missing. */
+    {
+        WDI_DATAPATH_CAPABILITIES *dp =
+            &params.DatapathAttributes.DataPathCapabilities;
+
+        /* MEMORY_MAPPED: the target can reach system memory directly.
+         * That is what a PCI device with DMA rings is; MESSAGE_BASED is
+         * for USB and SDIO parts that have to be fed. */
+        dp->InterconnectType = WDI_INTERCONNECT_MEMORY_MAPPED;
+
+        /* Sizes the component's peer table. A station has exactly one
+         * peer, its AP; the headroom is for the SoftAP mode the device
+         * advertises. */
+        dp->MaxNumPeers = 8;
+
+        /* 0: no priority queueing in the target, so the component keeps
+         * its full scheduler rather than handing us port-level queues
+         * we have nowhere to put. */
+        dp->TxTargetPriorityQueueing = 0;
+
+        /* One element per frame. The TX path copies each frame into a
+         * single contiguous slot in TxBufferPool; there is no
+         * scatter-gather to offer. */
+        dp->TxMaxScatterGatherElementsPerFrame = 1;
+
+        /* 0: completions for every frame, not only flagged ones. */
+        dp->TxExplicitSendCompleteFlagRequired = 0;
+
+        /* No minimum -- the device has no per-frame overhead that would
+         * make a small frame cost more than its size. */
+        dp->TxMinEffectiveFrameSize = 0;
+
+        /* Must be a power of two. Matches the per-frame slot size in
+         * TxBufferPool, which is the real allocation granularity. */
+        dp->TxFrameSizeGranularity = VWIFI_TLV_TX_SLOT_SIZE;
+
+        /* 0: the target does not forward received frames back out. */
+        dp->RxTxForwarding = 0;
+
+        /* Units of 0.5 Mbps, so 108 == 54 Mbps, agreeing with the
+         * MaxRxRate reported in the interface capabilities above. */
+        dp->RxMaxThroughput = 108;
+
+        params.DatapathAttributes.Optional.DataPathCapabilities_IsPresent =
+            TRUE;
+        params.Optional.DatapathAttributes_IsPresent = TRUE;
+    }
+
+    /* Still not filled: the country-region list, PM capabilities, P2P,
+     * AP and virtualization attributes. All optional, and all describe
+     * things this device does not do. Note that "optional" in
+     * WABIModel.xml has now twice meant "the message parses without it
+     * and the adapter does not work" -- treat the model as describing
+     * the wire format, not the requirements. */
 
     NDIS_STATUS st = GenerateWdiGetAdapterCapabilities(
         &params, kHeaderReserve, &ctx, &outLen, &pOut);
