@@ -36,6 +36,15 @@
 
 #include "vwifi_drv.h"
 
+/* One staged BSS: the device's own record plus the frame it came in.
+ * Shared by the pending batch and the cache below, which hold exactly
+ * the same thing for different lengths of time. */
+typedef struct _VWIFI_BSS_STAGE
+{
+    struct vwifi_bss_entry Entry;
+    UCHAR                  Frame[VWIFI_SCAN_MAX_FRAME];
+} VWIFI_BSS_STAGE, *PVWIFI_BSS_STAGE;
+
 typedef struct _VWIFI_SCAN_TASK
 {
     BOOLEAN   Active;
@@ -50,11 +59,25 @@ typedef struct _VWIFI_SCAN_TASK
     /* BSS entries awaiting indication. We stage the device's own
      * representation and convert to TLV only at indication time: the
      * DPC path stays cheap and TLV generation gets batched. */
-    struct {
-        struct vwifi_bss_entry Entry;
-        UCHAR                  Frame[VWIFI_SCAN_MAX_FRAME];
-    } *Pending;
+    PVWIFI_BSS_STAGE Pending;
     ULONG     PendingCapacity;
+
+    /* Everything seen recently, kept past the scan that found it.
+     *
+     * OID_WDI_GET_BSS_ENTRY_LIST is "get cached BSS entry list from
+     * adapter", and a WDI miniport is expected to have one. Refusing it
+     * does not merely return nothing: asking for the list and being
+     * told the adapter has none is what made the network vanish from
+     * `netsh wlan show networks` and from the UI, and stopped the
+     * component scanning.
+     *
+     * Keyed by BSSID, newest write wins, oldest evicted when full. No
+     * ageing: the device only reports what it currently sees, so an
+     * entry going stale means the next scan simply does not refresh
+     * it. */
+    PVWIFI_BSS_STAGE Cache;
+    ULONG     CacheCount;
+    ULONG     CacheCapacity;
 
     ULONGLONG LastIndicationTimeMs;
     /* When this scan was started, for the stale-task backstop below. */
@@ -195,6 +218,39 @@ VwifiScanOnBssFound(_Inout_ PVWIFI_ADAPTER Adapter,
     task->Pending[task->PendingCount].Entry.ie_len = frameLen;
     RtlCopyMemory(task->Pending[task->PendingCount].Frame, frame, frameLen);
     task->PendingCount++;
+
+    /* Keep a copy past this scan, so OID_WDI_GET_BSS_ENTRY_LIST has
+     * something to answer with. Replace by BSSID if we already know
+     * this one; otherwise append, evicting the oldest when full. */
+    {
+        ULONG slot = task->CacheCount;
+
+        for (ULONG i = 0; i < task->CacheCount; i++) {
+            if (RtlCompareMemory(task->Cache[i].Entry.bssid,
+                                 bss->bssid, 6) == 6) {
+                slot = i;
+                break;
+            }
+        }
+        if (slot == task->CacheCount) {
+            if (task->CacheCount < task->CacheCapacity) {
+                task->CacheCount++;
+            } else {
+                /* Full: drop the oldest and shuffle down. The cache is
+                 * small and this runs once per newly seen BSS, so the
+                 * copy is cheaper than threading a ring index through
+                 * every reader. */
+                RtlMoveMemory(&task->Cache[0], &task->Cache[1],
+                              (task->CacheCapacity - 1) *
+                                  sizeof(task->Cache[0]));
+                slot = task->CacheCapacity - 1;
+            }
+        }
+
+        task->Cache[slot].Entry = *bss;
+        task->Cache[slot].Entry.ie_len = frameLen;
+        RtlCopyMemory(task->Cache[slot].Frame, frame, frameLen);
+    }
 
     /* The device parses the SSID out of the beacon for its own BSS
      * table, so it is here for free -- and it is the reference for what
@@ -389,6 +445,21 @@ VwifiScanTaskCreate(_Inout_ PVWIFI_ADAPTER Adapter)
                   VWIFI_SCAN_PENDING_MAX * sizeof(task->Pending[0]));
     task->PendingCapacity = VWIFI_SCAN_PENDING_MAX;
 
+    task->Cache = NdisAllocateMemoryWithTagPriority(
+        Adapter->MiniportAdapterHandle,
+        VWIFI_SCAN_CACHE_MAX * sizeof(task->Cache[0]),
+        VWIFI_POOL_TAG, NormalPoolPriority);
+    if (!task->Cache) {
+        NdisFreeMemoryWithTagPriority(Adapter->MiniportAdapterHandle,
+                                      task->Pending, VWIFI_POOL_TAG);
+        NdisFreeMemoryWithTagPriority(Adapter->MiniportAdapterHandle,
+                                      task, VWIFI_POOL_TAG);
+        return NDIS_STATUS_RESOURCES;
+    }
+    RtlZeroMemory(task->Cache,
+                  VWIFI_SCAN_CACHE_MAX * sizeof(task->Cache[0]));
+    task->CacheCapacity = VWIFI_SCAN_CACHE_MAX;
+
     Adapter->ScanTask = task;
     return NDIS_STATUS_SUCCESS;
 }
@@ -399,6 +470,10 @@ VwifiScanTaskDestroy(_Inout_ PVWIFI_ADAPTER Adapter)
     PVWIFI_SCAN_TASK task = Adapter->ScanTask;
     if (!task) return;
 
+    if (task->Cache) {
+        NdisFreeMemoryWithTagPriority(Adapter->MiniportAdapterHandle,
+                                      task->Cache, VWIFI_POOL_TAG);
+    }
     if (task->Pending) {
         NdisFreeMemoryWithTagPriority(Adapter->MiniportAdapterHandle,
                                       task->Pending, VWIFI_POOL_TAG);
@@ -406,4 +481,62 @@ VwifiScanTaskDestroy(_Inout_ PVWIFI_ADAPTER Adapter)
     NdisFreeMemoryWithTagPriority(Adapter->MiniportAdapterHandle,
                                   task, VWIFI_POOL_TAG);
     Adapter->ScanTask = NULL;
+}
+
+/* ============================================================
+ * OID_WDI_GET_BSS_ENTRY_LIST
+ *
+ * "Get cached BSS entry list from adapter." The reply to the OID itself
+ * is header-only; the entries come back the same way a scan reports
+ * them, as an NDIS_STATUS_WDI_INDICATION_BSS_ENTRY_LIST.
+ *
+ * The request names an SSID, and this ignores it -- everything cached
+ * is indicated and the component matches. A BSS_ENTRY_LIST indication
+ * is the identical message the scan path already sends unsolicited, so
+ * a superset is exactly what a scan would have produced anyway, and
+ * filtering here would only risk hiding an entry the caller wanted.
+ * ============================================================ */
+VOID
+VwifiScanIndicateCachedBss(_Inout_ PVWIFI_ADAPTER Adapter,
+                           _In_ WDI_PORT_ID WdiPortId,
+                           _In_ ULONG NdisPortNumber)
+{
+    PVWIFI_SCAN_TASK task = Adapter->ScanTask;
+    VWIFI_TLV_BSS_ITEM items[VWIFI_SCAN_CACHE_MAX];
+    PVOID  generated = NULL;
+    ULONG  generatedLen = 0;
+    NDIS_STATUS status;
+    ULONG n;
+
+    if (!task || task->CacheCount == 0) {
+        VWIFI_INFO("BSS cache is empty; nothing to report");
+        return;
+    }
+
+    n = task->CacheCount;
+    if (n > VWIFI_SCAN_CACHE_MAX) n = VWIFI_SCAN_CACHE_MAX;
+
+    for (ULONG i = 0; i < n; i++) {
+        items[i].Entry = &task->Cache[i].Entry;
+        items[i].Frame = task->Cache[i].Frame;
+    }
+
+    status = VwifiTlvGenerateBssEntryList(Adapter->WdiPeerVersion,
+                                          items, n,
+                                          &generated, &generatedLen);
+    if (status != NDIS_STATUS_SUCCESS) {
+        VWIFI_ERR("cached BSS list generation failed 0x%x (%u entries)",
+                  status, n);
+        return;
+    }
+
+    VwifiSendWdiIndication(Adapter, WdiPortId, NdisPortNumber,
+                           NDIS_STATUS_WDI_INDICATION_BSS_ENTRY_LIST,
+                           NDIS_STATUS_SUCCESS,
+                           WDI_TRANSACTION_ID_UNSOLICIT,
+                           generated, generatedLen);
+
+    VWIFI_INFO("indicated cached BSS_ENTRY_LIST: %u entries, %u bytes",
+               n, generatedLen);
+    VwifiTlvFreeGenerated(generated);
 }

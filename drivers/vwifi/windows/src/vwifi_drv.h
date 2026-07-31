@@ -53,6 +53,9 @@
 #define VWIFI_SCAN_MAX_FRAME     768
 #define VWIFI_SCAN_MAX_SSIDS       4
 #define VWIFI_SCAN_PENDING_MAX    16
+/* How many BSSes the driver remembers between scans, to answer
+ * OID_WDI_GET_BSS_ENTRY_LIST. */
+#define VWIFI_SCAN_CACHE_MAX      32
 
 /* ============================================================
  * Logging
@@ -472,6 +475,11 @@ NDIS_STATUS VwifiHandleTaskChangeOpMode(_Inout_ PVWIFI_ADAPTER Adapter,
                                         _In_ PNDIS_OID_REQUEST Req);
 
 /* wdi_scan.c — Phase 2 scan task. */
+/* Re-indicate everything the scan cache holds, for
+ * OID_WDI_GET_BSS_ENTRY_LIST. */
+VOID        VwifiScanIndicateCachedBss(_Inout_ PVWIFI_ADAPTER Adapter,
+                                       _In_ WDI_PORT_ID WdiPortId,
+                                       _In_ ULONG NdisPortNumber);
 NDIS_STATUS VwifiScanTaskCreate(_Inout_ PVWIFI_ADAPTER Adapter);
 VOID        VwifiScanTaskDestroy(_Inout_ PVWIFI_ADAPTER Adapter);
 NDIS_STATUS VwifiHandleTaskScan(_Inout_ PVWIFI_ADAPTER Adapter,

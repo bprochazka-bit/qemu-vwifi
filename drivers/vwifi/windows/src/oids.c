@@ -847,6 +847,16 @@ VwifiOidRequest(
     if (oid == OID_WDI_GET_STATISTICS) {
         return VwifiHandleGetStatistics(adapter, OidRequest);
     }
+    if (oid == OID_WDI_GET_BSS_ENTRY_LIST) {
+        /* The entries go back as a BSS_ENTRY_LIST indication, exactly as
+         * a scan reports them; the OID itself only needs acknowledging.
+         * Refusing this is what made an already-discovered network
+         * disappear from `netsh wlan show networks` and from the UI. */
+        VWIFI_INFO("OID: cached BSS entry list requested");
+        VwifiScanIndicateCachedBss(adapter, VwifiGetWdiPortId(OidRequest),
+                                   OidRequest->PortNumber);
+        return VwifiWdiAckHeaderOnly(OidRequest, NDIS_STATUS_SUCCESS);
+    }
 
     if (OidRequest->RequestType == NdisRequestSetInformation) {
         switch (oid) {
