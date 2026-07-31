@@ -60,6 +60,10 @@ struct VWifiState {
     /* One-shot timer backing the device's scan dwell progression. */
     QEMUTimer    *scan_timer;
 
+    /* Set once we have complained that the guest never enabled MSI-X,
+     * so the warning does not repeat for every interrupt we drop. */
+    bool          intx_warned;
+
     /* Portable device. Allocated dynamically since its size is
      * exposed only via vwifi_dev_sizeof() to keep vwifi_device.c
      * changes from forcing header rebuilds. */
@@ -85,10 +89,36 @@ static int qemu_be_dma_write(void *be, uint64_t gpa, const void *buf, size_t len
 static void qemu_be_raise_irq(void *be, unsigned vec)
 {
     VWifiState *s = be;
+
     if (msix_enabled(&s->parent_obj)) {
         msix_notify(&s->parent_obj, vec);
-    } else {
-        pci_set_irq(&s->parent_obj, 1);
+        return;
+    }
+
+    /*
+     * No INTx fallback, deliberately.
+     *
+     * This used to be pci_set_irq(pdev, 1), and nothing anywhere ever
+     * called it with 0. INTx is level-triggered, so that asserts a line
+     * the device has no way to lower: irq_status is cleared by a
+     * ring-head MMIO write, which this function never sees. The guest
+     * re-enters its ISR forever and the VM locks up hard -- no guest
+     * bugcheck, no panic, just a frozen machine. A Windows guest whose
+     * INF omits the MSISupported key gets a line-based interrupt and
+     * lands here on the very first control response.
+     *
+     * The backend contract is MSI-X (see vwifi_backend_ops.raise_irq),
+     * and the Linux driver asks for PCI_IRQ_MSIX and nothing else, so
+     * this path has never delivered a working interrupt to anyone.
+     * Dropping the interrupt is what the guest already got out of it;
+     * wedging the host was the part worth removing.
+     */
+    if (!s->intx_warned) {
+        s->intx_warned = true;
+        warn_report("vwifi-virt: guest has not enabled MSI-X, so no "
+                    "interrupt can be delivered -- the device will look "
+                    "dead. The guest driver must enable MSI-X (on "
+                    "Windows that is the MSISupported INF key).");
     }
 }
 

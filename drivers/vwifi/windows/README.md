@@ -392,11 +392,50 @@ error code narrows it fast:
 | 52 | signature not verified | test-signing off, Secure Boot on, or memory integrity on |
 | 39 | driver corrupt or missing | `.sys` not copied to `System32\drivers`, or unsigned `.cat` |
 | 31 | device not working properly | `DriverEntry` or `MiniportInitializeEx` returned a failure status — check the debug output |
-| 10 | device cannot start | resource assignment failed; look at `hardware.c`'s BAR/MSI-X parsing |
+| 10 | device cannot start | resource assignment failed; look at `hardware.c`'s BAR/MSI-X parsing. If the log says `got a line-based interrupt`, see below — the driver is refusing to start on purpose. |
 
 `%windir%\inf\setupapi.dev.log` records what PnP did with the INF and
 why it rejected it, which covers the install-time failures that never
 reach the driver at all.
+
+### The whole VM freezes and reboots during install
+
+Not a bugcheck — no minidump, no Event 1001, nothing in the log,
+because the guest never got far enough to write one. That signature is
+an interrupt storm, and there was exactly one way to produce it here:
+the device running on a **line-based INTx interrupt instead of MSI-X**.
+
+`vwifi-virt` has no working INTx path. Its `raise_irq` backend asserted
+the line with `pci_set_irq(pdev, 1)` and nothing ever lowered it —
+`irq_status` is cleared by a ring-head MMIO write, which the assert
+path never sees. On a level-triggered line that re-enters the ISR
+forever and takes the host VM with it. The Linux driver asks for
+`PCI_IRQ_MSIX` and refuses anything else, so the path had never been
+exercised by anyone.
+
+Getting MSI-X takes **both** of these, and either one alone leaves you
+on INTx:
+
+- the INF's `[Vwifi.ndi.NT.HW]` section, which sets `MSISupported = 1`
+  under `Interrupt Management` in the device's *hardware* key. Windows
+  does not give a PCI device message-signaled interrupts unless its INF
+  asks. Note `.HW` — `AddReg` in the plain DDInstall section writes to
+  the driver key, where the PCI driver never looks.
+- `irq_chars.MsiSupported = TRUE` before `NdisMRegisterInterruptEx`.
+  This is the request, not a statement about the hardware; leave it
+  `FALSE` and NDIS connects a line interrupt regardless of what the INF
+  granted.
+
+`VwifiHwStart` now checks `irq_chars.InterruptType` afterwards and
+refuses to enable the device unless it is `NDIS_CONNECT_MESSAGE_BASED`,
+so a regression here is a Code 10 with an explanation rather than a
+frozen host. The device side no longer asserts INTx at all; it warns
+once on the QEMU console and drops the interrupt.
+
+To confirm MSI-X is really in use: Device Manager → the adapter →
+Properties → Resources, where message-signaled interrupts show as
+**negative** IRQ numbers. The driver also logs `MSI-X connected, 4
+messages`.
 
 ## Phase 1.5 — monitor mode with Wireshark + Npcap
 

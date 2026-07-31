@@ -10,6 +10,8 @@
 
 MINIPORT_MESSAGE_INTERRUPT    VwifiMessageIsr;
 MINIPORT_MESSAGE_INTERRUPT_DPC VwifiMessageDpc;
+MINIPORT_ISR                  VwifiLineIsr;
+MINIPORT_INTERRUPT_DPC        VwifiLineDpc;
 
 /* ============================================================
  * Parse the assigned PCI resources list to find BAR0 (MMIO).
@@ -89,6 +91,48 @@ VwifiMessageIsr(
 
     *QueueDefaultInterruptDpc = TRUE;
     return TRUE;
+}
+
+/* ============================================================
+ * Line-based ISR/DPC — present only so registration can succeed.
+ *
+ * NdisMRegisterInterruptEx wants InterruptHandler filled in whether or
+ * not we intend to run on a line interrupt, and NDIS decides which kind
+ * we get. This claims nothing: the device is not enabled until
+ * VwifiHwStart has confirmed we were given message-based interrupts, so
+ * if these ever run the interrupt belongs to somebody else on a shared
+ * line.
+ *
+ * Claiming it would be worse than useless. vwifi-virt has no working
+ * INTx path -- it asserts the line and has no means to lower it -- so
+ * returning TRUE here would turn a dead device into a storm.
+ * ============================================================ */
+_Use_decl_annotations_
+BOOLEAN
+VwifiLineIsr(
+    NDIS_HANDLE MiniportInterruptContext,
+    PBOOLEAN     QueueDefaultInterruptDpc,
+    PULONG       TargetProcessors)
+{
+    UNREFERENCED_PARAMETER(MiniportInterruptContext);
+    UNREFERENCED_PARAMETER(TargetProcessors);
+
+    *QueueDefaultInterruptDpc = FALSE;
+    return FALSE;   /* not ours */
+}
+
+_Use_decl_annotations_
+VOID
+VwifiLineDpc(
+    NDIS_HANDLE MiniportInterruptContext,
+    PVOID       MiniportDpcContext,
+    PVOID       ReceiveThrottleParameters,
+    PVOID       NdisReserved2)
+{
+    UNREFERENCED_PARAMETER(MiniportInterruptContext);
+    UNREFERENCED_PARAMETER(MiniportDpcContext);
+    UNREFERENCED_PARAMETER(ReceiveThrottleParameters);
+    UNREFERENCED_PARAMETER(NdisReserved2);
 }
 
 _Use_decl_annotations_
@@ -311,11 +355,22 @@ VwifiHwStart(_Inout_ PVWIFI_ADAPTER Adapter)
     if (status != NDIS_STATUS_SUCCESS) goto fail_scan;
 
     /* Connect MSI-X interrupts. NDIS walks the resource list to find
-     * the message table and wires up the callbacks. */
+     * the message table and wires up the callbacks.
+     *
+     * MsiSupported = TRUE is not optional and not a hint about the
+     * hardware: it is the request. Leave it FALSE and NDIS connects a
+     * line-based interrupt no matter what the device offers or what the
+     * INF granted. Both halves are needed -- the INF's MSISupported key
+     * is what makes Windows assign MSI-X resources in the first place,
+     * and this is what makes NDIS connect them as messages. */
     irq_chars.Header.Type     = NDIS_OBJECT_TYPE_MINIPORT_INTERRUPT;
     irq_chars.Header.Revision = NDIS_MINIPORT_INTERRUPT_REVISION_1;
     irq_chars.Header.Size     = NDIS_SIZEOF_MINIPORT_INTERRUPT_CHARACTERISTICS_REVISION_1;
-    irq_chars.MessageInterruptHandler   = VwifiMessageIsr;
+    irq_chars.InterruptHandler           = VwifiLineIsr;
+    irq_chars.InterruptDpcHandler        = VwifiLineDpc;
+    irq_chars.MsiSupported               = TRUE;
+    irq_chars.MsiSyncWithAllMessages     = TRUE;
+    irq_chars.MessageInterruptHandler    = VwifiMessageIsr;
     irq_chars.MessageInterruptDpcHandler = VwifiMessageDpc;
 
     status = NdisMRegisterInterruptEx(
@@ -326,6 +381,29 @@ VwifiHwStart(_Inout_ PVWIFI_ADAPTER Adapter)
         goto fail_connect;
     }
     Adapter->MessageInfo = irq_chars.MessageInfoTable;
+
+    /* Refuse to run on a line interrupt.
+     *
+     * This is a hard stop and not a degraded mode. vwifi-virt asserts
+     * INTx and has no way to lower it -- its interrupt status is
+     * cleared by a ring-head MMIO write, which the assert path never
+     * sees -- so enabling the device on a line interrupt storms the
+     * host and freezes the whole VM on the first control response, with
+     * no bugcheck and no dump to explain it. Failing here turns that
+     * into a Code 10 with a line in the log saying why. */
+    if (irq_chars.InterruptType != NDIS_CONNECT_MESSAGE_BASED) {
+        VWIFI_ERR("got a line-based interrupt (type %u), not MSI-X. "
+                  "Refusing to enable the device: this build of "
+                  "vwifi-virt cannot deliver INTx and would hang the VM.",
+                  irq_chars.InterruptType);
+        VWIFI_ERR("  cause: the installed INF has no MSISupported key "
+                  "under Interrupt Management. Reinstall the package "
+                  "built from inf\\vwifi.inx at this revision or later.");
+        status = NDIS_STATUS_RESOURCE_CONFLICT;
+        goto fail_irq;
+    }
+    VWIFI_INFO("MSI-X connected, %u messages",
+               Adapter->MessageInfo ? Adapter->MessageInfo->MessageCount : 0);
 
     /* Enable device: IRQs + ring processing. */
     VwifiWrite32(Adapter, VWIFI_REG_IRQ_MASK, 0);
