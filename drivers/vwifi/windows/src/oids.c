@@ -549,13 +549,31 @@ VwifiHandleTaskCreatePort(_Inout_ PVWIFI_ADAPTER Adapter,
     Adapter->PortId      = (ULONG)Req->PortNumber;
     Adapter->PortCreated = TRUE;
 
-    /* "No TLV data needed, header is sufficient" -- WABIModel.xml, the
-     * FromIhv side of WDI_TASK_CREATE_PORT. */
-    VwifiSendWdiIndication(Adapter, Req->PortNumber,
-                           NDIS_STATUS_WDI_INDICATION_CREATE_PORT_COMPLETE,
-                           NDIS_STATUS_SUCCESS,
-                           VwifiGetWdiTransactionId(Req),
-                           NULL, 0);
+    /* The completion carries a mandatory PortAttributes container --
+     * the created port's MAC and number. It is NOT header-only: that
+     * describes WDI_TASK_CREATE_PORT's own results message, which is a
+     * different thing from WDI_INDICATION_CREATE_PORT_COMPLETE. See the
+     * comment on VwifiTlvGenerateCreatePortComplete. */
+    {
+        PVOID blob    = NULL;
+        ULONG blobLen = 0;
+
+        status = VwifiTlvGenerateCreatePortComplete(
+                     Adapter->WdiPeerVersion, Adapter->CurrentMac,
+                     ndisPort, &blob, &blobLen);
+        if (status != NDIS_STATUS_SUCCESS) {
+            VWIFI_ERR("CREATE_PORT: completion generate failed 0x%08x %s",
+                      status, VwifiNdisStatusName(status));
+            return status;
+        }
+
+        VwifiSendWdiIndication(Adapter, Req->PortNumber,
+                               NDIS_STATUS_WDI_INDICATION_CREATE_PORT_COMPLETE,
+                               NDIS_STATUS_SUCCESS,
+                               VwifiGetWdiTransactionId(Req),
+                               blob, blobLen);
+        VwifiTlvFreeGenerated(blob);
+    }
     return NDIS_STATUS_SUCCESS;
 }
 

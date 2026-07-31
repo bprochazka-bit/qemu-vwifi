@@ -1131,6 +1131,50 @@ VwifiTlvParseCreatePort(
     return NDIS_STATUS_SUCCESS;
 }
 
+/* The CREATE_PORT completion is NOT header-only, whatever the task's
+ * own results message says.
+ *
+ * WABIModel.xml carries two separate messages here and it is easy to
+ * read the wrong one:
+ *
+ *   WDI_TASK_CREATE_PORT / WDI_TASK_CREATE_PORT_RESULTS, FromIhv,
+ *       "No TLV data needed, header is sufficient"      <- the M2
+ *   WDI_INDICATION_CREATE_PORT_COMPLETE,
+ *       containerRef WDI_TLV_PORT_ATTRIBUTES optional="false"  <- the M3
+ *
+ * The completion is the second one, and its PortAttributes container is
+ * mandatory. Sent as a bare header, the component reads a create-port
+ * completion that names no port, and tears the adapter down instead of
+ * adding it. Every other completion this driver sends -- delete port,
+ * scan, connect, change operation mode -- really is header-only; this
+ * is the exception.
+ */
+extern "C"
+NDIS_STATUS
+VwifiTlvGenerateCreatePortComplete(
+    ULONG PeerVersion,
+    const UCHAR *Mac,
+    ULONG PortNumber,
+    VOID **Buffer,
+    PULONG BufferLen)
+{
+    TLV_CONTEXT ctx = MakeCtx(PeerVersion);
+    WDI_INDICATION_CREATE_PORT_COMPLETE_PARAMETERS params = {};
+    UINT8 *pOut = nullptr;
+    ULONG outLen = 0;
+
+    RtlCopyMemory(params.PortAttributes.MacAddress.Address, Mac, 6);
+    params.PortAttributes.PortNumber = (UINT16)PortNumber;
+
+    NDIS_STATUS st = GenerateWdiIndicationCreatePortComplete(
+        &params, kHeaderReserve, &ctx, &outLen, &pOut);
+    if (st != NDIS_STATUS_SUCCESS) return st;
+
+    *Buffer    = pOut;
+    *BufferLen = outLen;
+    return NDIS_STATUS_SUCCESS;
+}
+
 extern "C"
 NDIS_STATUS
 VwifiTlvParseDeletePort(

@@ -418,6 +418,32 @@ Two things follow from having this table:
   `SoftwareRadioState` as TRUE. Those are "is the radio *enabled*",
   so TRUE means on and there is nothing for the OS to change.
 
+### A task's results message is not its completion indication
+
+`WABIModel.xml` describes both, near-identically named, and reading the
+wrong one produces a completion the component discards without
+comment. For create-port:
+
+```xml
+<message commandId="WDI_TASK_CREATE_PORT" type="WDI_TASK_CREATE_PORT_RESULTS"
+         description="No TLV data needed, header is sufficient" direction="FromIhv" />
+
+<message commandId="WDI_INDICATION_CREATE_PORT_COMPLETE" ... direction="FromIhv">
+  <containerRef id="WDI_TLV_PORT_ATTRIBUTES" name="PortAttributes"
+                type="PortAttributesContainer" optional="false" />
+</message>
+```
+
+The first is the M2 — the task was accepted. The **second** is what
+`NdisMIndicateStatusEx` carries, and its `PortAttributes` is mandatory.
+Sent as a bare header, the component reads a create-port completion
+naming no port and tears the adapter down.
+
+Search for `commandId="WDI_INDICATION_<name>_COMPLETE"`, not for the
+task. Of the completions this driver sends, only create-port needs a
+payload; delete-port, scan, connect and change-operation-mode really
+are header-only.
+
 ### "Optional" in WABIModel.xml does not mean optional
 
 The model file describes the wire format, not the requirements. A

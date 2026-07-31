@@ -159,6 +159,14 @@ VwifiSendWdiIndication(_Inout_ PVWIFI_ADAPTER Adapter,
     ind.StatusBuffer      = msg;
     ind.StatusBufferSize  = msgLen;
 
+    /* Logged, because indications are the half of the conversation that
+     * has never been visible. Everything the component sends us is
+     * traced in oids.c; everything we send back was silent, so a
+     * completion that was malformed, misaddressed or never sent at all
+     * looked exactly like one the component ignored. */
+    VWIFI_INFO("IND: 0x%08x port %u txn %u status 0x%08x, %u bytes",
+               StatusCode, PortId, TransactionId, MessageStatus, msgLen);
+
     NdisMIndicateStatusEx(Adapter->MiniportAdapterHandle, &ind);
 
     /* NdisMIndicateStatusEx copies the buffer, so it is ours to release

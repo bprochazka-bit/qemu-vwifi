@@ -178,6 +178,16 @@ NDIS_STATUS VwifiTlvParseCreatePort(
     _Out_writes_bytes_(6) UCHAR *MacOut,
     _Out_ BOOLEAN *MacPresent);
 
+/* Build the M3 for a create-port task. Its PortAttributes container is
+ * mandatory -- unlike the delete-port completion, which really is
+ * header-only. Release with VwifiTlvFreeGenerated. */
+NDIS_STATUS VwifiTlvGenerateCreatePortComplete(
+    _In_ ULONG PeerVersion,
+    _In_reads_bytes_(6) const UCHAR *Mac,
+    _In_ ULONG PortNumber,
+    _Outptr_result_bytebuffer_(*BufferLen) VOID **Buffer,
+    _Out_ PULONG BufferLen);
+
 NDIS_STATUS VwifiTlvParseDeletePort(
     _In_ ULONG PeerVersion,
     _In_reads_bytes_(BufferLen) const VOID *Buffer,
