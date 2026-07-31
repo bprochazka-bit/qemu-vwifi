@@ -43,6 +43,13 @@ typedef struct _VWIFI_BSS_STAGE
 {
     struct vwifi_bss_entry Entry;
     UCHAR                  Frame[VWIFI_SCAN_MAX_FRAME];
+
+    /* System time when the frame arrived, for the entry's age info.
+     * Recorded here rather than at indication time because the cache
+     * below replays entries long after the scan that found them, and
+     * an entry that keeps reporting "discovered just now" would never
+     * age out of the OS's list at all. */
+    ULONGLONG              SeenSystemTime;
 } VWIFI_BSS_STAGE, *PVWIFI_BSS_STAGE;
 
 typedef struct _VWIFI_SCAN_TASK
@@ -114,8 +121,10 @@ VwifiIndicateBssEntryList(_Inout_ PVWIFI_ADAPTER Adapter)
     if (n > VWIFI_SCAN_PENDING_MAX) n = VWIFI_SCAN_PENDING_MAX;
 
     for (ULONG i = 0; i < n; i++) {
-        items[i].Entry = &task->Pending[i].Entry;
-        items[i].Frame = task->Pending[i].Frame;
+        items[i].Entry         = &task->Pending[i].Entry;
+        items[i].Frame         = task->Pending[i].Frame;
+        items[i].HostTimeStamp = task->Pending[i].SeenSystemTime;
+        items[i].Cached        = FALSE;   /* live: a scan is running */
     }
 
     status = VwifiTlvGenerateBssEntryList(Adapter->WdiPeerVersion,
@@ -185,6 +194,7 @@ VwifiScanOnBssFound(_Inout_ PVWIFI_ADAPTER Adapter,
     PVWIFI_SCAN_TASK task = Adapter->ScanTask;
     const UCHAR *frame;
     USHORT frameLen;
+    LARGE_INTEGER now;
 
     /* The device observes BSSes continuously, not only during scans.
      * Outside a scan there is nothing to report. */
@@ -209,6 +219,13 @@ VwifiScanOnBssFound(_Inout_ PVWIFI_ADAPTER Adapter,
     }
     frame = (const UCHAR *)Payload + sizeof(*bss);
 
+    /* Stamped once, here, and carried by both copies below. This is the
+     * value WDI_TLV_BSS_ENTRY_AGE_INFO is specified to want -- system
+     * time, from NdisGetCurrentSystemTime -- and it is what decides how
+     * long the OS keeps the network in its list. Callable at
+     * DISPATCH_LEVEL, which is where this DPC runs. */
+    NdisGetCurrentSystemTime(&now);
+
     /* Flush first if the accumulator is full. */
     if (task->PendingCount >= task->PendingCapacity) {
         VwifiIndicateBssEntryList(Adapter);
@@ -216,6 +233,7 @@ VwifiScanOnBssFound(_Inout_ PVWIFI_ADAPTER Adapter,
 
     task->Pending[task->PendingCount].Entry = *bss;
     task->Pending[task->PendingCount].Entry.ie_len = frameLen;
+    task->Pending[task->PendingCount].SeenSystemTime = (ULONGLONG)now.QuadPart;
     RtlCopyMemory(task->Pending[task->PendingCount].Frame, frame, frameLen);
     task->PendingCount++;
 
@@ -249,6 +267,7 @@ VwifiScanOnBssFound(_Inout_ PVWIFI_ADAPTER Adapter,
 
         task->Cache[slot].Entry = *bss;
         task->Cache[slot].Entry.ie_len = frameLen;
+        task->Cache[slot].SeenSystemTime = (ULONGLONG)now.QuadPart;
         RtlCopyMemory(task->Cache[slot].Frame, frame, frameLen);
     }
 
@@ -517,8 +536,12 @@ VwifiScanIndicateCachedBss(_Inout_ PVWIFI_ADAPTER Adapter,
     if (n > VWIFI_SCAN_CACHE_MAX) n = VWIFI_SCAN_CACHE_MAX;
 
     for (ULONG i = 0; i < n; i++) {
-        items[i].Entry = &task->Cache[i].Entry;
-        items[i].Frame = task->Cache[i].Frame;
+        items[i].Entry         = &task->Cache[i].Entry;
+        items[i].Frame         = task->Cache[i].Frame;
+        items[i].HostTimeStamp = task->Cache[i].SeenSystemTime;
+        /* 1, not 0: these come out of the adapter's own BSS list, which
+         * is exactly what the TLV's second field distinguishes. */
+        items[i].Cached        = TRUE;
     }
 
     status = VwifiTlvGenerateBssEntryList(Adapter->WdiPeerVersion,

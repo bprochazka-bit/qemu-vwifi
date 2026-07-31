@@ -236,8 +236,23 @@ VwifiTlvGenerateBssEntryList(
         w->ChannelInfo.ChannelNumber = VwifiFreqToChannel(e->channel_freq);
         w->ChannelInfo.BandId        = VwifiFreqToBandId(e->channel_freq);
 
-        w->EntryAgeInfo.HostTimeStamp     = e->tsf;
-        w->EntryAgeInfo.CachedInformation = FALSE;
+        /* Age. The host clock, not the AP's.
+         *
+         * This used to pass `e->tsf` -- the AP's TSF, microseconds
+         * since the AP powered on. WDI_TLV_BSS_ENTRY_AGE_INFO wants a
+         * KeQuerySystemTime value, 100 ns units since 1601, and the OS
+         * ages entries by subtracting this from its own clock. A TSF in
+         * that field is roughly 1.3e17 units short, so every network
+         * arrived already four hundred years old.
+         *
+         * That is a scan that appears to work in every log the driver
+         * writes and produces a network list that empties itself: the
+         * entry is indicated, shown, aged out, and gone. Nothing is
+         * left for a connect to be built from, and the OS never gets as
+         * far as issuing one -- which is why a connect attempt reached
+         * this driver as no OID at all. */
+        w->EntryAgeInfo.HostTimeStamp     = Items[i].HostTimeStamp;
+        w->EntryAgeInfo.CachedInformation = Items[i].Cached;
         w->Optional.EntryAgeInfo_IsPresent = TRUE;
 
         /* The beacon / probe-response frame BODY -- MAC header removed.

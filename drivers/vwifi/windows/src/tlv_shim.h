@@ -65,6 +65,32 @@ typedef struct _VWIFI_TLV_BSS_ITEM
 {
     const struct vwifi_bss_entry *Entry;
     const UCHAR                  *Frame;    /* Entry->ie_len bytes */
+
+    /* When this entry was discovered, in *host system time*.
+     *
+     * WDI_TLV_BSS_ENTRY_AGE_INFO's first field is documented down to
+     * the API that must produce it: "The timestamp should be obtained
+     * with NdisGetCurrentSystemTime or KeQuerySystemTime." That is
+     * 100-nanosecond intervals since 1601, and the OS subtracts it from
+     * its own clock to age the entry out.
+     *
+     * The BSS entry's `tsf` is not that and cannot be substituted for
+     * it: it is the AP's own microsecond counter since the AP came up,
+     * a number some fifteen orders of magnitude smaller. Reported as a
+     * host timestamp it makes every BSS four centuries old on arrival,
+     * so the entry is stale the moment it lands -- visible for an
+     * instant, then aged out of the OS's list, with no fresh entry for
+     * a connect to be built from.
+     *
+     * The caller records it when the frame arrives, not when the
+     * indication is generated, because the cache replays entries long
+     * after the scan that found them. */
+    ULONGLONG                     HostTimeStamp;
+
+    /* 0 (live) if this entry was found by a scan that is running now,
+     * 1 (cached) if it is being replayed out of the adapter's own BSS
+     * list -- the second field of the same TLV. */
+    BOOLEAN                       Cached;
 } VWIFI_TLV_BSS_ITEM, *PVWIFI_TLV_BSS_ITEM;
 
 /* Generate an NDIS_STATUS_WDI_INDICATION_BSS_ENTRY_LIST payload from
