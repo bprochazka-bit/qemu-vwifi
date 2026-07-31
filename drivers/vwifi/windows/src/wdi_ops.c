@@ -111,17 +111,21 @@ VwifiWdiFreeAdapter(NDIS_HANDLE MiniportAdapterContext)
  * and wire up data-path resources; for us it is where the rings and
  * the interrupt come up.
  *
- * Both are asynchronous: the operation is finished when the completion
- * routine from NDIS_WDI_INIT_PARAMETERS is called, and the return value
- * says whether that has yet to happen. So the pair is "call the
- * completion routine, return NDIS_STATUS_PENDING" -- including on
- * failure, where the failing status rides in on the completion call.
+ * Both are asynchronous, so the completion routine from
+ * NDIS_WDI_INIT_PARAMETERS must be called: returning success without
+ * completing leaves the WLAN component waiting forever with nothing
+ * logged anywhere.
  *
- * This used to call the completion routine and then return
- * NDIS_STATUS_SUCCESS, which is a double completion: the return value
- * says the operation finished synchronously and the callback says it
- * finished asynchronously. PENDING is unambiguous under either reading
- * and costs nothing.
+ * On the return value, DO NOT "fix" this to NDIS_STATUS_PENDING
+ * without evidence. That looks like the tidier async contract -- the
+ * callback says the work is done, so the return value saying it
+ * finished synchronously is arguably a double completion -- and it was
+ * tried, on exactly that reasoning and no data. The build that
+ * followed locked the guest hard during install. That is not proof
+ * this was the cause, since another change shipped alongside it, but
+ * the shape here (complete, then return the status) is the one that
+ * has been observed to open the adapter cleanly, and reasoning about
+ * an undocumented state machine is worth less than that.
  * ============================================================ */
 _Use_decl_annotations_
 NDIS_STATUS
@@ -144,17 +148,13 @@ VwifiWdiOpenAdapter(
         VWIFI_ERR("WdiOpenAdapter: start failed 0x%08x", status);
     }
 
-    if (adapter->OpenAdapterCompleteHandler == NULL) {
-        /* Nothing to complete through, so the return value is the only
-         * channel left. Only reachable if AllocateAdapter was handed no
-         * NDIS_WDI_INIT_PARAMETERS at all. */
+    if (adapter->OpenAdapterCompleteHandler != NULL) {
+        adapter->OpenAdapterCompleteHandler(adapter->MiniportAdapterHandle,
+                                            status);
+    } else {
         VWIFI_WARN("no OpenAdapterCompleteHandler; completing inline");
-        return status;
     }
-
-    adapter->OpenAdapterCompleteHandler(adapter->MiniportAdapterHandle,
-                                        status);
-    return NDIS_STATUS_PENDING;
+    return status;
 }
 
 _Use_decl_annotations_
@@ -167,14 +167,13 @@ VwifiWdiCloseAdapter(NDIS_HANDLE MiniportAdapterContext)
 
     VwifiHwStop(adapter);
 
-    if (adapter->CloseAdapterCompleteHandler == NULL) {
+    if (adapter->CloseAdapterCompleteHandler != NULL) {
+        adapter->CloseAdapterCompleteHandler(adapter->MiniportAdapterHandle,
+                                             NDIS_STATUS_SUCCESS);
+    } else {
         VWIFI_WARN("no CloseAdapterCompleteHandler; completing inline");
-        return NDIS_STATUS_SUCCESS;
     }
-
-    adapter->CloseAdapterCompleteHandler(adapter->MiniportAdapterHandle,
-                                         NDIS_STATUS_SUCCESS);
-    return NDIS_STATUS_PENDING;
+    return NDIS_STATUS_SUCCESS;
 }
 
 /* ============================================================

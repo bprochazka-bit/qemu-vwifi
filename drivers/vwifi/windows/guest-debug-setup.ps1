@@ -5,7 +5,7 @@
 .DESCRIPTION
     Run once, as Administrator, inside the Windows VM. Reboot afterwards.
 
-    Does four things, each of which is a separate reason a test driver
+    Does five things, each of which is a separate reason a test driver
     "doesn't load" or "prints nothing":
 
       1. Enables test-signing, so an unsigned-by-Microsoft .sys loads.
@@ -18,6 +18,9 @@
          common "my driver is mute" cause.
       4. Optionally turns on kernel debugging over COM1, which pairs
          with QEMU's  -serial pipe:\\.\pipe\windbg-vwifi.
+      5. Turns off automatic restart on bugcheck and asks for a kernel
+         dump, so a crash leaves a code on screen and a .DMP behind
+         instead of looking like a spontaneous reboot.
 
 .PARAMETER CertPath
     Path to vwifi-test-cert.cer as exported by sign.cmd on the build
@@ -51,23 +54,23 @@ if (-not $isAdmin) {
 }
 
 # --- 1. test-signing -------------------------------------------------
-Write-Host '[1/4] Enabling test-signing ...'
+Write-Host '[1/5] Enabling test-signing ...'
 bcdedit /set testsigning on | Out-Null
 
 # --- 2. trust the test certificate -----------------------------------
 if ($CertPath) {
     if (-not (Test-Path $CertPath)) { throw "Certificate not found: $CertPath" }
-    Write-Host "[2/4] Importing $CertPath into Root and TrustedPublisher ..."
+    Write-Host "[2/5] Importing $CertPath into Root and TrustedPublisher ..."
     certutil -addstore Root             $CertPath | Out-Null
     certutil -addstore TrustedPublisher $CertPath | Out-Null
 } else {
-    Write-Host '[2/4] No -CertPath given; skipping certificate import.'
+    Write-Host '[2/5] No -CertPath given; skipping certificate import.'
 }
 
 # --- 3. let DbgPrintEx through ---------------------------------------
 # DPFLTR_IHVNETWORK_ID is what vwifi_drv.h's VWIFI_DBG() logs under.
 # 0xFFFFFFFF = every level, including DPFLTR_INFO_LEVEL.
-Write-Host '[3/4] Raising the IHVNETWORK debug print filter mask ...'
+Write-Host '[3/5] Raising the IHVNETWORK debug print filter mask ...'
 $filterKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Debug Print Filter'
 if (-not (Test-Path $filterKey)) { New-Item -Path $filterKey -Force | Out-Null }
 New-ItemProperty -Path $filterKey -Name 'IHVNETWORK' `
@@ -78,17 +81,40 @@ New-ItemProperty -Path $filterKey -Name 'DEFAULT' `
 
 # --- 4. kernel debugging / verifier ----------------------------------
 if ($KernelDebug) {
-    Write-Host '[4/4] Enabling kernel debugging over COM1 @ 115200 ...'
+    Write-Host '[4/5] Enabling kernel debugging over COM1 @ 115200 ...'
     bcdedit /debug on | Out-Null
     bcdedit /dbgsettings SERIAL DEBUGPORT:1 BAUDRATE:115200 | Out-Null
 } else {
-    Write-Host '[4/4] Skipping kernel debugging (-KernelDebug to enable).'
+    Write-Host '[4/5] Skipping kernel debugging (-KernelDebug to enable).'
 }
 
 if ($Verifier) {
     Write-Host '      Enabling Driver Verifier (standard flags) on vwifi.sys ...'
     verifier /standard /driver vwifi.sys | Out-Null
 }
+
+# --- 5. make a crash leave evidence ----------------------------------
+# "The machine locked up and rebooted" and "the machine bugchecked" look
+# identical from the chair when AutoReboot is on: the stop screen is up
+# for a fraction of a second and there is nothing to read afterwards.
+# The two need completely different investigations, so make the
+# difference visible before it costs another round trip.
+#
+# AutoReboot = 0 leaves the stop screen up with the bugcheck code on it.
+# CrashDumpEnabled = 2 is a kernel dump, which is what a driver fault
+# needs -- the default small dump often has no useful stack for one.
+# A genuine hard lock (an interrupt storm, a triple fault) produces
+# neither screen nor dump, so a blank reboot after this becomes real
+# evidence rather than an absence of it.
+Write-Host '[5/5] Configuring crash dumps (no auto-reboot, kernel dump) ...'
+$crashKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\CrashControl'
+New-ItemProperty -Path $crashKey -Name 'AutoReboot' `
+                 -Value 0 -PropertyType DWord -Force | Out-Null
+New-ItemProperty -Path $crashKey -Name 'CrashDumpEnabled' `
+                 -Value 2 -PropertyType DWord -Force | Out-Null
+New-ItemProperty -Path $crashKey -Name 'AlwaysKeepMemoryDump' `
+                 -Value 1 -PropertyType DWord -Force | Out-Null
+Write-Host '      Dumps land in %SystemRoot%\MEMORY.DMP and %SystemRoot%\Minidump.'
 
 Write-Host ''
 Write-Host 'Done. Two things this script cannot do for you:'

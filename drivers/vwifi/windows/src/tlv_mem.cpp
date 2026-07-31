@@ -48,6 +48,19 @@ void __cdecl operator delete(void *p)
     }
 }
 
+/* The delete that pairs with the AllocationContext new above. The
+ * compiler wants it for any `new (ctx) T()` whose constructor could
+ * throw -- it never can here, kernel C++ is built without exceptions,
+ * but without this the call warns C4291 and the pairing is the honest
+ * thing to have anyway. */
+void __cdecl operator delete(void *p, ULONG_PTR AllocationContext)
+{
+    UNREFERENCED_PARAMETER(AllocationContext);
+    if (p != nullptr) {
+        ExFreePoolWithTag(p, VWIFI_TLV_POOL_TAG);
+    }
+}
+
 /* Sized delete — C++14 emits calls to this form. Without it the link
  * fails with an unresolved external on newer toolchains. */
 void __cdecl operator delete(void *p, size_t Size)

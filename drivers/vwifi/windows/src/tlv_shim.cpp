@@ -636,9 +636,31 @@ VwifiTlvGenerateAdapterCapabilities(
     PULONG BufferLen)
 {
     TLV_CONTEXT ctx = MakeCtx(PeerVersion);
-    WDI_GET_ADAPTER_CAPABILITIES_PARAMETERS params = {};
     UINT8 *pOut = nullptr;
     ULONG outLen = 0;
+
+    /* Heap, not the stack.
+     *
+     * WDI_GET_ADAPTER_CAPABILITIES_PARAMETERS is the largest structure
+     * in the interface -- twelve nested attribute containers plus four
+     * ArrayOfElements members -- and a kernel stack is 12 KB total,
+     * shared with everything below us on a PnP start path. A local of
+     * that size is a stack overflow waiting for a deep enough caller,
+     * and a kernel stack overflow does not produce a bugcheck to read:
+     * the guard page fault double-faults and the machine resets.
+     *
+     * This is insurance, not a diagnosis -- the struct has not been
+     * measured on the target kit. It costs one pool allocation on a
+     * path that runs once per adapter open. */
+    /* (ULONG_PTR)0, not a bare 0: a bare 0 is an int and can convert to
+     * either ULONG_PTR or void*, which makes the call ambiguous against
+     * the standard placement form if <new> is in scope. */
+    auto *pParams =
+        new ((ULONG_PTR)0) WDI_GET_ADAPTER_CAPABILITIES_PARAMETERS();
+    if (pParams == nullptr) {
+        return NDIS_STATUS_RESOURCES;
+    }
+    WDI_GET_ADAPTER_CAPABILITIES_PARAMETERS &params = *pParams;
 
     /* WDI_GET_ADAPTER_CAPABILITIES_PARAMETERS is the largest structure
      * in the interface. Most of its members are optional TLVs with
@@ -702,6 +724,11 @@ VwifiTlvGenerateAdapterCapabilities(
 
     NDIS_STATUS st = GenerateWdiGetAdapterCapabilities(
         &params, kHeaderReserve, &ctx, &outLen, &pOut);
+
+    /* Delete on both paths: params owns the ArrayOfElements members,
+     * whose destructors run here. */
+    delete pParams;
+
     if (st != NDIS_STATUS_SUCCESS) return st;
 
     *Buffer    = pOut;
