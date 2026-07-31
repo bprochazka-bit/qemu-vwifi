@@ -225,7 +225,7 @@ VwifiTlvGenerateBssEntryList(
         w->EntryAgeInfo.CachedInformation = FALSE;
         w->Optional.EntryAgeInfo_IsPresent = TRUE;
 
-        /* The WHOLE beacon / probe-response frame, verbatim.
+        /* The beacon / probe-response frame BODY -- MAC header removed.
          *
          * Per WABIModel.xml, BSSEntryContainer carries the raw frame as
          * a byte blob, in one of two TLVs:
@@ -233,23 +233,45 @@ VwifiTlvGenerateBssEntryList(
          *   WDI_TLV_PROBE_RESPONSE_FRAME  name="ProbeResponseFrame"
          * both type="ByteBlob", both optional.
          *
-         * The OS parses the IEs itself (SSID, RSN, rates, HT/VHT caps).
-         * Handing over a reconstructed subset would silently lose
-         * capabilities — which is exactly why the device keeps whole
-         * frames rather than just the IE tail.
+         * The OS parses the body itself -- SSID, RSN, rates, HT/VHT caps
+         * -- so the whole thing is handed over rather than a
+         * reconstructed subset, which would silently lose capabilities.
+         * But it must start at the frame body, not the frame: WDI's
+         * beacon/probe-response blobs are documented as not including
+         * the 802.11 MAC header.
+         *
+         * Passing the whole frame does not fail, which is what makes it
+         * worth a comment. The OS reads the first eight bytes of the MAC
+         * header as the beacon timestamp, takes the next four as beacon
+         * interval and capability, and starts walking information
+         * elements from inside addr2. It finds no SSID element there and
+         * reports a perfectly visible network as "Hidden Network".
+         *
+         * The device sends whole frames deliberately -- Linux's
+         * cfg80211_inform_bss_frame_data() wants the MAC header -- so
+         * the trimming belongs here, in the consumer that needs it.
          *
          * WDI_BYTE_BLOB is ArrayOfElements<UINT8>: the bytes go directly
          * in ElementCount/pElements, with no Payload indirection. */
-        if (e->capability_info & VWIFI_BSS_F_BEACON) {
-            w->BeaconFrame.ElementCount = e->ie_len;
-            w->BeaconFrame.pElements    = const_cast<UINT8 *>(Items[i].Frame);
-            w->Optional.BeaconFrame_IsPresent = TRUE;
-        } else {
-            w->ProbeResponseFrame.ElementCount = e->ie_len;
-            w->ProbeResponseFrame.pElements =
-                const_cast<UINT8 *>(Items[i].Frame);
-            w->Optional.ProbeResponseFrame_IsPresent = TRUE;
+        if (e->ie_len > VWIFI_80211_MGMT_HDR_LEN) {
+            UINT8 *body = const_cast<UINT8 *>(Items[i].Frame) +
+                          VWIFI_80211_MGMT_HDR_LEN;
+            UINT32 bodyLen = e->ie_len - VWIFI_80211_MGMT_HDR_LEN;
+
+            if (e->capability_info & VWIFI_BSS_F_BEACON) {
+                w->BeaconFrame.ElementCount = bodyLen;
+                w->BeaconFrame.pElements    = body;
+                w->Optional.BeaconFrame_IsPresent = TRUE;
+            } else {
+                w->ProbeResponseFrame.ElementCount = bodyLen;
+                w->ProbeResponseFrame.pElements    = body;
+                w->Optional.ProbeResponseFrame_IsPresent = TRUE;
+            }
         }
+        /* Too short to hold a MAC header: no blob, and both presence
+         * bits stay clear. The entry still carries BSSID, signal and
+         * channel, so the BSS is reported -- as hidden, which is the
+         * honest answer for a frame we cannot read. */
     }
 
     /* The list member is called DeviceDescriptor, not BSSEntries, and it

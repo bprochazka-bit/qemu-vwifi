@@ -390,14 +390,33 @@ struct vwifi_bss_entry {
     uint32_t capability_info;       /* low 16 bits = 802.11 capability field;
                                      * bit 16 = VWIFI_BSS_F_BEACON */
     uint64_t tsf;
-    uint16_t ie_len;                /* length of the raw frame that follows —
-                                     * the WHOLE beacon/probe-resp, not just
-                                     * the IE tail (WDI wants the frame) */
+    uint16_t ie_len;                /* length of the raw frame that follows */
     uint16_t ssid_len;
     uint8_t  ssid[33];
     uint8_t  _reserved2[3];
-    /* followed by ie_len bytes of raw IEs copied from the beacon/probe-resp */
+    /* Followed by ie_len bytes: the WHOLE beacon / probe-response frame,
+     * starting at the 802.11 MAC header, not just the IE tail. The name
+     * is historical and misleading -- it is a frame length, not an IE
+     * length.
+     *
+     * The full frame is what Linux wants:
+     * cfg80211_inform_bss_frame_data() takes a struct ieee80211_mgmt,
+     * MAC header included.
+     *
+     * Windows wants the opposite, and each consumer is responsible for
+     * its own trimming. WDI's beacon/probe-response byte blobs are
+     * documented as NOT including the 802.11 MAC header, so the Windows
+     * driver skips VWIFI_80211_MGMT_HDR_LEN bytes before handing the
+     * frame over. Getting that wrong is not a parse error: the OS reads
+     * the first eight bytes of the MAC header as the beacon timestamp
+     * and starts looking for information elements inside addr2, finds no
+     * SSID, and reports the network as hidden. */
 } VWIFI_PACKED;
+
+/* 802.11 management frame header: frame control, duration, three
+ * addresses, sequence control. The frame body -- fixed parameters then
+ * information elements -- starts here. */
+#define VWIFI_80211_MGMT_HDR_LEN  24
 
 struct vwifi_connect_req {
     uint8_t  bssid[6];              /* specific AP to target */

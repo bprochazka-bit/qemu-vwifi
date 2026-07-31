@@ -196,6 +196,21 @@ VwifiScanOnBssFound(_Inout_ PVWIFI_ADAPTER Adapter,
     RtlCopyMemory(task->Pending[task->PendingCount].Frame, frame, frameLen);
     task->PendingCount++;
 
+    /* The device parses the SSID out of the beacon for its own BSS
+     * table, so it is here for free -- and it is the reference for what
+     * the OS ought to end up displaying. WDI has no SSID field: the OS
+     * reads it out of the frame body we hand over, so when this line
+     * shows a name and the UI still says "Hidden Network", the frame
+     * blob is what to look at, not the scan. */
+    VWIFI_INFO("BSS %02x:%02x:%02x:%02x:%02x:%02x ssid='%.*s' "
+               "freq=%u rssi=%d frame=%u (%s)",
+               bss->bssid[0], bss->bssid[1], bss->bssid[2],
+               bss->bssid[3], bss->bssid[4], bss->bssid[5],
+               bss->ssid_len > 32 ? 32 : bss->ssid_len, bss->ssid,
+               bss->channel_freq, bss->rssi, frameLen,
+               (bss->capability_info & VWIFI_BSS_F_BEACON)
+                   ? "beacon" : "probe-resp");
+
     /* The documented throttle: 3+ staged, or 500ms since last update. */
     if (task->PendingCount >= VWIFI_SCAN_BATCH_THRESHOLD ||
         (VwifiGetTickCountMs() - task->LastIndicationTimeMs)
