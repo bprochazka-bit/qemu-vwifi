@@ -38,6 +38,7 @@ if errorlevel 1 goto :abort
 call :find_tlv_lib
 if errorlevel 1 goto :abort
 call :make_version
+call :clean_stale_catalog
 
 echo Building vwifi %CFG%^|x64 ...
 msbuild "%~dp0vwifi.sln" ^
@@ -61,9 +62,9 @@ echo Build OK. Output:
 echo   %~dp0x64\%CFG%\
 dir /b "%~dp0x64\%CFG%\vwifi.sys" "%~dp0x64\%CFG%\vwifi.inf" 2>nul
 echo.
-echo   The output is flat here, not in a vwifi\ subfolder: MSBuild only
-echo   creates the package folder as part of its own signing step, which
-echo   this project turns off. sign.cmd assembles it.
+echo   The .sys and .inf land flat here. sign.cmd assembles them into
+echo   x64\%CFG%\vwifi\ -- that folder, not this one, is what gets
+echo   copied to the guest.
 echo.
 echo Warnings (review these^): %~dp0build-%CFG%.wrn
 echo Next: sign.cmd %CFG%
@@ -202,6 +203,33 @@ goto :clean_var_loop
 :clean_var_done
 set "%~1=!_cv!"
 set "_cv="
+exit /b 0
+
+
+rem --- a signed catalog blocks the next build ---------------------
+rem  drvcat.exe -- the WDK 10.0.26100+ replacement for Inf2Cat, and NOT
+rem  gated by EnableInf2Cat, which names the old tool -- refuses to
+rem  rewrite a catalog whose existing signature it cannot validate:
+rem
+rem    Unable to determine if catalog is signed. Error = 0x800B0109
+rem    Modifying catalog will result in the loss of its signature.
+rem    Use /force to break the catalog signature seal.
+rem    error MSB6006: "drvcat.exe" exited with code 1003
+rem
+rem  0x800B0109 is CERT_E_UNTRUSTEDROOT: our own test certificate, which
+rem  no build machine has any reason to trust. So the first build after
+rem  a successful sign.cmd fails, and keeps failing, until the catalog
+rem  is gone.
+rem
+rem  Deleted rather than passed /force: a delete needs no guess about
+rem  which MSBuild property maps to that switch in this kit version, and
+rem  the catalog is a build artifact that sign.cmd regenerates anyway.
+rem  Deleting recursively covers it wherever the kit puts it -- flat in
+rem  x64\<cfg>\ or in the x64\<cfg>\vwifi\ package folder.
+:clean_stale_catalog
+if not exist "%~dp0x64\%CFG%\." exit /b 0
+del /f /q /s "%~dp0x64\%CFG%\*.cat" >nul 2>&1
+echo   Cleared any previously signed catalog under x64\%CFG%
 exit /b 0
 
 
