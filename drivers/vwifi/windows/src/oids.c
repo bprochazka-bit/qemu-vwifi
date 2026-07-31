@@ -551,6 +551,14 @@ VwifiHandleTaskCreatePort(_Inout_ PVWIFI_ADAPTER Adapter,
     Adapter->PortId      = (ULONG)Req->PortNumber;
     Adapter->PortCreated = TRUE;
 
+    /* State the link, now that there is a port for it to belong to.
+     * Disconnected is the truth here and it is a different thing from
+     * never having said -- NDIS starts an adapter with no media state
+     * asserted, and this driver only ever spoke up on association or
+     * disconnect, so until something connected the OS had heard
+     * nothing at all. */
+    VwifiIndicateLinkState(Adapter, FALSE);
+
     /* The completion carries a mandatory PortAttributes container --
      * the created port's MAC and number. It is NOT header-only: that
      * describes WDI_TASK_CREATE_PORT's own results message, which is a

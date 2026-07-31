@@ -180,8 +180,14 @@ VwifiIndicateDisassociation(_Inout_ PVWIFI_ADAPTER Adapter, _In_ BOOLEAN Local)
 }
 
 /* Report media-connect state to NDIS so the OS knows the link is up.
- * Distinct from the WDI indications above. */
-static VOID
+ * Distinct from the WDI indications above.
+ *
+ * Not static: the initial state has to be reported when the port is
+ * created, before anything has associated. NDIS expects a miniport to
+ * say where its link stands; saying nothing is not the same as saying
+ * "down", and an interface whose media state was never stated is not
+ * obviously one the OS should start a connection on. */
+VOID
 VwifiIndicateLinkState(_Inout_ PVWIFI_ADAPTER Adapter, _In_ BOOLEAN Up)
 {
     NDIS_LINK_STATE linkState = { 0 };

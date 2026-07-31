@@ -494,6 +494,8 @@ NDIS_STATUS VwifiScanTaskCreate(_Inout_ PVWIFI_ADAPTER Adapter);
 VOID        VwifiScanTaskDestroy(_Inout_ PVWIFI_ADAPTER Adapter);
 NDIS_STATUS VwifiHandleTaskScan(_Inout_ PVWIFI_ADAPTER Adapter,
                                 _In_ PNDIS_OID_REQUEST Req);
+VOID        VwifiIndicateLinkState(_Inout_ PVWIFI_ADAPTER Adapter,
+                                   _In_ BOOLEAN Up);
 NDIS_STATUS VwifiHandleTaskScanAbort(_Inout_ PVWIFI_ADAPTER Adapter);
 VOID        VwifiScanOnBssFound(_Inout_ PVWIFI_ADAPTER Adapter,
                                 _In_reads_bytes_(PayloadLen) const VOID *Payload,
