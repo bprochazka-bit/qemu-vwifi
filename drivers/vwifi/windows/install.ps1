@@ -6,33 +6,33 @@
     Run elevated, from the folder holding vwifi.sys / vwifi.inf /
     vwifi.cat (that is x64\Debug\vwifi\ as assembled by sign.cmd).
 
-    Replacing a driver is not the same as installing one.
-    `pnputil /add-driver` adds a package, but PnP keeps the one already
-    bound to the device unless the new package ranks better -- and
-    ranking is on DriverVer, which stampinf writes as <date>,<version>.
-    build.cmd derives the version from the build time, so every build
-    strictly outranks the last and ranking alone picks the new one.
+    This STAGES the package and stops. It does not remove the old
+    package, disable the device, or restart it -- every one of those has
+    to stop a device the WLAN service is holding, and every one of them
+    has been observed to hang badly enough that the VM had to be forced
+    off.
 
-    The old package is therefore left alone by default. Removing it
-    means `pnputil /delete-driver /uninstall`, which has to stop the
-    device using it -- and once the driver works, that is a live adapter
-    to unwind. If the teardown stalls, so does the uninstall, and the
-    install never happens. Pass -RemoveOld to clean up superseded
-    packages; it runs last, after the new driver is in.
+    Staging is enough. PnP picks a package by DriverVer ranking, and
+    build.cmd derives the version from the build time, so each build
+    strictly outranks the last. Reboot and the new driver loads.
+
+    Reboot is currently the reliable way to swap drivers here, and this
+    script is honest about that rather than hanging while pretending
+    otherwise.
 
 .PARAMETER Path
     Folder holding the driver package. Defaults to the script's own
     folder, then to the build output under it.
 
-.PARAMETER RemoveOld
-    After installing, remove superseded vwifi packages. Off by default:
-    it has to stop whatever is using them, and a stall there used to
-    take the whole install with it.
+.PARAMETER Restart
+    Also restart the device so the staged driver takes effect without a
+    reboot. Off by default: this is the step that hangs. If it does,
+    the package is already staged, so a reboot still gets you there.
 #>
 [CmdletBinding()]
 param(
     [string] $Path,
-    [switch] $RemoveOld
+    [switch] $Restart
 )
 
 $ErrorActionPreference = 'Stop'
@@ -88,68 +88,41 @@ $driverVer = (Select-String -Path $inf -Pattern '^\s*DriverVer\s*=' |
               Select-Object -First 1).Line
 if ($driverVer) { Write-Host "Installing: $($driverVer.Trim())" }
 
-# --- 1. add and install the new package ------------------------------
+# --- 1. stage the new package ----------------------------------------
 #
-# Installed first, and the old package is NOT removed to make room.
-#
-# It used to be, because two builds on the same day carried an identical
-# DriverVer and PnP had no reason to prefer the new one. build.cmd now
-# derives the version from the build time (1.0.MMdd.HHmm), so every
-# build strictly outranks its predecessor and ordinary ranking picks it.
-#
-# Removing first also stopped being harmless the moment the driver
-# started working. `pnputil /delete-driver /uninstall /force` has to
-# stop the device that is using the package, which means unwinding a
-# live adapter -- port teardown, close, halt -- and if any of that
-# stalls, the uninstall stalls with it and takes the install with it.
-# That is a bad place for a bring-up script to wedge: nothing is
-# installed yet, and the reason for the stall is in the driver you were
-# about to replace.
+# The old package is not removed to make room. It used to be, because
+# two builds on the same day carried an identical DriverVer and PnP had
+# no reason to prefer the new one. build.cmd now derives the version
+# from the build time (1.0.MMdd.HHmm), so every build strictly outranks
+# its predecessor and ordinary ranking picks it up.
 Write-Host ''
-Write-Host '[1/4] Installing ...'
+Write-Host '[1/3] Staging the driver package ...'
 
-# Disable the device first, and re-enable it afterwards.
+# STAGE ONLY. Nothing here touches the running device.
 #
-# Once the driver works, the WLAN service holds the adapter open, and
-# pnputil cannot replace a driver whose device is in use -- it fails,
-# and the only way anyone found back out was a reboot. Disabling drops
-# the service's hold and takes the adapter through its own teardown,
-# which is a far better place to unwind than half way through an
-# uninstall.
+# Two earlier versions of this script did, and both wedged:
 #
-# Best-effort on purpose: on the very first install there is no device
-# to disable, and a device stuck in a bad state may refuse. Neither is
-# a reason not to try the install.
-$dev = Get-PnpDevice -InstanceId 'PCI\VEN_1AF4&DEV_0E00*' -ErrorAction SilentlyContinue |
-       Where-Object { $_.Status -ne 'Unknown' }
-$disabled = $false
-if ($dev) {
-    Write-Host '  disabling the adapter so pnputil is not fighting it ...'
-    try {
-        $dev | Disable-PnpDevice -Confirm:$false -ErrorAction Stop
-        $disabled = $true
-    } catch {
-        Write-Host "    (could not disable: $($_.Exception.Message))"
-        Write-Host '    continuing; the install may fail with the device in use.'
-    }
-}
-
-Write-Host "  adding $inf ..."
-& pnputil /add-driver $inf /install
+#   pnputil /delete-driver /uninstall /force  -- has to stop the device
+#       using the package.
+#   Disable-PnpDevice                         -- same thing by another
+#       route.
+#
+# Both hang, and they hang hard enough to take the reboot with them:
+# the VM has to be forced off. Why is not yet known -- no trace has been
+# captured during a disable, so whether the driver's teardown is even
+# reached is an open question, not a settled one. What is known is that
+# asking from here does not help.
+#
+# `pnputil /add-driver` without /install stages the package in the
+# driver store and returns immediately. PnP picks it up the next time
+# the device starts -- which, given a reboot is currently needed anyway,
+# costs nothing and cannot wedge.
+#
+# -Restart tries to make it take effect now, and is off by default
+# precisely because that is the part that hangs.
+Write-Host "  staging $inf in the driver store ..."
+& pnputil /add-driver $inf
 $addStatus = $LASTEXITCODE
-
-if ($disabled) {
-    Write-Host '  re-enabling the adapter ...'
-    try {
-        Get-PnpDevice -InstanceId 'PCI\VEN_1AF4&DEV_0E00*' -ErrorAction Stop |
-            Enable-PnpDevice -Confirm:$false -ErrorAction Stop
-    } catch {
-        Write-Host "    (could not re-enable: $($_.Exception.Message))"
-        Write-Host '    enable it by hand in Device Manager.'
-    }
-}
-
-$global:LASTEXITCODE = $addStatus
 if ($LASTEXITCODE -ne 0) {
     Write-Host ''
     Write-Host 'ERROR: pnputil failed. The usual causes:'
@@ -160,50 +133,29 @@ if ($LASTEXITCODE -ne 0) {
     exit 1
 }
 
-# --- 2. make PnP re-evaluate the device ------------------------------
+# --- 2. optionally try to make it take effect now --------------------
 Write-Host ''
-Write-Host '[2/4] Rescanning for devices ...'
-& pnputil /scan-devices | Out-Null
-
-# --- 3. clean up superseded packages, if asked -----------------------
-#
-# Last, and opt-in. By this point the device is bound to the new
-# package, so removing the old ones should not have to stop anything --
-# but "should not" is what the ordering above is defending against, and
-# a stall here costs nothing: the driver is already installed and Ctrl-C
-# is safe.
-Write-Host ''
-if (-not $RemoveOld) {
-    Write-Host '[3/4] Leaving superseded packages in place (-RemoveOld to clean up).'
+if (-not $Restart) {
+    Write-Host '[2/3] Staged. REBOOT to load it -- the new package outranks the'
+    Write-Host '      old one, so PnP picks it up when the device next starts.'
+    Write-Host '      (-Restart tries to do it now, and is the part that hangs.)'
 } else {
-    Write-Host '[3/4] Removing superseded vwifi packages ...'
-
-    # pnputil /enum-drivers emits blank-line-separated records; find the
-    # published oemNN.inf name of any whose original name is vwifi.inf.
-    $records = ((pnputil /enum-drivers) -join "`n") -split "`r?`n`r?`n"
-    $old = foreach ($r in $records) {
-        if ($r -match '(?im)^\s*Original Name:\s*vwifi\.inf\s*$' -and
-            $r -match '(?im)^\s*Published Name:\s*(oem\d+\.inf)\s*$') {
-            $Matches[1]
-        }
-    }
-
-    if (-not $old) {
-        Write-Host '  none installed.'
-    } else {
-        foreach ($o in $old) {
-            Write-Host "  removing $o (Ctrl-C is safe -- the new driver is in)"
-            & pnputil /delete-driver $o /uninstall | Out-Null
-            if ($LASTEXITCODE -ne 0) {
-                Write-Host "    (pnputil returned $LASTEXITCODE; continuing)"
-            }
-        }
+    Write-Host '[2/3] -Restart given: restarting the device ...'
+    Write-Host '      If this does not return, the disable is wedged. Capture'
+    Write-Host '      the -debugcon log on the host while it is stuck -- that'
+    Write-Host '      is the trace nobody has yet.'
+    try {
+        Get-PnpDevice -InstanceId 'PCI\VEN_1AF4&DEV_0E00*' -ErrorAction Stop |
+            Restart-PnpDevice -Confirm:$false -ErrorAction Stop
+    } catch {
+        Write-Host "      (restart failed: $($_.Exception.Message))"
+        Write-Host '      Reboot instead; the package is staged either way.'
     }
 }
 
-# --- 4. report where the device ended up -----------------------------
+# --- 3. report where the device ended up -----------------------------
 Write-Host ''
-Write-Host '[4/4] Device status:'
+Write-Host '[3/3] Device status:'
 $dev = Get-PnpDevice -InstanceId 'PCI\VEN_1AF4&DEV_0E00*' -ErrorAction SilentlyContinue
 if (-not $dev) {
     Write-Host '  no vwifi-virt device present -- is -device vwifi-virt on the QEMU command line?'

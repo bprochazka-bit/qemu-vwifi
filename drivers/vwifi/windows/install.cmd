@@ -28,7 +28,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0install.ps1" -Path "%~
 set "RC=%errorlevel%"
 echo.
 if not "%RC%"=="0" echo install.cmd: FAILED, exit code %RC%
-if "%RC%"=="0" echo install.cmd: done
+if "%RC%"=="0" echo install.cmd: staged -- REBOOT to load it.
 exit /b %RC%
 
 :no_script
