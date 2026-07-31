@@ -630,6 +630,103 @@ VwifiTlvParseDeleteCipherKeys(
  * Capabilities
  * ============================================================ */
 
+/* 5 GHz channel numbers, indexed by bit position in
+ * vwifi_caps.supported_channels_5. This table is a shared contract: it
+ * must stay identical to vwifi_unii_channels[] in the Linux driver's
+ * vwifi_cfg80211.c and to the table op_scan indexes in the QEMU device.
+ * Reorder one and the three disagree about what a set bit means. */
+static const UINT8 kUniiChannels[] = {
+    36, 40, 44, 48, 52, 56, 60, 64,
+    100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144,
+    149, 153, 157, 161, 165,
+};
+
+/* Supported rates in the 802.11 encoding: units of 500 kbps. */
+static const UINT16 kRatesDsss[] = { 2, 4, 11, 22 };            /* 1 .. 11 */
+static const UINT16 kRatesOfdm[] = { 12, 18, 24, 36, 48, 72, 96, 108 };
+
+#define VWIFI_CAPS_MAX_BANDS    2
+#define VWIFI_CAPS_MAX_PHYS     3
+#define VWIFI_CAPS_MAX_CHAN_24  14
+#define VWIFI_CAPS_MAX_CHAN_5   RTL_NUMBER_OF(kUniiChannels)
+#define VWIFI_CAPS_MAX_RATES    8
+#define VWIFI_CAPS_MAX_ALGOS    2
+
+/* Backing store for every ArrayOfElements the capabilities message
+ * points at. The library reads through those pointers during Generate,
+ * so the memory has to outlive the call -- one allocation, freed with
+ * the parameters block, rather than a dozen. */
+struct VwifiCapsScratch {
+    WDI_BAND_INFO_CONTAINER   Bands[VWIFI_CAPS_MAX_BANDS];
+    WDI_PHY_INFO_CONTAINER    Phys[VWIFI_CAPS_MAX_PHYS];
+    WDI_PHY_TYPE              PhyTypes[VWIFI_CAPS_MAX_BANDS][2];
+    WDI_CHANNEL_MAPPING_ENTRY Chan24[VWIFI_CAPS_MAX_CHAN_24];
+    WDI_CHANNEL_MAPPING_ENTRY Chan5[VWIFI_CAPS_MAX_CHAN_5];
+    UINT32                    Widths[VWIFI_CAPS_MAX_BANDS];
+    UINT32                    TxPower[VWIFI_CAPS_MAX_PHYS];
+    WDI_DATA_RATE_LIST        Rates[VWIFI_CAPS_MAX_PHYS][VWIFI_CAPS_MAX_RATES];
+    WDI_ALGO_PAIRS            Algos[VWIFI_CAPS_MAX_ALGOS];
+};
+
+static ULONG
+VwifiFillChannels24(UINT32 Mask, WDI_CHANNEL_MAPPING_ENTRY *Out, ULONG Max)
+{
+    ULONG n = 0;
+
+    /* Bit N is channel N, so bit 0 is unused -- matching the Linux
+     * driver, which loops 1..14 over the same mask. */
+    for (ULONG ch = 1; ch <= 14 && n < Max; ch++) {
+        if (!(Mask & (1u << ch))) continue;
+        Out[n].ChannelNumber          = (WDI_CHANNEL_NUMBER)ch;
+        Out[n].ChannelCenterFrequency = (ch == 14) ? 2484u : (2407u + ch * 5u);
+        n++;
+    }
+    return n;
+}
+
+static ULONG
+VwifiFillChannels5(UINT64 Mask, WDI_CHANNEL_MAPPING_ENTRY *Out, ULONG Max)
+{
+    ULONG n = 0;
+
+    /* Bit i indexes kUniiChannels[i]; the numbers are not contiguous. */
+    for (ULONG i = 0; i < RTL_NUMBER_OF(kUniiChannels) && n < Max; i++) {
+        if (!(Mask & (1ULL << i))) continue;
+        Out[n].ChannelNumber          = (WDI_CHANNEL_NUMBER)kUniiChannels[i];
+        Out[n].ChannelCenterFrequency = 5000u + 5u * kUniiChannels[i];
+        n++;
+    }
+    return n;
+}
+
+static VOID
+VwifiFillPhy(WDI_PHY_INFO_CONTAINER *Phy,
+             WDI_PHY_TYPE Type,
+             UINT32 *TxPowerSlot,
+             WDI_DATA_RATE_LIST *RateSlots,
+             const UINT16 *Rates,
+             ULONG RateCount,
+             ULONG BasicCount)
+{
+    Phy->PhyCapabilities.PhyType          = Type;
+    Phy->PhyCapabilities.SupportsCFPoll   = 0;
+    Phy->PhyCapabilities.MPDUMaxLength    = 2304;
+    Phy->PhyCapabilities.TemperatureClass = 1;
+    Phy->PhyCapabilities.DiversitySupport = 0;
+
+    *TxPowerSlot = 20;                      /* dBm, matching the Linux
+                                             * driver's max_power */
+    Phy->TxPowerLevelList.ElementCount = 1;
+    Phy->TxPowerLevelList.pElements    = TxPowerSlot;
+
+    for (ULONG i = 0; i < RateCount; i++) {
+        RateSlots[i].DataRateFlag  = (UINT8)(i < BasicCount ? 1 : 0);
+        RateSlots[i].DataRateValue = Rates[i];
+    }
+    Phy->DataRateList.ElementCount = (UINT32)RateCount;
+    Phy->DataRateList.pElements    = RateSlots;
+}
+
 extern "C"
 NDIS_STATUS
 VwifiTlvGenerateAdapterCapabilities(
@@ -682,6 +779,14 @@ VwifiTlvGenerateAdapterCapabilities(
         return NDIS_STATUS_RESOURCES;
     }
     WDI_GET_ADAPTER_CAPABILITIES_PARAMETERS &params = *pParams;
+
+    auto *scratch = static_cast<VwifiCapsScratch *>(
+        ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(VwifiCapsScratch),
+                        VWIFI_TLV_PARAMS_TAG));
+    if (scratch == nullptr) {
+        ExFreePoolWithTag(pParams, VWIFI_TLV_PARAMS_TAG);
+        return NDIS_STATUS_RESOURCES;
+    }
 
     /* WDI_GET_ADAPTER_CAPABILITIES_PARAMETERS is the largest structure
      * in the interface. Most of its members are optional TLVs with
@@ -766,31 +871,136 @@ VwifiTlvGenerateAdapterCapabilities(
         sc->BSSListCachemanagement = FALSE;
     }
 
-    /* Not filled: BandInfo, PhyInfo, the cipher/auth algorithm pair
-     * lists, and the country-region list. All are optional at this
-     * level in WABIModel.xml, so the message is well-formed without
-     * them — but the OS uses BandInfo to learn which channels exist, so
-     * a scan may well find nothing until they are supplied. That is the
-     * next piece of work on this function, and it needs the device's
-     * supported_channels_24 / _5 masks translated into
-     * WDI_BAND_INFO_CONTAINER entries.
+    /* Bands and PHYs.
      *
-     * Deliberately not bundled with the FirmwareVersion fix above.
-     * Every sub-container of BandInfoContainer and PhyInfoContainer is
-     * itself mandatory — BandCapabilities, ValidPhyTypes,
-     * ValidChannelTypes, ChannelWidthList; PhyCapabilities,
-     * TxPowerLevelList, DataRateList — so filling them is a large
-     * unverified change whose failure mode is the same opaque
-     * NDIS_STATUS_INVALID_DATA. Shipping it alongside a known-correct
-     * fix would make the next failure ambiguous again. */
+     * Optional TLVs, so leaving them out produced a message the
+     * generator was happy with — and an adapter the WLAN component
+     * silently declined to use. It read the capabilities, applied the
+     * adapter configuration, then closed the adapter without asking
+     * anything further. An adapter that reports no bands has no
+     * channels, and there is nothing to scan or connect on.
+     *
+     * Every sub-container of each is itself mandatory:
+     * BandCapabilities / ValidPhyTypes / ValidChannelTypes /
+     * ChannelWidthList, and PhyCapabilities / TxPowerLevelList /
+     * DataRateList. A band with any one of them missing is worse than
+     * no band at all — it fails the whole generate. */
+    {
+        ULONG nBands = 0, nPhys = 0;
+
+        if (Caps->supported_channels_24 != 0) {
+            WDI_BAND_INFO_CONTAINER *b = &scratch->Bands[nBands];
+
+            b->BandCapabilities.BandID    = WDI_BAND_ID_2400;
+            b->BandCapabilities.BandState = TRUE;
+
+            scratch->PhyTypes[nBands][0] = WDI_PHY_TYPE_HRDSSS;  /* 11b */
+            scratch->PhyTypes[nBands][1] = WDI_PHY_TYPE_ERP;     /* 11g */
+            b->ValidPhyTypes.ElementCount = 2;
+            b->ValidPhyTypes.pElements    = scratch->PhyTypes[nBands];
+
+            b->ValidChannelTypes.ElementCount = VwifiFillChannels24(
+                Caps->supported_channels_24, scratch->Chan24,
+                RTL_NUMBER_OF(scratch->Chan24));
+            b->ValidChannelTypes.pElements = scratch->Chan24;
+
+            scratch->Widths[nBands] = 20;      /* MHz; no HT40 here */
+            b->ChannelWidthList.ElementCount = 1;
+            b->ChannelWidthList.pElements    = &scratch->Widths[nBands];
+            nBands++;
+
+            VwifiFillPhy(&scratch->Phys[nPhys], WDI_PHY_TYPE_HRDSSS,
+                         &scratch->TxPower[nPhys], scratch->Rates[nPhys],
+                         kRatesDsss, RTL_NUMBER_OF(kRatesDsss),
+                         RTL_NUMBER_OF(kRatesDsss));
+            nPhys++;
+            VwifiFillPhy(&scratch->Phys[nPhys], WDI_PHY_TYPE_ERP,
+                         &scratch->TxPower[nPhys], scratch->Rates[nPhys],
+                         kRatesOfdm, RTL_NUMBER_OF(kRatesOfdm), 3);
+            nPhys++;
+        }
+
+        if (Caps->supported_channels_5 != 0) {
+            WDI_BAND_INFO_CONTAINER *b = &scratch->Bands[nBands];
+
+            b->BandCapabilities.BandID    = WDI_BAND_ID_5000;
+            b->BandCapabilities.BandState = TRUE;
+
+            scratch->PhyTypes[nBands][0] = WDI_PHY_TYPE_OFDM;    /* 11a */
+            b->ValidPhyTypes.ElementCount = 1;
+            b->ValidPhyTypes.pElements    = scratch->PhyTypes[nBands];
+
+            b->ValidChannelTypes.ElementCount = VwifiFillChannels5(
+                Caps->supported_channels_5, scratch->Chan5,
+                RTL_NUMBER_OF(scratch->Chan5));
+            b->ValidChannelTypes.pElements = scratch->Chan5;
+
+            scratch->Widths[nBands] = 20;
+            b->ChannelWidthList.ElementCount = 1;
+            b->ChannelWidthList.pElements    = &scratch->Widths[nBands];
+            nBands++;
+
+            VwifiFillPhy(&scratch->Phys[nPhys], WDI_PHY_TYPE_OFDM,
+                         &scratch->TxPower[nPhys], scratch->Rates[nPhys],
+                         kRatesOfdm, RTL_NUMBER_OF(kRatesOfdm), 3);
+            nPhys++;
+        }
+
+        if (nBands != 0) {
+            params.BandInfo.ElementCount = nBands;
+            params.BandInfo.pElements    = scratch->Bands;
+            params.Optional.BandInfo_IsPresent = TRUE;
+        }
+        if (nPhys != 0) {
+            params.PhyInfo.ElementCount = nPhys;
+            params.PhyInfo.pElements    = scratch->Phys;
+            params.Optional.PhyInfo_IsPresent = TRUE;
+        }
+    }
+
+    /* Which security this adapter can do.
+     *
+     * Also optional, and also the sort of thing whose absence makes an
+     * adapter useless rather than merely limited: with no algorithm
+     * pairs the OS has no basis to offer any network, secured or not.
+     * The device advertises VWIFI_CAP_WPA2, and wdi_keys.c installs
+     * CCMP pairwise/group keys, so open and WPA2-PSK are what is
+     * honestly supported. */
+    {
+        scratch->Algos[0].AuthAlgorithm   = WDI_AUTH_ALGO_80211_OPEN;
+        scratch->Algos[0].CipherAlgorithm = WDI_CIPHER_ALGO_NONE;
+        scratch->Algos[1].AuthAlgorithm   = WDI_AUTH_ALGO_RSNA_PSK;
+        scratch->Algos[1].CipherAlgorithm = WDI_CIPHER_ALGO_CCMP;
+
+        params.StationAttributes.UnicastAlgorithms.ElementCount = 2;
+        params.StationAttributes.UnicastAlgorithms.pElements = scratch->Algos;
+        params.StationAttributes.Optional.UnicastAlgorithms_IsPresent = TRUE;
+
+        params.StationAttributes.MulticastDataAlgorithms.ElementCount = 2;
+        params.StationAttributes.MulticastDataAlgorithms.pElements =
+            scratch->Algos;
+        params.StationAttributes.Optional.MulticastDataAlgorithms_IsPresent =
+            TRUE;
+
+        /* MulticastManagementAlgorithms left absent: MFPCapable is 0,
+         * so there is no management-frame cipher to name. */
+    }
+
+    /* Still not filled: the country-region list, PM capabilities,
+     * datapath, P2P, AP and virtualization attributes. All optional,
+     * and all describe things this device does not do. */
 
     NDIS_STATUS st = GenerateWdiGetAdapterCapabilities(
         &params, kHeaderReserve, &ctx, &outLen, &pOut);
 
-    /* Freed on both paths. No destructors to run: nothing was
-     * constructed, and nothing here ever took ownership of a pointer --
-     * every ArrayOfElements member stayed the empty one it started as,
-     * since none of the optional lists are filled in. */
+    /* Freed on both paths, and only after Generate has returned: every
+     * ArrayOfElements in the message points into the scratch block, and
+     * the library reads through those pointers while it serialises.
+     *
+     * No destructors to run. Nothing was constructed, and nothing here
+     * ever took ownership: MemoryInternallyAllocated is FALSE
+     * throughout, so the library knows none of it is its to release. */
+    ExFreePoolWithTag(scratch, VWIFI_TLV_PARAMS_TAG);
     ExFreePoolWithTag(pParams, VWIFI_TLV_PARAMS_TAG);
 
     if (st != NDIS_STATUS_SUCCESS) return st;
