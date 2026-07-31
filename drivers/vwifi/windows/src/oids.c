@@ -617,6 +617,66 @@ VwifiHandleTaskDeletePort(_Inout_ PVWIFI_ADAPTER Adapter,
 }
 
 /* ============================================================
+ * OID_WDI_GET_STATISTICS
+ *
+ * The last message in the bring-up trace still answered NOT_SUPPORTED.
+ * Both of its reply containers are mandatory, so it could not be
+ * answered with a bare header the way the sets can -- which is why it
+ * stayed unhandled while everything around it got fixed.
+ *
+ * Answered the same way as the capabilities: generated into the OID's
+ * own output buffer, not indicated. Whether the WLAN component actually
+ * minds a failed statistics query is unknown; it is the only thing left
+ * being refused, and leaving one unexplained refusal in a trace that is
+ * being read for exactly this is not worth the ambiguity.
+ * ============================================================ */
+static NDIS_STATUS
+VwifiHandleGetStatistics(_Inout_ PVWIFI_ADAPTER Adapter,
+                         _In_ PNDIS_OID_REQUEST Req)
+{
+    PVOID       blob    = NULL;
+    ULONG       blobLen = 0;
+    PVOID       out     = NULL;
+    ULONG       outLen  = 0;
+    NDIS_STATUS status;
+    WDI_MESSAGE_HEADER *hdr;
+
+    status = VwifiTlvGenerateStatistics(Adapter->WdiPeerVersion,
+                                        &blob, &blobLen);
+    if (status != NDIS_STATUS_SUCCESS) {
+        VWIFI_ERR("statistics generate failed 0x%08x %s",
+                  status, VwifiNdisStatusName(status));
+        return status;
+    }
+
+    if (blobLen < sizeof(WDI_MESSAGE_HEADER)) {
+        VwifiTlvFreeGenerated(blob);
+        return NDIS_STATUS_FAILURE;
+    }
+
+    hdr = (WDI_MESSAGE_HEADER *)blob;
+    RtlZeroMemory(hdr, sizeof(*hdr));
+    hdr->PortId        = VwifiGetWdiPortId(Req);
+    hdr->Status        = NDIS_STATUS_SUCCESS;
+    hdr->TransactionId = VwifiGetWdiTransactionId(Req);
+
+    VwifiOidOutBuffer(Req, &out, &outLen);
+    if (out == NULL || outLen < blobLen) {
+        VwifiOidSetNeeded(Req, blobLen);
+        VwifiOidSetWritten(Req, 0);
+        VwifiTlvFreeGenerated(blob);
+        return NDIS_STATUS_BUFFER_TOO_SHORT;
+    }
+
+    RtlCopyMemory(out, blob, blobLen);
+    VwifiOidSetWritten(Req, blobLen);
+    VwifiTlvFreeGenerated(blob);
+
+    VWIFI_INFO("OID: reported statistics (%u bytes)", blobLen);
+    return NDIS_STATUS_SUCCESS;
+}
+
+/* ============================================================
  * OID_WDI_TASK_DOT11_RESET
  *
  * Sent immediately after the port is created, and again a moment later.
@@ -783,6 +843,9 @@ VwifiOidRequest(
     }
     if (oid == OID_WDI_SET_ADAPTER_CONFIGURATION) {
         return VwifiHandleSetAdapterConfiguration(adapter, OidRequest);
+    }
+    if (oid == OID_WDI_GET_STATISTICS) {
+        return VwifiHandleGetStatistics(adapter, OidRequest);
     }
 
     if (OidRequest->RequestType == NdisRequestSetInformation) {

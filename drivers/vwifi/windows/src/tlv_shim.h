@@ -195,6 +195,18 @@ NDIS_STATUS VwifiTlvParseDeletePort(
     _Out_ PULONG PortNumber);
 
 /* ============================================================
+ * Statistics
+ * ============================================================ */
+
+/* Build a WDI_GET_STATISTICS reply. Both of its containers are
+ * mandatory, so there is no such thing as an empty answer. Release with
+ * VwifiTlvFreeGenerated. */
+NDIS_STATUS VwifiTlvGenerateStatistics(
+    _In_ ULONG PeerVersion,
+    _Outptr_result_bytebuffer_(*BufferLen) VOID **Buffer,
+    _Out_ PULONG BufferLen);
+
+/* ============================================================
  * Dot11 reset / receive packet filter
  * ============================================================ */
 

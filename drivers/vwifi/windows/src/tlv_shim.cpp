@@ -1240,6 +1240,59 @@ VwifiTlvParseDeletePort(
 }
 
 /* ============================================================
+ * Statistics
+ *
+ * Both containers are optional="false" and multiContainer="true", so
+ * the reply needs at least one of each -- an empty list is not a valid
+ * answer here, which is why returning NOT_SUPPORTED was the only option
+ * until now.
+ *
+ * The counters are honest zeroes. This device keeps none: the medium
+ * has no retries, no ACK failures and no FCS errors to count, and the
+ * per-frame outcomes those fields describe do not exist in it. Zero is
+ * what "this never happened" looks like, and it is a truer answer than
+ * an invented number.
+ *
+ * One MAC entry, for the broadcast address, which the field comment
+ * defines as the multicast/broadcast bucket -- there is no per-peer
+ * accounting to report, and claiming a peer that may not exist would be
+ * worse than reporting the aggregate. One PHY entry, matching the ERP
+ * PHY the capabilities advertise for 2.4 GHz.
+ * ============================================================ */
+
+extern "C"
+NDIS_STATUS
+VwifiTlvGenerateStatistics(
+    ULONG PeerVersion,
+    VOID **Buffer,
+    PULONG BufferLen)
+{
+    TLV_CONTEXT ctx = MakeCtx(PeerVersion);
+    WDI_GET_STATISTICS_PARAMETERS params = {};
+    WDI_MAC_STATISTICS_CONTAINER mac = {};
+    WDI_PHY_STATISTICS_CONTAINER phy = {};
+    UINT8 *pOut = nullptr;
+    ULONG outLen = 0;
+
+    RtlFillMemory(mac.MACAddress.Address, 6, 0xFF);
+
+    phy.PhyType = WDI_PHY_TYPE_ERP;
+
+    params.PeerMACStatistics.ElementCount = 1;
+    params.PeerMACStatistics.pElements    = &mac;
+    params.PhyStatistics.ElementCount     = 1;
+    params.PhyStatistics.pElements        = &phy;
+
+    NDIS_STATUS st = GenerateWdiGetStatistics(&params, kHeaderReserve,
+                                              &ctx, &outLen, &pOut);
+    if (st != NDIS_STATUS_SUCCESS) return st;
+
+    *Buffer    = pOut;
+    *BufferLen = outLen;
+    return NDIS_STATUS_SUCCESS;
+}
+
+/* ============================================================
  * Dot11 reset / receive packet filter
  * ============================================================ */
 
