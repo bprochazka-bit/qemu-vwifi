@@ -162,6 +162,29 @@ NDIS_STATUS VwifiTlvGenerateAdapterCapabilities(
     _Out_ PULONG BufferLen);
 
 /* ============================================================
+ * Ports
+ * ============================================================ */
+
+/* Parse an OID_WDI_TASK_CREATE_PORT. The port id itself is in the
+ * request's WDI_MESSAGE_HEADER, not here; this is what the port is for.
+ * *MacPresent is FALSE when the optional address is absent, meaning
+ * "use the adapter's own". */
+NDIS_STATUS VwifiTlvParseCreatePort(
+    _In_ ULONG PeerVersion,
+    _In_reads_bytes_(BufferLen) const VOID *Buffer,
+    _In_ ULONG BufferLen,
+    _Out_ PULONG OpModeMask,
+    _Out_ PULONG NdisPortNumber,
+    _Out_writes_bytes_(6) UCHAR *MacOut,
+    _Out_ BOOLEAN *MacPresent);
+
+NDIS_STATUS VwifiTlvParseDeletePort(
+    _In_ ULONG PeerVersion,
+    _In_reads_bytes_(BufferLen) const VOID *Buffer,
+    _In_ ULONG BufferLen,
+    _Out_ PULONG PortNumber);
+
+/* ============================================================
  * Adapter configuration
  * ============================================================ */
 

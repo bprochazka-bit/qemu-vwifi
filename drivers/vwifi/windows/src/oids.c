@@ -469,6 +469,133 @@ VwifiHandleSetAdapterConfiguration(_Inout_ PVWIFI_ADAPTER Adapter,
 }
 
 /* ============================================================
+ * OID_WDI_TASK_CREATE_PORT / OID_WDI_TASK_DELETE_PORT
+ *
+ * The last step of adapter bring-up, and the first thing that is a
+ * *task* rather than a get or a set: it is answered by an indication
+ * (NDIS_STATUS_WDI_INDICATION_CREATE_PORT_COMPLETE), not by the OID's
+ * output buffer, and the OID itself just returns success to say the
+ * task was accepted.
+ *
+ * A port in WDI is the host's handle on one virtual interface. It
+ * assigns the id -- it is in the request's WDI_MESSAGE_HEADER, not in
+ * the TLV body -- so there is nothing for us to allocate or hand back.
+ * The body says what the port is for: which operation modes the host
+ * may configure on it later, and the NDIS port number it will appear
+ * under.
+ *
+ * A single-radio virtual device has one port and no per-port state to
+ * keep, so creating one is bookkeeping. The device is already running
+ * by this point; the ports the host may go on to add are the
+ * component's abstraction, not the device's.
+ * ============================================================ */
+static NDIS_STATUS
+VwifiHandleTaskCreatePort(_Inout_ PVWIFI_ADAPTER Adapter,
+                          _In_ PNDIS_OID_REQUEST Req)
+{
+    PVOID       tlv    = NULL;
+    ULONG       tlvLen = 0;
+    ULONG       opModeMask = 0;
+    ULONG       ndisPort   = 0;
+    UCHAR       mac[6];
+    BOOLEAN     macPresent = FALSE;
+    NDIS_STATUS status;
+
+    status = VwifiGetTlvPayload(Req, &tlv, &tlvLen);
+    if (status != NDIS_STATUS_SUCCESS) {
+        VWIFI_ERR("CREATE_PORT: no TLV payload (0x%08x %s)",
+                  status, VwifiNdisStatusName(status));
+        return status;
+    }
+
+    status = VwifiTlvParseCreatePort(Adapter->WdiPeerVersion, tlv, tlvLen,
+                                     &opModeMask, &ndisPort,
+                                     mac, &macPresent);
+    if (status != NDIS_STATUS_SUCCESS) {
+        VWIFI_ERR("CREATE_PORT: parse failed 0x%08x %s",
+                  status, VwifiNdisStatusName(status));
+        return status;
+    }
+
+    VWIFI_INFO("OID: create port %u (ndis port %u, opmode mask 0x%x)",
+               Req->PortNumber, ndisPort, opModeMask);
+
+    /* An explicit address means the host wants this port on a MAC other
+     * than the adapter's own. The device has exactly one station
+     * address, so honour it rather than transmit under an address the
+     * host did not choose. */
+    if (macPresent) {
+        ULONG out_len = 0;
+
+        VWIFI_INFO("OID:   port MAC %02x:%02x:%02x:%02x:%02x:%02x",
+                   mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+        RtlCopyMemory(Adapter->CurrentMac, mac, 6);
+        status = VwifiCtrlSendSync(Adapter, VWIFI_OP_SET_STA_MAC,
+                                   mac, 6, NULL, &out_len);
+        if (status != NDIS_STATUS_SUCCESS) {
+            VWIFI_ERR("CREATE_PORT: SET_STA_MAC failed 0x%08x %s",
+                      status, VwifiNdisStatusName(status));
+            /* Report the failure through the completion, not the return
+             * value: the task was accepted, it is its outcome that is
+             * bad, and the host matches that on the transaction id. */
+            VwifiSendWdiIndication(
+                Adapter, Req->PortNumber,
+                NDIS_STATUS_WDI_INDICATION_CREATE_PORT_COMPLETE,
+                status, VwifiGetWdiTransactionId(Req), NULL, 0);
+            return NDIS_STATUS_SUCCESS;
+        }
+    }
+
+    Adapter->PortId      = (ULONG)Req->PortNumber;
+    Adapter->PortCreated = TRUE;
+
+    /* "No TLV data needed, header is sufficient" -- WABIModel.xml, the
+     * FromIhv side of WDI_TASK_CREATE_PORT. */
+    VwifiSendWdiIndication(Adapter, Req->PortNumber,
+                           NDIS_STATUS_WDI_INDICATION_CREATE_PORT_COMPLETE,
+                           NDIS_STATUS_SUCCESS,
+                           VwifiGetWdiTransactionId(Req),
+                           NULL, 0);
+    return NDIS_STATUS_SUCCESS;
+}
+
+static NDIS_STATUS
+VwifiHandleTaskDeletePort(_Inout_ PVWIFI_ADAPTER Adapter,
+                          _In_ PNDIS_OID_REQUEST Req)
+{
+    PVOID       tlv    = NULL;
+    ULONG       tlvLen = 0;
+    ULONG       portNumber = 0;
+    NDIS_STATUS status;
+
+    /* Parsed for the log only. The port to delete is identified by the
+     * header's port id like every other port-scoped message; the body's
+     * PortNumber is the NDIS one. A parse failure is not worth failing
+     * a teardown over. */
+    status = VwifiGetTlvPayload(Req, &tlv, &tlvLen);
+    if (status == NDIS_STATUS_SUCCESS) {
+        status = VwifiTlvParseDeletePort(Adapter->WdiPeerVersion,
+                                         tlv, tlvLen, &portNumber);
+        if (status != NDIS_STATUS_SUCCESS) {
+            VWIFI_WARN("DELETE_PORT: parse failed 0x%08x %s; deleting anyway",
+                       status, VwifiNdisStatusName(status));
+        }
+    }
+
+    VWIFI_INFO("OID: delete port %u (ndis port %u)",
+               Req->PortNumber, portNumber);
+
+    Adapter->PortCreated = FALSE;
+
+    VwifiSendWdiIndication(Adapter, Req->PortNumber,
+                           NDIS_STATUS_WDI_INDICATION_DELETE_PORT_COMPLETE,
+                           NDIS_STATUS_SUCCESS,
+                           VwifiGetWdiTransactionId(Req),
+                           NULL, 0);
+    return NDIS_STATUS_SUCCESS;
+}
+
+/* ============================================================
  * The real OID dispatcher — replaces the Phase-1 blanket stub.
  * ============================================================ */
 _Use_decl_annotations_
@@ -567,6 +694,10 @@ VwifiOidRequest(
             return VwifiHandleTaskDisconnect(adapter, OidRequest);
         case OID_WDI_TASK_CHANGE_OPERATION_MODE:
             return VwifiHandleTaskChangeOpMode(adapter, OidRequest);
+        case OID_WDI_TASK_CREATE_PORT:
+            return VwifiHandleTaskCreatePort(adapter, OidRequest);
+        case OID_WDI_TASK_DELETE_PORT:
+            return VwifiHandleTaskDeletePort(adapter, OidRequest);
         default:
             break;
         }

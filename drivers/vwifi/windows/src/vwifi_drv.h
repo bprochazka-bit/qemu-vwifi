@@ -213,6 +213,13 @@ typedef struct _VWIFI_ADAPTER
     PDMA_ADAPTER        DmaAdapter;
     ULONG               DmaMapRegisters;
 
+    /* The host's port, from OID_WDI_TASK_CREATE_PORT. WDI ports are
+     * the component's abstraction over one virtual interface; the host
+     * assigns the id and a single-radio device has exactly one, so
+     * there is no table here -- only which id is live. */
+    ULONG               PortId;
+    BOOLEAN             PortCreated;
+
     /* The WDI data path, captured in TalTxRxInitialize. The TAL
      * callbacks are handed a TAL_TXRX_HANDLE rather than the adapter,
      * so anything that has to call back into the WLAN component needs

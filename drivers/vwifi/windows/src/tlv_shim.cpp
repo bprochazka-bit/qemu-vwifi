@@ -1085,6 +1085,80 @@ VwifiTlvGenerateAdapterCapabilities(
 }
 
 /* ============================================================
+ * Ports
+ *
+ * The host assigns the port id -- it is in the WDI_MESSAGE_HEADER of
+ * the request, not in the TLV body. What the body carries is what the
+ * port is *for*: which operation modes the host may later configure on
+ * it, and the NDIS port number it will be registered under.
+ * ============================================================ */
+
+extern "C"
+NDIS_STATUS
+VwifiTlvParseCreatePort(
+    ULONG PeerVersion,
+    const VOID *Buffer,
+    ULONG BufferLen,
+    PULONG OpModeMask,
+    PULONG NdisPortNumber,
+    UCHAR *MacOut,
+    BOOLEAN *MacPresent)
+{
+    TLV_CONTEXT ctx = MakeCtx(PeerVersion);
+    WDI_TASK_CREATE_PORT_PARAMETERS parsed = {};
+    NDIS_STATUS st;
+
+    *OpModeMask     = 0;
+    *NdisPortNumber = 0;
+    *MacPresent     = FALSE;
+
+    st = ParseWdiTaskCreatePort(BufferLen,
+                                static_cast<const UINT8 *>(Buffer),
+                                &ctx, &parsed);
+    if (st != NDIS_STATUS_SUCCESS) {
+        return st;
+    }
+
+    *OpModeMask     = parsed.CreatePortParameters.OpModeMask;
+    *NdisPortNumber = parsed.CreatePortParameters.NdisPortNumber;
+
+    if (parsed.Optional.MacAddress_IsPresent) {
+        RtlCopyMemory(MacOut, parsed.MacAddress.Address, 6);
+        *MacPresent = TRUE;
+    }
+
+    CleanupParsedWdiTaskCreatePort(&parsed);
+    return NDIS_STATUS_SUCCESS;
+}
+
+extern "C"
+NDIS_STATUS
+VwifiTlvParseDeletePort(
+    ULONG PeerVersion,
+    const VOID *Buffer,
+    ULONG BufferLen,
+    PULONG PortNumber)
+{
+    TLV_CONTEXT ctx = MakeCtx(PeerVersion);
+    WDI_TASK_DELETE_PORT_PARAMETERS parsed = {};
+    NDIS_STATUS st;
+
+    *PortNumber = 0;
+
+    st = ParseWdiTaskDeletePort(BufferLen,
+                                static_cast<const UINT8 *>(Buffer),
+                                &ctx, &parsed);
+    if (st != NDIS_STATUS_SUCCESS) {
+        return st;
+    }
+
+    *PortNumber = parsed.DeletePortParameters.PortNumber;
+
+    CleanupParsedWdiTaskDeletePort(&parsed);
+    return NDIS_STATUS_SUCCESS;
+}
+
+/* ============================================================
  * Adapter configuration
  *
  * WDI_SET_ADAPTER_CONFIGURATION carries firmware-level settings, and
