@@ -19,7 +19,103 @@
  */
 
 #include "vwifi_drv.h"
+#include "tlv_shim.h"
 #include <windot11.h>
+
+/* ============================================================
+ * NDIS_OID_REQUEST.DATA is a union.
+ *
+ * The same field name means a different offset in each arm, so the
+ * buffer must always be read through the arm that matches RequestType.
+ * WDI's own OIDs are method requests, but the Native 802.11 ones are
+ * plain queries and sets, and the two are mixed in this file.
+ * ============================================================ */
+
+static VOID
+VwifiOidOutBuffer(_In_ PNDIS_OID_REQUEST Req,
+                  _Outptr_result_maybenull_ PVOID *Buf,
+                  _Out_ PULONG Len)
+{
+    if (Req->RequestType == NdisRequestMethod) {
+        *Buf = Req->DATA.METHOD_INFORMATION.InformationBuffer;
+        *Len = Req->DATA.METHOD_INFORMATION.OutputBufferLength;
+    } else {
+        *Buf = Req->DATA.QUERY_INFORMATION.InformationBuffer;
+        *Len = Req->DATA.QUERY_INFORMATION.InformationBufferLength;
+    }
+}
+
+static VOID
+VwifiOidSetWritten(_Inout_ PNDIS_OID_REQUEST Req, _In_ ULONG Written)
+{
+    if (Req->RequestType == NdisRequestMethod) {
+        Req->DATA.METHOD_INFORMATION.BytesWritten = Written;
+    } else {
+        Req->DATA.QUERY_INFORMATION.BytesWritten = Written;
+    }
+}
+
+static VOID
+VwifiOidSetNeeded(_Inout_ PNDIS_OID_REQUEST Req, _In_ ULONG Needed)
+{
+    if (Req->RequestType == NdisRequestMethod) {
+        Req->DATA.METHOD_INFORMATION.BytesNeeded = Needed;
+    } else {
+        Req->DATA.QUERY_INFORMATION.BytesNeeded = Needed;
+    }
+}
+
+static PCSTR
+VwifiOidRequestTypeName(_In_ NDIS_REQUEST_TYPE Type)
+{
+    switch (Type) {
+    case NdisRequestQueryInformation:  return "query";
+    case NdisRequestQueryStatistics:   return "query-stats";
+    case NdisRequestSetInformation:    return "set";
+    case NdisRequestMethod:            return "method";
+    default:                           return "?";
+    }
+}
+
+/* The OIDs the WLAN component sends while bringing an adapter up. Named
+ * so the trace is readable without a copy of dot11wdi.h to hand -- when
+ * an adapter is closed seconds after it opens, the OID it gave up on is
+ * the whole story, and a bare hex value buries it. */
+static PCSTR
+VwifiOidName(_In_ NDIS_OID Oid)
+{
+    switch (Oid) {
+    case OID_WDI_GET_ADAPTER_CAPABILITIES:  return "WDI_GET_ADAPTER_CAPABILITIES";
+    case OID_WDI_SET_ADAPTER_CONFIGURATION: return "WDI_SET_ADAPTER_CONFIGURATION";
+    case OID_WDI_TASK_CREATE_PORT:          return "WDI_TASK_CREATE_PORT";
+    case OID_WDI_TASK_DELETE_PORT:          return "WDI_TASK_DELETE_PORT";
+    case OID_WDI_TASK_OPEN:                 return "WDI_TASK_OPEN";
+    case OID_WDI_TASK_CLOSE:                return "WDI_TASK_CLOSE";
+    case OID_WDI_TASK_DOT11_RESET:          return "WDI_TASK_DOT11_RESET";
+    case OID_WDI_TASK_SET_RADIO_STATE:      return "WDI_TASK_SET_RADIO_STATE";
+    case OID_WDI_TASK_SCAN:                 return "WDI_TASK_SCAN";
+    case OID_WDI_TASK_CONNECT:              return "WDI_TASK_CONNECT";
+    case OID_WDI_TASK_DISCONNECT:           return "WDI_TASK_DISCONNECT";
+    case OID_WDI_TASK_CHANGE_OPERATION_MODE: return "WDI_TASK_CHANGE_OPERATION_MODE";
+    case OID_WDI_SET_POWER_STATE:           return "WDI_SET_POWER_STATE";
+    case OID_WDI_SET_OPERATION_MODE:        return "WDI_SET_OPERATION_MODE";
+    case OID_WDI_SET_RECEIVE_PACKET_FILTER: return "WDI_SET_RECEIVE_PACKET_FILTER";
+    case OID_WDI_SET_MULTICAST_LIST:        return "WDI_SET_MULTICAST_LIST";
+    case OID_WDI_SET_ADD_CIPHER_KEYS:       return "WDI_SET_ADD_CIPHER_KEYS";
+    case OID_WDI_SET_DELETE_CIPHER_KEYS:    return "WDI_SET_DELETE_CIPHER_KEYS";
+    case OID_WDI_SET_DEFAULT_KEY_ID:        return "WDI_SET_DEFAULT_KEY_ID";
+    case OID_WDI_GET_STATISTICS:            return "WDI_GET_STATISTICS";
+    case OID_WDI_GET_BSS_ENTRY_LIST:        return "WDI_GET_BSS_ENTRY_LIST";
+    case OID_WDI_SET_ADVERTISEMENT_INFORMATION: return "WDI_SET_ADVERTISEMENT_INFORMATION";
+    case OID_WDI_SET_CONNECTION_QUALITY:    return "WDI_SET_CONNECTION_QUALITY";
+    case OID_WDI_SET_PRIVACY_EXEMPTION_LIST: return "WDI_SET_PRIVACY_EXEMPTION_LIST";
+    case OID_DOT11_CURRENT_OPERATION_MODE:  return "DOT11_CURRENT_OPERATION_MODE";
+    case OID_DOT11_CURRENT_CHANNEL:         return "DOT11_CURRENT_CHANNEL";
+    case OID_DOT11_CURRENT_FREQUENCY:       return "DOT11_CURRENT_FREQUENCY";
+    case OID_GEN_CURRENT_PACKET_FILTER:     return "GEN_CURRENT_PACKET_FILTER";
+    default:                                return "";
+    }
+}
 
 /* 2.4 GHz channel number -> center frequency (MHz). */
 static USHORT
@@ -129,6 +225,101 @@ VwifiHandleSetPacketFilter(_Inout_ PVWIFI_ADAPTER Adapter,
 }
 
 /* ============================================================
+ * OID_WDI_GET_ADAPTER_CAPABILITIES
+ *
+ * The first thing the WLAN component asks for once OpenAdapter has
+ * completed, and the answer decides whether the adapter is usable at
+ * all. Returning NDIS_STATUS_NOT_SUPPORTED -- which is what the
+ * dispatcher's default arm did, silently, because this OID had no case
+ * and VwifiTlvGenerateAdapterCapabilities had no caller anywhere in the
+ * tree -- tells it nothing about the radio, so it closes the adapter
+ * again immediately. From the outside that looks like OpenAdapter
+ * succeeding and CloseAdapter arriving a fraction of a millisecond
+ * later with nothing in between.
+ *
+ * Unlike the WDI *tasks*, this one answers in the OID's own output
+ * buffer rather than through an indication. The reply is the same
+ * [WDI_MESSAGE_HEADER][TLV blob] shape as everything else, and the
+ * generator has already reserved the header at the front of the blob,
+ * so the header is filled in place -- see VwifiSendWdiIndication for
+ * why prepending a second one is wrong.
+ * ============================================================ */
+static NDIS_STATUS
+VwifiHandleGetAdapterCapabilities(_Inout_ PVWIFI_ADAPTER Adapter,
+                                  _In_ PNDIS_OID_REQUEST Req)
+{
+    PVOID       blob    = NULL;
+    ULONG       blobLen = 0;
+    PVOID       out     = NULL;
+    ULONG       outLen  = 0;
+    NDIS_STATUS status;
+    WDI_MESSAGE_HEADER *hdr;
+    UINT32      transactionId = WDI_TRANSACTION_ID_UNSOLICIT;
+    WDI_PORT_ID portId = 0;
+
+    /* The capabilities we report are built from what the device told us
+     * during GET_CAPS in VwifiHwStart. Without that there is nothing
+     * honest to say. */
+    if (!Adapter->CapsValid) {
+        VWIFI_ERR("GET_ADAPTER_CAPABILITIES before GET_CAPS completed");
+        return NDIS_STATUS_FAILURE;
+    }
+
+    /* Echo the request's port and transaction id when there is an input
+     * buffer to read them from. A method request carries one; a plain
+     * query does not. */
+    if (Req->RequestType == NdisRequestMethod &&
+        Req->DATA.METHOD_INFORMATION.InformationBuffer != NULL &&
+        Req->DATA.METHOD_INFORMATION.InputBufferLength >=
+            sizeof(WDI_MESSAGE_HEADER)) {
+        const WDI_MESSAGE_HEADER *in = (const WDI_MESSAGE_HEADER *)
+            Req->DATA.METHOD_INFORMATION.InformationBuffer;
+        transactionId = in->TransactionId;
+        portId        = in->PortId;
+    }
+
+    status = VwifiTlvGenerateAdapterCapabilities(
+                 Adapter->WdiPeerVersion, &Adapter->Caps,
+                 Adapter->CurrentMac, &blob, &blobLen);
+    if (status != NDIS_STATUS_SUCCESS) {
+        VWIFI_ERR("capabilities generate failed 0x%08x", status);
+        return status;
+    }
+
+    if (blobLen < sizeof(WDI_MESSAGE_HEADER)) {
+        VWIFI_ERR("capabilities blob %u bytes, shorter than the header "
+                  "space it was asked to reserve", blobLen);
+        VwifiTlvFreeGenerated(blob);
+        return NDIS_STATUS_FAILURE;
+    }
+
+    hdr = (WDI_MESSAGE_HEADER *)blob;
+    RtlZeroMemory(hdr, sizeof(*hdr));
+    hdr->PortId        = portId;
+    hdr->Status        = NDIS_STATUS_SUCCESS;
+    hdr->TransactionId = transactionId;
+    hdr->IhvSpecificId = 0;
+
+    VwifiOidOutBuffer(Req, &out, &outLen);
+    if (out == NULL || outLen < blobLen) {
+        /* NDIS convention: say how much is needed and let the OS come
+         * back with a buffer that size. Not an error worth logging as
+         * one -- a first probe with a short buffer is normal. */
+        VwifiOidSetNeeded(Req, blobLen);
+        VwifiOidSetWritten(Req, 0);
+        VwifiTlvFreeGenerated(blob);
+        return NDIS_STATUS_BUFFER_TOO_SHORT;
+    }
+
+    RtlCopyMemory(out, blob, blobLen);
+    VwifiOidSetWritten(Req, blobLen);
+    VwifiTlvFreeGenerated(blob);
+
+    VWIFI_INFO("OID: reported adapter capabilities (%u bytes)", blobLen);
+    return NDIS_STATUS_SUCCESS;
+}
+
+/* ============================================================
  * The real OID dispatcher — replaces the Phase-1 blanket stub.
  * ============================================================ */
 _Use_decl_annotations_
@@ -140,9 +331,35 @@ VwifiOidRequest(
     PVWIFI_ADAPTER adapter = (PVWIFI_ADAPTER)MiniportAdapterContext;
     NDIS_OID oid;
 
-    if (OidRequest->RequestType == NdisRequestSetInformation) {
-        oid = OidRequest->DATA.SET_INFORMATION.Oid;
+    /* Trace every request before dispatching.
+     *
+     * This is not incidental logging. The WLAN component's reaction to
+     * an OID it does not like is to close the adapter, with nothing
+     * logged on its side and nothing on ours if the OID falls through
+     * to the default arm -- which is how a missing
+     * GET_ADAPTER_CAPABILITIES handler presented as OpenAdapter
+     * succeeding and CloseAdapter arriving 130 microseconds later with
+     * an empty gap between them. The gap is the bug report; keep it
+     * full. */
+    switch (OidRequest->RequestType) {
+    case NdisRequestSetInformation: oid = OidRequest->DATA.SET_INFORMATION.Oid;    break;
+    case NdisRequestMethod:         oid = OidRequest->DATA.METHOD_INFORMATION.Oid; break;
+    default:                        oid = OidRequest->DATA.QUERY_INFORMATION.Oid;  break;
+    }
+    VWIFI_INFO("OID: %s 0x%08x %s",
+               VwifiOidRequestTypeName(OidRequest->RequestType),
+               oid, VwifiOidName(oid));
 
+    /* Answered the same way whichever arm it arrives in. WDI's own OIDs
+     * are method requests, but this one is a pure get and the WLAN
+     * component is documented loosely enough that it is not worth
+     * guessing -- handling both costs one case and removes the
+     * question. The trace above records which arm actually fired. */
+    if (oid == OID_WDI_GET_ADAPTER_CAPABILITIES) {
+        return VwifiHandleGetAdapterCapabilities(adapter, OidRequest);
+    }
+
+    if (OidRequest->RequestType == NdisRequestSetInformation) {
         switch (oid) {
         /* Both op-mode routes are handled, because they carry different
          * modes. OID_WDI_TASK_CHANGE_OPERATION_MODE (NdisRequestMethod,
@@ -166,8 +383,6 @@ VwifiOidRequest(
             break;
         }
     } else if (OidRequest->RequestType == NdisRequestQueryInformation) {
-        oid = OidRequest->DATA.QUERY_INFORMATION.Oid;
-
         switch (oid) {
         case OID_DOT11_CURRENT_OPERATION_MODE: {
             PDOT11_CURRENT_OPERATION_MODE mode;
@@ -191,8 +406,6 @@ VwifiOidRequest(
         }
     } else if (OidRequest->RequestType == NdisRequestMethod) {
         /* WDI tasks arrive as method requests. */
-        oid = OidRequest->DATA.METHOD_INFORMATION.Oid;
-
         switch (oid) {
         case OID_WDI_TASK_SCAN:
             return VwifiHandleTaskScan(adapter, OidRequest);
@@ -207,7 +420,14 @@ VwifiOidRequest(
         }
     }
 
-    /* Everything else: let the Microsoft WLAN component handle it. */
+    /* Everything else: let the Microsoft WLAN component handle it.
+     *
+     * Logged, not silent. NOT_SUPPORTED is a legitimate answer for most
+     * OIDs, but it is also how a genuinely required one disappears, and
+     * the two are indistinguishable without a line saying which OID
+     * went unanswered. */
+    VWIFI_INFO("OID: unhandled 0x%08x %s -> NOT_SUPPORTED",
+               oid, VwifiOidName(oid));
     return NDIS_STATUS_NOT_SUPPORTED;
 }
 

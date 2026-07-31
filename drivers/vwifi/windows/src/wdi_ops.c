@@ -108,11 +108,20 @@ VwifiWdiFreeAdapter(NDIS_HANDLE MiniportAdapterContext)
  *
  * OpenAdapter is where the WLAN component declares "I'm ready to
  * start issuing tasks." Real drivers use this to download firmware
- * and wire up data-path resources. We have none of that, so we
- * complete immediately — but we must still *call* the completion
- * routine, because these are asynchronous operations. Returning
- * success without completing leaves the WLAN component waiting
- * forever, with nothing logged anywhere.
+ * and wire up data-path resources; for us it is where the rings and
+ * the interrupt come up.
+ *
+ * Both are asynchronous: the operation is finished when the completion
+ * routine from NDIS_WDI_INIT_PARAMETERS is called, and the return value
+ * says whether that has yet to happen. So the pair is "call the
+ * completion routine, return NDIS_STATUS_PENDING" -- including on
+ * failure, where the failing status rides in on the completion call.
+ *
+ * This used to call the completion routine and then return
+ * NDIS_STATUS_SUCCESS, which is a double completion: the return value
+ * says the operation finished synchronously and the callback says it
+ * finished asynchronously. PENDING is unambiguous under either reading
+ * and costs nothing.
  * ============================================================ */
 _Use_decl_annotations_
 NDIS_STATUS
@@ -135,11 +144,17 @@ VwifiWdiOpenAdapter(
         VWIFI_ERR("WdiOpenAdapter: start failed 0x%08x", status);
     }
 
-    if (adapter->OpenAdapterCompleteHandler != NULL) {
-        adapter->OpenAdapterCompleteHandler(adapter->MiniportAdapterHandle,
-                                            status);
+    if (adapter->OpenAdapterCompleteHandler == NULL) {
+        /* Nothing to complete through, so the return value is the only
+         * channel left. Only reachable if AllocateAdapter was handed no
+         * NDIS_WDI_INIT_PARAMETERS at all. */
+        VWIFI_WARN("no OpenAdapterCompleteHandler; completing inline");
+        return status;
     }
-    return status;
+
+    adapter->OpenAdapterCompleteHandler(adapter->MiniportAdapterHandle,
+                                        status);
+    return NDIS_STATUS_PENDING;
 }
 
 _Use_decl_annotations_
@@ -152,11 +167,14 @@ VwifiWdiCloseAdapter(NDIS_HANDLE MiniportAdapterContext)
 
     VwifiHwStop(adapter);
 
-    if (adapter->CloseAdapterCompleteHandler != NULL) {
-        adapter->CloseAdapterCompleteHandler(adapter->MiniportAdapterHandle,
-                                             NDIS_STATUS_SUCCESS);
+    if (adapter->CloseAdapterCompleteHandler == NULL) {
+        VWIFI_WARN("no CloseAdapterCompleteHandler; completing inline");
+        return NDIS_STATUS_SUCCESS;
     }
-    return NDIS_STATUS_SUCCESS;
+
+    adapter->CloseAdapterCompleteHandler(adapter->MiniportAdapterHandle,
+                                         NDIS_STATUS_SUCCESS);
+    return NDIS_STATUS_PENDING;
 }
 
 /* ============================================================
