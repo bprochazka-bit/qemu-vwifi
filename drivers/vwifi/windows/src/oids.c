@@ -353,6 +353,122 @@ VwifiHandleGetAdapterCapabilities(_Inout_ PVWIFI_ADAPTER Adapter,
 }
 
 /* ============================================================
+ * "No TLV data needed, header is sufficient"
+ *
+ * WABIModel.xml uses that exact phrase for the FromIhv side of most of
+ * the bring-up messages — SET_ADAPTER_CONFIGURATION, TASK_CREATE_PORT,
+ * TASK_DELETE_PORT, TASK_SET_RADIO_STATE, TASK_OPEN, TASK_CLOSE. The
+ * reply is a bare WDI_MESSAGE_HEADER echoing the request's port and
+ * transaction id, with the outcome in its Status field.
+ *
+ * Tolerant about the output buffer on purpose: a set that is not
+ * expected to return anything may well arrive with no output buffer at
+ * all, and refusing that with BUFFER_TOO_SHORT would fail a request
+ * that actually succeeded.
+ * ============================================================ */
+static NDIS_STATUS
+VwifiWdiAckHeaderOnly(_In_ PNDIS_OID_REQUEST Req,
+                      _In_ NDIS_STATUS MessageStatus)
+{
+    PVOID  out    = NULL;
+    ULONG  outLen = 0;
+    WDI_MESSAGE_HEADER *hdr;
+    UINT32 transactionId = WDI_TRANSACTION_ID_UNSOLICIT;
+    WDI_PORT_ID portId = 0;
+
+    if (Req->RequestType == NdisRequestMethod &&
+        Req->DATA.METHOD_INFORMATION.InformationBuffer != NULL &&
+        Req->DATA.METHOD_INFORMATION.InputBufferLength >=
+            sizeof(WDI_MESSAGE_HEADER)) {
+        const WDI_MESSAGE_HEADER *in = (const WDI_MESSAGE_HEADER *)
+            Req->DATA.METHOD_INFORMATION.InformationBuffer;
+        transactionId = in->TransactionId;
+        portId        = in->PortId;
+    }
+
+    VwifiOidOutBuffer(Req, &out, &outLen);
+    if (out == NULL || outLen < sizeof(WDI_MESSAGE_HEADER)) {
+        VwifiOidSetWritten(Req, 0);
+        return NDIS_STATUS_SUCCESS;
+    }
+
+    hdr = (WDI_MESSAGE_HEADER *)out;
+    RtlZeroMemory(hdr, sizeof(*hdr));
+    hdr->PortId        = portId;
+    hdr->Status        = MessageStatus;
+    hdr->TransactionId = transactionId;
+    hdr->IhvSpecificId = 0;
+
+    VwifiOidSetWritten(Req, sizeof(WDI_MESSAGE_HEADER));
+    return NDIS_STATUS_SUCCESS;
+}
+
+/* ============================================================
+ * OID_WDI_SET_ADAPTER_CONFIGURATION
+ *
+ * Sent immediately after the capabilities are accepted, and returning
+ * NOT_SUPPORTED for it closes the adapter just as surely as failing the
+ * capabilities did.
+ *
+ * Of everything the message carries, only the configured MAC address
+ * maps onto anything this device has; the rest is firmware policy —
+ * P2P group-owner reset, unreachability detection, NLO scan mode,
+ * PLDR — with no equivalent here. Silently ignoring the MAC would mean
+ * frames going out with an address the OS did not ask for, so it is
+ * pushed down to the device.
+ *
+ * A parse failure is logged and does not fail the OID. The message is
+ * mostly settings we do not implement, and refusing the whole request
+ * because an unrelated container did not decode would trade a cosmetic
+ * problem for a dead adapter.
+ * ============================================================ */
+static NDIS_STATUS
+VwifiHandleSetAdapterConfiguration(_Inout_ PVWIFI_ADAPTER Adapter,
+                                   _In_ PNDIS_OID_REQUEST Req)
+{
+    PVOID       tlv    = NULL;
+    ULONG       tlvLen = 0;
+    UCHAR       mac[6];
+    BOOLEAN     macPresent = FALSE;
+    NDIS_STATUS status;
+
+    status = VwifiGetTlvPayload(Req, &tlv, &tlvLen);
+    if (status != NDIS_STATUS_SUCCESS) {
+        VWIFI_WARN("SET_ADAPTER_CONFIGURATION: no TLV payload (0x%08x %s)",
+                   status, VwifiNdisStatusName(status));
+        return VwifiWdiAckHeaderOnly(Req, NDIS_STATUS_SUCCESS);
+    }
+
+    status = VwifiTlvParseAdapterConfiguration(Adapter->WdiPeerVersion,
+                                               tlv, tlvLen,
+                                               mac, &macPresent);
+    if (status != NDIS_STATUS_SUCCESS) {
+        VWIFI_WARN("SET_ADAPTER_CONFIGURATION: parse failed 0x%08x %s; "
+                   "accepting anyway", status, VwifiNdisStatusName(status));
+        return VwifiWdiAckHeaderOnly(Req, NDIS_STATUS_SUCCESS);
+    }
+
+    if (macPresent) {
+        ULONG out_len = 0;
+
+        VWIFI_INFO("OID: configured MAC %02x:%02x:%02x:%02x:%02x:%02x",
+                   mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+        RtlCopyMemory(Adapter->CurrentMac, mac, 6);
+        status = VwifiCtrlSendSync(Adapter, VWIFI_OP_SET_STA_MAC,
+                                   mac, 6, NULL, &out_len);
+        if (status != NDIS_STATUS_SUCCESS) {
+            VWIFI_ERR("SET_STA_MAC failed 0x%08x %s", status,
+                      VwifiNdisStatusName(status));
+            return VwifiWdiAckHeaderOnly(Req, status);
+        }
+    } else {
+        VWIFI_INFO("OID: adapter configuration accepted (no MAC change)");
+    }
+
+    return VwifiWdiAckHeaderOnly(Req, NDIS_STATUS_SUCCESS);
+}
+
+/* ============================================================
  * The real OID dispatcher — replaces the Phase-1 blanket stub.
  * ============================================================ */
 _Use_decl_annotations_
@@ -390,6 +506,9 @@ VwifiOidRequest(
      * question. The trace above records which arm actually fired. */
     if (oid == OID_WDI_GET_ADAPTER_CAPABILITIES) {
         return VwifiHandleGetAdapterCapabilities(adapter, OidRequest);
+    }
+    if (oid == OID_WDI_SET_ADAPTER_CONFIGURATION) {
+        return VwifiHandleSetAdapterConfiguration(adapter, OidRequest);
     }
 
     if (OidRequest->RequestType == NdisRequestSetInformation) {

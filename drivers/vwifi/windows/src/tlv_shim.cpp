@@ -801,6 +801,50 @@ VwifiTlvGenerateAdapterCapabilities(
 }
 
 /* ============================================================
+ * Adapter configuration
+ *
+ * WDI_SET_ADAPTER_CONFIGURATION carries firmware-level settings, and
+ * for this device exactly one of them means anything: the MAC address
+ * the OS wants the adapter to use. Everything else in the message is
+ * about P2P group-owner reset policy, unreachability detection, NLO
+ * scan mode and PLDR — firmware concepts a virtual device has no
+ * equivalent for.
+ *
+ * MacAddress is optional. Absent means "keep what you have", which is
+ * the device's own default MAC, so a missing address is not an error.
+ * ============================================================ */
+
+extern "C"
+NDIS_STATUS
+VwifiTlvParseAdapterConfiguration(
+    ULONG PeerVersion,
+    const VOID *Buffer,
+    ULONG BufferLen,
+    UCHAR *MacOut,
+    BOOLEAN *MacPresent)
+{
+    TLV_CONTEXT ctx = MakeCtx(PeerVersion);
+    WDI_SET_FIRMWARE_CONFIGURATION_PARAMETERS parsed = {};
+    NDIS_STATUS st;
+
+    *MacPresent = FALSE;
+
+    st = ParseWdiSetAdapterConfigurationToIhv(
+             BufferLen, static_cast<const UINT8 *>(Buffer), &ctx, &parsed);
+    if (st != NDIS_STATUS_SUCCESS) {
+        return st;
+    }
+
+    if (parsed.Optional.MacAddress_IsPresent) {
+        RtlCopyMemory(MacOut, parsed.MacAddress.Address, 6);
+        *MacPresent = TRUE;
+    }
+
+    CleanupParsedWdiSetAdapterConfigurationToIhv(&parsed);
+    return NDIS_STATUS_SUCCESS;
+}
+
+/* ============================================================
  * Operation mode
  *
  * WDI_OPERATION_MODE (dot11wdi.h) enumerates STA, P2P_DEVICE,

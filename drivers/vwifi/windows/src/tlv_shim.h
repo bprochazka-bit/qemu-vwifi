@@ -162,6 +162,21 @@ NDIS_STATUS VwifiTlvGenerateAdapterCapabilities(
     _Out_ PULONG BufferLen);
 
 /* ============================================================
+ * Adapter configuration
+ * ============================================================ */
+
+/* Parse a WDI_SET_ADAPTER_CONFIGURATION and hand back the MAC address
+ * the OS wants used, if it supplied one. *MacPresent is FALSE when the
+ * optional container is absent, which means "keep the current address"
+ * and is not an error. */
+NDIS_STATUS VwifiTlvParseAdapterConfiguration(
+    _In_ ULONG PeerVersion,
+    _In_reads_bytes_(BufferLen) const VOID *Buffer,
+    _In_ ULONG BufferLen,
+    _Out_writes_bytes_(6) UCHAR *MacOut,
+    _Out_ BOOLEAN *MacPresent);
+
+/* ============================================================
  * Cleanup
  *
  * MUST be called for every successful Generate*. Microsoft is blunt
