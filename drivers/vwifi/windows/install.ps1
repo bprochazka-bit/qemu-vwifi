@@ -26,6 +26,8 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+Write-Host 'vwifi driver install'
+
 # Resolve the package folder.
 #
 # Not `param([string] $Path = $PSScriptRoot)`: that default came back
@@ -53,7 +55,12 @@ if (-not (Test-Path (Join-Path $Path 'vwifi.inf'))) {
 $isAdmin = ([Security.Principal.WindowsPrincipal] `
     [Security.Principal.WindowsIdentity]::GetCurrent()
     ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-if (-not $isAdmin) { throw 'Run this elevated (Run as Administrator).' }
+if (-not $isAdmin) {
+    Write-Host ''
+    Write-Host 'ERROR: not elevated. pnputil needs administrator rights.'
+    Write-Host '  Open an admin command prompt and re-run install.cmd there.'
+    exit 1
+}
 
 $inf = Join-Path $Path 'vwifi.inf'
 $sys = Join-Path $Path 'vwifi.sys'
