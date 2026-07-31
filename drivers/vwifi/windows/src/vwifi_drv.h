@@ -169,6 +169,19 @@ typedef struct _VWIFI_ADAPTER
      * "WDI TLV versioning". Never hardcode this. */
     ULONG               WdiPeerVersion;
 
+    /* DMA.
+     *
+     * The rings are common buffers obtained straight from WDM via
+     * IoGetDmaAdapter, not from NdisMAllocateSharedMemory. That NDIS
+     * routine needs NDIS_MINIPORT_ATTRIBUTES_BUS_MASTER to be in effect,
+     * and in the WDI model the attributes we fill in during
+     * AllocateAdapter are applied by the WLAN component, which does not
+     * carry our AttributeFlags through -- so it fails with
+     * NDIS_STATUS_RESOURCES no matter when it is called. The DMA adapter
+     * belongs to the PDO and does not care about any of that. */
+    PDMA_ADAPTER        DmaAdapter;
+    ULONG               DmaMapRegisters;
+
     /* PCI resources (discovered in hardware.c). */
     PHYSICAL_ADDRESS    MmioPhysicalAddress;
     PVOID               MmioVirtualAddress;
@@ -322,6 +335,17 @@ NDIS_STATUS VwifiHwReset(_Inout_ PVWIFI_ADAPTER Adapter);
 BOOLEAN     VwifiHwInterruptDpc(_In_ PVWIFI_ADAPTER Adapter);
 
 /* rings.c */
+/* Common-buffer helpers over the PDO's DMA adapter. Both are no-ops
+ * when Adapter->DmaAdapter is NULL. */
+NDIS_STATUS VwifiDmaAlloc(_Inout_ PVWIFI_ADAPTER Adapter,
+                          _In_ ULONG Length,
+                          _Outptr_result_maybenull_ PVOID *Va,
+                          _Out_ PHYSICAL_ADDRESS *Pa);
+VOID        VwifiDmaFree(_Inout_ PVWIFI_ADAPTER Adapter,
+                         _In_ ULONG Length,
+                         _In_opt_ PVOID Va,
+                         _In_ PHYSICAL_ADDRESS Pa);
+
 NDIS_STATUS VwifiRingsAllocate(_Inout_ PVWIFI_ADAPTER Adapter);
 VOID        VwifiRingsFree(_Inout_ PVWIFI_ADAPTER Adapter);
 VOID        VwifiRingsProgramMmio(_In_ PVWIFI_ADAPTER Adapter);

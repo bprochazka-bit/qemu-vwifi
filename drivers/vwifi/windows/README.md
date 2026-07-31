@@ -195,12 +195,22 @@ Recorded here because each one is a trap the next WDI driver hits too:
 - **`AllocateAdapter` cannot allocate anything NDIS-managed.** It fills
   in registration attributes that the WLAN component applies *after* it
   returns, so during the call the adapter is not yet a registered
-  miniport. `NdisMAllocateSharedMemory` needs
-  `NDIS_MINIPORT_ATTRIBUTES_BUS_MASTER` to be in effect and fails with
-  `NDIS_STATUS_RESOURCES` otherwise — a 1536-byte ring allocation
-  failing on an idle machine is what that looks like, and it surfaces
-  as Code 10. Rings, NBL pools and interrupts belong in `VwifiHwStart`,
+  miniport. Rings, NBL pools and interrupts belong in `VwifiHwStart`,
   called from `OpenAdapter`.
+- **`NdisMAllocateSharedMemory` never works here, whenever you call
+  it.** A 1536-byte ring allocation returns `NDIS_STATUS_RESOURCES` on
+  a completely idle machine — from `AllocateAdapter`, and still from
+  `OpenAdapter` after the split above, where the registration
+  attributes are unambiguously live. The routine needs
+  `NDIS_MINIPORT_ATTRIBUTES_BUS_MASTER` in effect; we do request that
+  flag, so the inference is that the WLAN component does not carry our
+  `AttributeFlags` through when it applies the attributes on our
+  behalf. The log proves only that NDIS refuses, not why. Either way
+  the rings now come from the PDO's own DMA adapter —
+  `IoGetDmaAdapter` in `VwifiHwStart`, `AllocateCommonBuffer` in
+  `VwifiDmaAlloc` — which depends on none of the miniport attribute
+  state. Symptom if you get this wrong: Code 10, with
+  `ring ctrl-req: ... alloc failed (1536 bytes)` in DebugView.
 - **The generated TLV headers are split across two folders.**
   `dot11wdi.h` and `wditypes.hpp` are on the kit's default include
   path; `TlvGeneratorParser.hpp` and the `TlvGenerated_.hpp` it

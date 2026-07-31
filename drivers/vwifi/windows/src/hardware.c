@@ -145,16 +145,79 @@ VwifiMessageDpc(
  * point the adapter is NOT yet a registered NDIS miniport: we are
  * filling in the registration attributes that the WLAN component will
  * apply *after* we return. So nothing here may call an NDIS routine
- * that needs a registered adapter — above all NdisMAllocateSharedMemory,
- * which needs NDIS_MINIPORT_ATTRIBUTES_BUS_MASTER to be in effect and
- * otherwise fails with NDIS_STATUS_RESOURCES no matter how small the
- * request. A 1536-byte ring allocation failing on an idle machine is
- * what that looks like from the outside.
+ * that needs a registered adapter.
  *
  * VwifiHwStart runs from MiniportWdiOpenAdapter, by which time the
  * attributes are live. Everything that touches NDIS-managed
  * resources — DMA rings, NBL pools, interrupts — belongs there.
+ *
+ * Note that the split alone did not fix the ring allocation: a
+ * 1536-byte NdisMAllocateSharedMemory still returned
+ * NDIS_STATUS_RESOURCES from OpenAdapter on an idle machine. The rings
+ * now come from the PDO's own DMA adapter instead; see the header
+ * comment on VwifiDmaAlloc in rings.c.
  * ============================================================ */
+
+/* ============================================================
+ * The PDO's DMA adapter.
+ *
+ * IoGetDmaAdapter and PutDmaAdapter are both PASSIVE_LEVEL-only, which
+ * OpenAdapter/CloseAdapter satisfy. Every common buffer taken from this
+ * adapter must be freed before it is put back, so the release below is
+ * ordered after VwifiRingsFree in both the failure path and HwStop.
+ * ============================================================ */
+static NDIS_STATUS
+VwifiDmaAdapterAcquire(_Inout_ PVWIFI_ADAPTER Adapter)
+{
+    DEVICE_DESCRIPTION desc = { 0 };
+    PDEVICE_OBJECT     pdo  = NULL;
+    ULONG              map_registers = 0;
+
+    if (Adapter->DmaAdapter) {
+        return NDIS_STATUS_SUCCESS;
+    }
+
+    NdisMGetDeviceProperty(Adapter->MiniportAdapterHandle,
+                           &pdo, NULL, NULL, NULL, NULL);
+    if (!pdo) {
+        VWIFI_ERR("NdisMGetDeviceProperty returned no PDO");
+        return NDIS_STATUS_RESOURCES;
+    }
+
+    /* VERSION1 rather than VERSION: Dma64BitAddresses is only honoured
+     * from version 1 on, and the ring ABI carries 64-bit addresses. */
+    desc.Version           = DEVICE_DESCRIPTION_VERSION1;
+    desc.Master            = TRUE;
+    desc.ScatterGather     = TRUE;
+    desc.Dma64BitAddresses = TRUE;
+    desc.InterfaceType     = PCIBus;
+    /* Only sizes the map-register grant, which we never draw on: every
+     * allocation here is a common buffer, and AllocateCommonBuffer is
+     * not bounded by MaximumLength. Set to the largest region we ask
+     * for so the number is at least meaningful. */
+    desc.MaximumLength     = VWIFI_RX_RING_SIZE * VWIFI_RX_BUFFER_SIZE;
+
+    Adapter->DmaAdapter = IoGetDmaAdapter(pdo, &desc, &map_registers);
+    if (!Adapter->DmaAdapter) {
+        VWIFI_ERR("IoGetDmaAdapter failed");
+        return NDIS_STATUS_RESOURCES;
+    }
+    Adapter->DmaMapRegisters = map_registers;
+
+    VWIFI_INFO("DMA adapter acquired, %u map registers", map_registers);
+    return NDIS_STATUS_SUCCESS;
+}
+
+static VOID
+VwifiDmaAdapterRelease(_Inout_ PVWIFI_ADAPTER Adapter)
+{
+    if (Adapter->DmaAdapter) {
+        Adapter->DmaAdapter->DmaOperations->PutDmaAdapter(
+            Adapter->DmaAdapter);
+        Adapter->DmaAdapter      = NULL;
+        Adapter->DmaMapRegisters = 0;
+    }
+}
 
 NDIS_STATUS
 VwifiHwInitialize(
@@ -223,9 +286,14 @@ VwifiHwStart(_Inout_ PVWIFI_ADAPTER Adapter)
         return NDIS_STATUS_SUCCESS;
     }
 
+    /* The rings are common buffers, so the DMA adapter has to exist
+     * before anything tries to allocate one. */
+    status = VwifiDmaAdapterAcquire(Adapter);
+    if (status != NDIS_STATUS_SUCCESS) return status;
+
     /* Allocate and program the four rings. */
     status = VwifiRingsAllocate(Adapter);
-    if (status != NDIS_STATUS_SUCCESS) return status;
+    if (status != NDIS_STATUS_SUCCESS) goto fail_dma;
     VwifiRingsProgramMmio(Adapter);
     VwifiRingsArmCtrlRsp(Adapter);
     VwifiRingsPostRxBuffers(Adapter);
@@ -309,6 +377,8 @@ fail_nbl:
     VwifiRxNblPoolDestroy(Adapter);
 fail_rings:
     VwifiRingsFree(Adapter);
+fail_dma:
+    VwifiDmaAdapterRelease(Adapter);
     return status;
 }
 
@@ -338,6 +408,10 @@ VwifiHwStop(_Inout_ PVWIFI_ADAPTER Adapter)
     VwifiScanTaskDestroy(Adapter);
     VwifiRxNblPoolDestroy(Adapter);
     VwifiRingsFree(Adapter);
+
+    /* Strictly after VwifiRingsFree -- FreeCommonBuffer needs the
+     * adapter it came from. */
+    VwifiDmaAdapterRelease(Adapter);
 }
 
 /* ============================================================
