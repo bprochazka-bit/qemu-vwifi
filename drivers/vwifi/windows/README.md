@@ -465,6 +465,57 @@ The rule that actually holds: if a container describes something the
 adapter *is*, fill it in, whatever the model says. Only omit containers
 describing features the device genuinely does not have.
 
+### When the driver log is silent, the problem is above the driver
+
+The 0xE9 trace records everything the driver is asked to do. That makes
+its silence informative in its own right: an operation that produces no
+driver output never reached the driver.
+
+Three that have behaved this way:
+
+- clicking Connect, which sits at "Checking network requirements"
+- disabling the network interface, which succeeds
+- uninstalling the driver from Device Manager, which hangs
+
+None of them logged a line. So the WLAN service and the Microsoft WDI
+component are doing something — or waiting for something — before they
+issue an OID, and no amount of driver-side logging will show it. That
+layer has its own logs:
+
+**Event Viewer** — Applications and Services Logs → Microsoft →
+Windows → **WLAN-AutoConfig → Operational**. Connect attempts appear
+here with a reason for each failure. This is the first place to look
+when a connect never reaches the driver.
+
+**A full WLAN report**, which is the same data rendered readably:
+
+```
+netsh wlan show wlanreport
+```
+writes `C:\ProgramData\Microsoft\Windows\WlanReport\wlan-report-latest.html`.
+
+**What the service currently believes**, which is worth comparing
+against what the driver logged it indicated:
+
+```
+netsh wlan show interfaces
+netsh wlan show networks mode=bssid
+```
+
+If `show networks` lists the SSID with a sensible signal percentage,
+the BSS entries are getting through intact. If it shows the network
+with 0% signal, or not at all, the fault is in what
+`VwifiTlvGenerateBssEntryList` reports rather than in the connect path.
+
+**An ETW trace of the component itself**, when the above is not
+specific enough:
+
+```
+netsh trace start scenario=wlan tracefile=C:\wlan.etl
+  ... reproduce ...
+netsh trace stop
+```
+
 ### Recovering a guest that hangs at boot
 
 Once the package is installed, PnP starts the driver during boot. If it

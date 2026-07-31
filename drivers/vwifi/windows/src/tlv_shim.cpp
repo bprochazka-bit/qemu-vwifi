@@ -215,8 +215,23 @@ VwifiTlvGenerateBssEntryList(
          * and when we saw it. */
         RtlCopyMemory(w->BSSID.Address, e->bssid, 6);
 
-        w->SignalInfo.RSSI        = e->rssi;
-        w->SignalInfo.LinkQuality = 0;
+        w->SignalInfo.RSSI = e->rssi;
+
+        /* LinkQuality is documented as "0 through 100. A value of 100
+         * specifies the highest link quality" -- so the zero this used
+         * to report was not "unknown", it was the worst value in the
+         * range, on every network, forever.
+         *
+         * Same mapping as VwifiRssiToLinkQuality in wdi_common.c, which
+         * cannot be called from here: that header is C-only and this
+         * translation unit is the C++ side of the shim. -50 dBm or
+         * better is 100, -100 or worse is 0, linear between. */
+        {
+            LONG r = (LONG)e->rssi;
+            w->SignalInfo.LinkQuality =
+                (r >= -50)  ? 100 :
+                (r <= -100) ? 0   : (UINT32)((r + 100) * 2);
+        }
 
         w->ChannelInfo.ChannelNumber = VwifiFreqToChannel(e->channel_freq);
         w->ChannelInfo.BandId        = VwifiFreqToBandId(e->channel_freq);
