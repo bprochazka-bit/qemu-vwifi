@@ -164,6 +164,7 @@
     <ClCompile Include="src\wdi_keys.c" />
     <ClCompile Include="src\wdi_ops.c" />
     <ClCompile Include="src\wdi_scan.c" />
+    <ClCompile Include="src\wdi_tal.c" />
     <!-- The WDI TLV generator/parser is C++ templates. These two
          translation units are the only C++ in the driver; everything
          else reaches them through tlv_shim.h's plain-C boundary. -->

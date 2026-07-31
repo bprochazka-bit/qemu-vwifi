@@ -213,6 +213,13 @@ typedef struct _VWIFI_ADAPTER
     PDMA_ADAPTER        DmaAdapter;
     ULONG               DmaMapRegisters;
 
+    /* The WDI data path, captured in TalTxRxInitialize. The TAL
+     * callbacks are handed a TAL_TXRX_HANDLE rather than the adapter,
+     * so anything that has to call back into the WLAN component needs
+     * these reachable from here. */
+    NDIS_HANDLE         DataPathHandle;
+    PNDIS_WDI_DATA_API  DataPathApi;
+
     /* PCI resources (discovered in hardware.c). */
     PHYSICAL_ADDRESS    MmioPhysicalAddress;
     PVOID               MmioVirtualAddress;
@@ -364,6 +371,11 @@ VOID        VwifiHwStop(_Inout_ PVWIFI_ADAPTER Adapter);
 VOID        VwifiHwShutdown(_Inout_ PVWIFI_ADAPTER Adapter);
 NDIS_STATUS VwifiHwReset(_Inout_ PVWIFI_ADAPTER Adapter);
 BOOLEAN     VwifiHwInterruptDpc(_In_ PVWIFI_ADAPTER Adapter);
+
+/* wdi_tal.c */
+/* Populates the WDI data-path handler table. Every entry is filled: a
+ * NULL in that table is a hole, not a default. */
+VOID VwifiTalFillDataHandlers(_Inout_ PNDIS_MINIPORT_WDI_DATA_HANDLERS H);
 
 /* rings.c */
 /* Common-buffer helpers over the PDO's DMA adapter. Both are no-ops

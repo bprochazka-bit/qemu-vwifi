@@ -283,26 +283,26 @@ VwifiWdiTalTxRxInitialize(
     PNDIS_MINIPORT_WDI_DATA_HANDLERS pMiniportDataHandlers,
     UINT32 *pMiniportWdiFrameMetadataExtraSpace)
 {
-    UNREFERENCED_PARAMETER(NdisMiniportDataPathHandle);
-    UNREFERENCED_PARAMETER(NdisWdiDataPathApi);
+    PVWIFI_ADAPTER adapter = (PVWIFI_ADAPTER)MiniportAdapterContext;
 
-    /* Logged loudly, and the handler table's state reported, because
-     * this is the prime suspect for the adapter being closed with
-     * nothing asked and nothing said.
-     *
-     * NDIS_MINIPORT_WDI_DATA_HANDLERS has twenty-five function pointers
-     * -- the whole TX/RX/TAL data path -- and we fill in none of them,
-     * nor its NDIS_OBJECT_HEADER. If the WLAN component requires a
-     * usable data path before it will create a port, a table of NULLs
-     * behind a zeroed header is exactly the sort of thing it would
-     * reject without comment.
-     *
-     * Whether it is even called is the question this log line answers.
-     * If it appears before WdiCloseAdapter, the data path is the next
-     * piece of work; if it never appears, the adapter is being given up
-     * on before the data path is reached and the cause is elsewhere. */
-    VWIFI_INFO("WdiTalTxRxInitialize: handler table %s",
-               pMiniportDataHandlers ? "supplied (left empty)" : "NULL");
+    VWIFI_INFO("WdiTalTxRxInitialize");
+
+    if (pMiniportDataHandlers == NULL) {
+        VWIFI_ERR("no data handler table supplied");
+        return NDIS_STATUS_INVALID_PARAMETER;
+    }
+
+    /* Keep the data-path handle and the component's own API table. The
+     * TAL callbacks get a TAL_TXRX_HANDLE, not the adapter, so anything
+     * that has to call back into the component later needs these
+     * reachable from the adapter. */
+    adapter->DataPathHandle = NdisMiniportDataPathHandle;
+    adapter->DataPathApi    = NdisWdiDataPathApi;
+
+    /* Fill in all twenty-five handlers. Leaving them NULL is what kept
+     * the adapter from ever getting a port -- see the header comment in
+     * wdi_tal.c. */
+    VwifiTalFillDataHandlers(pMiniportDataHandlers);
 
     /* Return our adapter pointer as the TAL handle so later callbacks
      * can find us. */
