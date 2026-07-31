@@ -195,6 +195,24 @@ NDIS_STATUS VwifiTlvParseDeletePort(
     _Out_ PULONG PortNumber);
 
 /* ============================================================
+ * Dot11 reset / receive packet filter
+ * ============================================================ */
+
+NDIS_STATUS VwifiTlvParseDot11Reset(
+    _In_ ULONG PeerVersion,
+    _In_reads_bytes_(BufferLen) const VOID *Buffer,
+    _In_ ULONG BufferLen,
+    _Out_ BOOLEAN *SetDefaultMib,
+    _Out_writes_bytes_(6) UCHAR *MacOut,
+    _Out_ BOOLEAN *MacPresent);
+
+NDIS_STATUS VwifiTlvParseReceivePacketFilter(
+    _In_ ULONG PeerVersion,
+    _In_reads_bytes_(BufferLen) const VOID *Buffer,
+    _In_ ULONG BufferLen,
+    _Out_ PULONG Filter);
+
+/* ============================================================
  * Adapter configuration
  * ============================================================ */
 

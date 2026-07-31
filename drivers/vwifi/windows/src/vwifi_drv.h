@@ -219,6 +219,12 @@ typedef struct _VWIFI_ADAPTER
      * there is no table here -- only which id is live. */
     WDI_PORT_ID         WdiPortId;
     ULONG               PortId;
+
+    /* The component's receive filter for this port, from
+     * OID_WDI_SET_RECEIVE_PACKET_FILTER. NDIS packet-type bits, not the
+     * device's raw-capture mask -- recorded so the trace can show what
+     * was asked for, not consulted by the RX path. */
+    ULONG               WdiPacketFilter;
     BOOLEAN             PortCreated;
 
     /* The WDI data path, captured in TalTxRxInitialize. The TAL

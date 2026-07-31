@@ -36,11 +36,22 @@ static NDIS_HANDLE g_DriverHandle = NULL;
  * last few lines -- which are the only ones that matter when the
  * machine stops mid-line.
  *
- * Safe at any IRQL: WRITE_PORT_UCHAR is an instruction, and the
- * formatting buffer is on the caller's stack, so there is no shared
- * state and nothing to lock. Callers include the ISR.
+ * The port IS shared state, which an earlier version of this comment
+ * denied. Two CPUs writing a line each byte at a time interleave them,
+ * and the result is unreadable exactly when it is most needed:
+ *
+ *   vwifiv:w iTfAiL:  rrexs: e14t5  pboyrttes  f0
+ *
+ * So the write is serialised. Not with a KSPIN_LOCK: this is called
+ * from the ISR at DIRQL, above the DISPATCH_LEVEL ceiling those
+ * require. Raising to HIGH_LEVEL first means nothing on this CPU can
+ * interrupt us mid-line -- which is what makes the interlocked spin
+ * below deadlock-free, since the holder can never be preempted by
+ * something on its own CPU that also wants the lock.
  * ==================================================================== */
 #define VWIFI_E9_PORT ((PUCHAR)0x00E9)
+
+static volatile LONG g_E9Lock = 0;
 
 VOID
 VwifiE9Printf(PCSTR Format, ...)
@@ -48,6 +59,7 @@ VwifiE9Printf(PCSTR Format, ...)
     CHAR    buf[256];
     va_list ap;
     PCSTR   p;
+    KIRQL   oldIrql;
 
     va_start(ap, Format);
     /* Return value ignored deliberately: on truncation this still
@@ -56,9 +68,17 @@ VwifiE9Printf(PCSTR Format, ...)
     (VOID)RtlStringCchVPrintfA(buf, RTL_NUMBER_OF(buf), Format, ap);
     va_end(ap);
 
+    KeRaiseIrql(HIGH_LEVEL, &oldIrql);
+    while (InterlockedCompareExchange(&g_E9Lock, 1, 0) != 0) {
+        YieldProcessor();
+    }
+
     for (p = buf; *p != '\0'; p++) {
         WRITE_PORT_UCHAR(VWIFI_E9_PORT, (UCHAR)*p);
     }
+
+    InterlockedExchange(&g_E9Lock, 0);
+    KeLowerIrql(oldIrql);
 }
 #endif /* DBG */
 

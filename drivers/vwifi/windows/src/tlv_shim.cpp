@@ -1225,6 +1225,74 @@ VwifiTlvParseDeletePort(
 }
 
 /* ============================================================
+ * Dot11 reset / receive packet filter
+ * ============================================================ */
+
+extern "C"
+NDIS_STATUS
+VwifiTlvParseDot11Reset(
+    ULONG PeerVersion,
+    const VOID *Buffer,
+    ULONG BufferLen,
+    BOOLEAN *SetDefaultMib,
+    UCHAR *MacOut,
+    BOOLEAN *MacPresent)
+{
+    TLV_CONTEXT ctx = MakeCtx(PeerVersion);
+    WDI_TASK_DOT11_RESET_PARAMETERS parsed = {};
+    NDIS_STATUS st;
+
+    *SetDefaultMib = FALSE;
+    *MacPresent    = FALSE;
+
+    st = ParseWdiTaskDot11Reset(BufferLen,
+                                static_cast<const UINT8 *>(Buffer),
+                                &ctx, &parsed);
+    if (st != NDIS_STATUS_SUCCESS) {
+        return st;
+    }
+
+    *SetDefaultMib = parsed.Dot11ResetParameters.SetDefaultMIB ? TRUE : FALSE;
+
+    if (parsed.Optional.ResetMACAddress_IsPresent) {
+        RtlCopyMemory(MacOut, parsed.ResetMACAddress.Address, 6);
+        *MacPresent = TRUE;
+    }
+
+    CleanupParsedWdiTaskDot11Reset(&parsed);
+    return NDIS_STATUS_SUCCESS;
+}
+
+extern "C"
+NDIS_STATUS
+VwifiTlvParseReceivePacketFilter(
+    ULONG PeerVersion,
+    const VOID *Buffer,
+    ULONG BufferLen,
+    PULONG Filter)
+{
+    TLV_CONTEXT ctx = MakeCtx(PeerVersion);
+    WDI_SET_RECEIVE_PACKET_FILTER_PARAMETERS parsed = {};
+    NDIS_STATUS st;
+
+    *Filter = 0;
+
+    st = ParseWdiSetReceivePacketFilter(BufferLen,
+                                        static_cast<const UINT8 *>(Buffer),
+                                        &ctx, &parsed);
+    if (st != NDIS_STATUS_SUCCESS) {
+        return st;
+    }
+
+    /* UINT32_CONTAINER is a plain typedef of UINT32 -- the member is the
+     * value, not a sub-struct. Same shape as WDI_OPERATION_MODE. */
+    *Filter = parsed.PacketFilterType;
+
+    CleanupParsedWdiSetReceivePacketFilter(&parsed);
+    return NDIS_STATUS_SUCCESS;
+}
+
+/* ============================================================
  * Adapter configuration
  *
  * WDI_SET_ADAPTER_CONFIGURATION carries firmware-level settings, and

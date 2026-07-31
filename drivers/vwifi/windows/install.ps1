@@ -106,8 +106,50 @@ if ($driverVer) { Write-Host "Installing: $($driverVer.Trim())" }
 # installed yet, and the reason for the stall is in the driver you were
 # about to replace.
 Write-Host ''
-Write-Host "[1/4] Installing $inf ..."
+Write-Host '[1/4] Installing ...'
+
+# Disable the device first, and re-enable it afterwards.
+#
+# Once the driver works, the WLAN service holds the adapter open, and
+# pnputil cannot replace a driver whose device is in use -- it fails,
+# and the only way anyone found back out was a reboot. Disabling drops
+# the service's hold and takes the adapter through its own teardown,
+# which is a far better place to unwind than half way through an
+# uninstall.
+#
+# Best-effort on purpose: on the very first install there is no device
+# to disable, and a device stuck in a bad state may refuse. Neither is
+# a reason not to try the install.
+$dev = Get-PnpDevice -InstanceId 'PCI\VEN_1AF4&DEV_0E00*' -ErrorAction SilentlyContinue |
+       Where-Object { $_.Status -ne 'Unknown' }
+$disabled = $false
+if ($dev) {
+    Write-Host '  disabling the adapter so pnputil is not fighting it ...'
+    try {
+        $dev | Disable-PnpDevice -Confirm:$false -ErrorAction Stop
+        $disabled = $true
+    } catch {
+        Write-Host "    (could not disable: $($_.Exception.Message))"
+        Write-Host '    continuing; the install may fail with the device in use.'
+    }
+}
+
+Write-Host "  adding $inf ..."
 & pnputil /add-driver $inf /install
+$addStatus = $LASTEXITCODE
+
+if ($disabled) {
+    Write-Host '  re-enabling the adapter ...'
+    try {
+        Get-PnpDevice -InstanceId 'PCI\VEN_1AF4&DEV_0E00*' -ErrorAction Stop |
+            Enable-PnpDevice -Confirm:$false -ErrorAction Stop
+    } catch {
+        Write-Host "    (could not re-enable: $($_.Exception.Message))"
+        Write-Host '    enable it by hand in Device Manager.'
+    }
+}
+
+$global:LASTEXITCODE = $addStatus
 if ($LASTEXITCODE -ne 0) {
     Write-Host ''
     Write-Host 'ERROR: pnputil failed. The usual causes:'

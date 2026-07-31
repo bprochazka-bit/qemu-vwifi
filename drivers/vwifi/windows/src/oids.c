@@ -617,6 +617,132 @@ VwifiHandleTaskDeletePort(_Inout_ PVWIFI_ADAPTER Adapter,
 }
 
 /* ============================================================
+ * OID_WDI_TASK_DOT11_RESET
+ *
+ * Sent immediately after the port is created, and again a moment later.
+ * Returning NOT_SUPPORTED leaves the port in a state the component will
+ * not connect from -- the trace showed it reach TASK_SCAN and stop
+ * there, never issuing TASK_CONNECT.
+ *
+ * "Reset" here is the 802.11 MLME-RESET, not a hardware reset: put the
+ * port back to a known state and, if SetDefaultMIB is set, restore its
+ * MIB defaults. For this device that means dropping any association and
+ * returning to idle, which the disconnect opcode already does. The
+ * rings, the interrupt and the device itself stay up -- resetting those
+ * would be a much bigger hammer than asked for, and would take the
+ * adapter down with it.
+ * ============================================================ */
+static NDIS_STATUS
+VwifiHandleTaskDot11Reset(_Inout_ PVWIFI_ADAPTER Adapter,
+                          _In_ PNDIS_OID_REQUEST Req)
+{
+    PVOID       tlv    = NULL;
+    ULONG       tlvLen = 0;
+    BOOLEAN     setDefaultMib = FALSE;
+    UCHAR       mac[6];
+    BOOLEAN     macPresent = FALSE;
+    NDIS_STATUS status;
+
+    status = VwifiGetTlvPayload(Req, &tlv, &tlvLen);
+    if (status == NDIS_STATUS_SUCCESS) {
+        status = VwifiTlvParseDot11Reset(Adapter->WdiPeerVersion,
+                                         tlv, tlvLen, &setDefaultMib,
+                                         mac, &macPresent);
+        if (status != NDIS_STATUS_SUCCESS) {
+            VWIFI_WARN("DOT11_RESET: parse failed 0x%08x %s; resetting anyway",
+                       status, VwifiNdisStatusName(status));
+        }
+    }
+
+    VWIFI_INFO("OID: dot11 reset (defaultMIB=%u, mac=%u)",
+               setDefaultMib, macPresent);
+
+    /* An explicit address is the port's new MAC across the reset. */
+    if (macPresent) {
+        ULONG out_len = 0;
+
+        RtlCopyMemory(Adapter->CurrentMac, mac, 6);
+        (VOID)VwifiCtrlSendSync(Adapter, VWIFI_OP_SET_STA_MAC,
+                                mac, 6, NULL, &out_len);
+    }
+
+    /* Back to idle. Best-effort: the device rejects a disconnect when
+     * nothing is associated, which is the common case here and not a
+     * reason to fail the reset. */
+    {
+        ULONG out_len = 0;
+        struct vwifi_disconnect_req dreq;
+
+        RtlZeroMemory(&dreq, sizeof(dreq));
+        (VOID)VwifiCtrlSendSync(Adapter, VWIFI_OP_DISCONNECT,
+                                &dreq, sizeof(dreq), NULL, &out_len);
+    }
+
+    VwifiSendWdiIndication(Adapter, VwifiGetWdiPortId(Req), Req->PortNumber,
+                           NDIS_STATUS_WDI_INDICATION_DOT11_RESET_COMPLETE,
+                           NDIS_STATUS_SUCCESS,
+                           VwifiGetWdiTransactionId(Req),
+                           NULL, 0);
+    return NDIS_STATUS_SUCCESS;
+}
+
+/* ============================================================
+ * OID_WDI_SET_RECEIVE_PACKET_FILTER / OID_WDI_SET_MULTICAST_LIST
+ *
+ * Both are plain sets answered with a bare header, and both were
+ * returning NOT_SUPPORTED. The packet filter is the one that matters:
+ * it says which received frames the component wants indicated, and a
+ * port that never gets one configured has no reason to expect data.
+ *
+ * The device's own filter is the raw-capture mask used by monitor mode,
+ * which is a different thing -- these bits are NDIS packet types, not
+ * 802.11 frame classes. In STA mode the device already delivers exactly
+ * the frames addressed to us, so there is nothing to push down and
+ * accepting the filter is honest rather than lazy. Monitor mode still
+ * goes through OID_GEN_CURRENT_PACKET_FILTER above, which does drive
+ * the device.
+ * ============================================================ */
+static NDIS_STATUS
+VwifiHandleSetReceivePacketFilter(_Inout_ PVWIFI_ADAPTER Adapter,
+                                  _In_ PNDIS_OID_REQUEST Req)
+{
+    PVOID       tlv    = NULL;
+    ULONG       tlvLen = 0;
+    ULONG       filter = 0;
+    NDIS_STATUS status;
+
+    status = VwifiGetTlvPayload(Req, &tlv, &tlvLen);
+    if (status == NDIS_STATUS_SUCCESS) {
+        status = VwifiTlvParseReceivePacketFilter(Adapter->WdiPeerVersion,
+                                                  tlv, tlvLen, &filter);
+        if (status != NDIS_STATUS_SUCCESS) {
+            VWIFI_WARN("RECEIVE_PACKET_FILTER: parse failed 0x%08x %s",
+                       status, VwifiNdisStatusName(status));
+        }
+    }
+
+    Adapter->WdiPacketFilter = filter;
+    VWIFI_INFO("OID: receive packet filter 0x%08x", filter);
+
+    return VwifiWdiAckHeaderOnly(Req, NDIS_STATUS_SUCCESS);
+}
+
+static NDIS_STATUS
+VwifiHandleSetMulticastList(_Inout_ PVWIFI_ADAPTER Adapter,
+                            _In_ PNDIS_OID_REQUEST Req)
+{
+    UNREFERENCED_PARAMETER(Adapter);
+
+    /* The list itself is optional in the model and this device has no
+     * multicast filter to program -- the medium delivers what it
+     * delivers and the stack drops what it does not want. Accepted
+     * rather than parsed, because storing a list nothing consults would
+     * only suggest it does something. */
+    VWIFI_INFO("OID: multicast list accepted (device has no filter)");
+    return VwifiWdiAckHeaderOnly(Req, NDIS_STATUS_SUCCESS);
+}
+
+/* ============================================================
  * The real OID dispatcher — replaces the Phase-1 blanket stub.
  * ============================================================ */
 _Use_decl_annotations_
@@ -719,6 +845,12 @@ VwifiOidRequest(
             return VwifiHandleTaskCreatePort(adapter, OidRequest);
         case OID_WDI_TASK_DELETE_PORT:
             return VwifiHandleTaskDeletePort(adapter, OidRequest);
+        case OID_WDI_TASK_DOT11_RESET:
+            return VwifiHandleTaskDot11Reset(adapter, OidRequest);
+        case OID_WDI_SET_RECEIVE_PACKET_FILTER:
+            return VwifiHandleSetReceivePacketFilter(adapter, OidRequest);
+        case OID_WDI_SET_MULTICAST_LIST:
+            return VwifiHandleSetMulticastList(adapter, OidRequest);
         default:
             break;
         }
