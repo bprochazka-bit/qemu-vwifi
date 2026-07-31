@@ -56,11 +56,42 @@
 
 /* ============================================================
  * Logging
+ *
+ * Two sinks, because DbgPrintEx on its own loses exactly the failures
+ * that are worth having. Its output goes to an attached kernel debugger
+ * -- DebugView is one -- and a guest that hard-locks takes DebugView's
+ * buffer down with it. Boot-time output is lost the same way: nothing
+ * is running yet to catch it. Every silent freeze in this driver's
+ * bring-up has been invisible for that reason and no other.
+ *
+ * VWIFI_E9 mirrors each line to I/O port 0xE9, QEMU's debug console.
+ * QEMU writes every byte to its -debugcon file the moment the guest
+ * emits it, on the host, outside the VM. A trace collected that way
+ * survives a hard lock, a triple fault and a reset alike, and it is the
+ * only thing that can say what the driver was doing at the instant a
+ * machine froze at the Windows logo.
+ *
+ * Port 0xE9 is unassigned on real hardware and writes to it are
+ * discarded, so this is inert outside a VM. It is Debug-only anyway: a
+ * release driver has no business writing to arbitrary I/O ports.
+ *
+ * Host side:
+ *     -debugcon file:/tmp/vwifi-boot.log
  * ============================================================ */
 
-#define VWIFI_DBG(level, fmt, ...) \
-    DbgPrintEx(DPFLTR_IHVNETWORK_ID, level, \
-               "vwifi: " fmt "\n", ##__VA_ARGS__)
+#if DBG
+VOID VwifiE9Printf(_In_z_ _Printf_format_string_ PCSTR Format, ...);
+#define VWIFI_E9(fmt, ...) VwifiE9Printf("vwifi: " fmt "\n", ##__VA_ARGS__)
+#else
+#define VWIFI_E9(fmt, ...) ((VOID)0)
+#endif
+
+#define VWIFI_DBG(level, fmt, ...)                                  \
+    do {                                                            \
+        DbgPrintEx(DPFLTR_IHVNETWORK_ID, level,                     \
+                   "vwifi: " fmt "\n", ##__VA_ARGS__);              \
+        VWIFI_E9(fmt, ##__VA_ARGS__);                               \
+    } while (0)
 
 #define VWIFI_INFO(fmt, ...)  VWIFI_DBG(DPFLTR_INFO_LEVEL,    fmt, ##__VA_ARGS__)
 #define VWIFI_WARN(fmt, ...)  VWIFI_DBG(DPFLTR_WARNING_LEVEL, fmt, ##__VA_ARGS__)

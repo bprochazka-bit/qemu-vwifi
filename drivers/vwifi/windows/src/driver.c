@@ -18,9 +18,49 @@
  */
 
 #include "vwifi_drv.h"
+#include <ntstrsafe.h>
 
 /* Registered by NdisMRegisterWdiMiniportDriver; saved for unload. */
 static NDIS_HANDLE g_DriverHandle = NULL;
+
+#if DBG
+/* ====================================================================
+ * QEMU debug console (I/O port 0xE9)
+ *
+ * The sink behind VWIFI_E9. See the logging block in vwifi_drv.h for
+ * why this exists: it is the only output path that survives the guest
+ * dying, because the bytes leave the VM one at a time as they are
+ * written and QEMU appends them to a host file immediately.
+ *
+ * Unbuffered on purpose. Buffering would be faster and would lose the
+ * last few lines -- which are the only ones that matter when the
+ * machine stops mid-line.
+ *
+ * Safe at any IRQL: WRITE_PORT_UCHAR is an instruction, and the
+ * formatting buffer is on the caller's stack, so there is no shared
+ * state and nothing to lock. Callers include the ISR.
+ * ==================================================================== */
+#define VWIFI_E9_PORT ((PUCHAR)0x00E9)
+
+VOID
+VwifiE9Printf(PCSTR Format, ...)
+{
+    CHAR    buf[256];
+    va_list ap;
+    PCSTR   p;
+
+    va_start(ap, Format);
+    /* Return value ignored deliberately: on truncation this still
+     * NUL-terminates, and a truncated line is worth infinitely more
+     * than no line when it is the last thing before a freeze. */
+    (VOID)RtlStringCchVPrintfA(buf, RTL_NUMBER_OF(buf), Format, ap);
+    va_end(ap);
+
+    for (p = buf; *p != '\0'; p++) {
+        WRITE_PORT_UCHAR(VWIFI_E9_PORT, (UCHAR)*p);
+    }
+}
+#endif /* DBG */
 
 /* ====================================================================
  * NDIS miniport handlers required beyond what WLAN component provides

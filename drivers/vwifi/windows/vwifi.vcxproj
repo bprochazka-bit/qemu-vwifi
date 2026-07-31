@@ -94,7 +94,11 @@
            implementations of these APIs when linking to the library".
            build.cmd locates it; override with /p:WdiTlvLib=<path>.
            An empty entry is harmless. -->
-      <AdditionalDependencies>$(DDK_LIB_PATH)ndis.lib;$(WdiTlvLib);%(AdditionalDependencies)</AdditionalDependencies>
+      <!-- ntstrsafe for RtlStringCchVPrintfA, used by the port-0xE9
+           logger. The header inlines most of these, but which ones are
+           inline varies by kit and an unresolved external here is a
+           pointless round trip. -->
+      <AdditionalDependencies>$(DDK_LIB_PATH)ndis.lib;$(DDK_LIB_PATH)ntstrsafe.lib;$(WdiTlvLib);%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <Inf>
       <!-- stampinf writes DriverVer as <date>,<TimeStamp>, and the date

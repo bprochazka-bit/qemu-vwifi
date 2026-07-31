@@ -386,6 +386,45 @@ Useful commands once it's loaded:
 | `!poolused 4 fiWv` | driver allocations by tag (`'fiWv'` = `VWIFI_POOL_TAG`) |
 | `!analyze -v` | after a bugcheck, before anything else |
 
+### Recovering a guest that hangs at boot
+
+Once the package is installed, PnP starts the driver during boot. If it
+locks the machine there, the guest hangs at the Windows logo on every
+boot and there is no desktop to uninstall from.
+
+The INF sets `ErrorControl = 1` (`SERVICE_ERROR_NORMAL`), which means
+Windows logs a failure to load and carries on booting. So the fix is to
+make the driver fail to load — take the `.sys` away from outside:
+
+```bash
+sudo modprobe nbd max_part=8
+sudo qemu-nbd --connect=/dev/nbd0 /path/to/win11.qcow2
+sudo mkdir -p /mnt/win && sudo mount /dev/nbd0p3 /mnt/win   # the Windows partition
+sudo mv /mnt/win/Windows/System32/drivers/vwifi.sys \
+        /mnt/win/Windows/System32/drivers/vwifi.sys.bak
+sudo umount /mnt/win && sudo qemu-nbd --disconnect /dev/nbd0
+```
+
+Boot, and the adapter comes up with a yellow bang instead of a hang.
+Then remove the package properly:
+
+```
+pnputil /enum-drivers | findstr /i vwifi
+pnputil /delete-driver oemNN.inf /uninstall /force
+```
+
+The VM must be shut down before connecting `qemu-nbd`; two writers on
+one image will corrupt it. Check `lsblk /dev/nbd0` if you are unsure
+which partition is Windows — it is the large NTFS one, not the small
+recovery or EFI partitions.
+
+If you would rather stay inside the guest, force-power-cycle it twice
+mid-boot to trigger Automatic Repair, then Advanced options → Startup
+Settings → Safe Mode (`4`). Network miniports do not start in Safe
+Mode, so `pnputil /delete-driver` works there. That is slower and
+depends on WinRE being intact, which is why the offline route is
+listed first.
+
 ### Debugging from a Linux host
 
 A guest that resets without a bugcheck cannot be debugged from inside
@@ -396,6 +435,24 @@ host, where the evidence still exists.
 
 This is not a workaround for having no WinDbg. For this class of
 failure it is strictly better, because QEMU sees the reset itself.
+
+**0. Capture the driver's own trace, on the host.** Do this before
+anything else — it is the only sink that survives the guest dying, and
+it usually answers the question on its own.
+
+```
+-debugcon file:/tmp/vwifi-boot.log
+```
+
+Every `VWIFI_INFO`/`WARN`/`ERR` line is mirrored to I/O port 0xE9 in
+Debug builds, and QEMU appends each byte to that file as the guest
+writes it. Unlike DebugView, whose buffer dies with the VM, and unlike
+DbgPrintEx, which needs an attached debugger and produces nothing
+during boot, this file is complete right up to the last instruction the
+driver executed. **The last line in it is where the machine froze.**
+
+This works at boot, which DebugView cannot do at all, so it is the only
+way to see a driver that hangs the guest before there is a desktop.
 
 **1. Stop the machine from resetting.** The single most useful flag:
 
@@ -483,6 +540,11 @@ cleanly:
 | Stop screen stays up, `MEMORY.DMP` written | an ordinary bugcheck. Windows was healthy enough to report it; the dump has the stack. |
 | No screen, no dump, `-d cpu_reset` shows a reset | triple fault. The register dump has the `RIP` — feed it to `rip2sym.py`. |
 | No screen, no dump, no reset logged, vCPUs pegged | a true hard lock. Check `info irq` for a storm, and `thread apply all x/i $pc` for where they are stuck. |
+
+In all three cases read `/tmp/vwifi-boot.log` first. A bugcheck tells
+you where Windows noticed; the 0xE9 trace tells you what the driver was
+doing, which is usually a more direct answer and never costs a round
+trip to collect.
 
 **If you want full WinDbg anyway**, the serial transport is the awkward
 part on Linux, so use the network one instead. KDNET needs a NIC
