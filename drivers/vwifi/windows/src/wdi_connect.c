@@ -48,6 +48,10 @@
 typedef struct _VWIFI_CONNECT_TASK
 {
     BOOLEAN Active;
+    /* Both port namespaces. WdiPortId scopes the WDI message
+     * header of every indication this task sends; PortId is the
+     * NDIS port the request arrived on. See VwifiGetWdiPortId. */
+    WDI_PORT_ID   WdiPortId;
     ULONG   PortId;
     UINT32  TransactionId;     /* echoed by CONNECT_COMPLETE */
     UCHAR   TargetBssid[6];
@@ -125,7 +129,7 @@ VwifiIndicateAssociationResult(_Inout_ PVWIFI_ADAPTER Adapter,
 
     VWIFI_INFO("indicating ASSOCIATION_RESULT status=%u aid=%u ies=%u",
                Result->status_code, Result->aid, Result->ie_len);
-    VwifiSendWdiIndication(Adapter, task->PortId,
+    VwifiSendWdiIndication(Adapter, task->WdiPortId, task->PortId,
                            NDIS_STATUS_WDI_INDICATION_ASSOCIATION_RESULT,
                            NDIS_STATUS_SUCCESS,
                            WDI_TRANSACTION_ID_UNSOLICIT, tlv, tlvLen);
@@ -142,7 +146,7 @@ VwifiIndicateConnectComplete(_Inout_ PVWIFI_ADAPTER Adapter,
      * The outcome rides in the message header's Status field, and the OS
      * already knows which BSS it asked us to join. */
     VWIFI_INFO("indicating CONNECT_COMPLETE (0x%x)", Status);
-    VwifiSendWdiIndication(Adapter, task->PortId,
+    VwifiSendWdiIndication(Adapter, task->WdiPortId, task->PortId,
                            NDIS_STATUS_WDI_INDICATION_CONNECT_COMPLETE,
                            Status, task->TransactionId, NULL, 0);
 
@@ -167,6 +171,7 @@ VwifiIndicateDisassociation(_Inout_ PVWIFI_ADAPTER Adapter, _In_ BOOLEAN Local)
     VWIFI_INFO("indicating DISASSOCIATION (%s-initiated)",
                Local ? "locally" : "peer");
     VwifiSendWdiIndication(Adapter,
+                           task ? task->WdiPortId : WDI_PORT_ID_ADAPTER,
                            task ? task->PortId : NDIS_DEFAULT_PORT_NUMBER,
                            NDIS_STATUS_WDI_INDICATION_DISASSOCIATION,
                            NDIS_STATUS_SUCCESS,
@@ -300,6 +305,7 @@ VwifiHandleTaskConnect(_Inout_ PVWIFI_ADAPTER Adapter,
     task->Active     = TRUE;
     task->Associated = FALSE;
     task->PortId     = Req->PortNumber;
+    task->WdiPortId  = VwifiGetWdiPortId(Req);
     task->TransactionId = VwifiGetWdiTransactionId(Req);
 
     /* Stash the target so the indications can report it. */

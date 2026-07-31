@@ -217,6 +217,7 @@ typedef struct _VWIFI_ADAPTER
      * the component's abstraction over one virtual interface; the host
      * assigns the id and a single-radio device has exactly one, so
      * there is no table here -- only which id is live. */
+    WDI_PORT_ID         WdiPortId;
     ULONG               PortId;
     BOOLEAN             PortCreated;
 
@@ -446,8 +447,12 @@ UINT32      VwifiGetWdiTransactionId(_In_ PNDIS_OID_REQUEST Req);
  * header rather than in a TLV. For the empty messages — SCAN_COMPLETE,
  * CONNECT_COMPLETE — it is the only place the outcome appears at all;
  * everything else passes NDIS_STATUS_SUCCESS. */
+WDI_PORT_ID VwifiGetWdiPortId(_In_ PNDIS_OID_REQUEST Req);
+/* WdiPortId scopes the WDI message header; NdisPortNumber scopes the
+ * NDIS status indication. Different namespaces -- see VwifiGetWdiPortId. */
 VOID        VwifiSendWdiIndication(_Inout_ PVWIFI_ADAPTER Adapter,
-                                   _In_ ULONG PortId,
+                                   _In_ WDI_PORT_ID WdiPortId,
+                                   _In_ ULONG NdisPortNumber,
                                    _In_ NDIS_STATUS StatusCode,
                                    _In_ NDIS_STATUS MessageStatus,
                                    _In_ UINT32 TransactionId,

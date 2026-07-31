@@ -80,6 +80,33 @@ VwifiGetWdiTransactionId(_In_ PNDIS_OID_REQUEST Req)
     return hdr->TransactionId;
 }
 
+/* The WDI port the request is scoped to.
+ *
+ * NOT NDIS_OID_REQUEST.PortNumber. Those are two different namespaces
+ * that happen to be small integers: PortNumber is the NDIS port the
+ * request arrived on, while WDI_PORT_ID lives in the message header and
+ * has its own reserved values -- WDI_PORT_ID_ADAPTER (0xFFFF) for
+ * adapter-scoped messages like CREATE_PORT, which has no port yet to be
+ * scoped to. Answering an adapter-scoped task with PortId 0 is a
+ * completion for a port the host was not asking about. */
+WDI_PORT_ID
+VwifiGetWdiPortId(_In_ PNDIS_OID_REQUEST Req)
+{
+    const WDI_MESSAGE_HEADER *hdr;
+
+    if (Req->RequestType != NdisRequestMethod) {
+        return WDI_PORT_ID_ADAPTER;
+    }
+
+    hdr = (const WDI_MESSAGE_HEADER *)
+              Req->DATA.METHOD_INFORMATION.InformationBuffer;
+    if (hdr == NULL ||
+        Req->DATA.METHOD_INFORMATION.InputBufferLength < sizeof(*hdr)) {
+        return WDI_PORT_ID_ADAPTER;
+    }
+    return hdr->PortId;
+}
+
 /* ============================================================
  * Indication sending
  *
@@ -103,7 +130,8 @@ VwifiGetWdiTransactionId(_In_ PNDIS_OID_REQUEST Req)
 
 VOID
 VwifiSendWdiIndication(_Inout_ PVWIFI_ADAPTER Adapter,
-                       _In_ ULONG PortId,
+                       _In_ WDI_PORT_ID WdiPortId,
+                       _In_ ULONG NdisPortNumber,
                        _In_ NDIS_STATUS StatusCode,
                        _In_ NDIS_STATUS MessageStatus,
                        _In_ UINT32 TransactionId,
@@ -144,7 +172,7 @@ VwifiSendWdiIndication(_Inout_ PVWIFI_ADAPTER Adapter,
      * the OS matches task completions on. */
     hdr = (WDI_MESSAGE_HEADER *)msg;
     RtlZeroMemory(hdr, sizeof(*hdr));
-    hdr->PortId        = (WDI_PORT_ID)PortId;
+    hdr->PortId        = WdiPortId;
     hdr->Status        = MessageStatus;
     hdr->TransactionId = TransactionId;
     hdr->IhvSpecificId = 0;
@@ -154,7 +182,7 @@ VwifiSendWdiIndication(_Inout_ PVWIFI_ADAPTER Adapter,
     ind.Header.Revision   = NDIS_STATUS_INDICATION_REVISION_1;
     ind.Header.Size       = NDIS_SIZEOF_STATUS_INDICATION_REVISION_1;
     ind.SourceHandle      = Adapter->MiniportAdapterHandle;
-    ind.PortNumber        = (NDIS_PORT_NUMBER)PortId;
+    ind.PortNumber        = (NDIS_PORT_NUMBER)NdisPortNumber;
     ind.StatusCode        = StatusCode;
     ind.StatusBuffer      = msg;
     ind.StatusBufferSize  = msgLen;
@@ -164,8 +192,10 @@ VwifiSendWdiIndication(_Inout_ PVWIFI_ADAPTER Adapter,
      * traced in oids.c; everything we send back was silent, so a
      * completion that was malformed, misaddressed or never sent at all
      * looked exactly like one the component ignored. */
-    VWIFI_INFO("IND: 0x%08x port %u txn %u status 0x%08x, %u bytes",
-               StatusCode, PortId, TransactionId, MessageStatus, msgLen);
+    VWIFI_INFO("IND: 0x%08x wdiport 0x%04x ndisport %u txn %u "
+               "status 0x%08x, %u bytes",
+               StatusCode, WdiPortId, NdisPortNumber, TransactionId,
+               MessageStatus, msgLen);
 
     NdisMIndicateStatusEx(Adapter->MiniportAdapterHandle, &ind);
 

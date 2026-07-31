@@ -517,8 +517,10 @@ VwifiHandleTaskCreatePort(_Inout_ PVWIFI_ADAPTER Adapter,
         return status;
     }
 
-    VWIFI_INFO("OID: create port %u (ndis port %u, opmode mask 0x%x)",
-               Req->PortNumber, ndisPort, opModeMask);
+    VWIFI_INFO("OID: create port: wdi port 0x%04x, ndis port %u "
+               "(req ndis %u), opmode mask 0x%x",
+               VwifiGetWdiPortId(Req), ndisPort,
+               Req->PortNumber, opModeMask);
 
     /* An explicit address means the host wants this port on a MAC other
      * than the adapter's own. The device has exactly one station
@@ -539,7 +541,7 @@ VwifiHandleTaskCreatePort(_Inout_ PVWIFI_ADAPTER Adapter,
              * value: the task was accepted, it is its outcome that is
              * bad, and the host matches that on the transaction id. */
             VwifiSendWdiIndication(
-                Adapter, Req->PortNumber,
+                Adapter, VwifiGetWdiPortId(Req), Req->PortNumber,
                 NDIS_STATUS_WDI_INDICATION_CREATE_PORT_COMPLETE,
                 status, VwifiGetWdiTransactionId(Req), NULL, 0);
             return NDIS_STATUS_SUCCESS;
@@ -567,7 +569,8 @@ VwifiHandleTaskCreatePort(_Inout_ PVWIFI_ADAPTER Adapter,
             return status;
         }
 
-        VwifiSendWdiIndication(Adapter, Req->PortNumber,
+        VwifiSendWdiIndication(Adapter, VwifiGetWdiPortId(Req),
+                               Req->PortNumber,
                                NDIS_STATUS_WDI_INDICATION_CREATE_PORT_COMPLETE,
                                NDIS_STATUS_SUCCESS,
                                VwifiGetWdiTransactionId(Req),
@@ -605,7 +608,7 @@ VwifiHandleTaskDeletePort(_Inout_ PVWIFI_ADAPTER Adapter,
 
     Adapter->PortCreated = FALSE;
 
-    VwifiSendWdiIndication(Adapter, Req->PortNumber,
+    VwifiSendWdiIndication(Adapter, VwifiGetWdiPortId(Req), Req->PortNumber,
                            NDIS_STATUS_WDI_INDICATION_DELETE_PORT_COMPLETE,
                            NDIS_STATUS_SUCCESS,
                            VwifiGetWdiTransactionId(Req),
@@ -788,7 +791,7 @@ VwifiHandleTaskChangeOpMode(_Inout_ PVWIFI_ADAPTER Adapter,
     /* The M0 needs no TLVs; completion arrives as
      * WDI_INDICATION_CHANGE_OPERATION_MODE_COMPLETE, which also needs
      * none. */
-    VwifiSendWdiIndication(Adapter, Req->PortNumber,
+    VwifiSendWdiIndication(Adapter, VwifiGetWdiPortId(Req), Req->PortNumber,
                            NDIS_STATUS_WDI_INDICATION_CHANGE_OPERATION_MODE_COMPLETE,
                            NDIS_STATUS_SUCCESS,
                            VwifiGetWdiTransactionId(Req),

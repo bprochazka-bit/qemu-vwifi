@@ -39,6 +39,10 @@
 typedef struct _VWIFI_SCAN_TASK
 {
     BOOLEAN   Active;
+    /* Both port namespaces. WdiPortId scopes the WDI message
+     * header of every indication this task sends; PortId is the
+     * NDIS port the request arrived on. See VwifiGetWdiPortId. */
+    WDI_PORT_ID     WdiPortId;
     ULONG     PortId;
     UINT32    TransactionId;   /* echoed by SCAN_COMPLETE */
     ULONG     PendingCount;
@@ -104,7 +108,7 @@ VwifiIndicateBssEntryList(_Inout_ PVWIFI_ADAPTER Adapter)
 
     /* BSS_ENTRY_LIST is an event, not the scan task's completion, so it
      * carries the unsolicited transaction id even mid-scan. */
-    VwifiSendWdiIndication(Adapter, task->PortId,
+    VwifiSendWdiIndication(Adapter, task->WdiPortId, task->PortId,
                            NDIS_STATUS_WDI_INDICATION_BSS_ENTRY_LIST,
                            NDIS_STATUS_SUCCESS,
                            WDI_TRANSACTION_ID_UNSOLICIT,
@@ -137,7 +141,7 @@ VwifiIndicateScanComplete(_Inout_ PVWIFI_ADAPTER Adapter, _In_ NDIS_STATUS Statu
 
     /* SCAN_COMPLETE carries no TLVs at all — the scan's outcome rides in
      * the message header's Status field. */
-    VwifiSendWdiIndication(Adapter, task->PortId,
+    VwifiSendWdiIndication(Adapter, task->WdiPortId, task->PortId,
                            NDIS_STATUS_WDI_INDICATION_SCAN_COMPLETE,
                            Status, task->TransactionId, NULL, 0);
 
@@ -300,6 +304,7 @@ VwifiHandleTaskScan(_Inout_ PVWIFI_ADAPTER Adapter,
 
     task->Active               = TRUE;
     task->PortId               = Req->PortNumber;
+    task->WdiPortId            = VwifiGetWdiPortId(Req);
     task->TransactionId        = VwifiGetWdiTransactionId(Req);
     task->PendingCount         = 0;
     task->LastIndicationTimeMs = VwifiGetTickCountMs();
