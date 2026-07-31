@@ -28,8 +28,16 @@
     Print the containing directory instead of the full file path.
 
 .PARAMETER RequirePathMatch
-    Only accept matches whose full path contains ALL of these
-    substrings. This is load-bearing, not a convenience: a kit carries
+    Comma- or semicolon-separated list of substrings. Only accept
+    matches whose full path contains ALL of them.
+
+    Note this is ONE string that the script splits itself, not a
+    PowerShell array. `powershell -File` passes every argument as a
+    literal string — it does not evaluate `a,b` as array syntax the way
+    an inline `-Command` would — so a [string[]] parameter would bind
+    the whole thing as a single element and match nothing.
+
+    This is load-bearing, not a convenience: a kit carries
     several parallel copies of the WDI TLV files and picking the wrong
     one produces a wall of errors inside the Microsoft header rather
     than anything pointing back here.
@@ -46,10 +54,19 @@ param(
     [Parameter(Mandatory = $true)] [string] $Name,
     [string] $Subtree,
     [switch] $WantDirectory,
-    [string[]] $RequirePathMatch
+    [string] $RequirePathMatch
 )
 
 $ErrorActionPreference = 'SilentlyContinue'
+
+$required = @()
+if ($RequirePathMatch) {
+    $required = $RequirePathMatch -split '[;,]' | Where-Object { $_ }
+}
+
+# Diagnostics go to stderr so they reach the console without polluting
+# the single line of stdout the caller captures.
+function Note([string] $m) { [Console]::Error.WriteLine("    $m") }
 
 # Candidate kit roots, best first. WindowsSdkDir is set by
 # LaunchBuildEnv.cmd and by the VS developer prompt, and points at the
@@ -76,8 +93,15 @@ foreach ($root in ($roots | Select-Object -Unique)) {
     if (-not (Test-Path $scope)) { continue }
 
     $hits = Get-ChildItem -Path $scope -Filter $Name -Recurse -File
-    foreach ($m in $RequirePathMatch) {
+    $before = @($hits)
+    foreach ($m in $required) {
         $hits = $hits | Where-Object { $_.FullName -like "*$m*" }
+    }
+    # If the filter emptied a non-empty set, say what was rejected —
+    # otherwise the only symptom is a missing /I and a C1083 much later.
+    if ($before.Count -gt 0 -and @($hits).Count -eq 0) {
+        Note "found $Name but none matched [$($required -join ', ')]:"
+        foreach ($b in $before) { Note "  $($b.FullName)" }
     }
     # Deterministic pick among what survives. Sorting descending on the
     # whole path was a mistake: it sorts 'um' above 'km' and '2.0' above

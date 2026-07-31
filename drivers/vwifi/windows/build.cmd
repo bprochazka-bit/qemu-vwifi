@@ -29,7 +29,9 @@ where msbuild >nul 2>&1
 if errorlevel 1 goto :no_msbuild
 
 call :find_tlv_include
+if errorlevel 1 goto :abort
 call :find_tlv_lib
+if errorlevel 1 goto :abort
 call :make_version
 
 echo Building vwifi %CFG%^|x64 ...
@@ -67,6 +69,10 @@ exit /b 0
 rem ===============================================================
 rem  Subroutines
 rem ===============================================================
+
+:abort
+endlocal
+exit /b 1
 
 :no_msbuild
 echo.
@@ -109,12 +115,16 @@ exit /b 0
 
 :no_include
 echo.
-echo WARNING: TlvGeneratorParser.hpp not found in the mounted kit.
-echo   tlv_shim.cpp will fail with C1083. Find it with:
+echo ERROR: TlvGeneratorParser.hpp not found in the mounted kit.
+echo   Any candidates that were found but rejected are listed above.
+echo   The build cannot succeed without it, so stopping here rather
+echo   than letting it fail later with a bare C1083.
+echo.
+echo   Find it with:
 echo     dir /s /b "%%ProgramFiles(x86)%%\Windows Kits\10\TlvGeneratorParser.hpp"
 echo   then re-run as:  set WdiTlvIncludeDir=^<its folder^> ^&^& build.cmd
 echo.
-exit /b 0
+exit /b 1
 
 
 rem --- the WDI TLV static library --------------------------------
@@ -132,12 +142,15 @@ exit /b 0
 
 :no_lib
 echo.
-echo WARNING: no WDI TLV library found. The link will fail with
-echo   LNK2019 on ParseWdiTaskScanToIhv and friends. Find it with:
+echo ERROR: no WDI TLV library found. Any candidates that were found
+echo   but rejected are listed above. The link would fail with LNK2019
+echo   on ParseWdiTaskScanToIhv and friends, so stopping here.
+echo.
+echo   Find it with:
 echo     dir /s /b "%%ProgramFiles(x86)%%\Windows Kits\10\Lib\*.lib" ^| findstr /i tlv
 echo   then re-run as:  set WdiTlvLib=^<full path to the .lib^> ^&^& build.cmd
 echo.
-exit /b 0
+exit /b 1
 
 
 rem --- a strictly increasing INF version -------------------------
