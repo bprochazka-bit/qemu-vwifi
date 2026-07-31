@@ -246,13 +246,22 @@ VwifiMiniportSendNetBufferLists(
     ULONG SendFlags)
 {
     PVWIFI_ADAPTER adapter = (PVWIFI_ADAPTER)MiniportAdapterContext;
-    PNET_BUFFER_LIST nbl, next;
+    PNET_BUFFER_LIST nbl;
     UNREFERENCED_PARAMETER(PortNumber);
 
-    for (nbl = NetBufferLists; nbl; nbl = next) {
-        next = NET_BUFFER_LIST_NEXT_NBL(nbl);
-        NET_BUFFER_LIST_NEXT_NBL(nbl) = NULL;
-
+    /* Walk the chain without unlinking it.
+     *
+     * This used to save NEXT_NBL and then null it, so that after the
+     * loop NetBufferLists was a one-element list -- and the single
+     * NdisMSendNetBufferListsComplete below returned exactly one NBL to
+     * the stack. Every other NBL in the chain was never completed and
+     * never freed.
+     *
+     * NDIS counts outstanding sends and MiniportPause does not finish
+     * until the count reaches zero, so one multi-NBL send is enough to
+     * make pausing the miniport wait forever: disabling the adapter
+     * hangs, uninstalling it hangs, and shutdown hangs behind those. */
+    for (nbl = NetBufferLists; nbl; nbl = NET_BUFFER_LIST_NEXT_NBL(nbl)) {
         if (adapter->OpMode == VWIFI_MODE_MONITOR) {
             /* Injection: each NB is a raw 802.11 frame (maybe with a
              * radiotap prefix). Flatten and inject. */
@@ -322,6 +331,7 @@ VwifiMiniportSendNetBufferLists(
         }
     }
 
+    /* The whole chain, in one call, exactly once. */
     NdisMSendNetBufferListsComplete(
         adapter->MiniportAdapterHandle,
         NetBufferLists,

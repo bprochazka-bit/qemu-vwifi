@@ -91,16 +91,70 @@ VwifiTalStop(_In_ TAL_TXRX_HANDLE MiniportTalTxRxContext)
     VWIFI_INFO("TAL stop");
 }
 
+/* ============================================================
+ * Put the device into the mode the host just gave the port.
+ *
+ * AddPort and SetPortOpMode are the only places the component states
+ * what a port is actually FOR. Nothing else does: OID_WDI_TASK_CHANGE_
+ * OPERATION_MODE is how a *running* adapter is switched, and it is
+ * never sent during bring-up, so a driver that only listens there never
+ * learns its own mode.
+ *
+ * Logging it and moving on -- which is what this used to do -- left
+ * Adapter->OpMode at VWIFI_MODE_IDLE and the device likewise. In that
+ * state VwifiMiniportSendNetBufferLists completes every frame with
+ * NDIS_STATUS_PAUSED, VwifiRxDrain re-arms slots and drops what it
+ * finds, and the device has never been told to behave as a station. An
+ * adapter that scans but cannot associate is what that looks like from
+ * the outside.
+ * ============================================================ */
+static VOID
+VwifiTalApplyOpMode(_Inout_ PVWIFI_ADAPTER Adapter,
+                    _In_ WDI_OPERATION_MODE OpMode)
+{
+    ULONG mode;
+
+    if (OpMode & WDI_OPERATION_MODE_STA) {
+        mode = VWIFI_MODE_STA;
+    } else {
+        /* The P2P roles are the rest of the enum and this device
+         * implements none of them. Saying so beats silently sitting in
+         * idle and looking like a hang. */
+        VWIFI_WARN("TAL: opmode 0x%x is not a mode this device has; "
+                   "staying idle", OpMode);
+        return;
+    }
+
+    if (Adapter->OpMode == mode) {
+        return;
+    }
+
+    /* VwifiSetOpMode goes to the device over the control ring and waits
+     * for the reply, so it needs PASSIVE_LEVEL. These callbacks are
+     * expected to arrive there; check rather than assume, because
+     * blocking above PASSIVE is a bugcheck and a wrong guess here would
+     * be indistinguishable from the hangs already being chased. */
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL) {
+        VWIFI_ERR("TAL: opmode change to %u wanted at IRQL %u -- cannot "
+                  "send a synchronous control request above PASSIVE",
+                  mode, KeGetCurrentIrql());
+        return;
+    }
+
+    (VOID)VwifiSetOpMode(Adapter, mode);
+}
+
 static VOID
 VwifiTalAddPort(
     _In_ TAL_TXRX_HANDLE MiniportTalTxRxContext,
     _In_ WDI_PORT_ID PortId,
     _In_ WDI_OPERATION_MODE OpMode)
 {
-    UNREFERENCED_PARAMETER(MiniportTalTxRxContext);
+    PVWIFI_ADAPTER adapter = (PVWIFI_ADAPTER)MiniportTalTxRxContext;
 
     /* The call that could not happen before this file existed. */
     VWIFI_INFO("TAL add port %u, opmode 0x%x", PortId, OpMode);
+    VwifiTalApplyOpMode(adapter, OpMode);
 }
 
 static VOID
@@ -118,8 +172,10 @@ VwifiTalSetPortOpMode(
     _In_ WDI_PORT_ID PortId,
     _In_ WDI_OPERATION_MODE Opmode)
 {
-    UNREFERENCED_PARAMETER(MiniportTalTxRxContext);
+    PVWIFI_ADAPTER adapter = (PVWIFI_ADAPTER)MiniportTalTxRxContext;
+
     VWIFI_INFO("TAL port %u opmode -> 0x%x", PortId, Opmode);
+    VwifiTalApplyOpMode(adapter, Opmode);
 }
 
 static VOID
