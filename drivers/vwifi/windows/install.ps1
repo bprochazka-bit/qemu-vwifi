@@ -10,18 +10,29 @@
     `pnputil /add-driver` adds a package, but PnP keeps the one already
     bound to the device unless the new package ranks better -- and
     ranking is on DriverVer, which stampinf writes as <date>,<version>.
-    Two builds on the same day with the same version are
-    indistinguishable, so the old package wins and you keep testing the
-    .sys you thought you replaced. This removes the old package
-    outright rather than relying on ranking.
+    build.cmd derives the version from the build time, so every build
+    strictly outranks the last and ranking alone picks the new one.
+
+    The old package is therefore left alone by default. Removing it
+    means `pnputil /delete-driver /uninstall`, which has to stop the
+    device using it -- and once the driver works, that is a live adapter
+    to unwind. If the teardown stalls, so does the uninstall, and the
+    install never happens. Pass -RemoveOld to clean up superseded
+    packages; it runs last, after the new driver is in.
 
 .PARAMETER Path
     Folder holding the driver package. Defaults to the script's own
     folder, then to the build output under it.
+
+.PARAMETER RemoveOld
+    After installing, remove superseded vwifi packages. Off by default:
+    it has to stop whatever is using them, and a stall there used to
+    take the whole install with it.
 #>
 [CmdletBinding()]
 param(
-    [string] $Path
+    [string] $Path,
+    [switch] $RemoveOld
 )
 
 $ErrorActionPreference = 'Stop'
@@ -77,35 +88,25 @@ $driverVer = (Select-String -Path $inf -Pattern '^\s*DriverVer\s*=' |
               Select-Object -First 1).Line
 if ($driverVer) { Write-Host "Installing: $($driverVer.Trim())" }
 
-# --- 1. remove every previously installed vwifi package --------------
+# --- 1. add and install the new package ------------------------------
+#
+# Installed first, and the old package is NOT removed to make room.
+#
+# It used to be, because two builds on the same day carried an identical
+# DriverVer and PnP had no reason to prefer the new one. build.cmd now
+# derives the version from the build time (1.0.MMdd.HHmm), so every
+# build strictly outranks its predecessor and ordinary ranking picks it.
+#
+# Removing first also stopped being harmless the moment the driver
+# started working. `pnputil /delete-driver /uninstall /force` has to
+# stop the device that is using the package, which means unwinding a
+# live adapter -- port teardown, close, halt -- and if any of that
+# stalls, the uninstall stalls with it and takes the install with it.
+# That is a bad place for a bring-up script to wedge: nothing is
+# installed yet, and the reason for the stall is in the driver you were
+# about to replace.
 Write-Host ''
-Write-Host '[1/4] Removing previously installed vwifi packages ...'
-
-# pnputil /enum-drivers emits blank-line-separated records; find the
-# published oemNN.inf name of any whose original name is vwifi.inf.
-$records = ((pnputil /enum-drivers) -join "`n") -split "`r?`n`r?`n"
-$old = foreach ($r in $records) {
-    if ($r -match '(?im)^\s*Original Name:\s*vwifi\.inf\s*$' -and
-        $r -match '(?im)^\s*Published Name:\s*(oem\d+\.inf)\s*$') {
-        $Matches[1]
-    }
-}
-
-if (-not $old) {
-    Write-Host '  none installed.'
-} else {
-    foreach ($o in $old) {
-        Write-Host "  removing $o"
-        & pnputil /delete-driver $o /uninstall /force | Out-Null
-        if ($LASTEXITCODE -ne 0) {
-            Write-Host "    (pnputil returned $LASTEXITCODE; continuing)"
-        }
-    }
-}
-
-# --- 2. add and install the new package ------------------------------
-Write-Host ''
-Write-Host "[2/4] Installing $inf ..."
+Write-Host "[1/4] Installing $inf ..."
 & pnputil /add-driver $inf /install
 if ($LASTEXITCODE -ne 0) {
     Write-Host ''
@@ -117,10 +118,46 @@ if ($LASTEXITCODE -ne 0) {
     exit 1
 }
 
-# --- 3. make PnP re-evaluate the device ------------------------------
+# --- 2. make PnP re-evaluate the device ------------------------------
 Write-Host ''
-Write-Host '[3/4] Rescanning for devices ...'
+Write-Host '[2/4] Rescanning for devices ...'
 & pnputil /scan-devices | Out-Null
+
+# --- 3. clean up superseded packages, if asked -----------------------
+#
+# Last, and opt-in. By this point the device is bound to the new
+# package, so removing the old ones should not have to stop anything --
+# but "should not" is what the ordering above is defending against, and
+# a stall here costs nothing: the driver is already installed and Ctrl-C
+# is safe.
+Write-Host ''
+if (-not $RemoveOld) {
+    Write-Host '[3/4] Leaving superseded packages in place (-RemoveOld to clean up).'
+} else {
+    Write-Host '[3/4] Removing superseded vwifi packages ...'
+
+    # pnputil /enum-drivers emits blank-line-separated records; find the
+    # published oemNN.inf name of any whose original name is vwifi.inf.
+    $records = ((pnputil /enum-drivers) -join "`n") -split "`r?`n`r?`n"
+    $old = foreach ($r in $records) {
+        if ($r -match '(?im)^\s*Original Name:\s*vwifi\.inf\s*$' -and
+            $r -match '(?im)^\s*Published Name:\s*(oem\d+\.inf)\s*$') {
+            $Matches[1]
+        }
+    }
+
+    if (-not $old) {
+        Write-Host '  none installed.'
+    } else {
+        foreach ($o in $old) {
+            Write-Host "  removing $o (Ctrl-C is safe -- the new driver is in)"
+            & pnputil /delete-driver $o /uninstall | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+                Write-Host "    (pnputil returned $LASTEXITCODE; continuing)"
+            }
+        }
+    }
+}
 
 # --- 4. report where the device ended up -----------------------------
 Write-Host ''
@@ -136,7 +173,8 @@ if (-not $dev) {
 }
 
 Write-Host ''
-Write-Host 'If it did not start, capture the driver''s own account of why:'
-Write-Host '  DebugView as admin, Capture Kernel + Enable Verbose Kernel Output,'
-Write-Host '  then disable and re-enable the device to re-run init with the'
-Write-Host '  capture already attached.'
+Write-Host 'The driver''s own account of what happened is on the HOST, not here:'
+Write-Host '  QEMU -debugcon file:/tmp/vwifi-boot.log'
+Write-Host 'It is written as the guest emits it, so it survives a hang, a'
+Write-Host 'bugcheck and a reset -- and unlike DebugView it captures boot.'
+Write-Host 'If something stalls, read that file while it is still stuck.'
