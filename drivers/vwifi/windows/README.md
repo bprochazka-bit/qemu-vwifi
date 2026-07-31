@@ -209,9 +209,9 @@ Recorded here because each one is a trap the next WDI driver hits too:
 
 ## Test-signing and installation
 
-Copy the signed package (`vwifi.sys`, `vwifi.inf`, `vwifi.cat`,
-`vwifi.pdb`), `install.cmd` and `vwifi-test-cert.cer` into the guest,
-then, in an **elevated PowerShell** there:
+`sign.cmd` leaves everything the guest needs in `x64\Debug\vwifi\` —
+the driver, the install scripts, the setup script and the certificate.
+Copy that one folder across, then, in an **elevated PowerShell** there:
 
 ```powershell
 .\guest-debug-setup.ps1 -CertPath .\vwifi-test-cert.cer -KernelDebug

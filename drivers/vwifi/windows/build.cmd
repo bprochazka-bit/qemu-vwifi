@@ -1,6 +1,6 @@
 @echo off
 rem ---------------------------------------------------------------
-rem  vwifi — debug build of the Windows WDI miniport.
+rem  vwifi -- debug build of the Windows WDI miniport.
 rem
 rem  Run from an EWDK build shell (mount the ISO, run
 rem  LaunchBuildEnv.cmd) or from a "Developer Command Prompt for
@@ -11,12 +11,12 @@ rem      build.cmd              rem Debug|x64, the bring-up default
 rem      build.cmd Release
 rem
 rem  Leaves three logs next to this script. build-<cfg>.err is the one
-rem  to paste when reporting a failure — it is errors only, in order.
+rem  to paste when reporting a failure -- it is errors only, in order.
 rem
 rem  To skip the search and point at the WDI TLV pieces yourself:
 rem      set "WdiTlvIncludeDir=<folder holding TlvGeneratorParser.hpp>"
 rem      set "WdiTlvLib=<full path to TLVGeneratorParser.lib>"
-rem  Either quoting style works — the value has quotes stripped. If what
+rem  Either quoting style works -- the value has quotes stripped. If what
 rem  you set does not exist, the script says so and searches anyway
 rem  rather than failing.
 rem
@@ -192,7 +192,7 @@ set "_cv=!%~1!"
 set "_cv=!_cv:"=!"
 :clean_var_loop
 rem  No `if cond A & B` here: in cmd the `&` separates statements at the
-rem  top level, so B would run whether or not the condition held — the
+rem  top level, so B would run whether or not the condition held -- the
 rem  goto would fire every time and spin forever. Labels instead.
 if "!_cv:~-1!"==" " goto :clean_var_trim
 goto :clean_var_done

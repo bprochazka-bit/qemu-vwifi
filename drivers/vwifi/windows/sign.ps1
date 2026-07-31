@@ -146,8 +146,26 @@ foreach ($f in @('vwifi.sys', 'vwifi.inf', 'vwifi.cat')) {
     }
 }
 
+# --- 6. make the package self-sufficient ------------------------------
+# The guest needs the install scripts, the one-time setup script and the
+# certificate as well as the driver. Putting them in the package folder
+# means one folder gets copied across and nothing is assembled by hand
+# -- and it stops install.cmd being run from the source tree, where
+# there is no driver to install.
+foreach ($f in @('install.cmd', 'install.ps1', 'guest-debug-setup.ps1')) {
+    $src = Join-Path $PSScriptRoot $f
+    if (Test-Path $src) { Copy-Item -LiteralPath $src -Destination $pkg -Force }
+}
+if (Test-Path $certFile) {
+    Copy-Item -LiteralPath $certFile -Destination $pkg -Force
+}
+
 Write-Host ''
-Write-Host 'Signed. Copy this folder to the guest:'
+Write-Host 'Signed. Copy this one folder to the guest -- it now holds the'
+Write-Host 'driver, the install scripts, the guest setup script and the'
+Write-Host 'certificate:'
 Write-Host "  $pkg"
-Write-Host 'plus the certificate, for the one-time guest setup:'
-Write-Host "  $certFile"
+Write-Host ''
+Write-Host 'In the guest, from that folder, elevated:'
+Write-Host '  .\guest-debug-setup.ps1 -CertPath .\vwifi-test-cert.cer   (once, then reboot)'
+Write-Host '  install.cmd                                               (after every build)'

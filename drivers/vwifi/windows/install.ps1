@@ -16,14 +16,39 @@
     outright rather than relying on ranking.
 
 .PARAMETER Path
-    Folder holding the driver package. Defaults to the script's folder.
+    Folder holding the driver package. Defaults to the script's own
+    folder, then to the build output under it.
 #>
 [CmdletBinding()]
 param(
-    [string] $Path = $PSScriptRoot
+    [string] $Path
 )
 
 $ErrorActionPreference = 'Stop'
+
+# Resolve the package folder.
+#
+# Not `param([string] $Path = $PSScriptRoot)`: that default came back
+# empty under `powershell -File`, and the first thing to touch it was a
+# Join-Path, which reports it as its own parameter binding error and
+# names no useful cause.
+if (-not $Path) { $Path = $PSScriptRoot }
+if (-not $Path) { $Path = Split-Path -Parent $MyInvocation.MyCommand.Path }
+if (-not $Path) { $Path = (Get-Location).Path }
+
+# This script lives beside the sources as well as inside the package
+# sign.cmd assembles, so running it from the repo folder on the build
+# machine is an easy mistake. Look in the build output before giving up.
+if (-not (Test-Path (Join-Path $Path 'vwifi.inf'))) {
+    foreach ($sub in @('x64\Debug\vwifi', 'x64\Release\vwifi')) {
+        $alt = Join-Path $Path $sub
+        if (Test-Path (Join-Path $alt 'vwifi.inf')) {
+            Write-Host "No driver package in $Path; using $alt"
+            $Path = $alt
+            break
+        }
+    }
+}
 
 $isAdmin = ([Security.Principal.WindowsPrincipal] `
     [Security.Principal.WindowsIdentity]::GetCurrent()
