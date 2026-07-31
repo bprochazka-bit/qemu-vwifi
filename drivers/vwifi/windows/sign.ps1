@@ -91,34 +91,59 @@ if (-not $cert) {
 }
 Export-Certificate -Cert $cert -FilePath $certFile -Force | Out-Null
 
-# --- 3. catalog ------------------------------------------------------
-Write-Host "Cataloging $pkg ..."
-$cat = Join-Path $pkg 'vwifi.cat'
-Remove-Item -LiteralPath $cat -Force -ErrorAction SilentlyContinue
+# --- 3. catalog, on a local drive -------------------------------------
+# Inf2Cat cannot read a driver directory on a mapped network drive: it
+# reports "Could not find file <path>" for a file that is demonstrably
+# there, then "Signability test failed.", then exits 0. Working from a
+# UNC path fails the same way. So catalog and sign in a local staging
+# folder and copy the results back, which costs three file copies and
+# removes the question entirely.
+$stage = Join-Path $env:TEMP 'vwifi-sign-stage'
+Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Path $stage -Force | Out-Null
 
-$inf2catOutput = & Inf2Cat /driver:"$pkg" /os:10_x64,Server10_x64 /uselocaltime 2>&1
+foreach ($f in @('vwifi.sys', 'vwifi.inf')) {
+    Copy-Item -LiteralPath (Join-Path $pkg $f) -Destination $stage -Force
+}
+
+Write-Host "Cataloging (staged in $stage) ..."
+$stagedCat = Join-Path $stage 'vwifi.cat'
+
+$inf2catOutput = & Inf2Cat /driver:"$stage" /os:10_x64,Server10_x64 /uselocaltime 2>&1
 $inf2catOutput | ForEach-Object { Write-Host "  $_" }
 
-# Inf2Cat reports "Signability test failed." and still exits 0. The
-# only reliable signal is whether the catalog exists.
-if (-not (Test-Path $cat)) {
+# Inf2Cat reports "Signability test failed." and still exits 0. The only
+# reliable signal is whether the catalog exists.
+if (-not (Test-Path $stagedCat)) {
     Fail @"
 Inf2Cat produced no catalog. Its own output is above; the usual causes:
   * a directive in the INF that is not signable for the target OS
-  * the INF referencing a file that is not in the package folder
-%windir%\inf\setupapi.dev.log is not involved yet -- this is purely the
-INF's own contents.
+  * the INF referencing a file that is not in the staging folder
+The staging folder is on a local drive, so this is no longer the
+mapped-drive problem -- it is the INF's own contents.
 "@
 }
 
-# --- 4. sign ---------------------------------------------------------
+# --- 4. sign ----------------------------------------------------------
 # No /t timestamp URL: test certificates expire on their own schedule
 # and the build machine may have no outbound network.
 Write-Host 'Signing ...'
 foreach ($f in @('vwifi.cat', 'vwifi.sys')) {
-    $target = Join-Path $pkg $f
+    $target = Join-Path $stage $f
     & signtool sign /v /fd sha256 /s My /n $certName $target
     if ($LASTEXITCODE -ne 0) { Fail "signtool failed on $f" }
+}
+
+# --- 5. bring the signed package back ---------------------------------
+foreach ($f in @('vwifi.sys', 'vwifi.inf', 'vwifi.cat')) {
+    Copy-Item -LiteralPath (Join-Path $stage $f) -Destination $pkg -Force
+}
+Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+
+foreach ($f in @('vwifi.sys', 'vwifi.inf', 'vwifi.cat')) {
+    if (-not (Test-Path (Join-Path $pkg $f))) {
+        Fail "signed $f did not make it back into $pkg"
+    }
 }
 
 Write-Host ''
