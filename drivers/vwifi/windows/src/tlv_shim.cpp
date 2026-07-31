@@ -716,6 +716,38 @@ VwifiTlvGenerateAdapterCapabilities(
         ic->ActionFramesSupported = FALSE;
     }
 
+    /* FirmwareVersion is NOT optional.
+     *
+     * WABIModel.xml, InterfaceAttributesContainer:
+     *   <containerRef id="WDI_TLV_FIRMWARE_VERSION" name="FirmwareVersion"
+     *                 type="ASCIIString"/>
+     * with no optional="true", unlike the NonWdiOidsList beside it. Left
+     * as the zeroed ArrayOfElements it starts out as -- count 0, null
+     * pointer -- the generator rejects the whole message with
+     * NDIS_STATUS_INVALID_DATA (0xc0010015) and the WLAN component
+     * closes the adapter a moment later, having learned nothing about
+     * it. There is no indication of which field was at fault; this one
+     * was found by reading the model.
+     *
+     * The count includes the terminator: the container is described as
+     * "Generic container for null-terminated ASCII strings", so the
+     * consumer is entitled to expect one in the bytes it receives.
+     *
+     * Static storage, so it outlives the Generate call without an
+     * allocation to free. Driver .rdata is non-paged -- only sections
+     * explicitly named PAGE* are pageable -- so this is safe to hand to
+     * a library that may touch it at raised IRQL. */
+    {
+        static const CHAR kFirmwareVersion[] = "vwifi-virt 1.0";
+
+        params.InterfaceAttributes.FirmwareVersion.ElementCount =
+            (UINT32)sizeof(kFirmwareVersion);
+        params.InterfaceAttributes.FirmwareVersion.pElements =
+            const_cast<CHAR *>(kFirmwareVersion);
+        /* MemoryInternallyAllocated stays FALSE: the buffer is ours and
+         * the library must not try to free it. */
+    }
+
     {
         WDI_STATION_CAPABILITIES *sc =
             &params.StationAttributes.StationCapabilities;
@@ -735,13 +767,22 @@ VwifiTlvGenerateAdapterCapabilities(
     }
 
     /* Not filled: BandInfo, PhyInfo, the cipher/auth algorithm pair
-     * lists, and the country-region list. All are optional TLVs whose
-     * presence bits stay clear, so the message is well-formed without
+     * lists, and the country-region list. All are optional at this
+     * level in WABIModel.xml, so the message is well-formed without
      * them — but the OS uses BandInfo to learn which channels exist, so
-     * a scan may be limited until they are supplied. That is the next
-     * piece of work on this function, and it needs the device's
+     * a scan may well find nothing until they are supplied. That is the
+     * next piece of work on this function, and it needs the device's
      * supported_channels_24 / _5 masks translated into
-     * WDI_BAND_INFO_CONTAINER entries. */
+     * WDI_BAND_INFO_CONTAINER entries.
+     *
+     * Deliberately not bundled with the FirmwareVersion fix above.
+     * Every sub-container of BandInfoContainer and PhyInfoContainer is
+     * itself mandatory — BandCapabilities, ValidPhyTypes,
+     * ValidChannelTypes, ChannelWidthList; PhyCapabilities,
+     * TxPowerLevelList, DataRateList — so filling them is a large
+     * unverified change whose failure mode is the same opaque
+     * NDIS_STATUS_INVALID_DATA. Shipping it alongside a known-correct
+     * fix would make the next failure ambiguous again. */
 
     NDIS_STATUS st = GenerateWdiGetAdapterCapabilities(
         &params, kHeaderReserve, &ctx, &outLen, &pOut);

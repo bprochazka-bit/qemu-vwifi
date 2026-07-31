@@ -65,6 +65,28 @@ VwifiOidSetNeeded(_Inout_ PNDIS_OID_REQUEST Req, _In_ ULONG Needed)
     }
 }
 
+/* The statuses the TLV generator and parser actually return. A bare
+ * 0xc0010015 costs a trip to the headers at exactly the moment the log
+ * is meant to be answering a question. */
+static PCSTR
+VwifiNdisStatusName(_In_ NDIS_STATUS Status)
+{
+    switch (Status) {
+    case NDIS_STATUS_SUCCESS:           return "SUCCESS";
+    case NDIS_STATUS_PENDING:           return "PENDING";
+    case NDIS_STATUS_FAILURE:           return "FAILURE";
+    case NDIS_STATUS_RESOURCES:         return "RESOURCES";
+    case NDIS_STATUS_NOT_SUPPORTED:     return "NOT_SUPPORTED";
+    case NDIS_STATUS_BUFFER_TOO_SHORT:  return "BUFFER_TOO_SHORT";
+    case NDIS_STATUS_INVALID_LENGTH:    return "INVALID_LENGTH";
+    case NDIS_STATUS_INVALID_DATA:      return "INVALID_DATA";
+    case NDIS_STATUS_INVALID_OID:       return "INVALID_OID";
+    case NDIS_STATUS_INVALID_PARAMETER: return "INVALID_PARAMETER";
+    case NDIS_STATUS_BAD_VERSION:       return "BAD_VERSION";
+    default:                            return "?";
+    }
+}
+
 static PCSTR
 VwifiOidRequestTypeName(_In_ NDIS_REQUEST_TYPE Type)
 {
@@ -282,7 +304,18 @@ VwifiHandleGetAdapterCapabilities(_Inout_ PVWIFI_ADAPTER Adapter,
                  Adapter->WdiPeerVersion, &Adapter->Caps,
                  Adapter->CurrentMac, &blob, &blobLen);
     if (status != NDIS_STATUS_SUCCESS) {
-        VWIFI_ERR("capabilities generate failed 0x%08x", status);
+        VWIFI_ERR("capabilities generate failed 0x%08x %s", status,
+                  VwifiNdisStatusName(status));
+        if (status == NDIS_STATUS_INVALID_DATA) {
+            /* The generator says only that the message is bad, never
+             * which field. Every previous instance has been a mandatory
+             * container left as its zeroed self, so that is where to
+             * look: WABIModel.xml, any containerRef without
+             * optional="true". */
+            VWIFI_ERR("  a mandatory container is empty -- check the "
+                      "containerRefs without optional=\"true\" under "
+                      "WDI_GET_ADAPTER_CAPABILITIES in WABIModel.xml");
+        }
         return status;
     }
 
