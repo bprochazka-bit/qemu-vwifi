@@ -133,24 +133,34 @@ if ($LASTEXITCODE -ne 0) {
     exit 1
 }
 
-# --- 2. optionally try to make it take effect now --------------------
+# --- 2. bind it, if the device has nothing bound ----------------------
+#
+# Staging alone does NOT load a driver. `pnputil /add-driver` without
+# /install writes the package to the driver store and stops there; the
+# device keeps whatever it already had, which for a device with nothing
+# bound means it stays in an error state and no driver output ever
+# appears. An earlier version of this script dropped the rescan at the
+# same time it dropped /install, so it staged packages that were never
+# used and reported success for doing it.
+#
+# pnputil /scan-devices re-enumerates. For a device with no driver that
+# binds the newly staged package immediately -- nothing has to be
+# stopped, so there is nothing to hang on. For a device that already has
+# a working driver, it does nothing, because replacing a bound driver
+# means restarting the device and that is the operation that wedges.
 Write-Host ''
-if (-not $Restart) {
-    Write-Host '[2/3] Staged. REBOOT to load it -- the new package outranks the'
-    Write-Host '      old one, so PnP picks it up when the device next starts.'
-    Write-Host '      (-Restart tries to do it now, and is the part that hangs.)'
+$dev = Get-PnpDevice -InstanceId 'PCI\VEN_1AF4&DEV_0E00*' -ErrorAction SilentlyContinue
+$bound = $dev | Where-Object { $_.Status -eq 'OK' }
+
+if ($bound) {
+    Write-Host '[2/3] A driver is already loaded on this device.'
+    Write-Host '      The new package is staged and outranks it, but swapping'
+    Write-Host '      a bound driver means restarting the device, which is the'
+    Write-Host '      step that hangs. REBOOT to load it.'
 } else {
-    Write-Host '[2/3] -Restart given: restarting the device ...'
-    Write-Host '      If this does not return, the disable is wedged. Capture'
-    Write-Host '      the -debugcon log on the host while it is stuck -- that'
-    Write-Host '      is the trace nobody has yet.'
-    try {
-        Get-PnpDevice -InstanceId 'PCI\VEN_1AF4&DEV_0E00*' -ErrorAction Stop |
-            Restart-PnpDevice -Confirm:$false -ErrorAction Stop
-    } catch {
-        Write-Host "      (restart failed: $($_.Exception.Message))"
-        Write-Host '      Reboot instead; the package is staged either way.'
-    }
+    Write-Host '[2/3] No driver bound; rescanning so PnP picks up the staged package ...'
+    & pnputil /scan-devices | Out-Null
+    Start-Sleep -Seconds 2
 }
 
 # --- 3. report where the device ended up -----------------------------

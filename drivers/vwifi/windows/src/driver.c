@@ -450,7 +450,19 @@ DriverEntry(
     NDIS_MINIPORT_DRIVER_WDI_CHARACTERISTICS      w = { 0 };
     NDIS_STATUS status;
 
-    VWIFI_INFO("DriverEntry");
+    /* Which build this is.
+     *
+     * Not decoration. The install script spent several rounds staging
+     * packages that were never bound, so every trace collected in that
+     * time came from whatever .sys happened to be loaded already --
+     * indistinguishable, from the log, from one where the change under
+     * test was present and did nothing. A version in the first line
+     * settles that in one glance.
+     *
+     * VWIFI_BUILD_VERSION arrives from the build as bare tokens
+     * (1.0.MMdd.HHmm), which lex as a single preprocessing number, so
+     * stringizing it gives the text back intact. */
+    VWIFI_INFO("DriverEntry  build " VWIFI_STR(VWIFI_BUILD_VERSION));
 
     /* Where we are loaded, so an instruction pointer can be turned back
      * into a source line without a Windows debugger.

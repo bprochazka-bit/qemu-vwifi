@@ -61,6 +61,10 @@
          not on every incremental bring-up build. Run them explicitly:
            msbuild /p:RunCodeAnalysis=true ... -->
     <RunCodeAnalysis>false</RunCodeAnalysis>
+    <!-- build.cmd passes this; the default keeps a hand-run msbuild
+         compiling. It is stamped into the binary and logged at
+         DriverEntry so a trace says which build produced it. -->
+    <VwifiInfVersion Condition="'$(VwifiInfVersion)'==''">0.0.0.0</VwifiInfVersion>
     <EnablePREfast>false</EnablePREfast>
   </PropertyGroup>
 
@@ -123,7 +127,7 @@
            network drive is enough to lose it, and the loss shows up as
            LNK4099 at link, long after the compile "succeeded". -->
       <DebugInformationFormat>OldStyle</DebugInformationFormat>
-      <PreprocessorDefinitions>DBG=1;DEPRECATE_DDK_FUNCTIONS=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>DBG=1;DEPRECATE_DDK_FUNCTIONS=1;VWIFI_BUILD_VERSION=$(VwifiInfVersion);%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <Link>
       <GenerateDebugInformation>true</GenerateDebugInformation>

@@ -57,6 +57,15 @@
  * OID_WDI_GET_BSS_ENTRY_LIST. */
 #define VWIFI_SCAN_CACHE_MAX      32
 
+/* Stamped in by the build; see the PreprocessorDefinitions in
+ * vwifi.vcxproj. Two levels of macro so the argument is expanded before
+ * it is stringized. */
+#ifndef VWIFI_BUILD_VERSION
+#define VWIFI_BUILD_VERSION 0.0.0.0
+#endif
+#define VWIFI_STR2(x) #x
+#define VWIFI_STR(x)  VWIFI_STR2(x)
+
 /* ============================================================
  * Logging
  *
