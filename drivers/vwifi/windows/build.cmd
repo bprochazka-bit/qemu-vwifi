@@ -111,7 +111,20 @@ for /f "usebackq delims=" %%D in (`powershell -NoProfile -ExecutionPolicy Bypass
 if not defined WdiTlvIncludeDir goto :no_include
 :show_include
 echo   TlvGeneratorParser.hpp: %WdiTlvIncludeDir%
+rem  Verify rather than trust. This also catches a WdiTlvIncludeDir left
+rem  over in the environment from an earlier attempt, which otherwise
+rem  silently produces a /I that resolves to nothing.
+if not exist "%WdiTlvIncludeDir%\TlvGeneratorParser.hpp" goto :bad_include
 exit /b 0
+
+:bad_include
+echo.
+echo ERROR: that folder does not contain TlvGeneratorParser.hpp.
+echo   If WdiTlvIncludeDir is set in your environment, clear it and let
+echo   the search run:
+echo     set "WdiTlvIncludeDir="
+echo.
+exit /b 1
 
 :no_include
 echo.
@@ -138,7 +151,16 @@ for /f "usebackq delims=" %%L in (`powershell -NoProfile -ExecutionPolicy Bypass
 if not defined WdiTlvLib goto :no_lib
 :show_lib
 echo   WDI TLV library:        %WdiTlvLib%
+if not exist "%WdiTlvLib%" goto :bad_lib
 exit /b 0
+
+:bad_lib
+echo.
+echo ERROR: that library file does not exist. If WdiTlvLib is set in
+echo   your environment, clear it and let the search run:
+echo     set "WdiTlvLib="
+echo.
+exit /b 1
 
 :no_lib
 echo.
