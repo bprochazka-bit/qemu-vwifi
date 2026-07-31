@@ -13,14 +13,19 @@ rem
 rem  Leaves three logs next to this script. build-<cfg>.err is the one
 rem  to paste when reporting a failure — it is errors only, in order.
 rem
-rem  NOTE ON STYLE: the discovery steps are subroutines, not inline
-rem  `if not defined X ( for /f ... )` blocks. cmd parses a
-rem  parenthesised block in one pass, and a `for /f` with a caret
-rem  continuation inside one breaks with "was unexpected at this time".
-rem  Subroutines are parsed a line at a time and do not have the
-rem  problem. Keep it that way.
+rem  To skip the search and point at the WDI TLV pieces yourself:
+rem      set "WdiTlvIncludeDir=<folder holding TlvGeneratorParser.hpp>"
+rem      set "WdiTlvLib=<full path to TLVGeneratorParser.lib>"
+rem  Either quoting style works — the value has quotes stripped. If what
+rem  you set does not exist, the script says so and searches anyway
+rem  rather than failing.
+rem
+rem  STYLE, learned the hard way in this file: no parenthesised blocks
+rem  around `for /f`, no caret continuations inside blocks, and no
+rem  argument ending in a backslash right before a closing quote. Each
+rem  of those has broken this script at least once.
 rem ---------------------------------------------------------------
-setlocal
+setlocal enabledelayedexpansion
 
 set CFG=%~1
 if "%CFG%"=="" set CFG=Debug
@@ -98,44 +103,39 @@ exit /b 1
 
 rem --- TlvGeneratorParser.hpp ------------------------------------
 rem  Not on the kit's default include path, unlike dot11wdi.h and
-rem  wditypes.hpp. A kit carries several parallel copies; this driver
-rem  needs km\wlan\1.0, the kernel-mode WDI 1.x set that matches the
-rem  dot11wdi.h it is written against. The um\wlan\2.0 copy compiles
-rem  only in user mode. Set WdiTlvIncludeDir yourself to skip the
-rem  search.
+rem  wditypes.hpp. A kit carries parallel copies; this driver needs the
+rem  kernel-mode one (under \km\), matching the dot11wdi.h it is written
+rem  against. The \um\ copy is user-mode WDI 2.0 and references types
+rem  that do not exist in a kernel translation unit.
 :find_tlv_include
-if defined WdiTlvIncludeDir goto :show_include
-echo Locating TlvGeneratorParser.hpp ...
-set "PF86=%ProgramFiles(x86)%"
-for /f "usebackq delims=" %%D in (`powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0find-wdk-file.ps1" -Name TlvGeneratorParser.hpp -Subtree Include -WantDirectory -RequirePathMatch km,wlan\1.0`) do set "WdiTlvIncludeDir=%%D"
-if not defined WdiTlvIncludeDir goto :no_include
-:show_include
-echo   TlvGeneratorParser.hpp: %WdiTlvIncludeDir%
-rem  Verify rather than trust. This also catches a WdiTlvIncludeDir left
-rem  over in the environment from an earlier attempt, which otherwise
-rem  silently produces a /I that resolves to nothing.
-if not exist "%WdiTlvIncludeDir%\TlvGeneratorParser.hpp" goto :bad_include
-exit /b 0
+if not defined WdiTlvIncludeDir goto :search_include
+call :clean_var WdiTlvIncludeDir
+if exist "!WdiTlvIncludeDir!\TlvGeneratorParser.hpp" goto :show_include
+echo   WdiTlvIncludeDir is set but holds no TlvGeneratorParser.hpp:
+echo     !WdiTlvIncludeDir!
+echo   Ignoring it and searching instead.
+set "WdiTlvIncludeDir="
 
-:bad_include
-echo.
-echo ERROR: that folder does not contain TlvGeneratorParser.hpp.
-echo   If WdiTlvIncludeDir is set in your environment, clear it and let
-echo   the search run:
-echo     set "WdiTlvIncludeDir="
-echo.
-exit /b 1
+:search_include
+echo Locating TlvGeneratorParser.hpp ...
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0find-wdk-file.ps1" -Name TlvGeneratorParser.hpp -Subtree Include -WantDirectory -MustContain "\km" -MustNotContain "\um" -Prefer "\wlan\1.0" >"%TEMP%\vwifi_inc.txt"
+set "WdiTlvIncludeDir="
+set /p WdiTlvIncludeDir=<"%TEMP%\vwifi_inc.txt"
+del "%TEMP%\vwifi_inc.txt" >nul 2>&1
+if not defined WdiTlvIncludeDir goto :no_include
+call :clean_var WdiTlvIncludeDir
+if not exist "!WdiTlvIncludeDir!\TlvGeneratorParser.hpp" goto :no_include
+
+:show_include
+echo   TlvGeneratorParser.hpp: !WdiTlvIncludeDir!
+exit /b 0
 
 :no_include
 echo.
-echo ERROR: TlvGeneratorParser.hpp not found in the mounted kit.
-echo   Any candidates that were found but rejected are listed above.
-echo   The build cannot succeed without it, so stopping here rather
-echo   than letting it fail later with a bare C1083.
-echo.
-echo   Find it with:
-echo     dir /s /b "%%ProgramFiles(x86)%%\Windows Kits\10\TlvGeneratorParser.hpp"
-echo   then re-run as:  set WdiTlvIncludeDir=^<its folder^> ^&^& build.cmd
+echo ERROR: could not locate TlvGeneratorParser.hpp. Every copy the
+echo   search looked at is listed above, with why it was rejected.
+echo   Point at it directly with:
+echo     set "WdiTlvIncludeDir=the folder holding it"
 echo.
 exit /b 1
 
@@ -144,35 +144,65 @@ rem --- the WDI TLV static library --------------------------------
 rem  TlvGenerated_.hpp only declares ParseWdi*/GenerateWdi*; the code
 rem  is in a .lib in the kit's Lib tree.
 :find_tlv_lib
-if defined WdiTlvLib goto :show_lib
-echo Locating the WDI TLV library ...
-set "PF86=%ProgramFiles(x86)%"
-for /f "usebackq delims=" %%L in (`powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0find-wdk-file.ps1" -Name TLVGeneratorParser.lib -Subtree Lib -RequirePathMatch km,x64,wlan\1.0`) do set "WdiTlvLib=%%L"
-if not defined WdiTlvLib goto :no_lib
-:show_lib
-echo   WDI TLV library:        %WdiTlvLib%
-if not exist "%WdiTlvLib%" goto :bad_lib
-exit /b 0
+if not defined WdiTlvLib goto :search_lib
+call :clean_var WdiTlvLib
+if exist "!WdiTlvLib!" goto :show_lib
+echo   WdiTlvLib is set but that file does not exist:
+echo     !WdiTlvLib!
+echo   Ignoring it and searching instead.
+set "WdiTlvLib="
 
-:bad_lib
-echo.
-echo ERROR: that library file does not exist. If WdiTlvLib is set in
-echo   your environment, clear it and let the search run:
-echo     set "WdiTlvLib="
-echo.
-exit /b 1
+:search_lib
+echo Locating the WDI TLV library ...
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0find-wdk-file.ps1" -Name TLVGeneratorParser.lib -Subtree Lib -MustContain "\km;\x64" -MustNotContain "\um" -Prefer "\wlan\1.0" >"%TEMP%\vwifi_lib.txt"
+set "WdiTlvLib="
+set /p WdiTlvLib=<"%TEMP%\vwifi_lib.txt"
+del "%TEMP%\vwifi_lib.txt" >nul 2>&1
+if not defined WdiTlvLib goto :no_lib
+call :clean_var WdiTlvLib
+if not exist "!WdiTlvLib!" goto :no_lib
+
+:show_lib
+echo   WDI TLV library:        !WdiTlvLib!
+exit /b 0
 
 :no_lib
 echo.
-echo ERROR: no WDI TLV library found. Any candidates that were found
-echo   but rejected are listed above. The link would fail with LNK2019
-echo   on ParseWdiTaskScanToIhv and friends, so stopping here.
-echo.
-echo   Find it with:
-echo     dir /s /b "%%ProgramFiles(x86)%%\Windows Kits\10\Lib\*.lib" ^| findstr /i tlv
-echo   then re-run as:  set WdiTlvLib=^<full path to the .lib^> ^&^& build.cmd
+echo ERROR: could not locate the WDI TLV library. Every copy the search
+echo   looked at is listed above, with why it was rejected. Point at it
+echo   directly with:
+echo     set "WdiTlvLib=full path to TLVGeneratorParser.lib"
 echo.
 exit /b 1
+
+
+rem --- normalise a path variable ---------------------------------
+rem  Strips surrounding quotes and any trailing spaces.
+rem
+rem  Quotes: `set VAR="C:\path with spaces"` puts them INSIDE the value,
+rem  which makes every "%VAR%\file" test malformed. That is the natural
+rem  way to type a path with spaces, not a user error.
+rem
+rem  Trailing spaces: they arrive from anything that formats output for
+rem  a console. MSBuild trims property values, so a padded path still
+rem  produced a correct /I and went unnoticed; `if exist` does not trim
+rem  and fails on a path that looks perfect when echoed.
+:clean_var
+set "_cv=!%~1!"
+set "_cv=!_cv:"=!"
+:clean_var_loop
+rem  No `if cond A & B` here: in cmd the `&` separates statements at the
+rem  top level, so B would run whether or not the condition held — the
+rem  goto would fire every time and spin forever. Labels instead.
+if "!_cv:~-1!"==" " goto :clean_var_trim
+goto :clean_var_done
+:clean_var_trim
+set "_cv=!_cv:~0,-1!"
+goto :clean_var_loop
+:clean_var_done
+set "%~1=!_cv!"
+set "_cv="
+exit /b 0
 
 
 rem --- a strictly increasing INF version -------------------------
