@@ -53,6 +53,10 @@ extern "C" {
  * PeerVersion is the whole point — see WDI TLV versioning.
  * ============================================================ */
 
+/* Distinct from tlv_mem.cpp's tag: allocations made here are ours, not
+ * the library's, and !poolused should say which is which. */
+#define VWIFI_TLV_PARAMS_TAG  (ULONG)'pTvw'   /* "vTp" in WinDbg */
+
 static inline TLV_CONTEXT MakeCtx(ULONG PeerVersion)
 {
     TLV_CONTEXT ctx;
@@ -651,12 +655,29 @@ VwifiTlvGenerateAdapterCapabilities(
      *
      * This is insurance, not a diagnosis -- the struct has not been
      * measured on the target kit. It costs one pool allocation on a
-     * path that runs once per adapter open. */
-    /* (ULONG_PTR)0, not a bare 0: a bare 0 is an int and can convert to
-     * either ULONG_PTR or void*, which makes the call ambiguous against
-     * the standard placement form if <new> is in scope. */
-    auto *pParams =
-        new ((ULONG_PTR)0) WDI_GET_ADAPTER_CAPABILITIES_PARAMETERS();
+     * path that runs once per adapter open.
+     *
+     * A raw zeroed allocation rather than `new`, and the constructors
+     * are deliberately not run. Two reasons:
+     *
+     *   Zeroes are what the constructors produce. ArrayOfElements<T> is
+     *   layout-identical to { UINT32 ElementCount; T* pElements;
+     *   BOOLEAN MemoryInternallyAllocated; } -- the generated header
+     *   asserts exactly that -- so all-bits-zero is a well-formed empty
+     *   array. The Optional bitfields are all IsPresent flags, and zero
+     *   is FALSE.
+     *
+     *   And `new` cannot be spelled here anyway. The library's operator
+     *   new takes (size_t, ULONG_PTR AllocationContext), so a placement
+     *   form needs a matching operator delete(void*, ULONG_PTR) -- but
+     *   ULONG_PTR *is* size_t on x64, which makes that the usual sized
+     *   deallocation function. The compiler then rejects the placement
+     *   new outright (C2956) and rejects the definition as a duplicate
+     *   of the sized delete (C2084). */
+    auto *pParams = static_cast<WDI_GET_ADAPTER_CAPABILITIES_PARAMETERS *>(
+        ExAllocatePool2(POOL_FLAG_NON_PAGED,
+                        sizeof(WDI_GET_ADAPTER_CAPABILITIES_PARAMETERS),
+                        VWIFI_TLV_PARAMS_TAG));
     if (pParams == nullptr) {
         return NDIS_STATUS_RESOURCES;
     }
@@ -725,9 +746,11 @@ VwifiTlvGenerateAdapterCapabilities(
     NDIS_STATUS st = GenerateWdiGetAdapterCapabilities(
         &params, kHeaderReserve, &ctx, &outLen, &pOut);
 
-    /* Delete on both paths: params owns the ArrayOfElements members,
-     * whose destructors run here. */
-    delete pParams;
+    /* Freed on both paths. No destructors to run: nothing was
+     * constructed, and nothing here ever took ownership of a pointer --
+     * every ArrayOfElements member stayed the empty one it started as,
+     * since none of the optional lists are filled in. */
+    ExFreePoolWithTag(pParams, VWIFI_TLV_PARAMS_TAG);
 
     if (st != NDIS_STATUS_SUCCESS) return st;
 
