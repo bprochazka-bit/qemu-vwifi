@@ -28,15 +28,25 @@
     Print the containing directory instead of the full file path.
 
 .PARAMETER RequirePathMatch
-    Only accept matches whose full path contains this substring — used
-    to pick the x64 library out of the per-architecture copies.
+    Only accept matches whose full path contains ALL of these
+    substrings. This is load-bearing, not a convenience: a kit carries
+    several parallel copies of the WDI TLV files and picking the wrong
+    one produces a wall of errors inside the Microsoft header rather
+    than anything pointing back here.
+
+    The pair this driver needs is km\wlan\1.0 — kernel-mode, WDI 1.x —
+    matching the dot11wdi.h it is written against (WDI_VERSION_LATEST
+    there is 1.1.13). The um\wlan\2.0 copy is user-mode WDI 2.0: it
+    references types like MLO_LINK_INFO that do not exist in a
+    kernel-mode translation unit, and its C_ASSERTs collide with
+    wdm.h's.
 #>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)] [string] $Name,
     [string] $Subtree,
     [switch] $WantDirectory,
-    [string] $RequirePathMatch
+    [string[]] $RequirePathMatch
 )
 
 $ErrorActionPreference = 'SilentlyContinue'
@@ -66,11 +76,16 @@ foreach ($root in ($roots | Select-Object -Unique)) {
     if (-not (Test-Path $scope)) { continue }
 
     $hits = Get-ChildItem -Path $scope -Filter $Name -Recurse -File
-    if ($RequirePathMatch) {
-        $hits = $hits | Where-Object { $_.FullName -like "*$RequirePathMatch*" }
+    foreach ($m in $RequirePathMatch) {
+        $hits = $hits | Where-Object { $_.FullName -like "*$m*" }
     }
-    # Highest kit version wins when several are installed side by side.
-    $hit = $hits | Sort-Object FullName -Descending | Select-Object -First 1
+    # Deterministic pick among what survives. Sorting descending on the
+    # whole path was a mistake: it sorts 'um' above 'km' and '2.0' above
+    # '1.0', so it chose exactly the copy that cannot be compiled in
+    # kernel mode. With the km\wlan\1.0 requirement above there is
+    # normally one candidate; sort only to stay deterministic if a
+    # machine has several kit versions installed.
+    $hit = $hits | Sort-Object FullName | Select-Object -First 1
     if ($hit) {
         if ($WantDirectory) { Write-Output $hit.DirectoryName }
         else                { Write-Output $hit.FullName }

@@ -92,12 +92,16 @@ exit /b 1
 
 rem --- TlvGeneratorParser.hpp ------------------------------------
 rem  Not on the kit's default include path, unlike dot11wdi.h and
-rem  wditypes.hpp. Set WdiTlvIncludeDir yourself to skip the search.
+rem  wditypes.hpp. A kit carries several parallel copies; this driver
+rem  needs km\wlan\1.0, the kernel-mode WDI 1.x set that matches the
+rem  dot11wdi.h it is written against. The um\wlan\2.0 copy compiles
+rem  only in user mode. Set WdiTlvIncludeDir yourself to skip the
+rem  search.
 :find_tlv_include
 if defined WdiTlvIncludeDir goto :show_include
 echo Locating TlvGeneratorParser.hpp ...
 set "PF86=%ProgramFiles(x86)%"
-for /f "usebackq delims=" %%D in (`powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0find-wdk-file.ps1" -Name TlvGeneratorParser.hpp -Subtree Include -WantDirectory`) do set "WdiTlvIncludeDir=%%D"
+for /f "usebackq delims=" %%D in (`powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0find-wdk-file.ps1" -Name TlvGeneratorParser.hpp -Subtree Include -WantDirectory -RequirePathMatch km,wlan\1.0`) do set "WdiTlvIncludeDir=%%D"
 if not defined WdiTlvIncludeDir goto :no_include
 :show_include
 echo   TlvGeneratorParser.hpp: %WdiTlvIncludeDir%
@@ -120,7 +124,7 @@ rem  is in a .lib in the kit's Lib tree.
 if defined WdiTlvLib goto :show_lib
 echo Locating the WDI TLV library ...
 set "PF86=%ProgramFiles(x86)%"
-for /f "usebackq delims=" %%L in (`powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0find-wdk-file.ps1" -Name TLVGeneratorParser.lib -Subtree Lib -RequirePathMatch x64`) do set "WdiTlvLib=%%L"
+for /f "usebackq delims=" %%L in (`powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0find-wdk-file.ps1" -Name TLVGeneratorParser.lib -Subtree Lib -RequirePathMatch km,x64,wlan\1.0`) do set "WdiTlvLib=%%L"
 if not defined WdiTlvLib goto :no_lib
 :show_lib
 echo   WDI TLV library:        %WdiTlvLib%
