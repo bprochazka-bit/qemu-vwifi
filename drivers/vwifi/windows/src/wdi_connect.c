@@ -45,9 +45,39 @@
 #include "tlv_shim.h"
 #include <dot11wdi.h>
 
+/* ============================================================
+ * THE COMPLETION RULE — the other thing to read before touching
+ * this file
+ * ============================================================
+ * Every task in here is completed by an indication that arrives
+ * later, driven by a device event. Two consequences, and both were
+ * learned the hard way:
+ *
+ *   A task that is never completed does not fail. It hangs, and it
+ *   hangs the whole WLAN service with it: NDIS serialises OID
+ *   requests per adapter and wlansvc serialises its own calls per
+ *   interface, so one outstanding task stops every query behind it.
+ *   The visible symptom is not "couldn't connect" -- it is `netsh
+ *   wlan show drivers` stopping mid-output, the flyout sitting on
+ *   "Checking network requirements" forever, and a VM that cannot be
+ *   shut down cleanly. So every path out of here completes exactly
+ *   once, and a watchdog completes it if the device never answers.
+ *
+ *   A task must be completed by ITS OWN indication. A disconnect is
+ *   not finished by CONNECT_COMPLETE, however much the two look
+ *   alike from in here -- see VwifiIndicateDisconnectComplete.
+ * ============================================================ */
+
+/* How long to wait for the device before giving up on a task.
+ *
+ * OID_WDI_TASK_CONNECT's documented "normal execution time" is 10
+ * seconds and OID_WDI_TASK_DISCONNECT's is 1. These are the outer
+ * bounds past which the event is not late, it is not coming. */
+#define VWIFI_CONNECT_WATCHDOG_MS      15000
+#define VWIFI_DISCONNECT_WATCHDOG_MS    5000
+
 typedef struct _VWIFI_CONNECT_TASK
 {
-    BOOLEAN Active;
     /* Both port namespaces. WdiPortId scopes the WDI message
      * header of every indication this task sends; PortId is the
      * NDIS port the request arrived on. See VwifiGetWdiPortId. */
@@ -58,7 +88,37 @@ typedef struct _VWIFI_CONNECT_TASK
     UCHAR   TargetSsid[33];
     USHORT  TargetSsidLen;
     BOOLEAN Associated;
+
+    /* The disconnect's own port and transaction id. Separate fields,
+     * not the connect's: a disconnect can arrive with no connect ever
+     * having run, and its completion has to echo the transaction id it
+     * came in with. */
+    WDI_PORT_ID   DiscWdiPortId;
+    ULONG   DiscPortId;
+    UINT32  DiscTransactionId;
+
+    /* 1 while the task awaits its completion indication.
+     *
+     * Interlocked, and claimed rather than tested, because the two
+     * paths that can complete a task run as independent DPCs -- the
+     * device's response drain and the watchdog below -- and may be on
+     * different processors at the same moment. Whoever swaps the flag
+     * back to 0 owns the completion; the loser does nothing. A plain
+     * BOOLEAN here is a double completion under exactly the timing
+     * that makes it hardest to reproduce. */
+    volatile LONG ConnectPending;
+    volatile LONG DisconnectPending;
+
+    /* Fires when the device has not answered in time, so that a lost
+     * event costs one failed connect instead of a wedged Wi-Fi stack.
+     * The same idea as the stale-scan backstop in wdi_scan.c, armed
+     * rather than lazy because nothing else comes along afterwards to
+     * notice on our behalf. */
+    NDIS_HANDLE Watchdog;
 } VWIFI_CONNECT_TASK, *PVWIFI_CONNECT_TASK;
+
+static VOID VwifiConnectArmWatchdog(_In_ PVWIFI_CONNECT_TASK Task,
+                                    _In_ ULONG Milliseconds);
 
 /* ============================================================
  * Parse the WDI connect request.
@@ -142,6 +202,13 @@ VwifiIndicateConnectComplete(_Inout_ PVWIFI_ADAPTER Adapter,
 {
     PVWIFI_CONNECT_TASK task = Adapter->ConnectTask;
 
+    /* Claim the completion. Whoever gets here first sends it; anyone
+     * arriving second -- the watchdog and a late ASSOC_RESULT racing,
+     * say -- finds the flag already clear and returns. */
+    if (InterlockedCompareExchange(&task->ConnectPending, 0, 1) != 1) {
+        return;
+    }
+
     /* CONNECT_COMPLETE carries no TLVs — not the BSSID, not the status.
      * The outcome rides in the message header's Status field, and the OS
      * already knows which BSS it asked us to join. */
@@ -149,8 +216,41 @@ VwifiIndicateConnectComplete(_Inout_ PVWIFI_ADAPTER Adapter,
     VwifiSendWdiIndication(Adapter, task->WdiPortId, task->PortId,
                            NDIS_STATUS_WDI_INDICATION_CONNECT_COMPLETE,
                            Status, task->TransactionId, NULL, 0);
+}
 
-    task->Active = FALSE;
+/* The disconnect task's completion -- and it has to be this message.
+ *
+ * OID_WDI_TASK_DISCONNECT's documented completion indication is
+ * NDIS_STATUS_WDI_INDICATION_DISCONNECT_COMPLETE, and nothing in this
+ * driver ever sent it. The disconnect handler returned
+ * INDICATION_REQUIRED and the device's DISCONNECTED event drove a
+ * DISASSOCIATION indication and a link-state change -- both correct,
+ * neither a completion -- so every OID_WDI_TASK_DISCONNECT ever issued
+ * to this driver stayed outstanding forever.
+ *
+ * A disconnect is not a rare path. It is what the OS issues to take a
+ * port down, so it runs when the adapter is disabled, when the device
+ * is uninstalled, and when the machine shuts down. That matches the
+ * symptom that has been present since the driver first loaded:
+ * disabling or removing the adapter hangs, produces no further driver
+ * output, and leaves the VM needing to be powered off.
+ *
+ * Header-only: "This indication contains no additional data. The data
+ * in the header is sufficient." */
+static VOID
+VwifiIndicateDisconnectComplete(_Inout_ PVWIFI_ADAPTER Adapter,
+                                _In_ NDIS_STATUS Status)
+{
+    PVWIFI_CONNECT_TASK task = Adapter->ConnectTask;
+
+    if (InterlockedCompareExchange(&task->DisconnectPending, 0, 1) != 1) {
+        return;
+    }
+
+    VWIFI_INFO("indicating DISCONNECT_COMPLETE (0x%x)", Status);
+    VwifiSendWdiIndication(Adapter, task->DiscWdiPortId, task->DiscPortId,
+                           NDIS_STATUS_WDI_INDICATION_DISCONNECT_COMPLETE,
+                           Status, task->DiscTransactionId, NULL, 0);
 }
 
 static VOID
@@ -214,6 +314,70 @@ VwifiIndicateLinkState(_Inout_ PVWIFI_ADAPTER Adapter, _In_ BOOLEAN Up)
 }
 
 /* ============================================================
+ * Watchdog
+ *
+ * Runs at DISPATCH_LEVEL, which is where the indications below are
+ * sent from anyway.
+ * ============================================================ */
+
+static VOID
+VwifiConnectWatchdog(_In_ PVOID SystemSpecific1,
+                     _In_ PVOID FunctionContext,
+                     _In_ PVOID SystemSpecific2,
+                     _In_ PVOID SystemSpecific3)
+{
+    PVWIFI_ADAPTER adapter = (PVWIFI_ADAPTER)FunctionContext;
+    PVWIFI_CONNECT_TASK task = adapter ? adapter->ConnectTask : NULL;
+
+    UNREFERENCED_PARAMETER(SystemSpecific1);
+    UNREFERENCED_PARAMETER(SystemSpecific2);
+    UNREFERENCED_PARAMETER(SystemSpecific3);
+
+    if (!task) return;
+
+    if (task->ConnectPending) {
+        VWIFI_WARN("no ASSOC_RESULT from the device -- failing the connect "
+                   "rather than leaving the task outstanding");
+        VwifiIndicateConnectComplete(adapter, NDIS_STATUS_FAILURE);
+    }
+
+    if (task->DisconnectPending) {
+        /* Completed as success, not failure. The local side of the
+         * disconnect is done either way -- the association state is
+         * cleared below in VwifiConnectOnDisconnected, and cleared here
+         * if that event never came -- and reporting failure would leave
+         * the OS believing the port is still connected to something it
+         * is not. */
+        VWIFI_WARN("no DISCONNECTED event from the device -- completing "
+                   "the disconnect anyway");
+        adapter->Associated = FALSE;
+        RtlZeroMemory(adapter->Bssid, 6);
+        VwifiIndicateDisconnectComplete(adapter, NDIS_STATUS_SUCCESS);
+        VwifiIndicateLinkState(adapter, FALSE);
+    }
+}
+
+static VOID
+VwifiConnectArmWatchdog(_In_ PVWIFI_CONNECT_TASK Task,
+                        _In_ ULONG Milliseconds)
+{
+    LARGE_INTEGER due;
+
+    /* One timer for both tasks, and arming it moves the single
+     * deadline. That is fine in both directions: a disconnect arriving
+     * during a connect shortens the connect's deadline, which is what
+     * the OS is asking for anyway, and a connect arriving during a
+     * disconnect lengthens the disconnect's, which only means a lost
+     * event is noticed later. The callback checks both, so neither can
+     * be left pending with no timer armed. */
+    if (!Task->Watchdog) return;
+
+    /* Negative is relative, in 100 ns units. */
+    due.QuadPart = -((LONGLONG)Milliseconds * 10000LL);
+    NdisSetTimerObject(Task->Watchdog, due, 0, NULL);
+}
+
+/* ============================================================
  * Device event handlers — called from VwifiCtrlRspDrain at DPC.
  * ============================================================ */
 
@@ -226,7 +390,7 @@ VwifiConnectOnAssocResult(_Inout_ PVWIFI_ADAPTER Adapter,
     const UCHAR *ies;
     PVWIFI_CONNECT_TASK task = Adapter->ConnectTask;
 
-    if (!task || !task->Active) return;
+    if (!task || !task->ConnectPending) return;
     if (PayloadLen < sizeof(*res)) {
         VWIFI_WARN("ASSOC_RESULT payload too short: %u", PayloadLen);
         return;
@@ -270,10 +434,18 @@ VwifiConnectOnDisconnected(_Inout_ PVWIFI_ADAPTER Adapter,
     Adapter->Associated = FALSE;
     RtlZeroMemory(Adapter->Bssid, 6);
 
-    if (task && task->Active) {
+    if (task && task->ConnectPending) {
         /* Disconnected while a connect was still in flight. */
         task->Associated = FALSE;
         VwifiIndicateConnectComplete(Adapter, NDIS_STATUS_FAILURE);
+    }
+
+    /* And if this event is the answer to an OID_WDI_TASK_DISCONNECT,
+     * that task's own completion. Both can be outstanding at once --
+     * the OS aborts a connect by disconnecting the port -- so this is
+     * not an else. */
+    if (task && task->DisconnectPending) {
+        VwifiIndicateDisconnectComplete(Adapter, NDIS_STATUS_SUCCESS);
     }
 
     VwifiIndicateDisassociation(Adapter, local);
@@ -296,7 +468,7 @@ VwifiHandleTaskConnect(_Inout_ PVWIFI_ADAPTER Adapter,
     ULONG outLen = 0;
 
     if (!task) return NDIS_STATUS_RESOURCES;
-    if (task->Active) {
+    if (task->ConnectPending) {
         VWIFI_WARN("connect task already active");
         return NDIS_STATUS_REQUEST_ABORTED;
     }
@@ -308,7 +480,6 @@ VwifiHandleTaskConnect(_Inout_ PVWIFI_ADAPTER Adapter,
         creq, sizeof(reqbuf), &reqLen);
     if (status != NDIS_STATUS_SUCCESS) return status;
 
-    task->Active     = TRUE;
     task->Associated = FALSE;
     task->PortId     = Req->PortNumber;
     task->WdiPortId  = VwifiGetWdiPortId(Req);
@@ -319,15 +490,33 @@ VwifiHandleTaskConnect(_Inout_ PVWIFI_ADAPTER Adapter,
     task->TargetSsidLen = creq->ssid_len;
     RtlCopyMemory(task->TargetSsid, creq->ssid, sizeof(task->TargetSsid));
 
-    /* Indicate the attempt is starting before we kick the device. */
+    /* Marked pending, and the watchdog armed, before the device is
+     * asked to do anything: the ASSOC_RESULT can land on another
+     * processor the instant the request is posted, and it drops the
+     * event if the task is not pending yet. */
+    InterlockedExchange(&task->ConnectPending, 1);
+    VwifiConnectArmWatchdog(task, VWIFI_CONNECT_WATCHDOG_MS);
 
     status = VwifiCtrlSendSync(Adapter, VWIFI_OP_CONNECT,
                               creq, reqLen, NULL, &outLen);
     if (status != NDIS_STATUS_SUCCESS) {
+        /* Failed before the task ever started, so it is the OID that
+         * reports it and no indication is sent -- returning a failure
+         * status and indicating a completion for the same task is the
+         * double completion this file's header warns about. Release the
+         * claim so a later connect is not refused as already active.
+         *
+         * If the ASSOC_RESULT beat us here the claim is already gone
+         * and the task is already completed; nothing to undo. */
         VWIFI_ERR("device rejected CONNECT: 0x%x", status);
-        task->Active = FALSE;
-        VwifiIndicateConnectComplete(Adapter, NDIS_STATUS_FAILURE);
-        return status;
+        if (InterlockedCompareExchange(&task->ConnectPending, 0, 1) == 1) {
+            BOOLEAN cancelled;
+            if (task->Watchdog) {
+                NdisCancelTimerObject(task->Watchdog, &cancelled);
+            }
+            return status;
+        }
+        return NDIS_STATUS_INDICATION_REQUIRED;
     }
 
     /* The device runs Auth/Assoc; ASSOC_RESULT completes the task. */
@@ -338,15 +527,41 @@ NDIS_STATUS
 VwifiHandleTaskDisconnect(_Inout_ PVWIFI_ADAPTER Adapter,
                           _In_ PNDIS_OID_REQUEST Req)
 {
+    PVWIFI_CONNECT_TASK task = Adapter->ConnectTask;
     struct vwifi_disconnect_req dreq = { 0 };
+    NDIS_STATUS status;
     ULONG outLen = 0;
 
-    UNREFERENCED_PARAMETER(Req);
+    if (!task) return NDIS_STATUS_RESOURCES;
+
+    /* The port and transaction id DISCONNECT_COMPLETE must echo. Read
+     * here, while the request buffer still exists. */
+    task->DiscPortId        = Req->PortNumber;
+    task->DiscWdiPortId     = VwifiGetWdiPortId(Req);
+    task->DiscTransactionId = VwifiGetWdiTransactionId(Req);
 
     dreq.reason_code = 3;   /* STA is leaving */
 
-    (VOID)VwifiCtrlSendSync(Adapter, VWIFI_OP_DISCONNECT,
-                            &dreq, sizeof(dreq), NULL, &outLen);
+    InterlockedExchange(&task->DisconnectPending, 1);
+    VwifiConnectArmWatchdog(task, VWIFI_DISCONNECT_WATCHDOG_MS);
+
+    status = VwifiCtrlSendSync(Adapter, VWIFI_OP_DISCONNECT,
+                               &dreq, sizeof(dreq), NULL, &outLen);
+    if (status != NDIS_STATUS_SUCCESS) {
+        /* Nothing is going to disconnect, so nothing will emit
+         * DISCONNECTED. Complete it here rather than let the watchdog
+         * discover it fifteen seconds from now -- and complete it as
+         * success, because a port that could not even be asked to
+         * disconnect is not one the OS should keep treating as
+         * connected. */
+        VWIFI_ERR("device rejected DISCONNECT: 0x%x", status);
+        Adapter->Associated = FALSE;
+        RtlZeroMemory(Adapter->Bssid, 6);
+        VwifiIndicateDisconnectComplete(Adapter, NDIS_STATUS_SUCCESS);
+        VwifiIndicateLinkState(Adapter, FALSE);
+        return NDIS_STATUS_INDICATION_REQUIRED;
+    }
+
     /* The device emits DISCONNECTED, which drives the indications. */
     return NDIS_STATUS_INDICATION_REQUIRED;
 }
@@ -358,11 +573,31 @@ VwifiHandleTaskDisconnect(_Inout_ PVWIFI_ADAPTER Adapter,
 NDIS_STATUS
 VwifiConnectTaskCreate(_Inout_ PVWIFI_ADAPTER Adapter)
 {
+    NDIS_TIMER_CHARACTERISTICS timerChars = { 0 };
+    NDIS_STATUS status;
     PVWIFI_CONNECT_TASK task = NdisAllocateMemoryWithTagPriority(
         Adapter->MiniportAdapterHandle, sizeof(*task),
         VWIFI_POOL_TAG, NormalPoolPriority);
     if (!task) return NDIS_STATUS_RESOURCES;
     RtlZeroMemory(task, sizeof(*task));
+
+    timerChars.Header.Type     = NDIS_OBJECT_TYPE_TIMER_CHARACTERISTICS;
+    timerChars.Header.Revision = NDIS_TIMER_CHARACTERISTICS_REVISION_1;
+    timerChars.Header.Size     = NDIS_SIZEOF_TIMER_CHARACTERISTICS_REVISION_1;
+    timerChars.AllocationTag   = VWIFI_POOL_TAG;
+    timerChars.TimerFunction   = VwifiConnectWatchdog;
+    timerChars.FunctionContext = Adapter;
+
+    status = NdisAllocateTimerObject(Adapter->MiniportAdapterHandle,
+                                     &timerChars, &task->Watchdog);
+    if (status != NDIS_STATUS_SUCCESS) {
+        /* Not fatal. Connect and disconnect still work; what is lost is
+         * the guarantee that a device that stops answering costs one
+         * failed task rather than a wedged Wi-Fi stack. */
+        VWIFI_WARN("connect watchdog timer unavailable (0x%x)", status);
+        task->Watchdog = NULL;
+    }
+
     Adapter->ConnectTask = task;
     return NDIS_STATUS_SUCCESS;
 }
@@ -370,8 +605,22 @@ VwifiConnectTaskCreate(_Inout_ PVWIFI_ADAPTER Adapter)
 VOID
 VwifiConnectTaskDestroy(_Inout_ PVWIFI_ADAPTER Adapter)
 {
-    if (!Adapter->ConnectTask) return;
+    PVWIFI_CONNECT_TASK task = Adapter->ConnectTask;
+
+    if (!task) return;
+
+    /* Cancel and free before the memory the callback reads goes away.
+     * NdisFreeTimerObject waits for a callback already running, which
+     * is the half NdisCancelTimerObject cannot promise. */
+    if (task->Watchdog) {
+        BOOLEAN cancelled;
+
+        NdisCancelTimerObject(task->Watchdog, &cancelled);
+        NdisFreeTimerObject(task->Watchdog);
+        task->Watchdog = NULL;
+    }
+
     NdisFreeMemoryWithTagPriority(Adapter->MiniportAdapterHandle,
-                                  Adapter->ConnectTask, VWIFI_POOL_TAG);
+                                  task, VWIFI_POOL_TAG);
     Adapter->ConnectTask = NULL;
 }
