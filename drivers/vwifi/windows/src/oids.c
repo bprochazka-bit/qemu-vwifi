@@ -468,6 +468,24 @@ VwifiHandleSetAdapterConfiguration(_Inout_ PVWIFI_ADAPTER Adapter,
     return VwifiWdiAckHeaderOnly(Req, NDIS_STATUS_SUCCESS);
 }
 
+/* Tasks return NDIS_STATUS_INDICATION_REQUIRED, never SUCCESS.
+ *
+ * A WDI task is accepted by the OID and completed by an indication.
+ * INDICATION_REQUIRED is how the miniport says exactly that: the
+ * request is taken, watch for the completion. SUCCESS says the opposite
+ * -- finished, nothing more coming -- and then an indication arrives
+ * for a task the component has already closed out.
+ *
+ * wdi_scan.c and wdi_connect.c have always returned
+ * INDICATION_REQUIRED. Every task handler added later returned SUCCESS,
+ * which is a double completion: WDI runs one task at a time per port,
+ * so a task the component has closed out early and then sees completed
+ * again is a state machine being told something it cannot place.
+ *
+ * No observed failure is attributed to this -- it is being corrected
+ * because it is wrong, not because a trace pointed at it.
+ */
+
 /* ============================================================
  * OID_WDI_TASK_CREATE_PORT / OID_WDI_TASK_DELETE_PORT
  *
@@ -544,7 +562,7 @@ VwifiHandleTaskCreatePort(_Inout_ PVWIFI_ADAPTER Adapter,
                 Adapter, VwifiGetWdiPortId(Req), Req->PortNumber,
                 NDIS_STATUS_WDI_INDICATION_CREATE_PORT_COMPLETE,
                 status, VwifiGetWdiTransactionId(Req), NULL, 0);
-            return NDIS_STATUS_SUCCESS;
+            return NDIS_STATUS_INDICATION_REQUIRED;
         }
     }
 
@@ -585,7 +603,7 @@ VwifiHandleTaskCreatePort(_Inout_ PVWIFI_ADAPTER Adapter,
                                blob, blobLen);
         VwifiTlvFreeGenerated(blob);
     }
-    return NDIS_STATUS_SUCCESS;
+    return NDIS_STATUS_INDICATION_REQUIRED;
 }
 
 static NDIS_STATUS
@@ -621,7 +639,7 @@ VwifiHandleTaskDeletePort(_Inout_ PVWIFI_ADAPTER Adapter,
                            NDIS_STATUS_SUCCESS,
                            VwifiGetWdiTransactionId(Req),
                            NULL, 0);
-    return NDIS_STATUS_SUCCESS;
+    return NDIS_STATUS_INDICATION_REQUIRED;
 }
 
 /* ============================================================
@@ -751,7 +769,7 @@ VwifiHandleTaskDot11Reset(_Inout_ PVWIFI_ADAPTER Adapter,
                            NDIS_STATUS_SUCCESS,
                            VwifiGetWdiTransactionId(Req),
                            NULL, 0);
-    return NDIS_STATUS_SUCCESS;
+    return NDIS_STATUS_INDICATION_REQUIRED;
 }
 
 /* ============================================================
@@ -893,7 +911,7 @@ VwifiHandleTaskSetRadioState(_Inout_ PVWIFI_ADAPTER Adapter,
                            NDIS_STATUS_SUCCESS,
                            VwifiGetWdiTransactionId(Req),
                            NULL, 0);
-    return NDIS_STATUS_SUCCESS;
+    return NDIS_STATUS_INDICATION_REQUIRED;
 }
 
 /* ============================================================
