@@ -510,9 +510,8 @@ VwifiHandleTaskConnect(_Inout_ PVWIFI_ADAPTER Adapter,
          * and the task is already completed; nothing to undo. */
         VWIFI_ERR("device rejected CONNECT: 0x%x", status);
         if (InterlockedCompareExchange(&task->ConnectPending, 0, 1) == 1) {
-            BOOLEAN cancelled;
             if (task->Watchdog) {
-                NdisCancelTimerObject(task->Watchdog, &cancelled);
+                (VOID)NdisCancelTimerObject(task->Watchdog);
             }
             return status;
         }
@@ -613,9 +612,7 @@ VwifiConnectTaskDestroy(_Inout_ PVWIFI_ADAPTER Adapter)
      * NdisFreeTimerObject waits for a callback already running, which
      * is the half NdisCancelTimerObject cannot promise. */
     if (task->Watchdog) {
-        BOOLEAN cancelled;
-
-        NdisCancelTimerObject(task->Watchdog, &cancelled);
+        (VOID)NdisCancelTimerObject(task->Watchdog);
         NdisFreeTimerObject(task->Watchdog);
         task->Watchdog = NULL;
     }
