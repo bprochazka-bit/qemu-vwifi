@@ -128,6 +128,13 @@
            warning is not a good reason to produce no binary during
            bring-up. Turn this back on with the compiler's. -->
       <TreatLinkerWarningAsErrors>false</TreatLinkerWarningAsErrors>
+      <!-- A linker map, because the .pdb is only readable by Windows
+           tooling. When the guest dies without a bugcheck the only
+           record of where the CPU was is an absolute RIP in QEMU's log
+           on the Linux host, and the map is what turns that into a
+           function name there. rip2sym.py reads it. -->
+      <GenerateMapFile>true</GenerateMapFile>
+      <MapFileName>$(OutDir)vwifi.map</MapFileName>
     </Link>
   </ItemDefinitionGroup>
 

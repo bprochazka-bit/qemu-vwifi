@@ -372,6 +372,10 @@ bp vwifi!VwifiMessageIsr
 The lifecycle is linear enough that stepping through those three once
 shows you everything.
 
+That recipe assumes a Windows host. For a Linux host see the section
+below, which is a different technique rather than a translation of this
+one — and the better one when the guest dies without bugchecking.
+
 Useful commands once it's loaded:
 
 | Command | What it tells you |
@@ -381,6 +385,124 @@ Useful commands once it's loaded:
 | `lm m vwifi` | did the image load, and did symbols resolve |
 | `!poolused 4 fiWv` | driver allocations by tag (`'fiWv'` = `VWIFI_POOL_TAG`) |
 | `!analyze -v` | after a bugcheck, before anything else |
+
+### Debugging from a Linux host
+
+A guest that resets without a bugcheck cannot be debugged from inside
+itself. There is no stop screen and no `MEMORY.DMP` because Windows
+never ran its crash path — the CPU faulted while already handling a
+fault, or never came back at all. Everything below watches from the
+host, where the evidence still exists.
+
+This is not a workaround for having no WinDbg. For this class of
+failure it is strictly better, because QEMU sees the reset itself.
+
+**1. Stop the machine from resetting.** The single most useful flag:
+
+```
+-no-reboot -no-shutdown
+```
+
+A triple fault now leaves the VM stopped with its registers intact
+instead of vanishing into a reboot. Everything else here depends on the
+corpse still being warm.
+
+**2. Log what QEMU sees.**
+
+```
+-d int,cpu_reset,guest_errors -D /tmp/vwifi-qemu.log
+```
+
+- `cpu_reset` dumps every register, `RIP` included, at the moment of
+  reset. On a triple fault that dump *is* the crash report.
+- `int` traces interrupt delivery. An interrupt storm is unmistakable:
+  the same vector repeating thousands of times per second, and a log
+  that grows without bound.
+- `guest_errors` catches the device model complaining — a bad MMIO
+  offset, a DMA to an unbacked address.
+
+`-d int` is very verbose. Turn it on for the run that reproduces the
+crash and off again afterwards.
+
+**3. Attach a debugger to the vCPUs.**
+
+```
+-gdb tcp::1234        # or just -s
+```
+
+When it locks, from another terminal:
+
+```
+gdb -ex 'target remote :1234'
+(gdb) info threads          # one per vCPU
+(gdb) thread apply all x/i $pc
+(gdb) thread apply all p/x $rip
+```
+
+All vCPUs spinning at the same address is a deadlock or a storm. One
+faulting and the rest idle is a plain crash.
+
+The QEMU monitor answers two questions gdb cannot:
+
+```
+(qemu) info irq             # interrupt counts -- a storm shows here
+(qemu) info registers -a
+```
+
+**4. Turn a RIP into a source line.** `DriverEntry` prints where the
+driver landed:
+
+```
+vwifi: image base FFFFF8021A340000 size 0x1e000  (RVA = RIP - base)
+```
+
+The build emits `x64\Debug\vwifi.map` beside the `.sys`. On the host:
+
+```
+./rip2sym.py --map x64/Debug/vwifi.map \
+             --base 0xfffff8021a340000 --size 0x1e000 \
+             0xfffff8021a34c1f3
+```
+
+```
+0xfffff8021a34c1f3  RVA 0xc1f3   VwifiOidRequest+0x2b3   [oids.obj]
+```
+
+It also takes several addresses at once, or `--stdin` to scrape them
+out of a QEMU log. An address outside the image is reported as such
+rather than resolved to a bogus symbol — "another module" is an answer.
+
+None of this needs a `.pdb` or any Windows tooling.
+
+**What the outcomes mean.** With `AutoReboot` off and a kernel dump
+configured (`guest-debug-setup.ps1` step 5/5), the three cases separate
+cleanly:
+
+| What you see | What it is |
+|---|---|
+| Stop screen stays up, `MEMORY.DMP` written | an ordinary bugcheck. Windows was healthy enough to report it; the dump has the stack. |
+| No screen, no dump, `-d cpu_reset` shows a reset | triple fault. The register dump has the `RIP` — feed it to `rip2sym.py`. |
+| No screen, no dump, no reset logged, vCPUs pegged | a true hard lock. Check `info irq` for a storm, and `thread apply all x/i $pc` for where they are stuck. |
+
+**If you want full WinDbg anyway**, the serial transport is the awkward
+part on Linux, so use the network one instead. KDNET needs a NIC
+Windows' debug transport supports — QEMU's `e1000e` (Intel 82574L)
+qualifies, `virtio-net` does not:
+
+```
+-device e1000e,netdev=kd -netdev user,id=kd,hostfwd=udp::50000-:50000
+```
+
+In the guest:
+
+```
+bcdedit /debug on
+bcdedit /dbgsettings net hostip:<the machine running WinDbg> port:50000 key:1.2.3.4
+```
+
+Then run WinDbg on the Windows build machine against that port. Worth
+setting up once the crash is understood and you want to step through
+the WDI handshake; overkill for finding out why the box resets.
 
 ### Reading a failed load
 

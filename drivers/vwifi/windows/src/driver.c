@@ -374,6 +374,19 @@ DriverEntry(
 
     VWIFI_INFO("DriverEntry");
 
+    /* Where we are loaded, so an instruction pointer can be turned back
+     * into a source line without a Windows debugger.
+     *
+     * This matters when the guest dies in a way Windows never gets to
+     * report -- a triple fault or a hard lock leaves no bugcheck and no
+     * dump, and the only surviving record of where the CPU was is
+     * whatever QEMU logged on the host. That is an absolute RIP. With
+     * the image base printed here, RIP - base is an RVA, and rip2sym.py
+     * resolves it against the linker map. See "Debugging from a Linux
+     * host" in the README. */
+    VWIFI_INFO("image base %p size 0x%x  (RVA = RIP - base)",
+               DriverObject->DriverStart, DriverObject->DriverSize);
+
     /* Base NDIS miniport characteristics. Per WDI IHV doc, most of
      * these are optional when the WLAN component is in play; OID and
      * Unload are the minimum. We fill in more to handle PCI resource
