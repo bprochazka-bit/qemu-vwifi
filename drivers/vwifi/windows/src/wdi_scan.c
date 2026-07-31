@@ -540,3 +540,15 @@ VwifiScanIndicateCachedBss(_Inout_ PVWIFI_ADAPTER Adapter,
                n, generatedLen);
     VwifiTlvFreeGenerated(generated);
 }
+
+/* OID_WDI_SET_FLUSH_BSS_ENTRY: drop what we remember. The host asks for
+ * this when it wants a fresh view rather than a cached one. */
+VOID
+VwifiScanFlushCache(_Inout_ PVWIFI_ADAPTER Adapter)
+{
+    PVWIFI_SCAN_TASK task = Adapter->ScanTask;
+
+    if (!task) return;
+    task->CacheCount = 0;
+    VWIFI_INFO("BSS cache flushed");
+}

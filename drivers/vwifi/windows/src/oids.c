@@ -803,6 +803,92 @@ VwifiHandleSetMulticastList(_Inout_ PVWIFI_ADAPTER Adapter,
 }
 
 /* ============================================================
+ * The rest of the station surface
+ *
+ * An audit of dot11wdi.h against this dispatcher found 15 of 66 WDI
+ * OIDs handled. Most of the remainder describe features this device
+ * genuinely lacks -- P2P, SoftAP, WoL, protocol and TCP offloads, FTM,
+ * IHV extensions, device services -- and NOT_SUPPORTED is the correct
+ * answer for those.
+ *
+ * These are not those. Every one of them is on the path a station
+ * takes to associate, and every one was being refused. They are
+ * gathered here because the model gives them all the same shape: the
+ * reply is a bare WDI_MESSAGE_HEADER, so accepting one costs a line.
+ * Refusing them cost a test cycle each to discover.
+ *
+ * What each one means for a device with no firmware to configure:
+ *
+ *   SET_PRIVACY_EXEMPTION_LIST  which ethertypes bypass encryption --
+ *       EAPOL, so the 4-way handshake can run before keys exist. The
+ *       device never encrypts on the host's behalf, so every frame is
+ *       already exempt.
+ *   SET_DEFAULT_KEY_ID          which group key index transmits. The
+ *       device tracks key indices itself, from SET_KEY.
+ *   SET_ASSOCIATION_PARAMETERS  per-BSSID association hints.
+ *   SET_CONNECTION_QUALITY      roaming thresholds the host suggests.
+ *   SET_ADVERTISEMENT_INFORMATION  what to advertise in probes.
+ *   SET_POWER_STATE             its one reply container is optional, so
+ *       a header is a complete answer. Nothing here sleeps.
+ *
+ * Accepting a setting this device does not implement is not the same
+ * as pretending it works: none of these change what the radio does,
+ * and refusing them stops the connect before it starts.
+ * ============================================================ */
+static NDIS_STATUS
+VwifiHandleAcceptedSet(_Inout_ PVWIFI_ADAPTER Adapter,
+                       _In_ PNDIS_OID_REQUEST Req,
+                       _In_ PCSTR What)
+{
+    UNREFERENCED_PARAMETER(Adapter);
+    VWIFI_INFO("OID: %s accepted (no device state to change)", What);
+    return VwifiWdiAckHeaderOnly(Req, NDIS_STATUS_SUCCESS);
+}
+
+/* ============================================================
+ * OID_WDI_ABORT_TASK
+ *
+ * Cancel whatever task is running on the port. For this driver that
+ * means the scan -- it is the only task that outlives its OID.
+ *
+ * VwifiHandleTaskScanAbort has existed since the scan was written and
+ * nothing ever called it, because this OID was never dispatched. A
+ * component that wants to stop scanning so it can connect asks here,
+ * gets NOT_SUPPORTED, and the scan it is waiting on never ends. Scans
+ * repeating forever while a connect never starts is what that looks
+ * like from the trace.
+ * ============================================================ */
+static NDIS_STATUS
+VwifiHandleAbortTask(_Inout_ PVWIFI_ADAPTER Adapter,
+                     _In_ PNDIS_OID_REQUEST Req)
+{
+    VWIFI_INFO("OID: abort task");
+    (VOID)VwifiHandleTaskScanAbort(Adapter);
+    return VwifiWdiAckHeaderOnly(Req, NDIS_STATUS_SUCCESS);
+}
+
+/* ============================================================
+ * OID_WDI_TASK_SET_RADIO_STATE
+ *
+ * A task, so it completes by indication. The capabilities report the
+ * radio as always enabled and this device has no way to turn it off,
+ * so the state is accepted and reported complete rather than acted on.
+ * ============================================================ */
+static NDIS_STATUS
+VwifiHandleTaskSetRadioState(_Inout_ PVWIFI_ADAPTER Adapter,
+                             _In_ PNDIS_OID_REQUEST Req)
+{
+    VWIFI_INFO("OID: set radio state (device radio is always on)");
+
+    VwifiSendWdiIndication(Adapter, VwifiGetWdiPortId(Req), Req->PortNumber,
+                           NDIS_STATUS_WDI_INDICATION_SET_RADIO_STATE_COMPLETE,
+                           NDIS_STATUS_SUCCESS,
+                           VwifiGetWdiTransactionId(Req),
+                           NULL, 0);
+    return NDIS_STATUS_SUCCESS;
+}
+
+/* ============================================================
  * The real OID dispatcher — replaces the Phase-1 blanket stub.
  * ============================================================ */
 _Use_decl_annotations_
@@ -846,6 +932,39 @@ VwifiOidRequest(
     }
     if (oid == OID_WDI_GET_STATISTICS) {
         return VwifiHandleGetStatistics(adapter, OidRequest);
+    }
+    if (oid == OID_WDI_ABORT_TASK) {
+        return VwifiHandleAbortTask(adapter, OidRequest);
+    }
+    if (oid == OID_WDI_TASK_SET_RADIO_STATE) {
+        return VwifiHandleTaskSetRadioState(adapter, OidRequest);
+    }
+    if (oid == OID_WDI_SET_PRIVACY_EXEMPTION_LIST) {
+        return VwifiHandleAcceptedSet(adapter, OidRequest,
+                                      "privacy exemption list");
+    }
+    if (oid == OID_WDI_SET_DEFAULT_KEY_ID) {
+        return VwifiHandleAcceptedSet(adapter, OidRequest, "default key id");
+    }
+    if (oid == OID_WDI_SET_ASSOCIATION_PARAMETERS) {
+        return VwifiHandleAcceptedSet(adapter, OidRequest,
+                                      "association parameters");
+    }
+    if (oid == OID_WDI_SET_CONNECTION_QUALITY) {
+        return VwifiHandleAcceptedSet(adapter, OidRequest,
+                                      "connection quality");
+    }
+    if (oid == OID_WDI_SET_ADVERTISEMENT_INFORMATION) {
+        return VwifiHandleAcceptedSet(adapter, OidRequest,
+                                      "advertisement information");
+    }
+    if (oid == OID_WDI_SET_POWER_STATE) {
+        return VwifiHandleAcceptedSet(adapter, OidRequest, "power state");
+    }
+    if (oid == OID_WDI_SET_FLUSH_BSS_ENTRY) {
+        VWIFI_INFO("OID: flush BSS entries");
+        VwifiScanFlushCache(adapter);
+        return VwifiWdiAckHeaderOnly(OidRequest, NDIS_STATUS_SUCCESS);
     }
     if (oid == OID_WDI_GET_BSS_ENTRY_LIST) {
         /* The entries go back as a BSS_ENTRY_LIST indication, exactly as

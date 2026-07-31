@@ -477,6 +477,7 @@ NDIS_STATUS VwifiHandleTaskChangeOpMode(_Inout_ PVWIFI_ADAPTER Adapter,
 /* wdi_scan.c — Phase 2 scan task. */
 /* Re-indicate everything the scan cache holds, for
  * OID_WDI_GET_BSS_ENTRY_LIST. */
+VOID        VwifiScanFlushCache(_Inout_ PVWIFI_ADAPTER Adapter);
 VOID        VwifiScanIndicateCachedBss(_Inout_ PVWIFI_ADAPTER Adapter,
                                        _In_ WDI_PORT_ID WdiPortId,
                                        _In_ ULONG NdisPortNumber);
