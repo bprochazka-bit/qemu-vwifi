@@ -191,6 +191,7 @@ VwifiMiniportPause(
 {
     PVWIFI_ADAPTER adapter = (PVWIFI_ADAPTER)MiniportAdapterContext;
     UNREFERENCED_PARAMETER(PauseParameters);
+    VWIFI_INFO("MiniportPause");
     InterlockedExchange(&adapter->DataPathRunning, 0);
     return NDIS_STATUS_SUCCESS;
 }
@@ -203,6 +204,7 @@ VwifiMiniportRestart(
 {
     PVWIFI_ADAPTER adapter = (PVWIFI_ADAPTER)MiniportAdapterContext;
     UNREFERENCED_PARAMETER(RestartParameters);
+    VWIFI_INFO("MiniportRestart");
     InterlockedExchange(&adapter->DataPathRunning, 1);
     return NDIS_STATUS_SUCCESS;
 }
@@ -350,6 +352,7 @@ VwifiMiniportReset(
     PBOOLEAN AddressingReset)
 {
     PVWIFI_ADAPTER adapter = (PVWIFI_ADAPTER)MiniportAdapterContext;
+    VWIFI_INFO("MiniportReset");
     *AddressingReset = FALSE;
     return VwifiHwReset(adapter);
 }
@@ -361,7 +364,12 @@ VwifiMiniportDevicePnPEventNotify(
     PNET_DEVICE_PNP_EVENT NetDevicePnPEvent)
 {
     UNREFERENCED_PARAMETER(MiniportAdapterContext);
-    UNREFERENCED_PARAMETER(NetDevicePnPEvent);
+
+    /* The PnP event codes are the OS explaining itself -- a surprise
+     * removal, a power state, a "your device is being reset". Worth
+     * having in the trace when an adapter goes away unbidden. */
+    VWIFI_INFO("MiniportDevicePnPEventNotify: event %u",
+               NetDevicePnPEvent ? NetDevicePnPEvent->DevicePnPEvent : 0);
 }
 
 _Use_decl_annotations_

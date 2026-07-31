@@ -187,6 +187,7 @@ NDIS_STATUS
 VwifiWdiStartOperation(NDIS_HANDLE MiniportAdapterContext)
 {
     UNREFERENCED_PARAMETER(MiniportAdapterContext);
+    VWIFI_INFO("WdiStartOperation");
     return NDIS_STATUS_SUCCESS;
 }
 
@@ -195,6 +196,7 @@ VOID
 VwifiWdiStopOperation(NDIS_HANDLE MiniportAdapterContext)
 {
     UNREFERENCED_PARAMETER(MiniportAdapterContext);
+    VWIFI_INFO("WdiStopOperation");
 }
 
 /* ============================================================
@@ -213,6 +215,7 @@ VwifiWdiPostPause(
 {
     UNREFERENCED_PARAMETER(MiniportAdapterContext);
     UNREFERENCED_PARAMETER(PauseParameters);
+    VWIFI_INFO("WdiPostPause");
     return NDIS_STATUS_SUCCESS;
 }
 
@@ -224,6 +227,7 @@ VwifiWdiPostRestart(
 {
     UNREFERENCED_PARAMETER(MiniportAdapterContext);
     UNREFERENCED_PARAMETER(RestartParameters);
+    VWIFI_INFO("WdiPostRestart");
     return NDIS_STATUS_SUCCESS;
 }
 
@@ -248,6 +252,7 @@ VwifiWdiHangDiagnose(
     UNREFERENCED_PARAMETER(MiniportDriverContext);
     UNREFERENCED_PARAMETER(DiagnoseLevel);
 
+    VWIFI_INFO("WdiHangDiagnose");
     *pOutputSize = 0;
 
     if (FirmwareBlob == NULL || BufferSize == 0) {
@@ -280,7 +285,24 @@ VwifiWdiTalTxRxInitialize(
 {
     UNREFERENCED_PARAMETER(NdisMiniportDataPathHandle);
     UNREFERENCED_PARAMETER(NdisWdiDataPathApi);
-    UNREFERENCED_PARAMETER(pMiniportDataHandlers);
+
+    /* Logged loudly, and the handler table's state reported, because
+     * this is the prime suspect for the adapter being closed with
+     * nothing asked and nothing said.
+     *
+     * NDIS_MINIPORT_WDI_DATA_HANDLERS has twenty-five function pointers
+     * -- the whole TX/RX/TAL data path -- and we fill in none of them,
+     * nor its NDIS_OBJECT_HEADER. If the WLAN component requires a
+     * usable data path before it will create a port, a table of NULLs
+     * behind a zeroed header is exactly the sort of thing it would
+     * reject without comment.
+     *
+     * Whether it is even called is the question this log line answers.
+     * If it appears before WdiCloseAdapter, the data path is the next
+     * piece of work; if it never appears, the adapter is being given up
+     * on before the data path is reached and the cause is elsewhere. */
+    VWIFI_INFO("WdiTalTxRxInitialize: handler table %s",
+               pMiniportDataHandlers ? "supplied (left empty)" : "NULL");
 
     /* Return our adapter pointer as the TAL handle so later callbacks
      * can find us. */
@@ -294,6 +316,7 @@ VOID
 VwifiWdiTalTxRxDeinitialize(TAL_TXRX_HANDLE MiniportTalTxRxContext)
 {
     UNREFERENCED_PARAMETER(MiniportTalTxRxContext);
+    VWIFI_INFO("WdiTalTxRxDeinitialize");
 }
 
 /* ============================================================
@@ -308,7 +331,7 @@ VwifiWdiLeIdleNotification(
     BOOLEAN ForceIdle)
 {
     UNREFERENCED_PARAMETER(MiniportAdapterContext);
-    UNREFERENCED_PARAMETER(ForceIdle);
+    VWIFI_INFO("WdiLeIdleNotification force=%u", ForceIdle);
     return NDIS_STATUS_SUCCESS;
 }
 
@@ -317,4 +340,5 @@ VOID
 VwifiWdiLeCancelIdleNotification(NDIS_HANDLE MiniportAdapterContext)
 {
     UNREFERENCED_PARAMETER(MiniportAdapterContext);
+    VWIFI_INFO("WdiLeCancelIdleNotification");
 }
