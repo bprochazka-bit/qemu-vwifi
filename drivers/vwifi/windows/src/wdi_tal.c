@@ -63,6 +63,18 @@
  * call, because at full rate they would bury everything else. The
  * control and flush handlers log every time: they are rare, and each
  * one is a step in a sequence worth seeing in order.
+ *
+ * That tracing paid for itself immediately: it showed TxAbort, RxStop
+ * and RxFlush arriving together at connect time and nothing after, and
+ * RxFlush turned out to be the one handler here that cannot finish by
+ * returning. See VwifiTalRxFlush.
+ *
+ * Which handlers must call back
+ * -----------------------------
+ * A handler with an _Out_ NDIS_STATUS can finish synchronously by
+ * reporting success -- TxAbort and RxStop both do. A handler returning
+ * void cannot, and must confirm through NDIS_WDI_DATA_API. Read the
+ * return type before assuming a stub is free.
  */
 
 #include "vwifi_drv.h"
@@ -458,9 +470,54 @@ VwifiTalRxFlush(
     _In_ TAL_TXRX_HANDLE MiniportTalTxRxContext,
     _In_ WDI_PORT_ID PortId)
 {
-    UNREFERENCED_PARAMETER(MiniportTalTxRxContext);
+    PVWIFI_ADAPTER adapter = (PVWIFI_ADAPTER)MiniportTalTxRxContext;
 
     VWIFI_INFO("TAL RxFlush: port %u", PortId);
+
+    /* RxFlush is the one handler in this file that CANNOT finish by
+     * returning.
+     *
+     * TxAbort and RxStop each take an _Out_ NDIS_STATUS: a success
+     * status there means "done, synchronously", and that is what they
+     * report. MiniportWdiRxFlush returns void. It has no way to say
+     * "done", so it is asynchronous by construction, and the TAL
+     * finishes it by calling NdisWdiRxFlushConfirm -- "the RxEngine
+     * must have finished discarding all matching RX data frames before
+     * invoking this function".
+     *
+     * This handler discarded nothing and confirmed nothing, and that
+     * one missing call is the whole of the connect hang.
+     *
+     * The sequence, from two logs that interlock to the millisecond:
+     * the MSM takes Cmd_Connect, calls MSMSecStopSecurity, and NWiFi
+     * issues OID_DOT11_RESET_REQUEST. The WLAN component then does what
+     * it is documented to do before a dot11 reset -- "aborts any task
+     * in progress on the port. It also flushes its Rx and TX queues" --
+     * which arrives here as TxAbort, RxStop, RxFlush, in that order, in
+     * the same millisecond. The first two completed. The third did not,
+     * so the flush never finished, so the component never issued
+     * OID_WDI_TASK_DOT11_RESET, so the reset never completed, so
+     * StopSecurity never returned. Everything downstream follows from
+     * there: no connect task, no more scans, wlansvc holding its
+     * interface lock, and netsh and Device Manager blocking behind it.
+     *
+     * Nothing to discard before confirming: no frame has ever been
+     * indicated to the component through the TAL. The RX path runs over
+     * the vwifi rings, and there is no RxEngine here holding anything.
+     * So the confirmation is immediate and it is honest.
+     *
+     * The API table comes from MiniportWdiTalTxRxInitialize and has been
+     * captured and unused since it was first stored. This is the first
+     * call this driver makes into it. */
+    if (adapter == NULL || adapter->DataPathApi == NULL ||
+        adapter->DataPathApi->RxFlushConfirm == NULL) {
+        VWIFI_ERR("TAL RxFlush: no RxFlushConfirm available -- the "
+                  "component will wait for this flush forever");
+        return;
+    }
+
+    adapter->DataPathApi->RxFlushConfirm(adapter->DataPathHandle);
+    VWIFI_INFO("TAL RxFlush: confirmed");
 }
 
 static VOID
