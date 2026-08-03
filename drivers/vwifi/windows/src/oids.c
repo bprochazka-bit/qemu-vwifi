@@ -776,6 +776,22 @@ VwifiHandleTaskDot11Reset(_Inout_ PVWIFI_ADAPTER Adapter,
                                 &dreq, sizeof(dreq), NULL, &out_len);
     }
 
+    /* And our own idea of the association, which the device call above
+     * does not touch.
+     *
+     * OID_WDI_TASK_DOT11_RESET is documented as "Reset the port's MAC
+     * entity to its initial state" and "Set the port state to INIT
+     * before completing the dot11 reset operation". A driver that tells
+     * the device to disconnect and goes on believing it is associated
+     * has reset the hardware and not itself, and the next thing to read
+     * Adapter->Associated gets an answer that is a reset old.
+     *
+     * The link state goes with it: INIT is a disconnected port, and
+     * saying so is free. */
+    Adapter->Associated = FALSE;
+    RtlZeroMemory(Adapter->Bssid, 6);
+    VwifiIndicateLinkState(Adapter, FALSE);
+
     VwifiSendWdiIndication(Adapter, VwifiGetWdiPortId(Req), Req->PortNumber,
                            NDIS_STATUS_WDI_INDICATION_DOT11_RESET_COMPLETE,
                            NDIS_STATUS_SUCCESS,
