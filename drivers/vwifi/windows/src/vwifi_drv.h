@@ -230,7 +230,17 @@ typedef struct _VWIFI_ADAPTER
      * assigns the id and a single-radio device has exactly one, so
      * there is no table here -- only which id is live. */
     WDI_PORT_ID         WdiPortId;
-    ULONG               PortId;
+
+    /* The NDIS port number the host assigned this port, out of the
+     * CREATE_PORT request's WDI_TLV_PORT_ATTRIBUTES.
+     *
+     * NOT NDIS_OID_REQUEST.PortNumber, which is the port the CREATE_PORT
+     * request itself arrived on -- an adapter-scoped request, so zero.
+     * This is the port the OS will address the station by, and every
+     * NDIS status indication about that port has to carry it or the
+     * indication lands on the default port and the station port is
+     * never told anything. */
+    ULONG               NdisPortNumber;
 
     /* The component's receive filter for this port, from
      * OID_WDI_SET_RECEIVE_PACKET_FILTER. NDIS packet-type bits, not the

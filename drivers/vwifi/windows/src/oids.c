@@ -566,8 +566,20 @@ VwifiHandleTaskCreatePort(_Inout_ PVWIFI_ADAPTER Adapter,
         }
     }
 
-    Adapter->PortId      = (ULONG)Req->PortNumber;
-    Adapter->PortCreated = TRUE;
+    /* ndisPort, not Req->PortNumber.
+     *
+     * The two are not the same and the difference is the whole point of
+     * this assignment. Req->PortNumber is the NDIS port the CREATE_PORT
+     * request arrived on, and CREATE_PORT is adapter-scoped -- there is
+     * no port yet -- so it is zero. ndisPort comes out of the request's
+     * WDI_TLV_PORT_ATTRIBUTES and is the number the OS will address the
+     * station port by from here on.
+     *
+     * Recording the wrong one sent every subsequent link-state
+     * indication to the default port instead of the station's, so the
+     * station port was never told what its media state was. */
+    Adapter->NdisPortNumber = ndisPort;
+    Adapter->PortCreated    = TRUE;
 
     /* State the link, now that there is a port for it to belong to.
      * Disconnected is the truth here and it is a different thing from

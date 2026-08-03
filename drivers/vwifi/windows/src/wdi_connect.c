@@ -310,6 +310,23 @@ VwifiIndicateLinkState(_Inout_ PVWIFI_ADAPTER Adapter, _In_ BOOLEAN Up)
     ind.StatusBuffer      = &linkState;
     ind.StatusBufferSize  = sizeof(linkState);
 
+    /* The station port, not the default one.
+     *
+     * This field was never set, so every link-state indication this
+     * driver has ever sent went to port 0. The station port the host
+     * created in OID_WDI_TASK_CREATE_PORT is the one the OS connects
+     * on, and it had heard nothing about its own media state -- not at
+     * port creation, not on association, not on disconnect. An
+     * interface whose media state was never stated is not one the OS
+     * has any reason to believe it can start a connection on.
+     *
+     * Zero until a port exists, which is correct: before CREATE_PORT
+     * the default port is all there is. */
+    ind.PortNumber        = (NDIS_PORT_NUMBER)Adapter->NdisPortNumber;
+
+    VWIFI_INFO("IND: LINK_STATE %s on ndisport %u",
+               Up ? "connected" : "disconnected", Adapter->NdisPortNumber);
+
     NdisMIndicateStatusEx(Adapter->MiniportAdapterHandle, &ind);
 }
 
