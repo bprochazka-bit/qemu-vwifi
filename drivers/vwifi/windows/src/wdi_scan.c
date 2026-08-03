@@ -90,13 +90,8 @@ typedef struct _VWIFI_SCAN_TASK
      * `netsh wlan show networks` and from the UI, and stopped the
      * component scanning.
      *
-     * Kept up to date whether or not a scan is running. The device
-     * reports every BSS it observes, continuously, which is what real
-     * hardware does and what makes an adapter's cached list worth
-     * having: entries stay fresh, so the OS's own list does not empty
-     * itself between scans. Discarding those reports outside a scan
-     * made the cache exactly as stale as the last scan, and a network
-     * that had been visible went missing until the next one.
+     * Updated whether or not a scan is running, though the device only
+     * emits BSS_FOUND during one -- see the note in VwifiScanOnBssFound.
      *
      * Keyed by BSSID, newest write wins, oldest evicted when full. No
      * ageing here -- each entry carries the time it was last seen and
@@ -288,16 +283,26 @@ VwifiScanOnBssFound(_Inout_ PVWIFI_ADAPTER Adapter,
 
     /* The cache, first and unconditionally.
      *
-     * The device observes BSSes continuously, not only during scans,
-     * and this used to return early when no scan was running -- so the
-     * adapter's cached list was only ever as fresh as the last scan.
-     * Between scans the entries aged past what the OS keeps and the
-     * network disappeared from `netsh wlan show networks` and from the
-     * flyout, with a connect attempt then having no BSS to build from.
+     * This used to return early unless a scan was running. Updating
+     * regardless costs nothing and means a report that arrives outside
+     * a scan is not thrown away.
      *
-     * Real hardware maintains its BSS list continuously; so does this
-     * now. Replace by BSSID if we already know this one; otherwise
-     * append, evicting the oldest when full. */
+     * It does not currently make the cache any fresher, and it is worth
+     * saying so rather than leaving the impression it does. The device
+     * observes every beacon and probe response continuously -- see
+     * bss_observe() in vwifi_device.c -- but it emits VWIFI_EV_BSS_FOUND
+     * only while a scan is running, once per BSS per scan. So between
+     * scans nothing arrives here to cache, and the cached entries age
+     * exactly as far as the gap between scans. Closing that would mean
+     * either a device event stream outside scans or an ABI operation to
+     * read the device's table on demand; neither exists yet.
+     *
+     * What keeps the list alive today is scans continuing to happen,
+     * which is what the overlap handling and the watchdog in this file
+     * are for.
+     *
+     * Replace by BSSID if we already know this one; otherwise append,
+     * evicting the oldest when full. */
     {
         ULONG slot = task->CacheCount;
 
@@ -405,19 +410,53 @@ VwifiHandleTaskScan(_Inout_ PVWIFI_ADAPTER Adapter,
 
     if (!task) return NDIS_STATUS_RESOURCES;
     if (task->Active) {
-        /* A scan is genuinely in flight. WDI runs one at a time per
-         * port, so refusing is the right answer -- and it is now only
-         * ever a real overlap, because the watchdog has already
-         * completed anything older than VWIFI_SCAN_STALE_MS.
+        /* A scan arriving while one is in flight is normal, and
+         * refusing it stops the OS scanning at all.
          *
-         * This used to be where a lost SCAN_COMPLETE was noticed, by
-         * checking the task's age here. That check could not fire in
-         * the case it existed for: an outstanding scan is exactly why
-         * the OS does not ask for the next one, so the code meant to
-         * notice only ran when there was nothing to notice. */
-        VWIFI_WARN("scan task already active (%llu ms)",
+         * This used to return NDIS_STATUS_REQUEST_ABORTED, and a trace
+         * caught what that costs: the OS asked again 1.3 seconds into
+         * the first sweep, was refused, and never asked for another
+         * scan for the rest of the session. The network list then
+         * emptied itself as the one entry aged out, and a connect had
+         * no BSS to be built from -- which is the whole reported
+         * failure, arriving by way of a rejected scan.
+         *
+         * There is nothing to refuse. The device is already sweeping
+         * every channel it supports (both masks are widened below
+         * whenever the request names none), so the sweep in progress
+         * satisfies the new request as well as the old one. So:
+         * complete the outstanding task, adopt the new one's
+         * transaction id, and let the running sweep finish into it.
+         *
+         * Not by re-issuing VWIFI_OP_SCAN -- the device answers -EBUSY
+         * while its scan state machine is not idle, and that would turn
+         * a normal overlap into a device error.
+         *
+         * Success for the outstanding one, because it is true: it ran,
+         * and its results went up as BSS_ENTRY_LIST indications as they
+         * were found. The OS asking again mid-sweep is not a failure of
+         * the sweep. */
+        VWIFI_WARN("scan requested %llu ms into one already running -- "
+                   "completing that one and adopting this request",
                    VwifiGetTickCountMs() - task->StartedTimeMs);
-        return NDIS_STATUS_REQUEST_ABORTED;
+
+        /* Clears Active and flushes anything staged. */
+        VwifiIndicateScanComplete(Adapter, NDIS_STATUS_SUCCESS);
+
+        task->PortId               = Req->PortNumber;
+        task->WdiPortId            = VwifiGetWdiPortId(Req);
+        task->TransactionId        = VwifiGetWdiTransactionId(Req);
+        task->PendingCount         = 0;
+        task->LastIndicationTimeMs = VwifiGetTickCountMs();
+        task->StartedTimeMs        = task->LastIndicationTimeMs;
+
+        InterlockedExchange(&task->Active, 1);
+        if (task->Watchdog) {
+            LARGE_INTEGER due;
+            due.QuadPart = -((LONGLONG)VWIFI_SCAN_STALE_MS * 10000LL);
+            NdisSetTimerObject(task->Watchdog, due, 0, NULL);
+        }
+        return NDIS_STATUS_INDICATION_REQUIRED;
     }
 
     /* The OID buffer is [WDI_MESSAGE_HEADER][TLV blob]; the parser
