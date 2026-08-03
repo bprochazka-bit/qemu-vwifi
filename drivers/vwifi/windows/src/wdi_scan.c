@@ -54,7 +54,19 @@ typedef struct _VWIFI_BSS_STAGE
 
 typedef struct _VWIFI_SCAN_TASK
 {
-    BOOLEAN   Active;
+    /* 1 while a scan awaits its SCAN_COMPLETE.
+     *
+     * Interlocked and claimed rather than tested: the device's response
+     * drain and the watchdog below are independent DPCs and can be on
+     * different processors at once, and whichever swaps this back to 0
+     * owns the completion. */
+    volatile LONG Active;
+
+    /* Fires if SCAN_COMPLETE never arrives. See VwifiScanWatchdog --
+     * the lazy check this replaces could not fire in the one case it
+     * existed for. */
+    NDIS_HANDLE Watchdog;
+
     /* Both port namespaces. WdiPortId scopes the WDI message
      * header of every indication this task sends; PortId is the
      * NDIS port the request arrived on. See VwifiGetWdiPortId. */
@@ -78,10 +90,17 @@ typedef struct _VWIFI_SCAN_TASK
      * `netsh wlan show networks` and from the UI, and stopped the
      * component scanning.
      *
+     * Kept up to date whether or not a scan is running. The device
+     * reports every BSS it observes, continuously, which is what real
+     * hardware does and what makes an adapter's cached list worth
+     * having: entries stay fresh, so the OS's own list does not empty
+     * itself between scans. Discarding those reports outside a scan
+     * made the cache exactly as stale as the last scan, and a network
+     * that had been visible went missing until the next one.
+     *
      * Keyed by BSSID, newest write wins, oldest evicted when full. No
-     * ageing: the device only reports what it currently sees, so an
-     * entry going stale means the next scan simply does not refresh
-     * it. */
+     * ageing here -- each entry carries the time it was last seen and
+     * the OS ages it out on that. */
     PVWIFI_BSS_STAGE Cache;
     ULONG     CacheCount;
     ULONG     CacheCapacity;
@@ -166,7 +185,11 @@ VwifiIndicateScanComplete(_Inout_ PVWIFI_ADAPTER Adapter, _In_ NDIS_STATUS Statu
 {
     PVWIFI_SCAN_TASK task = Adapter->ScanTask;
 
-    if (!task || !task->Active) return;
+    if (!task) return;
+
+    /* Claim the completion. The device's SCAN_COMPLETE and the watchdog
+     * both arrive here and only one of them may indicate. */
+    if (InterlockedCompareExchange(&task->Active, 0, 1) != 1) return;
 
     /* Flush anything still staged before completing the task. */
     VwifiIndicateBssEntryList(Adapter);
@@ -178,7 +201,46 @@ VwifiIndicateScanComplete(_Inout_ PVWIFI_ADAPTER Adapter, _In_ NDIS_STATUS Statu
                            Status, task->TransactionId, NULL, 0);
 
     VWIFI_INFO("indicated SCAN_COMPLETE (0x%x)", Status);
-    task->Active = FALSE;
+}
+
+/* ============================================================
+ * Scan watchdog
+ *
+ * A scan whose SCAN_COMPLETE never arrives -- the device drops the
+ * event when the response ring has no free slot -- used to be caught
+ * lazily, by the next scan request noticing the task had been active
+ * too long. That check cannot fire in the one situation it exists for.
+ * WDI runs one scan at a time per port, so an outstanding scan is
+ * exactly why the OS does not ask for the next one, and the thing that
+ * was supposed to notice only ran when it did. Scanning stopped, the
+ * OS's network list emptied itself as the entries aged out, and a
+ * connect then had no BSS to be built from.
+ *
+ * An armed timer notices without needing anyone to ask.
+ * ============================================================ */
+static VOID
+VwifiScanWatchdog(_In_ PVOID SystemSpecific1,
+                  _In_ PVOID FunctionContext,
+                  _In_ PVOID SystemSpecific2,
+                  _In_ PVOID SystemSpecific3)
+{
+    PVWIFI_ADAPTER adapter = (PVWIFI_ADAPTER)FunctionContext;
+    PVWIFI_SCAN_TASK task = adapter ? adapter->ScanTask : NULL;
+
+    UNREFERENCED_PARAMETER(SystemSpecific1);
+    UNREFERENCED_PARAMETER(SystemSpecific2);
+    UNREFERENCED_PARAMETER(SystemSpecific3);
+
+    if (!task || !task->Active) return;
+
+    VWIFI_WARN("no SCAN_COMPLETE after %u ms -- completing the scan so the "
+               "next one can be asked for", VWIFI_SCAN_STALE_MS);
+
+    /* Failure, not success: the entries found so far have already gone
+     * up as BSS_ENTRY_LIST indications, and what is unknown is whether
+     * the sweep finished. Claiming it did would be inventing a result.
+     * The flush inside this call still sends anything staged. */
+    VwifiIndicateScanComplete(adapter, NDIS_STATUS_FAILURE);
 }
 
 /* ============================================================
@@ -196,9 +258,7 @@ VwifiScanOnBssFound(_Inout_ PVWIFI_ADAPTER Adapter,
     USHORT frameLen;
     LARGE_INTEGER now;
 
-    /* The device observes BSSes continuously, not only during scans.
-     * Outside a scan there is nothing to report. */
-    if (!task || !task->Active) return;
+    if (!task) return;
 
     if (PayloadLen < sizeof(*bss)) {
         VWIFI_WARN("BSS_FOUND payload too short: %u", PayloadLen);
@@ -226,20 +286,18 @@ VwifiScanOnBssFound(_Inout_ PVWIFI_ADAPTER Adapter,
      * DISPATCH_LEVEL, which is where this DPC runs. */
     NdisGetCurrentSystemTime(&now);
 
-    /* Flush first if the accumulator is full. */
-    if (task->PendingCount >= task->PendingCapacity) {
-        VwifiIndicateBssEntryList(Adapter);
-    }
-
-    task->Pending[task->PendingCount].Entry = *bss;
-    task->Pending[task->PendingCount].Entry.ie_len = frameLen;
-    task->Pending[task->PendingCount].SeenSystemTime = (ULONGLONG)now.QuadPart;
-    RtlCopyMemory(task->Pending[task->PendingCount].Frame, frame, frameLen);
-    task->PendingCount++;
-
-    /* Keep a copy past this scan, so OID_WDI_GET_BSS_ENTRY_LIST has
-     * something to answer with. Replace by BSSID if we already know
-     * this one; otherwise append, evicting the oldest when full. */
+    /* The cache, first and unconditionally.
+     *
+     * The device observes BSSes continuously, not only during scans,
+     * and this used to return early when no scan was running -- so the
+     * adapter's cached list was only ever as fresh as the last scan.
+     * Between scans the entries aged past what the OS keeps and the
+     * network disappeared from `netsh wlan show networks` and from the
+     * flyout, with a connect attempt then having no BSS to build from.
+     *
+     * Real hardware maintains its BSS list continuously; so does this
+     * now. Replace by BSSID if we already know this one; otherwise
+     * append, evicting the oldest when full. */
     {
         ULONG slot = task->CacheCount;
 
@@ -286,6 +344,25 @@ VwifiScanOnBssFound(_Inout_ PVWIFI_ADAPTER Adapter,
                (bss->capability_info & VWIFI_BSS_F_BEACON)
                    ? "beacon" : "probe-resp");
 
+    /* Everything past here is the running scan's business. Outside a
+     * scan the cache above is the whole job: there is no scan for these
+     * entries to be results of, and BSS_ENTRY_LIST is how a scan
+     * reports, so an unsolicited stream of them between scans would be
+     * reporting a scan that is not happening. The OS gets them when it
+     * asks, through OID_WDI_GET_BSS_ENTRY_LIST. */
+    if (!task->Active) return;
+
+    /* Flush first if the accumulator is full. */
+    if (task->PendingCount >= task->PendingCapacity) {
+        VwifiIndicateBssEntryList(Adapter);
+    }
+
+    task->Pending[task->PendingCount].Entry = *bss;
+    task->Pending[task->PendingCount].Entry.ie_len = frameLen;
+    task->Pending[task->PendingCount].SeenSystemTime = (ULONGLONG)now.QuadPart;
+    RtlCopyMemory(task->Pending[task->PendingCount].Frame, frame, frameLen);
+    task->PendingCount++;
+
     /* The documented throttle: 3+ staged, or 500ms since last update. */
     if (task->PendingCount >= VWIFI_SCAN_BATCH_THRESHOLD ||
         (VwifiGetTickCountMs() - task->LastIndicationTimeMs)
@@ -328,32 +405,19 @@ VwifiHandleTaskScan(_Inout_ PVWIFI_ADAPTER Adapter,
 
     if (!task) return NDIS_STATUS_RESOURCES;
     if (task->Active) {
-        /*
-         * A scan that never completed must not wedge scanning forever.
+        /* A scan is genuinely in flight. WDI runs one at a time per
+         * port, so refusing is the right answer -- and it is now only
+         * ever a real overlap, because the watchdog has already
+         * completed anything older than VWIFI_SCAN_STALE_MS.
          *
-         * Active is cleared by SCAN_COMPLETE, so a lost event -- the
-         * device drops one when the response ring has no free slot --
-         * leaves it set with nothing left to clear it, and every scan
-         * from then on is rejected. The Linux driver arms a timer for
-         * this; here the check is lazy, because the moment that matters
-         * is precisely when the OS asks for the next scan.
-         *
-         * The bound is generous: the device dwells 100 ms on each of up
-         * to VWIFI_SCAN_MAX_CHANNELS channels, so a healthy scan is well
-         * under two seconds and anything past this is not merely slow.
-         */
-        ULONGLONG age = VwifiGetTickCountMs() - task->StartedTimeMs;
-
-        if (age < VWIFI_SCAN_STALE_MS) {
-            VWIFI_WARN("scan task already active (%llu ms)", age);
-            return NDIS_STATUS_REQUEST_ABORTED;
-        }
-
-        VWIFI_WARN("scan task active for %llu ms with no SCAN_COMPLETE -- "
-                   "completing it as failed and starting the new one", age);
-        /* Clears Active, and flushes any BSS entries staged by the
-         * scan that went missing so they are not lost silently. */
-        VwifiIndicateScanComplete(Adapter, NDIS_STATUS_FAILURE);
+         * This used to be where a lost SCAN_COMPLETE was noticed, by
+         * checking the task's age here. That check could not fire in
+         * the case it existed for: an outstanding scan is exactly why
+         * the OS does not ask for the next one, so the code meant to
+         * notice only ran when there was nothing to notice. */
+        VWIFI_WARN("scan task already active (%llu ms)",
+                   VwifiGetTickCountMs() - task->StartedTimeMs);
+        return NDIS_STATUS_REQUEST_ABORTED;
     }
 
     /* The OID buffer is [WDI_MESSAGE_HEADER][TLV blob]; the parser
@@ -392,7 +456,6 @@ VwifiHandleTaskScan(_Inout_ PVWIFI_ADAPTER Adapter,
                                  : 0;
     }
 
-    task->Active               = TRUE;
     task->PortId               = Req->PortNumber;
     task->WdiPortId            = VwifiGetWdiPortId(Req);
     task->TransactionId        = VwifiGetWdiTransactionId(Req);
@@ -400,11 +463,29 @@ VwifiHandleTaskScan(_Inout_ PVWIFI_ADAPTER Adapter,
     task->LastIndicationTimeMs = VwifiGetTickCountMs();
     task->StartedTimeMs        = task->LastIndicationTimeMs;
 
+    /* Marked active and the watchdog armed before the device is asked
+     * to do anything: BSS_FOUND events can land on another processor
+     * the instant the request is posted. */
+    InterlockedExchange(&task->Active, 1);
+    if (task->Watchdog) {
+        LARGE_INTEGER due;
+        due.QuadPart = -((LONGLONG)VWIFI_SCAN_STALE_MS * 10000LL);
+        NdisSetTimerObject(task->Watchdog, due, 0, NULL);
+    }
+
     status = VwifiCtrlSendSync(Adapter, VWIFI_OP_SCAN,
                                scanReq, reqLen, NULL, &outLen);
     if (status != NDIS_STATUS_SUCCESS) {
+        /* Rejected before the scan ever started, so the OID reports it
+         * and no SCAN_COMPLETE is indicated -- returning a failure
+         * status and indicating a completion for the same task is a
+         * double completion. Release the claim so the next scan is not
+         * refused as an overlap. */
         VWIFI_ERR("device rejected SCAN: 0x%x", status);
-        task->Active = FALSE;
+        if (InterlockedCompareExchange(&task->Active, 0, 1) == 1 &&
+            task->Watchdog) {
+            (VOID)NdisCancelTimerObject(task->Watchdog);
+        }
         return status;
     }
 
@@ -479,6 +560,28 @@ VwifiScanTaskCreate(_Inout_ PVWIFI_ADAPTER Adapter)
                   VWIFI_SCAN_CACHE_MAX * sizeof(task->Cache[0]));
     task->CacheCapacity = VWIFI_SCAN_CACHE_MAX;
 
+    {
+        NDIS_TIMER_CHARACTERISTICS tc = { 0 };
+        NDIS_STATUS st;
+
+        tc.Header.Type     = NDIS_OBJECT_TYPE_TIMER_CHARACTERISTICS;
+        tc.Header.Revision = NDIS_TIMER_CHARACTERISTICS_REVISION_1;
+        tc.Header.Size     = NDIS_SIZEOF_TIMER_CHARACTERISTICS_REVISION_1;
+        tc.AllocationTag   = VWIFI_POOL_TAG;
+        tc.TimerFunction   = VwifiScanWatchdog;
+        tc.FunctionContext = Adapter;
+
+        st = NdisAllocateTimerObject(Adapter->MiniportAdapterHandle,
+                                     &tc, &task->Watchdog);
+        if (st != NDIS_STATUS_SUCCESS) {
+            /* Not fatal. Scanning still works; what is lost is the
+             * guarantee that a lost SCAN_COMPLETE costs one scan rather
+             * than every scan from then on. */
+            VWIFI_WARN("scan watchdog timer unavailable (0x%x)", st);
+            task->Watchdog = NULL;
+        }
+    }
+
     Adapter->ScanTask = task;
     return NDIS_STATUS_SUCCESS;
 }
@@ -488,6 +591,15 @@ VwifiScanTaskDestroy(_Inout_ PVWIFI_ADAPTER Adapter)
 {
     PVWIFI_SCAN_TASK task = Adapter->ScanTask;
     if (!task) return;
+
+    /* Cancel and free before the memory the callback reads goes away.
+     * NdisFreeTimerObject waits for a callback already running, which
+     * is the half NdisCancelTimerObject cannot promise. */
+    if (task->Watchdog) {
+        (VOID)NdisCancelTimerObject(task->Watchdog);
+        NdisFreeTimerObject(task->Watchdog);
+        task->Watchdog = NULL;
+    }
 
     if (task->Cache) {
         NdisFreeMemoryWithTagPriority(Adapter->MiniportAdapterHandle,
