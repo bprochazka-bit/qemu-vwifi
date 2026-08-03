@@ -776,6 +776,27 @@ VwifiHandleTaskDot11Reset(_Inout_ PVWIFI_ADAPTER Adapter,
                                 &dreq, sizeof(dreq), NULL, &out_len);
     }
 
+    /* Re-assert the media state after the reset.
+     *
+     * A DOT11_RESET -- especially with SetDefaultMIB -- returns the port
+     * to power-on defaults, and the WLAN component treats the media state
+     * it last heard about as stale across it. The connect that the MSM
+     * issues immediately after StopSecurity is exactly this reset, and a
+     * wlan ETW trace caught the connect wedging right here: the reset
+     * completed, OID_GEN_MEDIA_CONNECT_STATUS was left pending, and the
+     * association request was never issued -- the MSM was waiting for the
+     * port to state where its link stood again, and this handler never
+     * said. CREATE_PORT and the disconnect path both indicate link state;
+     * the reset path was the one that did not, so it was invisible during
+     * bring-up (nothing blocks on the media state there) and fatal during
+     * a connect (the MSM blocks on it).
+     *
+     * Disconnected is the truth after a reset, and re-stating it lets the
+     * pending media-status query complete so the connect can proceed. */
+    Adapter->Associated = FALSE;
+    RtlZeroMemory(Adapter->Bssid, 6);
+    VwifiIndicateLinkState(Adapter, FALSE);
+
     VwifiSendWdiIndication(Adapter, VwifiGetWdiPortId(Req), Req->PortNumber,
                            NDIS_STATUS_WDI_INDICATION_DOT11_RESET_COMPLETE,
                            NDIS_STATUS_SUCCESS,
@@ -1158,5 +1179,10 @@ VwifiHandleTaskChangeOpMode(_Inout_ PVWIFI_ADAPTER Adapter,
                            NDIS_STATUS_SUCCESS,
                            VwifiGetWdiTransactionId(Req),
                            NULL, 0);
-    return NDIS_STATUS_SUCCESS;
+    /* A task is completed by its indication above, so it returns
+     * INDICATION_REQUIRED, never SUCCESS -- SUCCESS tells the component
+     * the task finished with nothing more coming, and then the indication
+     * arrives for a task it has already closed out. See the block above
+     * VwifiHandleTaskCreatePort. */
+    return NDIS_STATUS_INDICATION_REQUIRED;
 }

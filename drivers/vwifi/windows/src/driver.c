@@ -413,12 +413,13 @@ VwifiHeartbeat(_In_ PVOID SystemSpecific1,
     if (adapter == NULL) return;
 
     adapter->HangChecks++;
-    VWIFI_INFO("alive: beat %u, scan %u, conn 0x%x, assoc %u, port %u",
+    VWIFI_INFO("alive: beat %u, scan %u, conn 0x%x, assoc %u, port %u, opmode %u",
                adapter->HangChecks,
                VwifiScanTaskState(adapter),
                VwifiConnectTaskState(adapter),
                adapter->Associated ? 1u : 0u,
-               adapter->PortCreated ? 1u : 0u);
+               adapter->PortCreated ? 1u : 0u,
+               adapter->OpMode);
 }
 
 NDIS_STATUS
