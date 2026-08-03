@@ -45,6 +45,24 @@
  * limitation, not a temporary shim that happens to work — anything sent
  * this way stays queued in the component. Scanning and connecting are
  * control-path operations and do not go through here.
+ *
+ * Every handler traces
+ * --------------------
+ * Including the ones that do nothing. Ten of them used to be silent,
+ * and that silence cost a diagnosis: an ETW trace showed the WLAN
+ * component take OID_DOT11_RESET_REQUEST, never turn it into
+ * OID_WDI_TASK_DOT11_RESET for this driver, and never complete it. What
+ * the component is documented to do first is "abort any task in
+ * progress on the port. It also flushes its Rx and TX queues" -- which
+ * runs through TxAbort, RxStop and RxFlush, all three of which said
+ * nothing. So the driver's trace could not distinguish "the component
+ * never called us" from "the component called us and we are where it
+ * stopped".
+ *
+ * The per-frame handlers still announce themselves once rather than per
+ * call, because at full rate they would bury everything else. The
+ * control and flush handlers log every time: they are rare, and each
+ * one is a step in a sequence worth seeing in order.
  */
 
 #include "vwifi_drv.h"
@@ -271,11 +289,10 @@ VwifiTalTxAbort(
     _Out_ NDIS_STATUS *pWifiStatus)
 {
     UNREFERENCED_PARAMETER(MiniportTalTxRxContext);
-    UNREFERENCED_PARAMETER(PortId);
-    UNREFERENCED_PARAMETER(PeerId);
 
     /* Nothing was ever accepted, so there is nothing outstanding to
      * abort and success is the truthful answer. */
+    VWIFI_INFO("TAL TxAbort: port %u peer %u", PortId, PeerId);
     *pWifiStatus = NDIS_STATUS_SUCCESS;
 }
 
@@ -290,6 +307,7 @@ VwifiTalTxTargetDescInit(
 
     /* No per-frame target descriptor to build: this device takes whole
      * frames through the TX ring, not a descriptor the TAL prepares. */
+    VWIFI_TAL_ONCE("TAL TxTargetDescInit (first call)");
     *pWifiStatus = NDIS_STATUS_SUCCESS;
 }
 
@@ -300,6 +318,8 @@ VwifiTalTxTargetDescDeInit(
 {
     UNREFERENCED_PARAMETER(MiniportTalTxRxContext);
     UNREFERENCED_PARAMETER(pNBL);
+
+    VWIFI_TAL_ONCE("TAL TxTargetDescDeInit (first call)");
 }
 
 static VOID
@@ -358,6 +378,8 @@ VwifiTalTxTalSendComplete(
     UNREFERENCED_PARAMETER(MiniportTalTxRxContext);
     UNREFERENCED_PARAMETER(pNBL);
     UNREFERENCED_PARAMETER(TxFrameStatus);
+
+    VWIFI_TAL_ONCE("TAL TxTalSendComplete (first call)");
 }
 
 static VOID
@@ -367,8 +389,8 @@ VwifiTalTxQueueInOrder(
     _In_ UINT32 ExTidBitmask)
 {
     UNREFERENCED_PARAMETER(MiniportTalTxRxContext);
-    UNREFERENCED_PARAMETER(PeerId);
-    UNREFERENCED_PARAMETER(ExTidBitmask);
+
+    VWIFI_INFO("TAL TxQueueInOrder: peer %u tids 0x%x", PeerId, ExTidBitmask);
 }
 
 static VOID
@@ -379,9 +401,9 @@ VwifiTalTxPeerBacklog(
     _In_ BOOLEAN bBacklogged)
 {
     UNREFERENCED_PARAMETER(MiniportTalTxRxContext);
-    UNREFERENCED_PARAMETER(PortId);
-    UNREFERENCED_PARAMETER(PeerId);
-    UNREFERENCED_PARAMETER(bBacklogged);
+
+    VWIFI_INFO("TAL TxPeerBacklog: port %u peer %u backlogged %u",
+               PortId, PeerId, bBacklogged ? 1u : 0u);
 }
 
 static VOID
@@ -393,8 +415,9 @@ VwifiTalTxSuspectFrameAbort(
 {
     UNREFERENCED_PARAMETER(MiniportTalTxRxContext);
     UNREFERENCED_PARAMETER(SuspectFrameContext);
-    UNREFERENCED_PARAMETER(NumSuspectFrames);
     UNREFERENCED_PARAMETER(SuspectFrameList);
+
+    VWIFI_INFO("TAL TxSuspectFrameAbort: %u frames", NumSuspectFrames);
 }
 
 /* ============================================================
@@ -408,9 +431,9 @@ VwifiTalRxStop(
     _Out_ NDIS_STATUS *pWifiStatus)
 {
     UNREFERENCED_PARAMETER(MiniportTalTxRxContext);
-    UNREFERENCED_PARAMETER(PortId);
 
     /* Nothing is running, so it is already stopped. */
+    VWIFI_INFO("TAL RxStop: port %u", PortId);
     *pWifiStatus = NDIS_STATUS_SUCCESS;
 }
 
@@ -420,7 +443,8 @@ VwifiTalRxFlush(
     _In_ WDI_PORT_ID PortId)
 {
     UNREFERENCED_PARAMETER(MiniportTalTxRxContext);
-    UNREFERENCED_PARAMETER(PortId);
+
+    VWIFI_INFO("TAL RxFlush: port %u", PortId);
 }
 
 static VOID
@@ -429,7 +453,8 @@ VwifiTalRxRestart(
     _In_ WDI_PORT_ID PortId)
 {
     UNREFERENCED_PARAMETER(MiniportTalTxRxContext);
-    UNREFERENCED_PARAMETER(PortId);
+
+    VWIFI_INFO("TAL RxRestart: port %u", PortId);
 }
 
 static VOID
@@ -446,6 +471,7 @@ VwifiTalRxGetMpdus(
     /* NULL, explicitly. This is an _Out_ pointer the component will
      * walk; leaving it as whatever was on the stack is the difference
      * between "no frames" and a bugcheck. */
+    VWIFI_TAL_ONCE("TAL RxGetMpdus (first call) -- returning no frames");
     *ppNBL = NULL;
 }
 
@@ -459,12 +485,16 @@ VwifiTalRxReturnFrames(
 
     /* Nothing was ever indicated through the TAL, so nothing can come
      * back through here. */
+    VWIFI_TAL_ONCE("TAL RxReturnFrames (first call) -- unexpected, nothing "
+                   "was indicated through the TAL");
 }
 
 static VOID
 VwifiTalRxResume(_In_ TAL_TXRX_HANDLE MiniportTalTxRxContext)
 {
     UNREFERENCED_PARAMETER(MiniportTalTxRxContext);
+
+    VWIFI_INFO("TAL RxResume");
 }
 
 static VOID
@@ -473,7 +503,8 @@ VwifiTalRxThrottle(
     _In_ WDI_RX_THROTTLE_LEVEL RxThrottleLevel)
 {
     UNREFERENCED_PARAMETER(MiniportTalTxRxContext);
-    UNREFERENCED_PARAMETER(RxThrottleLevel);
+
+    VWIFI_INFO("TAL RxThrottle: level %u", RxThrottleLevel);
 }
 
 static VOID
@@ -492,6 +523,7 @@ VwifiTalRxPpduRssi(
      * and monitor.c puts it straight into the radiotap header. A fixed
      * mid-scale value is honest here in a way an invented dBm reading
      * would not be. */
+    VWIFI_TAL_ONCE("TAL RxPpduRssi (first call)");
     *pRssi = 60;
 }
 
