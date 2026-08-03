@@ -90,14 +90,30 @@ VwifiTalStart(
 {
     UNREFERENCED_PARAMETER(MiniportTalTxRxContext);
 
-    VWIFI_INFO("TAL start: max %u ports, %u peers",
+    VWIFI_INFO("TAL start: max %u ports, %u peers, params %u bytes",
                pWifiTxRxConfiguration ? pWifiTxRxConfiguration->MaxNumPorts : 0,
-               pWifiTxRxConfiguration ? pWifiTxRxConfiguration->MaxNumPeers : 0);
+               pWifiTxRxConfiguration ? pWifiTxRxConfiguration->MaxNumPeers : 0,
+               (ULONG)sizeof(*pTalTxRxParameters));
 
-    /* The only thing we get to say here. One outstanding transfer: the
-     * TAL TX path is not implemented, so there is no depth to offer and
-     * claiming otherwise would invite the component to queue work that
-     * never completes. */
+    /* Zero the whole block before writing the one field we know about.
+     *
+     * pTalTxRxParameters is _Out_, which makes initialising every byte
+     * of it this function's job, and this function was setting exactly
+     * one member. Whatever else TAL_TXRX_PARAMETERS holds was left as
+     * whatever the component's caller had on its stack -- and the
+     * component configures its data path from this block.
+     *
+     * Zero is not known to be a good value for the fields we are not
+     * naming; it is only known to be a defined one. That is the whole
+     * claim. Stack residue is worse in every case and unreproducible in
+     * the bargain, which is exactly the shape of failure being chased
+     * here. The size is logged so a trace says how much of this struct
+     * the kit actually has. */
+    RtlZeroMemory(pTalTxRxParameters, sizeof(*pTalTxRxParameters));
+
+    /* One outstanding transfer: the TAL TX path is not implemented, so
+     * there is no depth to offer and claiming otherwise would invite
+     * the component to queue work that never completes. */
     pTalTxRxParameters->MaxOutstandingTransfers = 1;
     return NDIS_STATUS_SUCCESS;
 }
