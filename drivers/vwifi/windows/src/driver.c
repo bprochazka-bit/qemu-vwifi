@@ -170,6 +170,9 @@ VwifiAdapterCreate(
     }
     RtlZeroMemory(adapter, sizeof(*adapter));
     adapter->MiniportAdapterHandle = MiniportAdapterHandle;
+    /* Not zero: zero is a valid operation mode, and this field means
+     * "nothing pending". */
+    adapter->PendingOpMode = -1;
     InitializeListHead(&adapter->PendingReqList);
     KeInitializeSpinLock(&adapter->PendingReqLock);
 

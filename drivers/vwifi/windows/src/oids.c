@@ -1158,5 +1158,9 @@ VwifiHandleTaskChangeOpMode(_Inout_ PVWIFI_ADAPTER Adapter,
                            NDIS_STATUS_SUCCESS,
                            VwifiGetWdiTransactionId(Req),
                            NULL, 0);
-    return NDIS_STATUS_SUCCESS;
+    /* INDICATION_REQUIRED, for the reason set out above the create-port
+     * handler. This one was missed when the other four task handlers
+     * were corrected: it sends its completion indication and then
+     * returned SUCCESS as well, which is the same double completion. */
+    return NDIS_STATUS_INDICATION_REQUIRED;
 }

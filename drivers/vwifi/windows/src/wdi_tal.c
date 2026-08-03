@@ -108,6 +108,31 @@ VwifiTalStop(_In_ TAL_TXRX_HANDLE MiniportTalTxRxContext)
  * adapter that scans but cannot associate is what that looks like from
  * the outside.
  * ============================================================ */
+/* The passive-level half of VwifiTalApplyOpMode.
+ *
+ * NDIS runs this at PASSIVE_LEVEL, which is what VwifiSetOpMode needs
+ * and what the TAL callback could not promise. */
+static NDIS_IO_WORKITEM_FUNCTION VwifiTalOpModeWorker;
+
+_Use_decl_annotations_
+static VOID
+VwifiTalOpModeWorker(PVOID Context, NDIS_HANDLE WorkItem)
+{
+    PVWIFI_ADAPTER adapter = (PVWIFI_ADAPTER)Context;
+    LONG mode = InterlockedExchange(&adapter->PendingOpMode, -1);
+
+    /* Negative means another worker already took it. Two TAL callbacks
+     * in quick succession can queue two items; the first one to run
+     * does the work and the second finds nothing to do. */
+    if (mode >= 0) {
+        VWIFI_INFO("TAL: applying deferred opmode %d at IRQL %u",
+                   mode, KeGetCurrentIrql());
+        (VOID)VwifiSetOpMode(adapter, (ULONG)mode);
+    }
+
+    NdisFreeIoWorkItem(WorkItem);
+}
+
 static VOID
 VwifiTalApplyOpMode(_Inout_ PVWIFI_ADAPTER Adapter,
                     _In_ WDI_OPERATION_MODE OpMode)
@@ -130,18 +155,43 @@ VwifiTalApplyOpMode(_Inout_ PVWIFI_ADAPTER Adapter,
     }
 
     /* VwifiSetOpMode goes to the device over the control ring and waits
-     * for the reply, so it needs PASSIVE_LEVEL. These callbacks are
-     * expected to arrive there; check rather than assume, because
-     * blocking above PASSIVE is a bugcheck and a wrong guess here would
-     * be indistinguishable from the hangs already being chased. */
-    if (KeGetCurrentIrql() != PASSIVE_LEVEL) {
-        VWIFI_ERR("TAL: opmode change to %u wanted at IRQL %u -- cannot "
-                  "send a synchronous control request above PASSIVE",
-                  mode, KeGetCurrentIrql());
+     * for the reply, so it needs PASSIVE_LEVEL. The TAL callbacks can
+     * arrive above it, and blocking there is a bugcheck.
+     *
+     * This used to log an error and return, which meant the mode change
+     * was silently dropped whenever the component happened to call at
+     * DISPATCH_LEVEL. The consequence is the one described at the top of
+     * this section: the adapter stays in VWIFI_MODE_IDLE, every send is
+     * completed with NDIS_STATUS_PAUSED, every receive is dropped, and
+     * the device is never told to behave as a station -- an adapter
+     * that scans but cannot associate. Worse, it depends on the IRQL
+     * the component happens to pick, so it works until it doesn't.
+     *
+     * Deferred to a work item instead. NDIS runs those at PASSIVE. */
+    if (KeGetCurrentIrql() == PASSIVE_LEVEL) {
+        (VOID)VwifiSetOpMode(Adapter, mode);
         return;
     }
 
-    (VOID)VwifiSetOpMode(Adapter, mode);
+    {
+        NDIS_HANDLE wi;
+
+        /* Published before the item is queued: the worker reads it and
+         * the worker cannot run until NdisQueueIoWorkItem returns. */
+        InterlockedExchange(&Adapter->PendingOpMode, (LONG)mode);
+
+        wi = NdisAllocateIoWorkItem(Adapter->MiniportAdapterHandle);
+        if (wi == NULL) {
+            VWIFI_ERR("TAL: opmode change to %u wanted at IRQL %u and no "
+                      "work item to defer it to", mode, KeGetCurrentIrql());
+            InterlockedExchange(&Adapter->PendingOpMode, -1);
+            return;
+        }
+
+        VWIFI_INFO("TAL: opmode change to %u at IRQL %u -- deferring to a "
+                   "work item", mode, KeGetCurrentIrql());
+        NdisQueueIoWorkItem(wi, VwifiTalOpModeWorker, Adapter);
+    }
 }
 
 static VOID

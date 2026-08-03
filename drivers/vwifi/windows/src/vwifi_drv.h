@@ -296,6 +296,11 @@ typedef struct _VWIFI_ADAPTER
 
     /* Current operating mode + channel, mirrored to the device. */
     ULONG               OpMode;         /* enum vwifi_mode */
+
+    /* An operation mode the TAL asked for above PASSIVE_LEVEL, waiting
+     * for the work item that can actually send it. -1 (or any negative)
+     * means nothing is pending. See VwifiTalApplyOpMode. */
+    volatile LONG       PendingOpMode;
     ULONG               RawFilter;      /* VWIFI_RAW_F_* */
     USHORT              CurrentFreq;    /* MHz */
 
