@@ -539,6 +539,16 @@ VwifiHandleTaskScan(_Inout_ PVWIFI_ADAPTER Adapter,
     return NDIS_STATUS_INDICATION_REQUIRED;
 }
 
+/* For the heartbeat in MiniportCheckForHangEx, which lives in driver.c
+ * and cannot see this file's private task structure. */
+ULONG
+VwifiScanTaskState(_In_ PVWIFI_ADAPTER Adapter)
+{
+    PVWIFI_SCAN_TASK task = Adapter->ScanTask;
+
+    return (task && task->Active) ? 1u : 0u;
+}
+
 NDIS_STATUS
 VwifiHandleTaskScanAbort(_Inout_ PVWIFI_ADAPTER Adapter)
 {

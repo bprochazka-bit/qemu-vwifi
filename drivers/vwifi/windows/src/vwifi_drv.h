@@ -307,6 +307,12 @@ typedef struct _VWIFI_ADAPTER
     BOOLEAN             Associated;
     UCHAR               Bssid[6];
 
+    /* MiniportCheckForHangEx call count, for the heartbeat it prints.
+     * NDIS calls that handler on a timer whether or not anything else
+     * is happening, which makes it the one place in this driver that
+     * can prove the miniport is still being called at all. */
+    ULONG               HangChecks;
+
     /* Ctrl-request payload scratch buffers (per-slot). */
     PVOID               CtrlReqPayloadVa;
     NDIS_PHYSICAL_ADDRESS CtrlReqPayloadPa;
@@ -507,6 +513,8 @@ NDIS_STATUS VwifiHandleTaskScan(_Inout_ PVWIFI_ADAPTER Adapter,
 VOID        VwifiIndicateLinkState(_Inout_ PVWIFI_ADAPTER Adapter,
                                    _In_ BOOLEAN Up);
 NDIS_STATUS VwifiHandleTaskScanAbort(_Inout_ PVWIFI_ADAPTER Adapter);
+/* 1 if a scan is awaiting its SCAN_COMPLETE. For the heartbeat. */
+ULONG       VwifiScanTaskState(_In_ PVWIFI_ADAPTER Adapter);
 VOID        VwifiScanOnBssFound(_Inout_ PVWIFI_ADAPTER Adapter,
                                 _In_reads_bytes_(PayloadLen) const VOID *Payload,
                                 _In_ ULONG PayloadLen);
@@ -521,6 +529,11 @@ NDIS_STATUS VwifiHandleTaskConnect(_Inout_ PVWIFI_ADAPTER Adapter,
                                    _In_ PNDIS_OID_REQUEST Req);
 NDIS_STATUS VwifiHandleTaskDisconnect(_Inout_ PVWIFI_ADAPTER Adapter,
                                       _In_ PNDIS_OID_REQUEST Req);
+/* Bit 0: a connect awaits CONNECT_COMPLETE. Bit 1: a disconnect awaits
+ * DISCONNECT_COMPLETE. For the heartbeat. */
+#define VWIFI_TASK_CONNECT_PENDING     0x1
+#define VWIFI_TASK_DISCONNECT_PENDING  0x2
+ULONG       VwifiConnectTaskState(_In_ PVWIFI_ADAPTER Adapter);
 VOID        VwifiConnectOnAssocResult(_Inout_ PVWIFI_ADAPTER Adapter,
                                       _In_reads_bytes_(PayloadLen) const VOID *Payload,
                                       _In_ ULONG PayloadLen);

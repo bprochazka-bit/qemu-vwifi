@@ -363,6 +363,40 @@ VwifiMiniportCheckForHangEx(NDIS_HANDLE MiniportAdapterContext)
     PVWIFI_ADAPTER adapter = (PVWIFI_ADAPTER)MiniportAdapterContext;
     ULONG sig;
 
+    /* The heartbeat.
+     *
+     * NDIS calls this handler on its own timer -- every
+     * CheckForHangTimeInSeconds, set to 4 in the registration
+     * attributes -- whether or not anything else is happening. That
+     * makes it the one place in this driver that can answer a question
+     * every trace so far has left open: when the guest stops responding
+     * and nothing appears in the log, is the miniport not being called,
+     * or is it being called and unable to say so?
+     *
+     * Silence has been read as the first of those, here and in what I
+     * told you about it. That reading is only sound if the log itself
+     * is known to be working, and after a hang it is not: a wedged
+     * kernel, a stalled port-0xE9 write, or a lock held by a spinning
+     * CPU all produce exactly the same empty file as a miniport that
+     * was never called.
+     *
+     * A line every 8 seconds settles it. If the heartbeat keeps ticking
+     * after a connect stalls, the driver and NDIS are both alive and
+     * the block is above them. If it stops at the moment of the click,
+     * the block is at or below NDIS and the earlier conclusion was
+     * wrong.
+     *
+     * The task state rides along because it is free here and it says
+     * whether anything is outstanding on our side. */
+    if ((adapter->HangChecks++ % 2) == 0) {
+        VWIFI_INFO("alive: beat %u, scan %u, conn 0x%x, assoc %u, port %u",
+                   adapter->HangChecks,
+                   VwifiScanTaskState(adapter),
+                   VwifiConnectTaskState(adapter),
+                   adapter->Associated ? 1u : 0u,
+                   adapter->PortCreated ? 1u : 0u);
+    }
+
     /* Quick sanity check: signature register must read back. If the
      * device has disappeared or gone insane, the read will likely
      * return 0xFFFFFFFF and we report a hang. */
