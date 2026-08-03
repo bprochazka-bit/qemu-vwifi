@@ -56,16 +56,36 @@ static volatile LONG g_E9Lock = 0;
 VOID
 VwifiE9Printf(PCSTR Format, ...)
 {
-    CHAR    buf[256];
-    va_list ap;
-    PCSTR   p;
-    KIRQL   oldIrql;
+    CHAR      buf[288];
+    va_list   ap;
+    PCSTR     p;
+    KIRQL     oldIrql;
+    size_t    used = 0;
+    ULONGLONG ms;
+
+    /* Timestamped, because a trace without one cannot be lined up
+     * against anything that happened outside the guest. Reading this
+     * log has meant marking it by hand -- pressing Enter between a scan,
+     * a netsh command and a connect click -- to know which lines came
+     * from which. That is a real cost on every round trip and it is one
+     * line of code to remove.
+     *
+     * Seconds since boot, to the millisecond. KeQueryInterruptTime is
+     * callable at any IRQL, which matters because this runs from the
+     * ISR, and it is monotonic across the sleeps and clock adjustments
+     * that would make wall time useless here. */
+    ms = KeQueryInterruptTime() / 10000ULL;
+
+    (VOID)RtlStringCchPrintfA(buf, RTL_NUMBER_OF(buf), "vwifi: [%5llu.%03llu] ",
+                              ms / 1000ULL, ms % 1000ULL);
+    (VOID)RtlStringCchLengthA(buf, RTL_NUMBER_OF(buf), &used);
 
     va_start(ap, Format);
     /* Return value ignored deliberately: on truncation this still
      * NUL-terminates, and a truncated line is worth infinitely more
      * than no line when it is the last thing before a freeze. */
-    (VOID)RtlStringCchVPrintfA(buf, RTL_NUMBER_OF(buf), Format, ap);
+    (VOID)RtlStringCchVPrintfA(buf + used, RTL_NUMBER_OF(buf) - used,
+                               Format, ap);
     va_end(ap);
 
     KeRaiseIrql(HIGH_LEVEL, &oldIrql);

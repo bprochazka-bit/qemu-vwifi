@@ -91,9 +91,12 @@
  *     -debugcon file:/tmp/vwifi-boot.log
  * ============================================================ */
 
+/* The "vwifi: " prefix and the timestamp are added by VwifiE9Printf,
+ * not here: the time has to be read when the line is emitted, and a
+ * format string cannot do that. */
 #if DBG
 VOID VwifiE9Printf(_In_z_ _Printf_format_string_ PCSTR Format, ...);
-#define VWIFI_E9(fmt, ...) VwifiE9Printf("vwifi: " fmt "\n", ##__VA_ARGS__)
+#define VWIFI_E9(fmt, ...) VwifiE9Printf(fmt "\n", ##__VA_ARGS__)
 #else
 #define VWIFI_E9(fmt, ...) ((VOID)0)
 #endif
