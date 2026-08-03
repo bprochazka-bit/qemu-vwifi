@@ -7,6 +7,10 @@ rem  folder holding vwifi.sys / vwifi.inf / vwifi.cat:
 rem
 rem      install.cmd
 rem
+rem  Boot the guest with the vwifi-virt device OFF the QEMU command
+rem  line first. install.ps1 removes the old package, and with no
+rem  device present there is nothing for the removal to stop.
+rem
 rem  This is a wrapper. The work is in install.ps1, deliberately: the
 rem  device enumeration needs a pipeline full of parentheses, and
 rem  embedding that in a cmd `for /f` is how you get "was unexpected at
@@ -28,7 +32,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0install.ps1" -Path "%~
 set "RC=%errorlevel%"
 echo.
 if not "%RC%"=="0" echo install.cmd: FAILED, exit code %RC%
-if "%RC%"=="0" echo install.cmd: staged -- REBOOT to load it.
+if "%RC%"=="0" echo install.cmd: installed. Shut down, put -device vwifi-virt back, boot.
 exit /b %RC%
 
 :no_script
