@@ -441,6 +441,12 @@ VwifiHwStart(_Inout_ PVWIFI_ADAPTER Adapter)
     }
 
     Adapter->Started = TRUE;
+
+    /* Last, and its failure is not this function's failure: the
+     * heartbeat is a diagnostic, and an adapter that works without a
+     * trace line every eight seconds is still an adapter that works. */
+    (VOID)VwifiHeartbeatStart(Adapter);
+
     VWIFI_INFO("adapter started");
     return NDIS_STATUS_SUCCESS;
 
@@ -471,6 +477,10 @@ VwifiHwStop(_Inout_ PVWIFI_ADAPTER Adapter)
         return;
     }
     Adapter->Started = FALSE;
+
+    /* First: the beat reads adapter state that everything below is
+     * about to tear down. */
+    VwifiHeartbeatStop(Adapter);
 
     if (Adapter->MmioVirtualAddress) {
         VwifiWrite32(Adapter, VWIFI_REG_CTRL, 0);

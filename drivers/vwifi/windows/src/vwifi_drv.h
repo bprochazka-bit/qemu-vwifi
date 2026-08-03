@@ -307,10 +307,10 @@ typedef struct _VWIFI_ADAPTER
     BOOLEAN             Associated;
     UCHAR               Bssid[6];
 
-    /* MiniportCheckForHangEx call count, for the heartbeat it prints.
-     * NDIS calls that handler on a timer whether or not anything else
-     * is happening, which makes it the one place in this driver that
-     * can prove the miniport is still being called at all. */
+    /* The periodic heartbeat: a timer this driver owns, and the count
+     * of beats it has printed. See VwifiHeartbeatStart in driver.c for
+     * why the beat is not driven by MiniportCheckForHangEx. */
+    NDIS_HANDLE         HeartbeatTimer;
     ULONG               HangChecks;
 
     /* Ctrl-request payload scratch buffers (per-slot). */
@@ -410,6 +410,10 @@ NDIS_STATUS VwifiHwInitialize(_Inout_ PVWIFI_ADAPTER Adapter,
  * interrupts — happens here, from OpenAdapter, not in Initialize. */
 NDIS_STATUS VwifiHwStart(_Inout_ PVWIFI_ADAPTER Adapter);
 VOID        VwifiHwStop(_Inout_ PVWIFI_ADAPTER Adapter);
+
+/* driver.c — the periodic "alive" trace. */
+NDIS_STATUS VwifiHeartbeatStart(_Inout_ PVWIFI_ADAPTER Adapter);
+VOID        VwifiHeartbeatStop(_Inout_ PVWIFI_ADAPTER Adapter);
 VOID        VwifiHwShutdown(_Inout_ PVWIFI_ADAPTER Adapter);
 NDIS_STATUS VwifiHwReset(_Inout_ PVWIFI_ADAPTER Adapter);
 BOOLEAN     VwifiHwInterruptDpc(_In_ PVWIFI_ADAPTER Adapter);

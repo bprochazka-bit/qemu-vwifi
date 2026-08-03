@@ -354,6 +354,93 @@ VwifiMiniportCancelSend(
 }
 
 /* ====================================================================
+ * Heartbeat
+ *
+ * A line every VWIFI_HEARTBEAT_MS on a timer this driver owns, saying
+ * the driver is still being scheduled and what it still has
+ * outstanding.
+ *
+ * It exists because silence in the trace has been ambiguous every time
+ * the guest wedged, and I read it as "the miniport was never called"
+ * without being able to show that. That reading is only sound if the
+ * log is known to be working. A stalled port-0xE9 write, a lock held
+ * by a spinning CPU, or a block below NDIS all produce the same empty
+ * file as a miniport nothing ever reached.
+ *
+ * The first attempt put this in MiniportCheckForHangEx, on the
+ * reasoning that NDIS polls it on its own timer. It printed nothing at
+ * all -- NDIS does not poll a WDI miniport that way. Hence a timer of
+ * our own, which depends on nothing but KeSetTimer underneath.
+ *
+ * If the beat keeps ticking while a connect is stalled, the driver is
+ * alive, nothing is outstanding on our side, and the block is above
+ * us. If it stops, the block is at or below NDIS.
+ * ==================================================================== */
+#define VWIFI_HEARTBEAT_MS 8000
+
+static VOID
+VwifiHeartbeat(_In_ PVOID SystemSpecific1,
+               _In_ PVOID FunctionContext,
+               _In_ PVOID SystemSpecific2,
+               _In_ PVOID SystemSpecific3)
+{
+    PVWIFI_ADAPTER adapter = (PVWIFI_ADAPTER)FunctionContext;
+
+    UNREFERENCED_PARAMETER(SystemSpecific1);
+    UNREFERENCED_PARAMETER(SystemSpecific2);
+    UNREFERENCED_PARAMETER(SystemSpecific3);
+
+    if (adapter == NULL) return;
+
+    adapter->HangChecks++;
+    VWIFI_INFO("alive: beat %u, scan %u, conn 0x%x, assoc %u, port %u",
+               adapter->HangChecks,
+               VwifiScanTaskState(adapter),
+               VwifiConnectTaskState(adapter),
+               adapter->Associated ? 1u : 0u,
+               adapter->PortCreated ? 1u : 0u);
+}
+
+NDIS_STATUS
+VwifiHeartbeatStart(_Inout_ PVWIFI_ADAPTER Adapter)
+{
+    NDIS_TIMER_CHARACTERISTICS tc = { 0 };
+    LARGE_INTEGER due;
+    NDIS_STATUS status;
+
+    tc.Header.Type     = NDIS_OBJECT_TYPE_TIMER_CHARACTERISTICS;
+    tc.Header.Revision = NDIS_TIMER_CHARACTERISTICS_REVISION_1;
+    tc.Header.Size     = NDIS_SIZEOF_TIMER_CHARACTERISTICS_REVISION_1;
+    tc.AllocationTag   = VWIFI_POOL_TAG;
+    tc.TimerFunction   = VwifiHeartbeat;
+    tc.FunctionContext = Adapter;
+
+    status = NdisAllocateTimerObject(Adapter->MiniportAdapterHandle, &tc,
+                                     &Adapter->HeartbeatTimer);
+    if (status != NDIS_STATUS_SUCCESS) {
+        VWIFI_WARN("heartbeat timer unavailable (0x%x)", status);
+        Adapter->HeartbeatTimer = NULL;
+        return status;
+    }
+
+    /* Periodic: the third argument is the repeat interval, so this
+     * re-arms itself and no callback has to. */
+    due.QuadPart = -((LONGLONG)VWIFI_HEARTBEAT_MS * 10000LL);
+    NdisSetTimerObject(Adapter->HeartbeatTimer, due, VWIFI_HEARTBEAT_MS, NULL);
+    return NDIS_STATUS_SUCCESS;
+}
+
+VOID
+VwifiHeartbeatStop(_Inout_ PVWIFI_ADAPTER Adapter)
+{
+    if (Adapter->HeartbeatTimer == NULL) return;
+
+    (VOID)NdisCancelTimerObject(Adapter->HeartbeatTimer);
+    NdisFreeTimerObject(Adapter->HeartbeatTimer);
+    Adapter->HeartbeatTimer = NULL;
+}
+
+/* ====================================================================
  * Check-for-hang / Reset / PnP / Shutdown
  * ==================================================================== */
 _Use_decl_annotations_
@@ -363,39 +450,18 @@ VwifiMiniportCheckForHangEx(NDIS_HANDLE MiniportAdapterContext)
     PVWIFI_ADAPTER adapter = (PVWIFI_ADAPTER)MiniportAdapterContext;
     ULONG sig;
 
-    /* The heartbeat.
+    /* No heartbeat here.
      *
-     * NDIS calls this handler on its own timer -- every
-     * CheckForHangTimeInSeconds, set to 4 in the registration
-     * attributes -- whether or not anything else is happening. That
-     * makes it the one place in this driver that can answer a question
-     * every trace so far has left open: when the guest stops responding
-     * and nothing appears in the log, is the miniport not being called,
-     * or is it being called and unable to say so?
+     * This handler was where the heartbeat went first, on the reasoning
+     * that NDIS calls it every CheckForHangTimeInSeconds regardless of
+     * what else is happening. It printed nothing, ever -- not during a
+     * hang, not during normal operation. NDIS does not poll a WDI
+     * miniport this way; hang detection for WDI goes through the
+     * WdiHangDiagnose handler and the component's own watchdogs
+     * instead, and the registration attribute is ignored.
      *
-     * Silence has been read as the first of those, here and in what I
-     * told you about it. That reading is only sound if the log itself
-     * is known to be working, and after a hang it is not: a wedged
-     * kernel, a stalled port-0xE9 write, or a lock held by a spinning
-     * CPU all produce exactly the same empty file as a miniport that
-     * was never called.
-     *
-     * A line every 8 seconds settles it. If the heartbeat keeps ticking
-     * after a connect stalls, the driver and NDIS are both alive and
-     * the block is above them. If it stops at the moment of the click,
-     * the block is at or below NDIS and the earlier conclusion was
-     * wrong.
-     *
-     * The task state rides along because it is free here and it says
-     * whether anything is outstanding on our side. */
-    if ((adapter->HangChecks++ % 2) == 0) {
-        VWIFI_INFO("alive: beat %u, scan %u, conn 0x%x, assoc %u, port %u",
-                   adapter->HangChecks,
-                   VwifiScanTaskState(adapter),
-                   VwifiConnectTaskState(adapter),
-                   adapter->Associated ? 1u : 0u,
-                   adapter->PortCreated ? 1u : 0u);
-    }
+     * The heartbeat is now on a timer this driver owns. See
+     * VwifiHeartbeat below. */
 
     /* Quick sanity check: signature register must read back. If the
      * device has disappeared or gone insane, the read will likely
