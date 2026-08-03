@@ -320,9 +320,31 @@ VwifiWdiTalTxRxDeinitialize(TAL_TXRX_HANDLE MiniportTalTxRxContext)
 }
 
 /* ============================================================
- * Low-energy idle notification (USB selective suspend). Not
- * relevant for a virtual PCI device; just succeed so the WLAN
- * component's power management doesn't get wedged.
+ * Low-energy idle notification (NDIS selective suspend).
+ *
+ * INCOMPLETE, DELIBERATELY, AND NOT SAFE TO CALL COMPLETE.
+ *
+ * The comment here used to read "not relevant for a virtual PCI
+ * device; just succeed so the WLAN component's power management
+ * doesn't get wedged." That is the same reasoning that produced the
+ * RxFlush bug -- succeeding is exactly what wedges a caller whose
+ * contract expects a callback -- so it is written out rather than left
+ * to mislead the next reader.
+ *
+ * What the contract actually says: NDIS calls MiniportWdiIdleNotification
+ * to START a selective-suspend operation. The driver then calls
+ * NdisWdiIdleNotificationConfirm to say the adapter can safely be
+ * suspended, or NdisWdiIdleNotificationComplete to complete a pending
+ * notification. Both live in NDIS_WDI_INIT_PARAMETERS. Returning
+ * success and calling neither does not decline the suspend; it starts
+ * one and never finishes it.
+ *
+ * This has never been observed to fire, and should not: selective
+ * suspend is a capability the adapter has to advertise, and this driver
+ * advertises none of it. That is the only thing making the gap
+ * harmless, and it is a property of the capabilities message rather
+ * than of this code -- so if selective suspend is ever advertised,
+ * these two handlers must be finished at the same time.
  * ============================================================ */
 _Use_decl_annotations_
 NDIS_STATUS
