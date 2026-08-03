@@ -416,12 +416,22 @@ VwifiHeartbeat(_In_ PVOID SystemSpecific1,
     if (adapter == NULL) return;
 
     adapter->HangChecks++;
-    VWIFI_INFO("alive: beat %u, scan %u, conn 0x%x, assoc %u, port %u",
+
+    /* opmode is here because it is the field most likely to be quietly
+     * wrong: it is pushed to the device from a TAL callback that may
+     * have to defer to a work item, so "did the adapter actually become
+     * a station" is a question the trace should answer without anyone
+     * having to reason about IRQL. pend is the deferred request, -1
+     * when there is none. */
+    VWIFI_INFO("alive: beat %u, scan %u, conn 0x%x, assoc %u, port %u, "
+               "opmode %u, pend %d",
                adapter->HangChecks,
                VwifiScanTaskState(adapter),
                VwifiConnectTaskState(adapter),
                adapter->Associated ? 1u : 0u,
-               adapter->PortCreated ? 1u : 0u);
+               adapter->PortCreated ? 1u : 0u,
+               adapter->OpMode,
+               adapter->PendingOpMode);
 }
 
 NDIS_STATUS
