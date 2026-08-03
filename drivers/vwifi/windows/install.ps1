@@ -57,7 +57,13 @@ $ErrorActionPreference = 'Stop'
 $HwId       = 'PCI\VEN_1AF4&DEV_0E00'
 $InstalledSys = Join-Path $env:SystemRoot 'System32\drivers\vwifi.sys'
 
-Write-Host 'vwifi driver install'
+# Stamped so a run can be told apart from a run of the previous script.
+# The package carries its own copy of this file (sign.ps1 puts it there),
+# so a guest that was handed only a fresh vwifi.sys keeps running the old
+# one, reports success, and looks exactly like this one failing.
+$ScriptRevision = '2026-08-03 remove-then-install'
+
+Write-Host "vwifi driver install  [$ScriptRevision]"
 
 # Resolve the package folder.
 #
@@ -114,19 +120,46 @@ Write-Host "Package SHA256: $((Get-FileHash $sys -Algorithm SHA256).Hash)"
 # Every vwifi package currently in the driver store, as its published
 # oemNN.inf name.
 #
-# Parsed out of `pnputil /enum-drivers` by splitting the output into
-# blank-line-separated blocks and keeping the ones that mention
-# vwifi.inf. Deliberately not matching on field labels: those are
-# localised and this has to work on whatever guest is to hand. The
-# values -- oem21.inf, vwifi.inf -- are not.
+# Two independent methods, unioned, because getting this wrong is
+# silent: an empty result and a clean store look identical, and the
+# script then reports "nothing to remove" and installs alongside the
+# package it was supposed to replace.
+#
+#   1. `pnputil /enum-drivers`, split into blank-line-separated blocks,
+#      keeping blocks that mention vwifi.inf. Deliberately not matching
+#      on field labels -- those are localised and this has to work on
+#      whatever guest is to hand. The values, oem21.inf and vwifi.inf,
+#      are not localised.
+#
+#   2. %SystemRoot%\INF\oem*.inf read directly. That directory is where
+#      the published copy of every third-party INF lives, so a file
+#      there naming our device is our package. No parsing of tool output
+#      at all, which makes it the check that cannot be defeated by an
+#      output format changing.
 function Get-VwifiStorePackages {
-    $text = (& pnputil /enum-drivers | Out-String)
     $out = @()
-    foreach ($block in ($text -split "(\r?\n){2,}")) {
+
+    # (?: ... ) and not ( ... ): PowerShell's -split includes captured
+    # groups in its output, so a capturing separator scatters the
+    # newlines it matched through the block list.
+    $text = (& pnputil /enum-drivers | Out-String)
+    foreach ($block in ($text -split "(?:\r?\n){2,}")) {
         if ($block -notmatch 'vwifi\.inf') { continue }
         if ($block -match '(oem\d+\.inf)') { $out += $Matches[1] }
     }
-    return ($out | Select-Object -Unique)
+
+    $infDir = Join-Path $env:SystemRoot 'INF'
+    foreach ($f in @(Get-ChildItem -Path $infDir -Filter 'oem*.inf' `
+                                   -ErrorAction SilentlyContinue)) {
+        try {
+            $body = Get-Content -LiteralPath $f.FullName -Raw -ErrorAction Stop
+        } catch { continue }
+        if ($body -match 'DEV_0E00' -or $body -match 'vwifi') {
+            $out += $f.Name
+        }
+    }
+
+    return @($out | Select-Object -Unique | Sort-Object)
 }
 
 # Devnodes for the vwifi device, present or not. Get-PnpDevice reports
@@ -185,10 +218,13 @@ if ($KeepOld) {
     Write-Host ''
     Write-Host '      Or re-run with -Force to try anyway.'
     exit 1
-} elseif ($oldPackages.Count -eq 0 -and $devices.Count -eq 0) {
-    Write-Host '[2/5] Nothing to remove'
+} elseif ($oldPackages.Count -eq 0 -and $devices.Count -eq 0 -and
+          -not (Test-Path $InstalledSys)) {
+    Write-Host '[2/5] Nothing to remove: no package in the store, no device'
+    Write-Host '      node, no binary in System32\drivers.'
 } else {
-    Write-Host '[2/5] Removing old packages and device nodes ...'
+    Write-Host ("[2/5] Removing {0} package(s), {1} device node(s) ..." -f `
+                $oldPackages.Count, $devices.Count)
 
     # Devnodes first. Removing the devnode drops its Driver key, which
     # is the binding that would otherwise survive into the next boot and
@@ -220,6 +256,12 @@ if ($KeepOld) {
         Write-Host "  deleting $oem"
         & pnputil /delete-driver $oem /uninstall /force 2>&1 |
             ForEach-Object { Write-Host "    $_" }
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warning "  pnputil returned $LASTEXITCODE deleting $oem"
+        }
+    }
+    if ($oldPackages.Count -eq 0) {
+        Write-Host '  no packages found in the driver store'
     }
 
     # And the binary itself. PnP copies vwifi.sys out of the store into
