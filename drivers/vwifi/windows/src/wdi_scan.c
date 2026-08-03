@@ -72,7 +72,18 @@ typedef struct _VWIFI_SCAN_TASK
      * NDIS port the request arrived on. See VwifiGetWdiPortId. */
     WDI_PORT_ID     WdiPortId;
     ULONG     PortId;
-    UINT32    TransactionId;   /* echoed by SCAN_COMPLETE */
+
+    /* Every scan task the device's current sweep is going to answer.
+     *
+     * Usually one. The host can ask for a second scan a few
+     * milliseconds into the first -- it does exactly that as part of a
+     * connect -- and one sweep satisfies both, so both transaction ids
+     * are held here and both get a SCAN_COMPLETE when the sweep really
+     * finishes. Completing one of them early, before the device has
+     * reported anything, tells the host the scan found nothing. */
+    UINT32    TransactionIds[VWIFI_SCAN_MAX_PENDING_TASKS];
+    ULONG     TransactionCount;
+
     ULONG     PendingCount;
 
     /* BSS entries awaiting indication. We stage the device's own
@@ -116,6 +127,11 @@ typedef struct _VWIFI_SCAN_TASK
  * it as lost. A full sweep is 16 channels x 100 ms dwell; ten seconds
  * is far enough past that to mean the completion is never coming. */
 #define VWIFI_SCAN_STALE_MS          10000
+
+/* How many scan tasks one device sweep may be answering at once. The
+ * host asks for a second scan milliseconds into the first as part of a
+ * connect; four is room to spare for that. */
+#define VWIFI_SCAN_MAX_PENDING_TASKS 4
 
 /* ============================================================
  * Indicate the accumulated BSS entries
@@ -189,13 +205,22 @@ VwifiIndicateScanComplete(_Inout_ PVWIFI_ADAPTER Adapter, _In_ NDIS_STATUS Statu
     /* Flush anything still staged before completing the task. */
     VwifiIndicateBssEntryList(Adapter);
 
-    /* SCAN_COMPLETE carries no TLVs at all — the scan's outcome rides in
-     * the message header's Status field. */
-    VwifiSendWdiIndication(Adapter, task->WdiPortId, task->PortId,
-                           NDIS_STATUS_WDI_INDICATION_SCAN_COMPLETE,
-                           Status, task->TransactionId, NULL, 0);
+    /* One SCAN_COMPLETE per task the sweep was answering, each echoing
+     * its own transaction id. SCAN_COMPLETE carries no TLVs at all --
+     * the outcome rides in the message header's Status field. */
+    {
+        ULONG n = task->TransactionCount;
 
-    VWIFI_INFO("indicated SCAN_COMPLETE (0x%x)", Status);
+        if (n > VWIFI_SCAN_MAX_PENDING_TASKS) n = VWIFI_SCAN_MAX_PENDING_TASKS;
+        for (ULONG i = 0; i < n; i++) {
+            VwifiSendWdiIndication(Adapter, task->WdiPortId, task->PortId,
+                                   NDIS_STATUS_WDI_INDICATION_SCAN_COMPLETE,
+                                   Status, task->TransactionIds[i], NULL, 0);
+        }
+        VWIFI_INFO("indicated SCAN_COMPLETE (0x%x) for %u task(s)",
+                   Status, n);
+        task->TransactionCount = 0;
+    }
 }
 
 /* ============================================================
@@ -410,47 +435,50 @@ VwifiHandleTaskScan(_Inout_ PVWIFI_ADAPTER Adapter,
 
     if (!task) return NDIS_STATUS_RESOURCES;
     if (task->Active) {
-        /* A scan arriving while one is in flight is normal, and
-         * refusing it stops the OS scanning at all.
+        /* A scan arriving while one is in flight is normal, and neither
+         * refusing it nor cutting the running one short is right.
          *
-         * This used to return NDIS_STATUS_REQUEST_ABORTED, and a trace
-         * caught what that costs: the OS asked again 1.3 seconds into
-         * the first sweep, was refused, and never asked for another
-         * scan for the rest of the session. The network list then
-         * emptied itself as the one entry aged out, and a connect had
-         * no BSS to be built from -- which is the whole reported
-         * failure, arriving by way of a rejected scan.
+         * It first returned NDIS_STATUS_REQUEST_ABORTED. A trace caught
+         * what that costs: the OS asked again 1.3 seconds into the
+         * first sweep, was refused, and never asked for another scan
+         * for the rest of the session.
          *
-         * There is nothing to refuse. The device is already sweeping
-         * every channel it supports (both masks are widened below
-         * whenever the request names none), so the sweep in progress
-         * satisfies the new request as well as the old one. So:
-         * complete the outstanding task, adopt the new one's
-         * transaction id, and let the running sweep finish into it.
+         * The fix for that completed the outstanding task immediately
+         * and adopted the new request, and a later trace caught what
+         * THAT costs. The host issues a scan as part of a connect and
+         * another a few milliseconds behind it; the second arrived 15 ms
+         * into the first, so the first was completed 15 ms in, before
+         * the device had reported a single BSS. A SCAN_COMPLETE with no
+         * entries is not "the sweep is still going" -- it is "the scan
+         * found nothing". The host read it exactly that way and failed
+         * the association with STATUS_NETWORK_UNREACHABLE, two
+         * milliseconds after we said it, and about a second before the
+         * sweep actually found the AP.
          *
-         * Not by re-issuing VWIFI_OP_SCAN -- the device answers -EBUSY
-         * while its scan state machine is not idle, and that would turn
-         * a normal overlap into a device error.
+         * So: neither. The device is already sweeping every channel it
+         * supports, and one sweep answers both requests. Remember the
+         * new transaction id alongside the old and let the sweep finish
+         * into both -- each task gets exactly one SCAN_COMPLETE, and
+         * every one of them arrives after real results.
          *
-         * Success for the outstanding one, because it is true: it ran,
-         * and its results went up as BSS_ENTRY_LIST indications as they
-         * were found. The OS asking again mid-sweep is not a failure of
-         * the sweep. */
-        VWIFI_WARN("scan requested %llu ms into one already running -- "
-                   "completing that one and adopting this request",
-                   VwifiGetTickCountMs() - task->StartedTimeMs);
+         * The device is not asked to scan again. It answers -EBUSY
+         * while its scan state machine is not idle, which would turn a
+         * normal overlap into a device error. */
+        if (task->TransactionCount >= VWIFI_SCAN_MAX_PENDING_TASKS) {
+            VWIFI_WARN("scan requested with %u already pending on this "
+                       "sweep -- refusing", task->TransactionCount);
+            return NDIS_STATUS_REQUEST_ABORTED;
+        }
 
-        /* Clears Active and flushes anything staged. */
-        VwifiIndicateScanComplete(Adapter, NDIS_STATUS_SUCCESS);
+        task->TransactionIds[task->TransactionCount++] =
+            VwifiGetWdiTransactionId(Req);
 
-        task->PortId               = Req->PortNumber;
-        task->WdiPortId            = VwifiGetWdiPortId(Req);
-        task->TransactionId        = VwifiGetWdiTransactionId(Req);
-        task->PendingCount         = 0;
-        task->LastIndicationTimeMs = VwifiGetTickCountMs();
-        task->StartedTimeMs        = task->LastIndicationTimeMs;
+        VWIFI_INFO("scan requested %llu ms into one already running -- "
+                   "the running sweep will answer both (%u pending)",
+                   VwifiGetTickCountMs() - task->StartedTimeMs,
+                   task->TransactionCount);
 
-        InterlockedExchange(&task->Active, 1);
+        /* Re-arm: the watchdog now guards two tasks, not one. */
         if (task->Watchdog) {
             LARGE_INTEGER due;
             due.QuadPart = -((LONGLONG)VWIFI_SCAN_STALE_MS * 10000LL);
@@ -497,7 +525,8 @@ VwifiHandleTaskScan(_Inout_ PVWIFI_ADAPTER Adapter,
 
     task->PortId               = Req->PortNumber;
     task->WdiPortId            = VwifiGetWdiPortId(Req);
-    task->TransactionId        = VwifiGetWdiTransactionId(Req);
+    task->TransactionIds[0]    = VwifiGetWdiTransactionId(Req);
+    task->TransactionCount     = 1;
     task->PendingCount         = 0;
     task->LastIndicationTimeMs = VwifiGetTickCountMs();
     task->StartedTimeMs        = task->LastIndicationTimeMs;
