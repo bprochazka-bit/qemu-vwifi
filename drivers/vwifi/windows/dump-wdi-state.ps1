@@ -68,12 +68,21 @@ param(
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'wdk-symbols.ps1')
 
-# ndis.sys is what !ndiskd actually needs; the other two are here so the
-# stack is readable end to end if the first pass raises new questions.
-$modules = @(
+# Microsoft binaries, whose PDBs come from the symbol server. ndis.sys
+# is what !ndiskd actually needs; wdiwifi.sys is here so the stack is
+# readable end to end if the first pass raises new questions.
+$msModules = @(
     "$env:SystemRoot\System32\drivers\ndis.sys",
-    "$env:SystemRoot\System32\drivers\wdiwifi.sys",
-    "$env:SystemRoot\System32\drivers\vwifi.sys"
+    "$env:SystemRoot\System32\drivers\wdiwifi.sys"
+) | Where-Object { Test-Path $_ }
+
+# Ours. Deliberately NOT in the list above: vwifi.pdb is produced by our
+# own build, so Microsoft's symbol server has never heard of it and asking
+# for it returns 404. The build writes it next to the .sys under
+# x64\<cfg>\, and those directories go on the symbol path directly.
+$localSymbolDirs = @(
+    (Join-Path $PSScriptRoot 'x64\Debug'),
+    (Join-Path $PSScriptRoot 'x64\Release')
 ) | Where-Object { Test-Path $_ }
 
 function Assert-Admin {
@@ -84,9 +93,9 @@ function Assert-Admin {
 }
 
 function Show-SymbolKeys {
-    Write-Host 'Symbol-server URLs for this machine''s binaries:'
+    Write-Host 'Fetch these from Microsoft''s symbol server:'
     Write-Host ''
-    foreach ($m in $modules) {
+    foreach ($m in $msModules) {
         $cv = Get-PeCodeViewInfo $m
         if ($cv) {
             Write-Host ("  {0}" -f (Split-Path $m -Leaf))
@@ -96,8 +105,27 @@ function Show-SymbolKeys {
         }
     }
     Write-Host ''
-    Write-Host 'Download those, put the .pdb files in one directory, and pass it'
-    Write-Host 'as -SymbolPath. ndis.sys is the one !ndiskd cannot work without.'
+    Write-Host 'Put those .pdb files in one directory and pass it as -SymbolPath.'
+    Write-Host 'ndis.sys is the one !ndiskd cannot work without; wdiwifi.sys only'
+    Write-Host 'makes its frames readable if the first pass raises new questions.'
+    Write-Host ''
+
+    # vwifi.pdb is ours. It is called out rather than silently omitted
+    # because an earlier version listed it alongside the Microsoft
+    # binaries, which sent people to a symbol-server URL that can only
+    # ever 404 -- the server has never seen a driver we built.
+    Write-Host 'vwifi.sys is NOT on the symbol server -- it is our own build, so'
+    Write-Host 'that URL would 404. Its PDB is already on this machine:'
+    if ($localSymbolDirs.Count -eq 0) {
+        Write-Host '  (no x64\Debug or x64\Release here yet -- build first)'
+    } else {
+        foreach ($d in $localSymbolDirs) {
+            $pdb = Join-Path $d 'vwifi.pdb'
+            $mark = if (Test-Path $pdb) { 'vwifi.pdb' } else { '(no vwifi.pdb yet)' }
+            Write-Host ("  {0}  {1}" -f $d, $mark)
+        }
+        Write-Host '  These are added to the symbol path automatically.'
+    }
 }
 
 function Enable-LocalKd {
@@ -123,20 +151,33 @@ function Test-LocalKdEnabled {
 }
 
 function Get-SymbolPathArg {
+    # Our own build output always goes on, whatever else does. These are
+    # local directories, not a server, so they cannot cause the
+    # half-resolve problem the srv* fallback would, and without them
+    # `lm vm vwifi` has nothing to say about our own driver.
+    $parts = @()
+
     if ($SymbolPath) {
         if (-not (Test-Path $SymbolPath)) { throw "no such path: $SymbolPath" }
         $full = (Resolve-Path $SymbolPath).Path
         $n = @(Get-ChildItem $full -Filter '*.pdb' -Recurse -ErrorAction SilentlyContinue).Count
         Write-Host "      Symbols: $full ($n pdb)"
         if ($n -eq 0) { Write-Warning 'that directory contains no .pdb files' }
-        # No srv* fallback appended on purpose. If the supplied symbols
-        # are wrong we want !ndiskd to fail visibly, not to half-resolve
-        # from a server this machine probably cannot reach anyway.
-        return $full
+        if (-not (Get-ChildItem $full -Filter 'ndis.pdb' -Recurse -ErrorAction SilentlyContinue)) {
+            Write-Warning 'no ndis.pdb there -- !ndiskd needs it and will print errors instead of state'
+        }
+        $parts += $full
+        # No srv* fallback on purpose. If the supplied symbols are wrong
+        # we want !ndiskd to fail visibly, not to half-resolve from a
+        # server this machine probably cannot reach anyway.
+    } else {
+        $parts += "srv*$env:SystemDrive\symbols*https://msdl.microsoft.com/download/symbols"
+        Write-Warning 'no -SymbolPath given; this needs internet. Use -ShowSymbolKeys if there is none.'
     }
-    $p = "srv*$env:SystemDrive\symbols*https://msdl.microsoft.com/download/symbols"
-    Write-Host "      Symbols: $p"
-    Write-Warning 'no -SymbolPath given; this needs internet. Use -ShowSymbolKeys if there is none.'
+
+    $parts += $localSymbolDirs
+    $p = ($parts -join ';')
+    Write-Host "      Symbol path: $p"
     return $p
 }
 
