@@ -460,73 +460,84 @@ if ($wdiState) {
     # dx resolved the same type happily, so dx is what the public PDB
     # actually supports.
     $a = "(wdiwifi!CAdapter*)0x$wdiState"
-    # Force wdiwifi's symbols in before asking dx for its types.
-    #
-    # Module symbols load lazily, and dx does a qualified type lookup
-    # that does NOT trigger the load -- it just answers "Unable to find
-    # module 'wdiwifi' for qualified type lookup". The previous run only
-    # worked by accident: it happened to run `dt wdiwifi!CAdapter` first,
-    # which failed with "Symbol not found" but pulled the symbols in as
-    # a side effect, so every dx after it succeeded. Dropping the dt
-    # removed the side effect and every dx failed.
+    # Flink MINUS 8. dt says CBSSEntry puts __VFN_table at +0x000 and
+    # m_BssListEntry at +0x008, and _CPP_LIST_ENTRY leads with its
+    # LIST_ENTRY, so the list threads through +0x008 and the object
+    # starts eight bytes earlier. Casting Flink straight to CBSSEntry*
+    # shifted every field by eight and produced a confident, entirely
+    # fictional entry -- Rssi 6226015, unreadable frame pointers,
+    # channel 0. Cast through unsigned char* so the subtraction is in
+    # bytes; subtracting from a _LIST_ENTRY* would step 16 per unit.
+    $e = "(wdiwifi!CBSSEntry*)((unsigned char*)(($a)->m_ExtStaBSSList.m_BSSEntryList.Flink) - 8)"
+    # .reload /f forces wdiwifi's symbols in before anything asks dx for
+    # its types. Module symbols load lazily and dx does a qualified type
+    # lookup that does NOT trigger the load -- it just answers "Unable to
+    # find module 'wdiwifi' for qualified type lookup". An earlier run
+    # only worked by accident: it happened to run `dt wdiwifi!CAdapter`
+    # first, which failed with "Symbol not found" but pulled the symbols
+    # in as a side effect. Dropping the dt removed the side effect and
+    # every dx failed.
     $out3 = Invoke-Kd -Kd $kd -Sym $sym -LogFile $log3 -Commands (@(
         $load,
         '.reload /f wdiwifi.sys',
         'lm vm wdiwifi',
         "dx -r1 $a",
 
-        # The BSS entry as wdiwifi parsed it.
-        #
-        # _ROAM_TRACELOGGING_DATA settled where the connect dies:
-        # bssCandidateCount 1, roamAPRankIndex 0xffffffff,
-        # bestCandidateRank 0, connectJobStartTime equal to
-        # connectJobEndTime and connectRoamTaskStartTime zero. One
-        # candidate, ranked unusable, job over in zero time, and the
-        # task that would issue OID_WDI_TASK_CONNECT never started.
-        #
-        # So the entry IS examined and IS rejected, and what ranking
-        # reads is what wdiwifi extracted from the frame we handed it --
-        # not the TLVs we filled in, the parse of the beacon body. That
-        # object is the last thing between our bytes and the verdict.
-        #
-        # Several list forms, because CBSSEntry's link member name is
-        # not known and the cheapest way to find out is to let the
-        # debugger answer.
+        # The BSS entry as wdiwifi parsed it. Every field it extracted
+        # from our beacon is right: BSSID, Rssi -30, channel 11,
+        # WDI_BAND_ID_2400, centre 2462, ESS set, capability 0x421,
+        # BlockedReasons 0, both frame bodies present. So the entry is
+        # not malformed and this dump is no longer the open question --
+        # it is here only to confirm the same entry is still the one
+        # being talked about.
         "dx -r1 ($a)->m_ExtStaBSSList",
-        "dx -r1 ($a)->m_ExtStaBSSList.m_BSSEntryList",
-        # Flink MINUS 8. dt says CBSSEntry puts __VFN_table at +0x000 and
-        # m_BssListEntry at +0x008, and _CPP_LIST_ENTRY leads with its
-        # LIST_ENTRY, so the list threads through +0x008 and the object
-        # starts eight bytes earlier. Casting Flink straight to
-        # CBSSEntry* shifted every field by eight and produced a
-        # confident, entirely fictional entry -- Rssi 6226015, unreadable
-        # frame pointers, channel 0.
-        #
-        # That dump did prove one thing before it was discarded: its
-        # m_BssListEntry.pThis read 0x14433221102, which is 02 11 22 33
-        # 44 01 little-endian -- our BSSID, sitting exactly eight bytes
-        # further on. The entry is ours; only the arithmetic was wrong.
-        #
-        # Cast through unsigned char* so the subtraction is in bytes.
-        # Subtracting from a _LIST_ENTRY* would step 16 bytes per unit.
-        "dx -r2 (wdiwifi!CBSSEntry*)((unsigned char*)(($a)->m_ExtStaBSSList.m_BSSEntryList.Flink) - 8)",
-        "dx -r2 (wdiwifi!CBSSEntry*)((__int64)(($a)->m_ExtStaBSSList.m_BSSEntryList.Flink) - 8)",
-        # dt, not dx, and no address: this prints CBSSEntry's field
-        # offsets so the link member can be located, which is what a
-        # FromListEntry traversal would have needed as a quoted argument.
-        # Embedding quotes here means getting them past PowerShell's
-        # parser and then past its native-argument handling into kd, and
-        # dt answers the same question without any.
-        'dt wdiwifi!CBSSEntry',
-        'dt wdiwifi!CBSSListManager',
-        "dx -r1 ($a)->m_ExtStaBSSList.m_BSSEntryFactory",
+        "dx -r2 $e",
 
-        # Depth 1 throughout. Every -r2 so far on something whose first
-        # member is a back-pointer -- m_pAdapter, m_pChangeCallback --
-        # has expanded the whole parent object again and pushed the
-        # fields actually wanted off the end of the output.
+        # The bytes themselves, which no dx of a parsed struct can
+        # stand in for. m_BeaconFrameBody and m_ProbeResponseFrameBody
+        # are what wdiwifi's own IE walker reads; if an IE is
+        # mis-ordered, over-long, or missing something ranking needs,
+        # it shows here and nowhere else. 256 bytes covers both bodies
+        # (0x65 and 0x5f) with room to see where they stop.
+        "db @@c++(($e)->m_BeaconFrameBody.pBuffer) L0n256",
+        "db @@c++(($e)->m_ProbeResponseFrameBody.pBuffer) L0n256",
+
+        # What the port driver kept from OID_WDI_GET_ADAPTER_CAPABILITIES
+        # and OID_WDI_TASK_CREATE_PORT. m_CachedRank on the entry is
+        # 0x64, so ranking itself works -- which points away from the
+        # entry and towards the profile it is being ranked against.
+        "dx -r2 ($a)->m_AdapterPropertyCache",
+        "dx -r2 ($a)->m_DatapathCapabilities",
         "dx -r1 ($a)->m_pPortList[0]",
-        "dx -r1 ($a)->m_pPortList[0]->m_pRoamTraceLoggingData"
+        "dx -r2 ($a)->m_pPortList[0]->m_PortPropertyCache",
+
+        # Connect history, in case something here is refusing the BSSID
+        # before ranking ever runs. m_DisallowedBssidCount is 0 and
+        # m_BlockedInfo.BlockedReasons is 0, so if a refusal is
+        # remembered anywhere it is in one of these two.
+        "dx -r2 ($a)->m_pPortList[0]->m_pConnectHistory",
+        "dx -r2 ($a)->m_pPortList[0]->m_pBssidConnectHistory",
+        "dx -r1 ($a)->m_pPortList[0]->m_pRoamTraceLoggingData",
+
+        # wdiwifi's own vocabulary for the verdict. roamDebugCode came
+        # back WdiRoamDebugCodeNotSet and roamConfigFlags 0x2021, and
+        # neither means anything without the enumerator lists -- which
+        # the public PDB does carry, because dx printed the names.
+        'dt wdiwifi!_WDI_ROAM_DEBUG_CODE',
+        'dt wdiwifi!_WDI_ROAM_CONFIGURATION_FLAGS',
+        'dt wdiwifi!_WFC_PORT_DOT11_STATE',
+        'dt wdiwifi!_WFC_ROAM_CONNECT_TRIGGER',
+        'dt wdiwifi!_WDI_ASSOC_STATUS',
+
+        # Function symbols, which public PDBs do have even though they
+        # carry no C++ type layout. Naming the routine that sets
+        # roamAPRankIndex is the difference between guessing at the
+        # rejection and disassembling it: local kernel debugging cannot
+        # break, but it can read code, so `uf` on the right name in the
+        # next round reads the conditions out of wdiwifi directly.
+        'x wdiwifi!*Candidate*',
+        'x wdiwifi!*Rank*',
+        'x wdiwifi!*RoamReconnect*'
     ) -join ';')
     Write-Host "      $log3 ($($out3.Count) lines)"
 } else {
@@ -537,5 +548,6 @@ Write-Host '[4/4] Done'
 Write-Host "      $log1 ($($out1.Count) lines)"
 Write-Host "      $log2 ($($out2.Count) lines)"
 Write-Host ''
-Write-Host '      Send wdi-state-detail.txt. The port state and the capabilities'
-Write-Host '      wdiwifi recorded are what this exists to show.'
+Write-Host '      Send wdi-state-adapter.txt. That is the one that matters now:'
+Write-Host '      the beacon and probe bytes wdiwifi holds, the cached profile it'
+Write-Host '      ranks them against, and the names of the routines that decide.'

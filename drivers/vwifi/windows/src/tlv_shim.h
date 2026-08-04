@@ -52,6 +52,30 @@ NDIS_STATUS VwifiTlvParseScanRequest(
     _In_ ULONG ReqCap,
     _Out_ PULONG ReqLen);
 
+/* Parse the SSID out of an OID_WDI_GET_BSS_ENTRY_LIST M1.
+ *
+ * WABIModel's ToIhv message for this command carries exactly one
+ * container and it is not optional:
+ *
+ *   <message commandId="WDI_GET_BSS_ENTRY_LIST" ... direction="ToIhv">
+ *     <containerRef id="WDI_TLV_SSID" name="SSID" type="WiFiSSID" />
+ *   </message>
+ *
+ * So the request is not "give me your cache", it is "give me your
+ * cache for THIS network". A zero-length SSID is the wildcard.
+ *
+ * `Ssid` receives at most 32 bytes and *SsidLen the real length; a
+ * wildcard yields *SsidLen == 0. Failing to parse is not fatal to the
+ * caller -- the honest fallback is to report everything -- so the
+ * status is advisory.
+ */
+NDIS_STATUS VwifiTlvParseBssListRequest(
+    _In_ ULONG PeerVersion,
+    _In_reads_bytes_(BufferLen) const VOID *Buffer,
+    _In_ ULONG BufferLen,
+    _Out_writes_to_(32, *SsidLen) UCHAR *Ssid,
+    _Out_ PULONG SsidLen);
+
 /* One BSS to report. Points into the device's event payload; the shim
  * copies what it needs during generation.
  *

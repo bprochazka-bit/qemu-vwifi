@@ -1038,10 +1038,53 @@ VwifiOidRequest(
     }
     if (oid == OID_WDI_GET_BSS_ENTRY_LIST) {
         /* The entries go back as a BSS_ENTRY_LIST indication, exactly as
-         * a scan reports them; the OID itself only needs acknowledging.
-         * Refusing this is what made an already-discovered network
-         * disappear from `netsh wlan show networks` and from the UI. */
-        VWIFI_INFO("OID: cached BSS entry list requested");
+         * a scan reports them; the OID itself only needs acknowledging
+         * -- WABIModel's FromIhv message for this command is "No TLV
+         * data needed, header is sufficient". Refusing this is what made
+         * an already-discovered network disappear from `netsh wlan show
+         * networks` and from the UI.
+         *
+         * The request's SSID is logged rather than used. It is the one
+         * place the port driver states, in its own words, which network
+         * it is asking about, and during a connect that is the network
+         * being connected to. Printing it next to the SSID our entries
+         * actually carry turns "the BSS looks right" into a comparison
+         * of the two strings that have to match. Filtering on it would
+         * only ever remove entries, and reporting a superset is within
+         * contract, so nothing is filtered. */
+        PVOID       ssidBuf = NULL;
+        ULONG       ssidBufLen = 0;
+        UCHAR       wantSsid[32];
+        ULONG       wantLen = 0;
+        NDIS_STATUS ssidStatus;
+
+        ssidStatus = VwifiGetTlvPayload(OidRequest, &ssidBuf, &ssidBufLen);
+        if (ssidStatus == NDIS_STATUS_SUCCESS) {
+            ssidStatus = VwifiTlvParseBssListRequest(
+                adapter->WdiPeerVersion, ssidBuf, ssidBufLen,
+                wantSsid, &wantLen);
+        }
+
+        if (ssidStatus != NDIS_STATUS_SUCCESS) {
+            /* Not fatal, but say so rather than printing "wildcard" and
+             * inviting the reader to conclude the port driver asked for
+             * one. The mandatory container failing to parse would itself
+             * be a finding. */
+            VWIFI_WARN("OID: cached BSS entry list requested, SSID "
+                       "unparseable (0x%08x)", ssidStatus);
+        } else if (wantLen == 0) {
+            VWIFI_INFO("OID: cached BSS entry list requested (wildcard)");
+        } else {
+            CHAR  pretty[33];
+            ULONG i;
+            for (i = 0; i < wantLen; i++) {
+                pretty[i] = (wantSsid[i] >= 0x20 && wantSsid[i] < 0x7f)
+                                ? (CHAR)wantSsid[i] : '.';
+            }
+            pretty[wantLen] = '\0';
+            VWIFI_INFO("OID: cached BSS entry list requested for "
+                       "ssid='%s' (%u bytes)", pretty, wantLen);
+        }
         VwifiScanIndicateCachedBss(adapter, VwifiGetWdiPortId(OidRequest),
                                    OidRequest->PortNumber);
         return VwifiWdiAckHeaderOnly(OidRequest, NDIS_STATUS_SUCCESS);

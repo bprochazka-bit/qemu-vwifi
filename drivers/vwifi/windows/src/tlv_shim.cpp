@@ -178,6 +178,42 @@ VwifiTlvParseScanRequest(
 
 extern "C"
 NDIS_STATUS
+VwifiTlvParseBssListRequest(
+    ULONG PeerVersion,
+    const VOID *Buffer,
+    ULONG BufferLen,
+    UCHAR *Ssid,
+    PULONG SsidLen)
+{
+    TLV_CONTEXT ctx = MakeCtx(PeerVersion);
+    WDI_GET_BSS_ENTRY_LIST_UPDATE_PARAMETERS parsed = {};
+    NDIS_STATUS st;
+
+    *SsidLen = 0;
+
+    st = ParseWdiGetBssEntryListToIhv(BufferLen,
+                                      static_cast<const UINT8 *>(Buffer),
+                                      &ctx, &parsed);
+    if (st != NDIS_STATUS_SUCCESS) {
+        return st;
+    }
+
+    /* WDI_SSID is ArrayOfElements<UINT8>, same shape as the entries in
+     * a scan request's SSIDList -- a counted byte array, not a struct
+     * with an SSIDLength member. */
+    ULONG len = parsed.SSID.ElementCount;
+    if (len > 32) len = 32;
+    if (len > 0 && parsed.SSID.pElements != nullptr) {
+        RtlCopyMemory(Ssid, parsed.SSID.pElements, len);
+        *SsidLen = len;
+    }
+
+    CleanupParsedWdiGetBssEntryListToIhv(&parsed);
+    return NDIS_STATUS_SUCCESS;
+}
+
+extern "C"
+NDIS_STATUS
 VwifiTlvGenerateBssEntryList(
     ULONG PeerVersion,
     const VWIFI_TLV_BSS_ITEM *Items,
