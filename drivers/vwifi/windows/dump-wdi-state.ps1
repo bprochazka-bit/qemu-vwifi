@@ -494,7 +494,23 @@ if ($wdiState) {
         # debugger answer.
         "dx -r1 ($a)->m_ExtStaBSSList",
         "dx -r1 ($a)->m_ExtStaBSSList.m_BSSEntryList",
-        "dx -r2 (wdiwifi!CBSSEntry*)(($a)->m_ExtStaBSSList.m_BSSEntryList.Flink)",
+        # Flink MINUS 8. dt says CBSSEntry puts __VFN_table at +0x000 and
+        # m_BssListEntry at +0x008, and _CPP_LIST_ENTRY leads with its
+        # LIST_ENTRY, so the list threads through +0x008 and the object
+        # starts eight bytes earlier. Casting Flink straight to
+        # CBSSEntry* shifted every field by eight and produced a
+        # confident, entirely fictional entry -- Rssi 6226015, unreadable
+        # frame pointers, channel 0.
+        #
+        # That dump did prove one thing before it was discarded: its
+        # m_BssListEntry.pThis read 0x14433221102, which is 02 11 22 33
+        # 44 01 little-endian -- our BSSID, sitting exactly eight bytes
+        # further on. The entry is ours; only the arithmetic was wrong.
+        #
+        # Cast through unsigned char* so the subtraction is in bytes.
+        # Subtracting from a _LIST_ENTRY* would step 16 bytes per unit.
+        "dx -r2 (wdiwifi!CBSSEntry*)((unsigned char*)(($a)->m_ExtStaBSSList.m_BSSEntryList.Flink) - 8)",
+        "dx -r2 (wdiwifi!CBSSEntry*)((__int64)(($a)->m_ExtStaBSSList.m_BSSEntryList.Flink) - 8)",
         # dt, not dx, and no address: this prints CBSSEntry's field
         # offsets so the link member can be located, which is what a
         # FromListEntry traversal would have needed as a quoted argument.
