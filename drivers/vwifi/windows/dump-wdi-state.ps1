@@ -196,6 +196,35 @@ function Get-SymbolPathArg {
     return $p
 }
 
+# ndiskd.dll does not sit beside kd.exe -- Debugging Tools puts its
+# extensions in subdirectories (winxp, winext, w2k), and ndiskd lives in
+# winxp. `.load ndiskd` by bare name relies on the debugger's extension
+# search path being right, which is exactly the thing that fails when
+# the tools have been copied around rather than installed. Finding the
+# DLL and loading it by full path removes the guess.
+function Find-NdiskdDll {
+    param([Parameter(Mandatory)][string] $KdPath)
+    $root = Split-Path $KdPath -Parent
+    $hit = Get-ChildItem -Path $root -Filter 'ndiskd.dll' -Recurse -File -ErrorAction SilentlyContinue |
+           Sort-Object FullName | Select-Object -First 1
+    if ($hit) { return $hit.FullName }
+    return $null
+}
+
+# 8.3 form, so a path under "Program Files (x86)" carries no spaces into
+# kd's -c string. Quoting inside that string has to survive PowerShell's
+# native-argument handling, which is not worth relying on when the short
+# name sidesteps it entirely.
+function Get-ShortPath {
+    param([Parameter(Mandatory)][string] $Path)
+    try {
+        $fso = New-Object -ComObject Scripting.FileSystemObject
+        $sp  = $fso.GetFile($Path).ShortPath
+        if ($sp -and $sp -notmatch '\s') { return $sp }
+    } catch { }
+    return $Path
+}
+
 function Invoke-Kd {
     param(
         [Parameter(Mandatory)][string] $Kd,
@@ -236,16 +265,23 @@ function Find-MiniportHandle {
 function Show-MiniportDiagnosis {
     param([string[]] $Lines, [string] $LogFile)
 
-    $loadFailed = $Lines | Select-String -Pattern 'Unable to load|No export|not found|cannot find|is not a valid'
-    $anyRows    = $Lines | Select-String -Pattern '\b[0-9a-fA-F]{12,16}\b'
+    # `.chain` lists the loaded extension DLLs, so whether ndiskd is
+    # actually in the debugger is a fact in the output rather than an
+    # inference from error text. That distinction matters: the previous
+    # version keyed off "Unable to load" and blamed a missing extension
+    # for what was really a malformed -c string.
+    $chainHasNdiskd = $Lines | Select-String -Pattern 'ndiskd' -SimpleMatch
+    $loadFailed     = $Lines | Select-String -Pattern 'Unable to load|No export|is not a valid'
+    $anyRows        = $Lines | Select-String -Pattern '\b[0-9a-fA-F]{12,16}\b'
 
     Write-Host ''
     if (-not $Lines -or $Lines.Count -lt 5) {
         Write-Warning "kd produced almost nothing. Check $LogFile -- local KD may not be active."
-    } elseif ($loadFailed) {
-        Write-Warning 'ndiskd did not load. It ships as ndiskd.dll beside kd.exe:'
-        Write-Warning 'copying kd.exe alone is not enough, the whole Debuggers\x64 folder is needed.'
-        $loadFailed | Select-Object -First 3 | ForEach-Object { Write-Host "      $_" }
+    } elseif ($loadFailed -or -not $chainHasNdiskd) {
+        Write-Warning 'ndiskd is not loaded in the debugger.'
+        Write-Warning 'It ships in a subdirectory beside kd.exe (Debuggers\x64\winxp\ndiskd.dll),'
+        Write-Warning 'so copying kd.exe on its own is not enough -- the whole folder is needed.'
+        if ($loadFailed) { $loadFailed | Select-Object -First 3 | ForEach-Object { Write-Host "      $_" } }
     } elseif (-not $anyRows) {
         Write-Warning 'ndiskd loaded but listed no adapters, which is what it does'
         Write-Warning 'without ndis.sys symbols. Re-run with -SymbolPath pointing at ndis.pdb.'
@@ -291,11 +327,20 @@ $sym    = Get-SymbolPathArg
 # Pass one: what miniports exist, and does ndiskd work at all.
 $log1 = Join-Path $OutDir 'wdi-state-miniports.txt'
 Write-Host '[2/4] Listing miniports'
-$out1 = Invoke-Kd -Kd $kd -Sym $sym -LogFile $log1 -Commands @'
-.load ndiskd
-!ndiskd.help
-!ndiskd.miniports
-'@
+# Semicolons, not newlines. kd's -c takes ONE command string with ';'
+# separators; a multi-line string is not parsed as successive commands,
+# which is why the first version of this loaded nothing and then blamed
+# a missing extension for it.
+$ndiskd = Find-NdiskdDll -KdPath $kd
+$load   = if ($ndiskd) {
+    Write-Host "      ndiskd: $ndiskd"
+    ".load $(Get-ShortPath $ndiskd)"
+} else {
+    Write-Warning 'ndiskd.dll not found near kd.exe; relying on the extension search path'
+    '.load ndiskd'
+}
+$out1 = Invoke-Kd -Kd $kd -Sym $sym -LogFile $log1 `
+            -Commands (@($load, '.chain', '!ndiskd.miniports') -join ';')
 
 if ($out1.Count -eq 0) { throw "kd produced no output; see $log1" }
 
