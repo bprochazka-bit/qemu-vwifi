@@ -52,6 +52,11 @@ typedef struct _VWIFI_BSS_STAGE
     ULONGLONG              SeenSystemTime;
 } VWIFI_BSS_STAGE, *PVWIFI_BSS_STAGE;
 
+/* How many scan tasks one device sweep may be answering at once. The
+ * host asks for a second scan milliseconds into the first as part of a
+ * connect; four is room to spare for that. */
+#define VWIFI_SCAN_MAX_PENDING_TASKS 4
+
 typedef struct _VWIFI_SCAN_TASK
 {
     /* 1 while a scan awaits its SCAN_COMPLETE.
@@ -127,11 +132,6 @@ typedef struct _VWIFI_SCAN_TASK
  * it as lost. A full sweep is 16 channels x 100 ms dwell; ten seconds
  * is far enough past that to mean the completion is never coming. */
 #define VWIFI_SCAN_STALE_MS          10000
-
-/* How many scan tasks one device sweep may be answering at once. The
- * host asks for a second scan milliseconds into the first as part of a
- * connect; four is room to spare for that. */
-#define VWIFI_SCAN_MAX_PENDING_TASKS 4
 
 /* ============================================================
  * Indicate the accumulated BSS entries
