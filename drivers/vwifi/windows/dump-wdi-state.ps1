@@ -530,18 +530,55 @@ if ($wdiState) {
         'dt wdiwifi!_WDI_ASSOC_STATUS',
 
         # Function symbols, which public PDBs do have even though they
-        # carry no C++ type layout. Naming the routine that sets
-        # roamAPRankIndex is the difference between guessing at the
-        # rejection and disassembling it: local kernel debugging cannot
-        # break, but it can read code, so `uf` on the right name in the
-        # next round reads the conditions out of wdiwifi directly.
+        # carry no C++ type layout. Kept because the names are how pass
+        # four knows what to disassemble, and because a wdiwifi update
+        # can rename or split these.
         'x wdiwifi!*Candidate*',
         'x wdiwifi!*Rank*',
         'x wdiwifi!*RoamReconnect*'
     ) -join ';')
     Write-Host "      $log3 ($($out3.Count) lines)"
+
+    # Pass four: the decision itself.
+    #
+    # The symbol sweep named the whole path. CRoamReconnectJob
+    # ::StartConnectJob runs CConnectJob::PickCandidates, which takes a
+    # _WFC_CONNECTION_PROFILE_PARAMETERS and scores entries with
+    # CBSSEntry::CalculateRank, which takes a
+    # _BSS_ENTRY_CONNECT_MATCHING_CRITERIA. Those two struct names are
+    # the question stated in wdiwifi's own words: the criteria struct is
+    # a field-by-field list of what a BSS is required to match, and the
+    # profile struct is what the match is against.
+    #
+    # dt first, because a named field list may settle it outright and
+    # costs a dozen lines. uf second, because if it does not, the
+    # branches in PickCandidates are the only remaining authority --
+    # m_CachedRank is 0x64 while bestCandidateRank is 0, which says the
+    # entry is rejected by a filter that runs BEFORE ranking, and a
+    # filter that never runs cannot be read out of any struct.
+    #
+    # Separate kd invocation and separate log. uf on two routines can
+    # run to a thousand lines and would push everything above it out of
+    # the pass-three file.
+    $log4 = Join-Path $OutDir 'wdi-state-decide.txt'
+    $out4 = Invoke-Kd -Kd $kd -Sym $sym -LogFile $log4 -Commands (@(
+        '.reload /f wdiwifi.sys',
+        'dt wdiwifi!_BSS_ENTRY_CONNECT_MATCHING_CRITERIA',
+        'dt wdiwifi!_WFC_CONNECTION_PROFILE_PARAMETERS',
+        'dt wdiwifi!_ROAM_CONTROL_PARAMETERS',
+        'dt wdiwifi!_WFC_CONNECT_SCAN_TYPE',
+        'dt wdiwifi!_BSS_ENTRY_BLOCKED_INFO',
+        'uf wdiwifi!CBSSEntry::CalculateRank',
+        'uf wdiwifi!CConnectJob::PickCandidates',
+        'uf wdiwifi!CConnectJob::CheckAndUpdateCandidates'
+    ) -join ';')
+    Write-Host "      $log4 ($($out4.Count) lines)"
 } else {
     Write-Warning 'no "WDI state" pointer in pass two; skipping the adapter dump'
+    Write-Warning 'If -MiniportHandle was given: handles are reassigned every'
+    Write-Warning 'time the driver reloads, so a handle from an earlier run'
+    Write-Warning 'names a different (or dead) adapter. Drop it and let pass'
+    Write-Warning 'one find the adapter itself.'
 }
 
 Write-Host '[4/4] Done'

@@ -1066,12 +1066,20 @@ VwifiOidRequest(
         }
 
         if (ssidStatus != NDIS_STATUS_SUCCESS) {
-            /* Not fatal, but say so rather than printing "wildcard" and
-             * inviting the reader to conclude the port driver asked for
-             * one. The mandatory container failing to parse would itself
-             * be a finding. */
-            VWIFI_WARN("OID: cached BSS entry list requested, SSID "
-                       "unparseable (0x%08x)", ssidStatus);
+            /* Not a warning, and not a defect on either side. WABIModel
+             * marks WDI_TLV_SSID mandatory in this message, but wdiwifi
+             * sends the header and nothing else, so the parser answers
+             * NDIS_STATUS_FILE_NOT_FOUND (0xc001001b) -- which is what
+             * the generated parser returns for "required container not
+             * present", not a malformed buffer.
+             *
+             * The TLV length is printed because it is what distinguishes
+             * the two readings: 0 means there was no container to find
+             * and the request really is "your whole cache", anything
+             * larger means a container we failed to parse. */
+            VWIFI_INFO("OID: cached BSS entry list requested, no SSID "
+                       "container (0x%08x, %u TLV bytes)",
+                       ssidStatus, ssidBufLen);
         } else if (wantLen == 0) {
             VWIFI_INFO("OID: cached BSS entry list requested (wildcard)");
         } else {
