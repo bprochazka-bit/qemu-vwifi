@@ -249,10 +249,16 @@ function Find-MiniportHandle {
     # ndiskd emits its handles as DML links, so in a log the row can
     # read `<link cmd="...">ffffe00...</link>`; the hex is still there,
     # which is why this scrapes for hex rather than parsing columns.
+    # Kernel pointers only. The old pattern took any 8+ hex digits on
+    # the row, which on a DML-marked row can be part of the link's
+    # command text rather than the object -- and a wrong-but-plausible
+    # handle gets "is not a valid NetAdapter", which reads like the
+    # adapter being broken rather than the handle being junk.
     foreach ($l in $Lines) {
         if ($l -notmatch [regex]::Escape($Adapter)) { continue }
-        $m = [regex]::Match($l, '\b([0-9a-fA-F]{8,16})\b')
-        if ($m.Success) { return $m.Groups[1].Value }
+        foreach ($m in [regex]::Matches($l, '\b(f{4}[0-9a-fA-F]{12})\b')) {
+            return $m.Groups[1].Value
+        }
     }
     return $null
 }
@@ -340,7 +346,9 @@ $load   = if ($ndiskd) {
     '.load ndiskd'
 }
 $out1 = Invoke-Kd -Kd $kd -Sym $sym -LogFile $log1 `
-            -Commands (@($load, '.chain', '!ndiskd.miniports') -join ';')
+            -Commands (@($load, '.chain',
+                         '!ndiskd.miniports',
+                         '!ndiskd.netadapter') -join ';')
 
 if ($out1.Count -eq 0) { throw "kd produced no output; see $log1" }
 
@@ -371,13 +379,21 @@ if ($MiniportHandle) {
 # own output and nothing else.
 $log2 = Join-Path $OutDir 'wdi-state-detail.txt'
 Write-Host '[3/4] Dumping adapter, port and WDI state'
+# Two commands were removed after a run showed them to be inventions
+# of mine rather than things this ndiskd has: `!ndiskd.miniports -wdi`
+# answered "Unknown parameter wdi", and `!ndiskd.pendingoids` answered
+# "ndiskd has no pendingoids export". `!ndiskd.oid` is the real one and
+# does report pending and queued OIDs.
+#
+# !ndiskd.wdiminidriver is kept but is not expected to work: it
+# dereferences wdiwifi!CMiniportDriver, a C++ type that only exists in
+# private symbols, and Microsoft's public PDB has no type information.
+# It stays because its failure is informative and costs one line.
 $cmds = @(
+    "!ndiskd.netadapter $handle",
     "!ndiskd.miniport $handle",
     "!ndiskd.wdiminidriver $handle",
-    "!ndiskd.netadapter $handle",
-    '!ndiskd.miniports -wdi',
     '!ndiskd.oid',
-    '!ndiskd.pendingoids',
     'lm vm ndis',
     'lm vm wdiwifi',
     'lm vm vwifi'
