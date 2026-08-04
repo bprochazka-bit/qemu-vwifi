@@ -757,16 +757,40 @@ static const UINT8 kUniiChannels[] = {
     149, 153, 157, 161, 165,
 };
 
-/* Supported rates in the 802.11 encoding: units of 500 kbps. */
+/* Supported rates in the 802.11 encoding: units of 500 kbps.
+ *
+ * Three lists, not two, because WDI_PHY_TYPE_ERP is neither of the
+ * other two. 802.11b (HRDSSS) is CCK only, 802.11a (OFDM) is OFDM only,
+ * and 802.11g (ERP) is *both* -- that is what the "extended rate" in
+ * Extended Rate PHY means. Advertising ERP with an OFDM-only rate list
+ * describes a PHY that cannot receive a CCK frame, which no real 11g
+ * radio is and ours is not either.
+ *
+ * This matters beyond pedantry. wdiwifi resolves a 2.4 GHz BSS to one
+ * of the PHYs we list here and then checks the BSS's basic rate set
+ * against that PHY's rates. A BSS whose basic set it cannot satisfy is
+ * not a candidate. With ERP carrying no CCK, the two 2.4 GHz PHYs
+ * between them covered every rate but neither covered a normal mixed
+ * 11g beacon on its own. */
 static const UINT16 kRatesDsss[] = { 2, 4, 11, 22 };            /* 1 .. 11 */
 static const UINT16 kRatesOfdm[] = { 12, 18, 24, 36, 48, 72, 96, 108 };
+static const UINT16 kRatesErp[]  = { 2, 4, 11, 22,              /* CCK   */
+                                     12, 18, 24, 36, 48, 72, 96, 108 };
 
 #define VWIFI_CAPS_MAX_BANDS    2
 #define VWIFI_CAPS_MAX_PHYS     3
 #define VWIFI_CAPS_MAX_CHAN_24  14
 #define VWIFI_CAPS_MAX_CHAN_5   RTL_NUMBER_OF(kUniiChannels)
-#define VWIFI_CAPS_MAX_RATES    8
+#define VWIFI_CAPS_MAX_RATES    RTL_NUMBER_OF(kRatesErp)   /* the longest */
 #define VWIFI_CAPS_MAX_ALGOS    16
+
+/* VwifiFillPhy writes RateCount slots with no bound of its own, so the
+ * scratch row has to be at least as long as the longest list any caller
+ * passes. Checked here rather than trusted, because adding a rate to
+ * one of these lists is exactly the edit that would overrun it. */
+C_ASSERT(RTL_NUMBER_OF(kRatesDsss) <= VWIFI_CAPS_MAX_RATES);
+C_ASSERT(RTL_NUMBER_OF(kRatesOfdm) <= VWIFI_CAPS_MAX_RATES);
+C_ASSERT(RTL_NUMBER_OF(kRatesErp)  <= VWIFI_CAPS_MAX_RATES);
 
 /* Backing store for every ArrayOfElements the capabilities message
  * points at. The library reads through those pointers during Generate,
@@ -1103,9 +1127,12 @@ VwifiTlvGenerateAdapterCapabilities(
                          kRatesDsss, RTL_NUMBER_OF(kRatesDsss),
                          RTL_NUMBER_OF(kRatesDsss));
             nPhys++;
+            /* Basic count 4: 1, 2, 5.5 and 11 Mbps. An 11g AP's basic
+             * set is normally exactly those, and a station whose basic
+             * set is a superset of the BSS's can always join. */
             VwifiFillPhy(&scratch->Phys[nPhys], WDI_PHY_TYPE_ERP,
                          &scratch->TxPower[nPhys], scratch->Rates[nPhys],
-                         kRatesOfdm, RTL_NUMBER_OF(kRatesOfdm), 3);
+                         kRatesErp, RTL_NUMBER_OF(kRatesErp), 4);
             nPhys++;
         }
 
