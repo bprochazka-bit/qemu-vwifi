@@ -267,6 +267,20 @@ VwifiScanWatchdog(_In_ PVOID SystemSpecific1,
  * Device events — DPC context
  * ============================================================ */
 
+/* The same 2.4/5 GHz mapping tlv_shim.cpp uses for
+ * WDI_TLV_BSS_ENTRY_CHANNEL_INFO. Duplicated rather than shared because
+ * that one lives on the C++ side of the shim; the point here is to
+ * compare what we tell the host against what the AP says in its own
+ * DS Parameter Set, so it has to be the same arithmetic. */
+static ULONG
+VwifiFreqToChannelNumber(_In_ USHORT FreqMhz)
+{
+    if (FreqMhz == 2484)                    return 14;
+    if (FreqMhz >= 2412 && FreqMhz <= 2472) return (ULONG)((FreqMhz - 2407) / 5);
+    if (FreqMhz >= 5160 && FreqMhz <= 5885) return (ULONG)((FreqMhz - 5000) / 5);
+    return 0;
+}
+
 /* Decode the management-frame body exactly as the OS will.
  *
  * WDI hands the raw beacon or probe-response body to the host and the
@@ -286,12 +300,14 @@ VwifiScanWatchdog(_In_ PVOID SystemSpecific1,
  * be decoded without the frame itself. */
 static VOID
 VwifiScanTraceFrameBody(_In_reads_bytes_(BodyLen) const UCHAR *Body,
-                        _In_ ULONG BodyLen)
+                        _In_ ULONG BodyLen,
+                        _In_ ULONG ReportedChannel)
 {
     CHAR  ies[160];
     ULONG w = 0;
     ULONG off;
     USHORT cap, bi;
+    ULONG dsChannel = 0;      /* element 3, the channel the AP claims */
 
     if (BodyLen < 12) {
         VWIFI_WARN("BSS body only %u bytes -- no fixed fields", BodyLen);
@@ -305,6 +321,12 @@ VwifiScanTraceFrameBody(_In_reads_bytes_(BodyLen) const UCHAR *Body,
     for (off = 12; off + 2 <= BodyLen; ) {
         UCHAR id  = Body[off];
         UCHAR len = Body[off + 1];
+
+        /* Element 3 is the DS Parameter Set: one byte, the channel the
+         * AP says it is on. The host has two channel numbers for this
+         * BSS -- this one and the one in WDI_TLV_BSS_ENTRY_CHANNEL_INFO
+         * -- and they had better agree. */
+        if (id == 3 && len == 1) dsChannel = Body[off + 2];
 
         if (off + 2 + len > BodyLen) {
             (VOID)RtlStringCchPrintfA(ies + w, RTL_NUMBER_OF(ies) - w,
@@ -329,12 +351,15 @@ VwifiScanTraceFrameBody(_In_reads_bytes_(BodyLen) const UCHAR *Body,
      * "ad hoc", and it will not connect an infrastructure request to a
      * BSS that does not claim ESS. */
     VWIFI_INFO("BSS body: %u bytes cap=0x%04x (ESS=%u IBSS=%u Privacy=%u) "
-               "bi=%u ies:%s",
+               "bi=%u ds-chan=%u (we report %u)%s ies:%s",
                BodyLen, cap,
                (cap & 0x0001) ? 1u : 0u,
                (cap & 0x0002) ? 1u : 0u,
                (cap & 0x0010) ? 1u : 0u,
-               bi, ies);
+               bi, dsChannel, ReportedChannel,
+               (dsChannel != 0 && dsChannel != ReportedChannel)
+                   ? " MISMATCH" : "",
+               ies);
 }
 
 VOID
@@ -448,7 +473,8 @@ VwifiScanOnBssFound(_Inout_ PVWIFI_ADAPTER Adapter,
      * that decides whether it will treat this BSS as connectable. */
     if (frameLen > VWIFI_80211_MGMT_HDR_LEN) {
         VwifiScanTraceFrameBody(frame + VWIFI_80211_MGMT_HDR_LEN,
-                                (ULONG)(frameLen - VWIFI_80211_MGMT_HDR_LEN));
+                                (ULONG)(frameLen - VWIFI_80211_MGMT_HDR_LEN),
+                                VwifiFreqToChannelNumber(bss->channel_freq));
     }
 
     /* Everything past here is the running scan's business. Outside a
