@@ -465,6 +465,51 @@ The rule that actually holds: if a container describes something the
 adapter *is*, fill it in, whatever the model says. Only omit containers
 describing features the device genuinely does not have.
 
+### Establish which layer is failing before testing theories inside one
+
+`OID_WDI_TASK_CONNECT` has never reached this driver. What the traces
+show instead is `wdiwifi.sys` accepting `OID_DOT11_CONNECT_REQUEST`,
+returning success, and about two milliseconds later sending
+`NDIS_STATUS_DOT11_CONNECTION_COMPLETION` back up with
+`STATUS_NETWORK_UNREACHABLE` / `DOT11_ASSOC_STATUS_UNREACHABLE`.
+
+Several rounds went into the BSS entry on the assumption that the port
+driver was examining it and finding it wanting: the beacon frame, the
+age timestamp, the algorithm pairs, the band and channel, who owns the
+BSS list. Each of those found a real bug. None of them was this bug.
+
+The measurement that settled it took one command:
+
+```
+trace-wdi.cmd -Ssid foobar -Wait 45
+```
+
+Connecting to an SSID that exists nowhere fails **identically** to
+connecting to the one that is on the air — same `0xC000023C`, same
+`assocStatus 0x2`, same two milliseconds, no scan in between. The OID
+sequences are the same OIDs in the same order with the same counts,
+from the dot11 reset through `OID_DOT11_CONNECT_REQUEST`. The two cases
+are indistinguishable at the driver boundary, which means the refusal
+happens before the port driver considers any BSS at all.
+
+So a whole class of theory — anything about what is *in* the BSS entry
+— is ruled out, and was rulable out from the start. The lesson is not
+about WDI: when a component you cannot see into rejects something,
+first find a control case that isolates *which layer* is refusing.
+Testing hypotheses inside a layer that turns out not to be involved
+produces real fixes and no progress, and it is slow to notice because
+each fix is defensible on its own.
+
+Ruled out for the connect refusal, each against the generated headers
+or `WABIModel.xml` rather than by inference: BSS entry completeness and
+field semantics; `{OPEN, NONE}` in the advertised algorithm pairs;
+band, channel and PHY; the transaction id on our indication (the header
+documents `WDI_TRANSACTION_ID_UNSOLICIT` for every indication except
+*task* completions, and a GET is not one); `WDI_PORT_ID_ADAPTER`
+(`0xFFFF`) on the create-port request; the create-port completion's
+contents; `WDI_OPERATION_MODE_STA` being `0x01`; and station and
+interface capabilities field by field.
+
 ### When the driver log is silent, the problem is above the driver
 
 The 0xE9 trace records everything the driver is asked to do. That makes
