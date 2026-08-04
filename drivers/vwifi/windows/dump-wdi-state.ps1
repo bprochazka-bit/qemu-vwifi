@@ -495,7 +495,14 @@ if ($wdiState) {
         "dx -r1 ($a)->m_ExtStaBSSList",
         "dx -r1 ($a)->m_ExtStaBSSList.m_BSSEntryList",
         "dx -r2 (wdiwifi!CBSSEntry*)(($a)->m_ExtStaBSSList.m_BSSEntryList.Flink)",
-        "dx -r1 Debugger.Utility.Collections.FromListEntry(($a)->m_ExtStaBSSList.m_BSSEntryList, \"wdiwifi!CBSSEntry\", \"m_Link\")",
+        # dt, not dx, and no address: this prints CBSSEntry's field
+        # offsets so the link member can be located, which is what a
+        # FromListEntry traversal would have needed as a quoted argument.
+        # Embedding quotes here means getting them past PowerShell's
+        # parser and then past its native-argument handling into kd, and
+        # dt answers the same question without any.
+        'dt wdiwifi!CBSSEntry',
+        'dt wdiwifi!CBSSListManager',
         "dx -r1 ($a)->m_ExtStaBSSList.m_BSSEntryFactory",
 
         # Depth 1 throughout. Every -r2 so far on something whose first
