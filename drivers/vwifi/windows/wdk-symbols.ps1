@@ -27,6 +27,46 @@
     would find nothing while looking like a clean negative.
 #>
 
+# Run a native command without its stderr becoming a terminating error.
+#
+# PowerShell 5.1 turns a native program's stderr into ErrorRecords, and
+# these scripts set $ErrorActionPreference = 'Stop' so that real cmdlet
+# failures are loud. The combination means any ordinary diagnostic a
+# tool writes to stderr -- tracepdb complaining about one input, netsh
+# reporting a profile already exists -- aborts the script with a
+# RemoteException that names a line number and nothing else.
+#
+# Native tools report failure through their exit code, so that is what
+# callers get, alongside the combined output as plain strings.
+function Invoke-Native {
+    param(
+        [Parameter(Mandatory)][string] $Exe,
+        [string[]] $Arguments = @()
+    )
+    $saved = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $out  = & $Exe @Arguments 2>&1 | ForEach-Object { "$_" }
+        $code = $LASTEXITCODE
+        return [pscustomobject]@{ Output = @($out); ExitCode = $code }
+    } finally {
+        $ErrorActionPreference = $saved
+    }
+}
+
+# Real .pdb files, never the directories a symbol store names *.pdb.
+#
+# A symbol-server download is laid out as <name>.pdb\<guid+age>\<name>.pdb,
+# so a plain -Filter '*.pdb' matches the container directory as well as
+# the file inside it. Handing that directory to tracepdb produces "is a
+# directory not a file", which -- see Invoke-Native -- used to surface as
+# an unhandled exception rather than a message.
+function Get-PdbFiles {
+    param([Parameter(Mandatory)][string] $Path)
+    if (-not (Test-Path $Path)) { return @() }
+    return @(Get-ChildItem -Path $Path -Filter '*.pdb' -Recurse -File -ErrorAction SilentlyContinue)
+}
+
 function Find-WdkTool {
     param([Parameter(Mandatory)][string] $Name)
 

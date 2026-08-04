@@ -131,8 +131,8 @@ function Show-SymbolKeys {
 function Enable-LocalKd {
     Assert-Admin
     Write-Host 'Enabling local kernel debugging'
-    & bcdedit /dbgsettings local | ForEach-Object { Write-Host "  $_" }
-    & bcdedit /debug on          | ForEach-Object { Write-Host "  $_" }
+    (Invoke-Native 'bcdedit' @('/dbgsettings','local')).Output | ForEach-Object { Write-Host "  $_" }
+    (Invoke-Native 'bcdedit' @('/debug','on')).Output          | ForEach-Object { Write-Host "  $_" }
     Write-Host ''
     Write-Host 'Reboot, then re-run without -Enable.'
     Write-Host ''
@@ -143,8 +143,8 @@ function Enable-LocalKd {
 }
 
 function Test-LocalKdEnabled {
-    $dbg = (& bcdedit /enum '{current}' 2>&1 | Out-String)
-    $set = (& bcdedit /dbgsettings 2>&1 | Out-String)
+    $dbg = ((Invoke-Native 'bcdedit' @('/enum','{current}')).Output -join "`n")
+    $set = ((Invoke-Native 'bcdedit' @('/dbgsettings')).Output -join "`n")
     $on    = $dbg -match '(?im)^\s*debug\s+Yes\s*$'
     $local = $set -match '(?im)debugtype\s+Local'
     return @{ DebugOn = $on; TypeLocal = $local }
@@ -160,16 +160,24 @@ function Get-SymbolPathArg {
     if ($SymbolPath) {
         if (-not (Test-Path $SymbolPath)) { throw "no such path: $SymbolPath" }
         $full = (Resolve-Path $SymbolPath).Path
-        $n = @(Get-ChildItem $full -Filter '*.pdb' -Recurse -ErrorAction SilentlyContinue).Count
-        Write-Host "      Symbols: $full ($n pdb)"
-        if ($n -eq 0) { Write-Warning 'that directory contains no .pdb files' }
-        if (-not (Get-ChildItem $full -Filter 'ndis.pdb' -Recurse -ErrorAction SilentlyContinue)) {
+        $pdbs = Get-PdbFiles $full
+        Write-Host "      Symbols: $full ($($pdbs.Count) pdb)"
+        if ($pdbs.Count -eq 0) { Write-Warning 'that directory contains no .pdb files' }
+        if (-not ($pdbs | Where-Object { $_.Name -ieq 'ndis.pdb' })) {
             Write-Warning 'no ndis.pdb there -- !ndiskd needs it and will print errors instead of state'
         }
+
+        # Both forms, because a symbol-server download is laid out as
+        # <name>.pdb\<guid+age>\<name>.pdb while a hand-assembled folder
+        # is usually flat, and which one this is depends on how the
+        # files were fetched. The bare path covers flat; srv*<path> with
+        # no upstream tells dbghelp to read the same directory as a
+        # symbol store. Neither reaches the network.
         $parts += $full
-        # No srv* fallback on purpose. If the supplied symbols are wrong
-        # we want !ndiskd to fail visibly, not to half-resolve from a
-        # server this machine probably cannot reach anyway.
+        $parts += "srv*$full"
+        # No upstream server on purpose. If the supplied symbols are
+        # wrong we want !ndiskd to fail visibly, not to half-resolve
+        # from a server this machine probably cannot reach anyway.
     } else {
         $parts += "srv*$env:SystemDrive\symbols*https://msdl.microsoft.com/download/symbols"
         Write-Warning 'no -SymbolPath given; this needs internet. Use -ShowSymbolKeys if there is none.'
@@ -190,7 +198,7 @@ function Invoke-Kd {
     )
     # -kl local kernel debug, -logo overwrite log, and a trailing q so
     # the session exits instead of sitting at a prompt no one is at.
-    & $Kd -kl -y "$Sym" -logo "$LogFile" -c "$Commands;q" 2>&1 | Out-Null
+    (Invoke-Native $Kd @('-kl','-y',$Sym,'-logo',$LogFile,'-c',"$Commands;q")) | Out-Null
     if (Test-Path $LogFile) { return Get-Content $LogFile }
     return @()
 }

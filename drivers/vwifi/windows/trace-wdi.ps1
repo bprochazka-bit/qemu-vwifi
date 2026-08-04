@@ -187,9 +187,7 @@ function Get-TmfDirectory {
     if ($SymbolPath) {
         if (-not (Test-Path $SymbolPath)) { throw "no such path: $SymbolPath" }
         $src = Get-Item $SymbolPath
-        $pdbFiles = if ($src.PSIsContainer) {
-            Get-ChildItem $src.FullName -Filter '*.pdb' -Recurse
-        } else { @($src) }
+        $pdbFiles = if ($src.PSIsContainer) { Get-PdbFiles $src.FullName } else { @($src) }
         foreach ($f in $pdbFiles) { Copy-Item $f.FullName -Destination $sym -Force }
         Write-Host ("      Using {0} supplied PDB(s)" -f @($pdbFiles).Count)
     }
@@ -198,19 +196,19 @@ function Get-TmfDirectory {
     if ($SymbolPath) {
         # nothing to fetch
     } elseif ($symchk) {
-        & $symchk /r $wdiSys /s "srv*$sym*https://msdl.microsoft.com/download/symbols" 2>&1 |
+        (Invoke-Native $symchk @('/r', $wdiSys, '/s', "srv*$sym*https://msdl.microsoft.com/download/symbols")).Output |
             Select-Object -Last 2 | ForEach-Object { Write-Host "        $_" }
     } else {
         (Get-SymbolFile -ImagePath $wdiSys -DestDir $sym) | Out-Null
     }
 
-    $pdbs = @(Get-ChildItem -Path $sym -Filter '*.pdb' -Recurse -ErrorAction SilentlyContinue)
+    $pdbs = Get-PdbFiles $sym
     if ($pdbs.Count -eq 0) {
         Write-Warning 'no PDB retrieved; WPP records will stay as raw ids'
         return $null
     }
     Write-Host "      Building TMFs from $($pdbs.Count) PDB(s)"
-    foreach ($p in $pdbs) { & $tracepdb -f $p.FullName -p $tmf 2>&1 | Out-Null }
+    foreach ($p in $pdbs) { (Invoke-Native $tracepdb @('-f', $p.FullName, '-p', $tmf)) | Out-Null }
 
     $n = @(Get-ChildItem $tmf -Filter '*.tmf' -ErrorAction SilentlyContinue).Count
     if ($n -eq 0) {
@@ -260,7 +258,7 @@ function Get-RegisteredTraceGuids {
         return @()
     }
     $rx = '([0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12})'
-    $g = foreach ($l in (& $tracelog -enumguid 2>&1)) {
+    $g = foreach ($l in (Invoke-Native $tracelog @('-enumguid')).Output) {
         if ("$l" -match $rx) { $Matches[1] }
     }
     return @($g | Sort-Object -Unique)
@@ -301,7 +299,7 @@ function Invoke-Capture([string[]] $WppGuids) {
 
     # An interrupted run leaves the session registered, and logman
     # create then fails on the name rather than doing the obvious thing.
-    logman stop $session -ets 2>$null | Out-Null
+    (Invoke-Native 'logman' @('stop', $session, '-ets')) | Out-Null
 
     Write-Host "[1/5] Starting session -> $EtlPath"
 
@@ -323,12 +321,13 @@ function Invoke-Capture([string[]] $WppGuids) {
         '-f', 'bincirc', '-max', '64',
         '-ets'
     )
-    $out = & logman @create 2>&1
-    if ($LASTEXITCODE -ne 0) {
+    $r = Invoke-Native 'logman' $create
+    $out = $r.Output
+    if ($r.ExitCode -ne 0) {
         # Print what logman actually said. Swallowing it turns a typo in
         # a switch into an unexplained exit code.
         $out | ForEach-Object { Write-Host "      $_" }
-        throw "logman create failed ($LASTEXITCODE)"
+        throw "logman create failed ($($r.ExitCode))"
     }
     Write-Host '        + WDILib (documented, but silent unless the miniport links it)'
 
@@ -338,8 +337,8 @@ function Invoke-Capture([string[]] $WppGuids) {
     # link the library.
     foreach ($g in $WppGuids) {
         if ($g -eq ($wdiGuid -replace '[{}]', '')) { continue }
-        & logman update trace $session -p "{$g}" 0xffffffff 0xff -ets | Out-Null
-        if ($LASTEXITCODE -eq 0) { Write-Host "        + wdiwifi {$g}" }
+        $u = Invoke-Native 'logman' @('update','trace',$session,'-p',"{$g}",'0xffffffff','0xff','-ets')
+        if ($u.ExitCode -eq 0) { Write-Host "        + wdiwifi {$g}" }
         else { Write-Warning "could not add {$g}" }
     }
     if ($WppGuids.Count -eq 0) {
@@ -347,8 +346,8 @@ function Invoke-Capture([string[]] $WppGuids) {
     }
 
     foreach ($p in $manifestProviders) {
-        & logman update trace $session -p $p.Name 0xffffffffffffffff 0xff -ets | Out-Null
-        if ($LASTEXITCODE -eq 0) { Write-Host ("        + {0}" -f $p.Desc) }
+        $u = Invoke-Native 'logman' @('update','trace',$session,'-p',$p.Name,'0xffffffffffffffff','0xff','-ets')
+        if ($u.ExitCode -eq 0) { Write-Host ("        + {0}" -f $p.Desc) }
         else { Write-Warning ("could not add {0}" -f $p.Name) }
     }
 
@@ -364,7 +363,7 @@ function Invoke-Capture([string[]] $WppGuids) {
     Start-Sleep -Seconds $Wait
 
     Write-Host '[4/5] Stopping session'
-    & logman stop $session -ets | Out-Null
+    (Invoke-Native 'logman' @('stop', $session, '-ets')) | Out-Null
     Remove-AutoConnectProfile
 
     if (-not (Test-Path $EtlPath)) { throw "no $EtlPath was produced" }
@@ -397,9 +396,11 @@ function Invoke-AutoConnect {
     Set-Content -Path $tmp -Value $xml -Encoding UTF8
 
     try {
-        & netsh wlan add profile filename="$tmp" 2>&1 | ForEach-Object { Write-Host "      $_" }
+        (Invoke-Native 'netsh' @('wlan','add','profile',"filename=$tmp")).Output |
+            ForEach-Object { Write-Host "      $_" }
         Start-Sleep -Milliseconds 500
-        & netsh wlan connect name="$Ssid" 2>&1 | ForEach-Object { Write-Host "      $_" }
+        (Invoke-Native 'netsh' @('wlan','connect',"name=$Ssid")).Output |
+            ForEach-Object { Write-Host "      $_" }
         # Record it for Remove-AutoConnectProfile, which runs after the
         # capture window rather than here. Deleting a profile aborts any
         # attempt using it, and this used to do that five seconds in --
@@ -416,7 +417,7 @@ function Invoke-AutoConnect {
 
 function Remove-AutoConnectProfile {
     if (-not $script:AutoProfile) { return }
-    & netsh wlan delete profile name="$script:AutoProfile" 2>&1 | Out-Null
+    (Invoke-Native 'netsh' @('wlan','delete','profile',"name=$script:AutoProfile")) | Out-Null
     Write-Host "      Removed temporary profile $script:AutoProfile"
     $script:AutoProfile = $null
 }
@@ -440,15 +441,15 @@ function Invoke-Decode {
     # and both read the same file, so their timestamps line up exactly.
     $tracefmt = Find-WdkTool 'tracefmt.exe'
     if ($tracefmt -and $tmf) {
-        & $tracefmt $EtlPath -p $tmf -o $wppOut -nosummary 2>&1 |
+        (Invoke-Native $tracefmt @($EtlPath,'-p',$tmf,'-o',$wppOut,'-nosummary')).Output |
             Select-Object -Last 3 | ForEach-Object { Write-Host "      $_" }
     } elseif ($tracefmt) {
-        & $tracefmt $EtlPath -o $wppOut -nosummary 2>&1 | Out-Null
+        (Invoke-Native $tracefmt @($EtlPath,'-o',$wppOut,'-nosummary')) | Out-Null
     } else {
         Write-Warning 'tracefmt.exe not found (WDK); skipping WPP decode'
     }
 
-    & tracerpt $EtlPath -o $evtOut -of XML -y 2>&1 | Out-Null
+    (Invoke-Native 'tracerpt' @($EtlPath,'-o',$evtOut,'-of','XML','-y')) | Out-Null
 
     Write-Host ''
     Write-Host '      --- results ---'
