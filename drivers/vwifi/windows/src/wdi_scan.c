@@ -159,6 +159,27 @@ typedef struct _VWIFI_SCAN_TASK
 /* ============================================================
  * Indicate the accumulated BSS entries
  * ============================================================ */
+/* One line per BSS entry we are about to hand the host.
+ *
+ * Per entry rather than an aggregate count, because the questions this
+ * answers are per entry: did the beacon go out, and -- since the host
+ * now asks us for the cached list -- which list did this entry come
+ * from. `Which` is "live" for a running scan's results and "cached" for
+ * a reply to OID_WDI_GET_BSS_ENTRY_LIST. */
+static VOID
+VwifiTraceBssItem(_In_z_ const CHAR *Which,
+                  _In_ ULONG Index,
+                  _In_ const VWIFI_BSS_STAGE *Stage)
+{
+    VWIFI_INFO("BSS entry %u (%s): %02x:%02x:%02x:%02x:%02x:%02x "
+               "beacon=%u probe=%u",
+               Index, Which,
+               Stage->Entry.bssid[0], Stage->Entry.bssid[1],
+               Stage->Entry.bssid[2], Stage->Entry.bssid[3],
+               Stage->Entry.bssid[4], Stage->Entry.bssid[5],
+               Stage->BeaconLen, Stage->ProbeLen);
+}
+
 static VOID
 VwifiIndicateBssEntryList(_Inout_ PVWIFI_ADAPTER Adapter)
 {
@@ -182,19 +203,7 @@ VwifiIndicateBssEntryList(_Inout_ PVWIFI_ADAPTER Adapter)
         items[i].HostTimeStamp = task->Pending[i].SeenSystemTime;
         items[i].Cached        = FALSE;   /* live: a scan is running */
 
-        /* Per entry, because "did the beacon go out" is exactly the
-         * question this change exists to answer, and an aggregate count
-         * would not say which BSS was short of one. */
-        VWIFI_INFO("BSS entry %u: %02x:%02x:%02x:%02x:%02x:%02x "
-                   "beacon=%u probe=%u",
-                   i,
-                   task->Pending[i].Entry.bssid[0],
-                   task->Pending[i].Entry.bssid[1],
-                   task->Pending[i].Entry.bssid[2],
-                   task->Pending[i].Entry.bssid[3],
-                   task->Pending[i].Entry.bssid[4],
-                   task->Pending[i].Entry.bssid[5],
-                   task->Pending[i].BeaconLen, task->Pending[i].ProbeLen);
+        VwifiTraceBssItem("live", i, &task->Pending[i]);
     }
 
     status = VwifiTlvGenerateBssEntryList(Adapter->WdiPeerVersion,
@@ -976,7 +985,14 @@ VwifiScanIndicateCachedBss(_Inout_ PVWIFI_ADAPTER Adapter,
     ULONG n;
 
     if (!task || task->CacheCount == 0) {
-        VWIFI_INFO("BSS cache is empty; nothing to report");
+        /* Loud, because this is no longer a harmless nothing-to-say.
+         * We advertise BSSListCachemanagement = TRUE, so the host asks
+         * this question when it needs a BSS to connect to -- typically
+         * a few milliseconds after a dot11 reset, with no time to scan.
+         * An empty answer here is a connect that will fail with "the
+         * specific network is not available". */
+        VWIFI_WARN("BSS cache is empty -- answering GET_BSS_ENTRY_LIST "
+                   "with nothing; a connect issued now cannot succeed");
         return;
     }
 
@@ -993,6 +1009,8 @@ VwifiScanIndicateCachedBss(_Inout_ PVWIFI_ADAPTER Adapter,
         /* 1, not 0: these come out of the adapter's own BSS list, which
          * is exactly what the TLV's second field distinguishes. */
         items[i].Cached        = TRUE;
+
+        VwifiTraceBssItem("cached", i, &task->Cache[i]);
     }
 
     status = VwifiTlvGenerateBssEntryList(Adapter->WdiPeerVersion,

@@ -939,7 +939,14 @@ VwifiTlvGenerateAdapterCapabilities(
 
         /* These are the sizes the OS sizes its own requests against, so
          * they have to match what the device actually accepts rather
-         * than being aspirational. */
+         * than being aspirational.
+         *
+         * Every field of WDI_STATION_CAPABILITIES is set here, including
+         * the ones whose honest answer is zero. The struct is
+         * zero-constructed, so an unset field and a deliberate zero look
+         * identical afterwards -- and the difference between "we decided
+         * this is zero" and "we never thought about it" is exactly what
+         * went wrong below. */
         sc->ScanSSIDListSize       = Caps->max_scan_ssids;
         sc->DesiredBSSIDListSize   = 1;
         sc->DesiredSSIDListSize    = 1;
@@ -947,8 +954,74 @@ VwifiTlvGenerateAdapterCapabilities(
         sc->DefaultKeyTableSize    = 4;   /* four GTK slots */
         sc->MaxNumPerSTA           = 1;
         sc->MFPCapable             = 0;
-        sc->AutoPowerSaveMode      = FALSE;
-        sc->BSSListCachemanagement = FALSE;
+
+        /* The host sends OID_WDI_SET_PRIVACY_EXEMPTION_LIST as part of
+         * every connect -- it is one of the two OIDs
+         * OID_DOT11_CONNECT_REQUEST translates into -- and this is the
+         * number of entries we are telling it we can hold. It was left
+         * at zero while the handler accepted any list it was given,
+         * which is the adapter saying "I take none of these" and then
+         * taking them. */
+        sc->PrivacyExemptionListSize = 32;
+
+        /* Length in bytes of the longest WEP key we accept. Zero was a
+         * straight contradiction of the algorithm pair list further
+         * down, which advertises Open/WEP-40 and Open/WEP-104 -- and
+         * which Windows believes: `netsh wlan show drivers` lists both.
+         * 13 bytes is the 104-bit key. */
+        sc->WEPKeyValueMaxLength   = 13;
+
+        /* No WMM/QoS, no host FIPS, no power save, no network-offload
+         * (NLO) list, no HESSID, no disconnected standby, no FTM, no
+         * WPA3 host FIPS, no RSN override. All genuinely absent rather
+         * than merely unimplemented in this block. */
+        sc->SupportedQOSFlags            = 0;
+        sc->HostFIPSModeImplemented      = 0;
+        sc->AutoPowerSaveMode            = FALSE;
+        sc->uMaxNetworkOffloadListSize   = 0;
+        sc->HESSIDConnectionSupported    = FALSE;
+        sc->DisconnectedStandbySupported = FALSE;
+        sc->FTMAsInitiatorSupport        = FALSE;
+        sc->FTMNumberOfSupportedTargets  = 0;
+        sc->HostWPA3FIPSModeEnabled      = FALSE;
+        sc->rsnOverrideSupported         = FALSE;
+
+        /* We associate only to a BSSID the host names in the connect's
+         * preferred list -- the device is told a BSSID and uses it --
+         * so the override stays FALSE. */
+        sc->ConnectBSSSelectionOverride  = FALSE;
+
+        /* "If the adapter would maintain the Station BSS List cache."
+         *
+         * TRUE, because we do. wdi_scan.c keeps a 32-entry BSSID-keyed
+         * cache that outlives the scan that filled it, and oids.c
+         * answers OID_WDI_GET_BSS_ENTRY_LIST out of it.
+         *
+         * This said FALSE, and FALSE is what tells the host "the
+         * adapter has no BSS list, so don't ask" -- which is why
+         * OID_WDI_GET_BSS_ENTRY_LIST has never once arrived in any
+         * trace this project has collected, despite the handler being
+         * there the whole time.
+         *
+         * That is not merely a wasted handler. It decides who owns the
+         * list a connect is built from, and it lines up with what the
+         * traces show: the host does OID_WDI_TASK_DOT11_RESET, then
+         * roughly ten milliseconds later OID_DOT11_CONNECT_REQUEST, and
+         * fails it in 1.5 ms with STATUS_NETWORK_UNREACHABLE without
+         * ever issuing OID_WDI_TASK_CONNECT to us. A dot11 reset with
+         * bSetDefaultMIB clears the station MIB, the BSS list included;
+         * with the host owning the only copy there is nothing left to
+         * build WDI_TLV_CONNECT_BSS_ENTRY from, and that TLV is
+         * mandatory in WDI_TASK_CONNECT. The host then scans -- which
+         * the traces also show, immediately after the failure -- but by
+         * then the connect has already been answered.
+         *
+         * Saying TRUE gives it somewhere to ask. Whether that is the
+         * whole story is not settled: wdiwifi.sys makes this decision
+         * internally and its WPP is not in any capture we have been
+         * able to take. What is settled is that this field was
+         * describing an adapter we are not. */
+        sc->BSSListCachemanagement = TRUE;
     }
 
     /* Bands and PHYs.

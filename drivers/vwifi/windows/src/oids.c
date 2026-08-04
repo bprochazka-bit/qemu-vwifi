@@ -792,6 +792,22 @@ VwifiHandleTaskDot11Reset(_Inout_ PVWIFI_ADAPTER Adapter,
     RtlZeroMemory(Adapter->Bssid, 6);
     VwifiIndicateLinkState(Adapter, FALSE);
 
+    /* The BSS cache deliberately survives this.
+     *
+     * It is tempting to read "reset the MAC entity to its initial
+     * state" as covering the scan results too, and dropping them here
+     * would look tidy. It would also be the end of connecting: the
+     * host resets the port and then issues its connect within about ten
+     * milliseconds, far too soon for a fresh scan to have found
+     * anything, so the BSS the connect is built from has to be one we
+     * were already holding.
+     *
+     * We advertise WDI_STATION_CAPABILITIES.BSSListCachemanagement =
+     * TRUE precisely so the host will come and ask us for it via
+     * OID_WDI_GET_BSS_ENTRY_LIST at that moment. Flushing here would
+     * make that answer empty. Only OID_WDI_SET_FLUSH_BSS_ENTRY, which
+     * is the host explicitly asking for a fresh view, may clear it. */
+
     VwifiSendWdiIndication(Adapter, VwifiGetWdiPortId(Req), Req->PortNumber,
                            NDIS_STATUS_WDI_INDICATION_DOT11_RESET_COMPLETE,
                            NDIS_STATUS_SUCCESS,
