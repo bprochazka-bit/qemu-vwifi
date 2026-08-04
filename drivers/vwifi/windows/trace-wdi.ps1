@@ -83,6 +83,21 @@
 .EXAMPLE
     # Capture while you click the tray icon yourself:
     .\trace-wdi.cmd
+
+.EXAMPLE
+    # Control experiment: connect to an SSID that does not exist.
+    #
+    # This is the one measurement that splits the remaining hypotheses.
+    # If a network that is definitely not on the air fails the same way
+    # the real one does -- same status, same timing, no scan first --
+    # then the port driver is refusing before it ever considers a BSS,
+    # and every theory about our BSS entry's contents is aimed at the
+    # wrong thing. If it fails differently, our entry really is being
+    # examined and rejected.
+    #
+    # Give it longer than the default: a real network fails in two
+    # milliseconds, while an absent one is scanned for first.
+    .\trace-wdi.cmd -Ssid foobar -Wait 45
 #>
 [CmdletBinding()]
 param(
@@ -96,6 +111,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$script:AutoProfile = $null
 $session   = 'vwifi-wdi'
 $wdiGuid   = '{21ba7b61-05f8-41f1-9048-c09493dcfe38}'
 $wdiSys    = "$env:SystemRoot\System32\drivers\wdiwifi.sys"
@@ -482,6 +498,7 @@ function Invoke-Capture([string[]] $WppGuids) {
 
     Write-Host '[4/5] Stopping session'
     & logman stop $session -ets | Out-Null
+    Remove-AutoConnectProfile
 
     if (-not (Test-Path $EtlPath)) { throw "no $EtlPath was produced" }
     $kb = [int]((Get-Item $EtlPath).Length / 1KB)
@@ -516,13 +533,25 @@ function Invoke-AutoConnect {
         & netsh wlan add profile filename="$tmp" 2>&1 | ForEach-Object { Write-Host "      $_" }
         Start-Sleep -Milliseconds 500
         & netsh wlan connect name="$Ssid" 2>&1 | ForEach-Object { Write-Host "      $_" }
+        # Record it for Remove-AutoConnectProfile, which runs after the
+        # capture window rather than here. Deleting a profile aborts any
+        # attempt using it, and this used to do that five seconds in --
+        # fine for a network that fails in two milliseconds, fatal for
+        # one that does not exist, where Windows scans for far longer
+        # than five seconds before giving up. That is precisely the
+        # comparison this switch is useful for, so the teardown must not
+        # be what ends it.
+        $script:AutoProfile = $Ssid
     } finally {
         Remove-Item $tmp -ErrorAction SilentlyContinue
-        # Deferred: deleting the profile while the attempt is in flight
-        # would abort it and trace the teardown instead of the failure.
-        Start-Sleep -Seconds 5
-        & netsh wlan delete profile name="$Ssid" 2>&1 | Out-Null
     }
+}
+
+function Remove-AutoConnectProfile {
+    if (-not $script:AutoProfile) { return }
+    & netsh wlan delete profile name="$script:AutoProfile" 2>&1 | Out-Null
+    Write-Host "      Removed temporary profile $script:AutoProfile"
+    $script:AutoProfile = $null
 }
 
 # -------------------------------------------------------------- decode
