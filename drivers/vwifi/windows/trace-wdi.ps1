@@ -91,7 +91,8 @@ param(
     [string] $EtlPath = 'C:\vwifi-wdi.etl',
     [switch] $NoDecode,
     [switch] $DecodeOnly,
-    [switch] $ListProviders
+    [switch] $ListProviders,
+    [string] $SymbolPath
 )
 
 $ErrorActionPreference = 'Stop'
@@ -229,7 +230,7 @@ function Get-SymbolFile([string] $ImagePath, [string] $DestDir) {
     New-Item -ItemType Directory -Force -Path $DestDir | Out-Null
 
     $url = 'https://msdl.microsoft.com/download/symbols/{0}/{1}/{0}' -f $cv.PdbName, $cv.Key
-    Write-Host "      GET $($cv.PdbName) [$($cv.Key)]"
+    Write-Host "      GET $url"
 
     try {
         # PowerShell 5.1 still defaults to TLS 1.0, which msdl refuses.
@@ -238,7 +239,17 @@ function Get-SymbolFile([string] $ImagePath, [string] $DestDir) {
         Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing `
             -UserAgent 'Microsoft-Symbol-Server/10.0.0.0' -TimeoutSec 120
     } catch {
+        # Print the URL, not just the failure. This machine's only
+        # network adapter is the one being debugged, so the download
+        # failing is expected rather than exceptional -- and the URL is
+        # everything needed to fetch the PDB from anywhere else and drop
+        # it in with -SymbolPath.
         Write-Warning "symbol download failed: $($_.Exception.Message)"
+        Write-Host ''
+        Write-Host '      Fetch it from any machine with internet:'
+        Write-Host "        $url"
+        Write-Host "      then re-run with:  -SymbolPath <the-downloaded-.pdb>"
+        Write-Host ''
         Remove-Item $dest -ErrorAction SilentlyContinue
         return $null
     }
@@ -280,11 +291,30 @@ function Get-TmfDirectory {
 
     Write-Host "      Fetching symbols for wdiwifi.sys $ver (once; cached after this)"
 
-    # symchk if it happens to be here, otherwise fetch it ourselves. The
-    # EWDK carries the build tools but not the Debugging Tools, so
-    # symchk is usually absent and its absence must not stop the run.
+    # Three ways to end up with a PDB, in order of preference:
+    # one the caller supplies, symchk if it happens to be installed, or
+    # a direct fetch. The EWDK carries the build tools but not the
+    # Debugging Tools, so symchk is usually absent; and this machine's
+    # only network adapter is the one being debugged, so the fetch
+    # usually fails too. -SymbolPath is the one that always works.
+    #
+    # Supplied PDBs are copied rather than used in place, so the cache
+    # keyed on this wdiwifi.sys keeps them and later runs need neither
+    # the network nor the switch.
+    if ($SymbolPath) {
+        if (-not (Test-Path $SymbolPath)) { throw "no such path: $SymbolPath" }
+        $src = Get-Item $SymbolPath
+        $pdbFiles = if ($src.PSIsContainer) {
+            Get-ChildItem $src.FullName -Filter '*.pdb' -Recurse
+        } else { @($src) }
+        foreach ($f in $pdbFiles) { Copy-Item $f.FullName -Destination $sym -Force }
+        Write-Host ("      Using {0} supplied PDB(s)" -f @($pdbFiles).Count)
+    }
+
     $symchk = Find-Tool 'symchk.exe'
-    if ($symchk) {
+    if ($SymbolPath) {
+        # nothing to fetch
+    } elseif ($symchk) {
         & $symchk /r $wdiSys /s "srv*$sym*https://msdl.microsoft.com/download/symbols" 2>&1 |
             Select-Object -Last 2 | ForEach-Object { Write-Host "        $_" }
     } else {
@@ -332,6 +362,54 @@ function Get-WppGuidsFromTmf([string] $TmfDir) {
              Where-Object { $_ -match '^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$' } |
              Sort-Object -Unique
     return @($guids)
+}
+
+# Every trace GUID currently registered on the machine.
+#
+# tracelog ships with the EWDK, needs no network, and lists WPP control
+# GUIDs as well as manifest providers. On its own it is not enough --
+# it says which GUIDs exist but not which module owns them -- so it is
+# only half of Get-WppGuidsFromImage below.
+function Get-RegisteredTraceGuids {
+    $tracelog = Find-Tool 'tracelog.exe'
+    if (-not $tracelog) {
+        Write-Warning 'tracelog.exe not found; cannot enumerate registered trace GUIDs'
+        return @()
+    }
+    $rx = '([0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12})'
+    $g = foreach ($l in (& $tracelog -enumguid 2>&1)) {
+        if ("$l" -match $rx) { $Matches[1] }
+    }
+    return @($g | Sort-Object -Unique)
+}
+
+# Which of those GUIDs wdiwifi.sys actually contains.
+#
+# The offline answer to "what are the port driver's control GUIDs",
+# for when the PDB cannot be fetched -- which on this test machine is
+# the normal case, since the only network adapter it has is the one
+# being debugged.
+#
+# WPP compiles its control GUID into the image, so the bytes are in the
+# binary; and tracelog lists the GUIDs the system has registered. Either
+# set alone is useless -- the image contains many 16-byte sequences that
+# merely look like GUIDs, and the registered list has no attribution --
+# but a GUID that is in both is a trace provider this binary registered.
+#
+# Compared as hex over the whole file rather than by constructing a Guid
+# per offset: a few hundred IndexOf calls against one string, instead of
+# a hundred thousand object allocations.
+function Get-WppGuidsFromImage([string] $ImagePath, [string[]] $Candidates) {
+    if (-not (Test-Path $ImagePath) -or $Candidates.Count -eq 0) { return @() }
+
+    $hex = [BitConverter]::ToString([IO.File]::ReadAllBytes($ImagePath)) -replace '-'
+    $hit = foreach ($c in $Candidates) {
+        # ToByteArray gives the on-disk little-endian layout, which is
+        # how WPP stores it -- not the display order.
+        $needle = [BitConverter]::ToString(([guid]$c).ToByteArray()) -replace '-'
+        if ($hex.IndexOf($needle, [StringComparison]::OrdinalIgnoreCase) -ge 0) { $c }
+    }
+    return @($hit)
 }
 
 # ------------------------------------------------------------- capture
@@ -573,13 +651,27 @@ if (-not $DecodeOnly -or $ListProviders) {
     Write-Host '[0/5] Preparing symbols'
     $script:TmfDir = Get-TmfDirectory
 }
+
+# Preferred: the PDB names the GUIDs outright, and the same TMFs then
+# decode the result. Fallback: intersect the image with the registered
+# trace GUIDs, which needs no network. The fallback gets the capture
+# right even when decoding will only yield raw ids -- which is still
+# the difference between a trace of the port driver and a trace of
+# everything except the port driver.
 $guids = Get-WppGuidsFromTmf $script:TmfDir
+$source = 'wdiwifi.pdb'
+if ($guids.Count -eq 0) {
+    Write-Host '      No TMFs; falling back to image/registered-GUID intersection'
+    $guids  = Get-WppGuidsFromImage -ImagePath $wdiSys -Candidates (Get-RegisteredTraceGuids)
+    $source = 'wdiwifi.sys x tracelog -enumguid'
+}
 
 if ($ListProviders) {
     Write-Host ''
-    Write-Host 'WPP control GUIDs registered by wdiwifi.sys:'
+    Write-Host "WPP control GUIDs for wdiwifi.sys (via $source):"
     if ($guids.Count -eq 0) {
-        Write-Host '  (none -- no TMFs, so either no symbols or no WPP metadata in the PDB)'
+        Write-Host '  (none found)'
+        Write-Host '  Without a PDB this needs tracelog.exe from the EWDK build environment.'
     } else {
         $guids | ForEach-Object { Write-Host "  {$_}" }
     }
