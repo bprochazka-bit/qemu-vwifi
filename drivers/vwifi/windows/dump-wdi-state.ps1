@@ -475,30 +475,36 @@ if ($wdiState) {
         'lm vm wdiwifi',
         "dx -r1 $a",
 
-        # The ports. CAdapter carries m_pPortList as CPort*[5]; the
-        # ExtSTA port is the one that a connect would run on, and its
-        # state is the last thing on this side that could refuse a
-        # connect before any BSS is considered. -r1 per port: -r2 buries
-        # the interesting fields under sub-objects and risks the same
-        # truncation the debug arrays caused.
-        "dx -r1 ($a)->m_pPortList",
+        # The port and, more to the point, what it remembers.
+        #
+        # Everything structural has now come back healthy: the ExtSTA
+        # port exists with m_Dot11State WfcPortDot11StateOp, all 25 TAL
+        # handlers are registered non-null, m_MiniportDataApi is
+        # complete, the peer table is empty as it should be while
+        # unassociated, and the BSS list holds a fresh entry. So stop
+        # asking whether the pieces are present and ask what the port
+        # recorded when the connect was refused.
+        #
+        # CPort carries m_pConnectHistory (CNetworkHistoryList),
+        # m_pBssidConnectHistory (CBssidConnectHistory) and
+        # m_pRoamTraceLoggingData. A component that refuses a connect in
+        # two milliseconds and reports a reason upward has to get that
+        # reason from somewhere, and these are the only places on this
+        # side that look like they keep one.
+        #
+        # m_PortPropertyCache and m_AdapterPropertyCache are the
+        # assembled connect parameters -- desired SSID, BSS type, auth
+        # and cipher as wdiwifi resolved them. If its view of the
+        # request differs from what wlansvc asked for, that is visible
+        # here and nowhere else we have looked.
         "dx -r1 ($a)->m_pPortList[0]",
-        "dx -r1 ($a)->m_pPortList[1]",
-        "dx -r1 ($a)->m_pPortList[2]",
-
-        # What we registered and what we were handed. m_MiniportDataHandlers
-        # is our TAL handler table as wdiwifi recorded it, m_MiniportDataApi
-        # the NDIS_WDI_DATA_API it gave us -- the two halves of the contract
-        # that has already produced one silent failure (RxFlushConfirm).
-        "dx -r1 ($a)->m_MiniportDataHandlers",
-        "dx -r1 ($a)->m_MiniportDataApi",
-        "dx -r1 ($a)->m_DatapathCapabilities",
-        "dx -r1 ($a)->m_PeerTable",
-
-        "dx -r2 ($a)->m_ExtStaBSSList",
-        "dx -r2 ($a)->m_CommandScheduler",
-        "dx -r2 ($a)->m_ActiveJobsList",
-        "dx -r2 ($a)->m_SerializedJobList"
+        "dx -r2 ($a)->m_pPortList[0]->m_PortPropertyCache",
+        "dx -r3 ($a)->m_pPortList[0]->m_pConnectHistory",
+        "dx -r3 ($a)->m_pPortList[0]->m_pBssidConnectHistory",
+        "dx -r2 ($a)->m_pPortList[0]->m_pRoamTraceLoggingData",
+        "dx -r2 ($a)->m_AdapterPropertyCache",
+        "dx -r2 ($a)->m_ServicesManager",
+        "dx -r2 ($a)->m_ExtStaBSSList"
     ) -join ';')
     Write-Host "      $log3 ($($out3.Count) lines)"
 } else {
