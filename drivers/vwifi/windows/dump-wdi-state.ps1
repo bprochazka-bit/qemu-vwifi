@@ -474,12 +474,31 @@ if ($wdiState) {
         '.reload /f wdiwifi.sys',
         'lm vm wdiwifi',
         "dx -r1 $a",
+
+        # The ports. CAdapter carries m_pPortList as CPort*[5]; the
+        # ExtSTA port is the one that a connect would run on, and its
+        # state is the last thing on this side that could refuse a
+        # connect before any BSS is considered. -r1 per port: -r2 buries
+        # the interesting fields under sub-objects and risks the same
+        # truncation the debug arrays caused.
+        "dx -r1 ($a)->m_pPortList",
+        "dx -r1 ($a)->m_pPortList[0]",
+        "dx -r1 ($a)->m_pPortList[1]",
+        "dx -r1 ($a)->m_pPortList[2]",
+
+        # What we registered and what we were handed. m_MiniportDataHandlers
+        # is our TAL handler table as wdiwifi recorded it, m_MiniportDataApi
+        # the NDIS_WDI_DATA_API it gave us -- the two halves of the contract
+        # that has already produced one silent failure (RxFlushConfirm).
+        "dx -r1 ($a)->m_MiniportDataHandlers",
+        "dx -r1 ($a)->m_MiniportDataApi",
+        "dx -r1 ($a)->m_DatapathCapabilities",
+        "dx -r1 ($a)->m_PeerTable",
+
         "dx -r2 ($a)->m_ExtStaBSSList",
-        "dx -r3 ($a)->m_ExtStaBSSList.m_BSSEntryList",
         "dx -r2 ($a)->m_CommandScheduler",
         "dx -r2 ($a)->m_ActiveJobsList",
-        "dx -r2 ($a)->m_SerializedJobList",
-        "dx -r2 ($a)->m_CtlPlane"
+        "dx -r2 ($a)->m_SerializedJobList"
     ) -join ';')
     Write-Host "      $log3 ($($out3.Count) lines)"
 } else {
