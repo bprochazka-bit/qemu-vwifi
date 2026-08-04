@@ -376,8 +376,19 @@ if ($MiniportHandle) {
     # reading the table yourself always works, whatever this script's
     # matching does or does not manage.
     $handle = $MiniportHandle -replace '^0x', ''
-    $driver = $handle
-    Write-Host "      NetAdapter (given): $handle"
+    # The Driver is a different object and must still be looked up. It
+    # used to default to $handle, which meant !ndiskd.minidriver was
+    # handed a NetAdapter and printed a handler table decoded from the
+    # wrong struct -- entries like "SendNetBufferListsHandler
+    # ndis!NetDmaDeregisterProvider" and "PauseHandler 00000001", which
+    # look like a broken driver rather than a bad argument.
+    $found  = Find-MiniportHandle -Lines $out1
+    $driver = if ($found) { $found.Driver } else { $null }
+    if ($driver) {
+        Write-Host "      NetAdapter (given): $handle   Driver: $driver"
+    } else {
+        Write-Warning "NetAdapter $handle given, but no Driver found in pass one -- skipping -handlers"
+    }
 } else {
     $found = Find-MiniportHandle -Lines $out1
     if (-not $found) {
@@ -406,7 +417,7 @@ Write-Host '[3/4] Dumping adapter, port and WDI state'
 $cmds = @(
     "!ndiskd.netadapter $handle",
     "!ndiskd.miniport $handle -ports",
-    "!ndiskd.minidriver $driver -handlers",
+    $(if ($driver) { "!ndiskd.minidriver $driver -handlers" } else { '.echo no-driver-handle' }),
     "!ndiskd.miniport $handle -log",
     "!ndiskd.oid -miniport $handle",
     'lm vm ndis',
@@ -439,11 +450,25 @@ foreach ($l in $out2) {
 $log3 = Join-Path $OutDir 'wdi-state-adapter.txt'
 if ($wdiState) {
     Write-Host "      WDI state (wdiwifi!CAdapter): $wdiState"
+    # -r1, not -r2. CAdapter carries m_DebugHungDeviceCommand[184] and
+    # m_DebugHungTask[472]; at depth 2 dx prints those byte by byte and
+    # the output runs out before reaching the members after them -- which
+    # is where the port list lives. Depth 1 names every member, then the
+    # interesting ones are expanded individually.
+    #
+    # dt is gone: it answered "Symbol wdiwifi!CAdapter not found" while
+    # dx resolved the same type happily, so dx is what the public PDB
+    # actually supports.
+    $a = "(wdiwifi!CAdapter*)0x$wdiState"
     $out3 = Invoke-Kd -Kd $kd -Sym $sym -LogFile $log3 -Commands (@(
         $load,
-        "dt wdiwifi!CAdapter $wdiState",
-        "dx -r2 (wdiwifi!CAdapter*)0x$wdiState",
-        "!ndiskd.wdiminidriver $driver -handlers"
+        "dx -r1 $a",
+        "dx -r2 ($a)->m_ExtStaBSSList",
+        "dx -r3 ($a)->m_ExtStaBSSList.m_BSSEntryList",
+        "dx -r2 ($a)->m_CommandScheduler",
+        "dx -r2 ($a)->m_ActiveJobsList",
+        "dx -r2 ($a)->m_SerializedJobList",
+        "dx -r2 ($a)->m_CtlPlane"
     ) -join ';')
     Write-Host "      $log3 ($($out3.Count) lines)"
 } else {
