@@ -405,14 +405,50 @@ Write-Host '[3/4] Dumping adapter, port and WDI state'
 # It stays because its failure is informative and costs one line.
 $cmds = @(
     "!ndiskd.netadapter $handle",
-    "!ndiskd.miniport $handle",
-    "!ndiskd.wdiminidriver $driver",
-    '!ndiskd.oid',
+    "!ndiskd.miniport $handle -ports",
+    "!ndiskd.minidriver $driver -handlers",
+    "!ndiskd.miniport $handle -log",
+    "!ndiskd.oid -miniport $handle",
     'lm vm ndis',
     'lm vm wdiwifi',
     'lm vm vwifi'
 ) -join ';'
 $out2 = Invoke-Kd -Kd $kd -Sym $sym -LogFile $log2 -Commands $cmds
+
+# Pass three: wdiwifi's own per-adapter object.
+#
+# !ndiskd.netadapter prints "WDI state <ptr>", which is a
+# wdiwifi!CAdapter -- the port driver's own record of this adapter, and
+# the closest thing to the state that decides whether a connect is
+# attempted. It is only knowable after pass two has run, hence a third
+# pass rather than more commands in the second.
+#
+# Treat what comes back with suspicion. Public PDBs carry no C++ type
+# layout, and pass two already showed what that looks like:
+# !ndiskd.wdiminidriver, handed the handle ndiskd itself suggests,
+# reported DRIVER_OBJECT 0, "Ndis API version v0.0", "WDI API version
+# 0.0.0" and a "WDI adapter" pointer that is really the VirtIO Ethernet
+# driver's handle. Those are not the port driver's real values; they are
+# what reading a struct with no layout information produces.
+$wdiState = $null
+foreach ($l in $out2) {
+    $m = [regex]::Match($l, 'WDI state\s+([0-9a-fA-F]{8,16})')
+    if ($m.Success) { $wdiState = $m.Groups[1].Value; break }
+}
+
+$log3 = Join-Path $OutDir 'wdi-state-adapter.txt'
+if ($wdiState) {
+    Write-Host "      WDI state (wdiwifi!CAdapter): $wdiState"
+    $out3 = Invoke-Kd -Kd $kd -Sym $sym -LogFile $log3 -Commands (@(
+        $load,
+        "dt wdiwifi!CAdapter $wdiState",
+        "dx -r2 (wdiwifi!CAdapter*)0x$wdiState",
+        "!ndiskd.wdiminidriver $driver -handlers"
+    ) -join ';')
+    Write-Host "      $log3 ($($out3.Count) lines)"
+} else {
+    Write-Warning 'no "WDI state" pointer in pass two; skipping the adapter dump'
+}
 
 Write-Host '[4/4] Done'
 Write-Host "      $log1 ($($out1.Count) lines)"
