@@ -242,23 +242,34 @@ function Invoke-Kd {
 function Find-MiniportHandle {
     param([string[]] $Lines)
 
-    # !ndiskd.miniports prints a table whose rows carry the miniport
-    # handle and the adapter's friendly name. Match the row by name,
-    # then take the first pointer-width hex token on it.
+    # The table is
     #
-    # ndiskd emits its handles as DML links, so in a log the row can
-    # read `<link cmd="...">ffffe00...</link>`; the hex is still there,
-    # which is why this scrapes for hex rather than parsing columns.
-    # Kernel pointers only. The old pattern took any 8+ hex digits on
-    # the row, which on a DML-marked row can be part of the link's
-    # command text rather than the object -- and a wrong-but-plausible
-    # handle gets "is not a valid NetAdapter", which reads like the
-    # adapter being broken rather than the handle being junk.
+    #     Driver             NetAdapter          Name
+    #     ffffd008e41f0020   ffffd008db5e11a0    vwifi virtual Wi-Fi adapter
+    #
+    # so there are TWO kernel pointers per row and they are different
+    # objects. Taking the first one handed the Driver to commands that
+    # validate a NetAdapter, which answered "is not a valid NetAdapter"
+    # -- a message that sounds like the adapter is broken when in fact
+    # the wrong column was read.
+    #
+    # The column order is taken from the header rather than assumed,
+    # since being wrong about it is silent and looks like a device fault.
+    $netIdx = 1
+    foreach ($l in $Lines) {
+        if ($l -match 'Driver' -and $l -match 'NetAdapter') {
+            $netIdx = if ($l.IndexOf('NetAdapter') -lt $l.IndexOf('Driver')) { 0 } else { 1 }
+            break
+        }
+    }
+
     foreach ($l in $Lines) {
         if ($l -notmatch [regex]::Escape($Adapter)) { continue }
-        foreach ($m in [regex]::Matches($l, '\b(f{4}[0-9a-fA-F]{12})\b')) {
-            return $m.Groups[1].Value
-        }
+        $ptrs = @([regex]::Matches($l, '\b(f{4}[0-9a-fA-F]{12})\b') | ForEach-Object { $_.Groups[1].Value })
+        if ($ptrs.Count -eq 0) { continue }
+        $net = if ($ptrs.Count -gt $netIdx) { $ptrs[$netIdx] } else { $ptrs[-1] }
+        $drv = if ($ptrs.Count -gt 1) { $ptrs[1 - $netIdx] } else { $ptrs[0] }
+        return [pscustomobject]@{ NetAdapter = $net; Driver = $drv }
     }
     return $null
 }
@@ -365,14 +376,17 @@ if ($MiniportHandle) {
     # reading the table yourself always works, whatever this script's
     # matching does or does not manage.
     $handle = $MiniportHandle -replace '^0x', ''
-    Write-Host "      miniport handle (given): $handle"
+    $driver = $handle
+    Write-Host "      NetAdapter (given): $handle"
 } else {
-    $handle = Find-MiniportHandle -Lines $out1
-    if (-not $handle) {
+    $found = Find-MiniportHandle -Lines $out1
+    if (-not $found) {
         Show-MiniportDiagnosis -Lines $out1 -LogFile $log1
         return
     }
-    Write-Host "      miniport handle: $handle"
+    $handle = $found.NetAdapter
+    $driver = $found.Driver
+    Write-Host "      NetAdapter: $handle   Driver: $driver"
 }
 # Pass two: everything worth knowing about that miniport. Each command
 # is independent, so one that this ndiskd build does not have costs its
@@ -392,7 +406,7 @@ Write-Host '[3/4] Dumping adapter, port and WDI state'
 $cmds = @(
     "!ndiskd.netadapter $handle",
     "!ndiskd.miniport $handle",
-    "!ndiskd.wdiminidriver $handle",
+    "!ndiskd.wdiminidriver $driver",
     '!ndiskd.oid',
     'lm vm ndis',
     'lm vm wdiwifi',
