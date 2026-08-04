@@ -18,7 +18,6 @@
  */
 
 #include "vwifi_drv.h"
-#include <ntstrsafe.h>
 
 /* Registered by NdisMRegisterWdiMiniportDriver; saved for unload. */
 static NDIS_HANDLE g_DriverHandle = NULL;

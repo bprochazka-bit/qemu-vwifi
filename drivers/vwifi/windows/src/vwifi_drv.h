@@ -13,6 +13,11 @@
 #include <ndis.h>
 #include <dot11wdi.h>
 #include <windot11.h>
+/* RtlStringCch* -- the safe-string routines. Shared rather than
+ * per-file: the port-0xE9 logger needs them, and so does anything that
+ * assembles a trace line, which is the one thing every file here ends
+ * up doing. */
+#include <ntstrsafe.h>
 
 #include "vwifi_abi.h"
 /* NOTE: the WDI TLV library is C++ (TlvGeneratorParser.hpp, plus C++
