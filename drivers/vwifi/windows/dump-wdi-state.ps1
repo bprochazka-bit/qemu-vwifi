@@ -475,36 +475,35 @@ if ($wdiState) {
         'lm vm wdiwifi',
         "dx -r1 $a",
 
-        # The port and, more to the point, what it remembers.
+        # The BSS entry as wdiwifi parsed it.
         #
-        # Everything structural has now come back healthy: the ExtSTA
-        # port exists with m_Dot11State WfcPortDot11StateOp, all 25 TAL
-        # handlers are registered non-null, m_MiniportDataApi is
-        # complete, the peer table is empty as it should be while
-        # unassociated, and the BSS list holds a fresh entry. So stop
-        # asking whether the pieces are present and ask what the port
-        # recorded when the connect was refused.
+        # _ROAM_TRACELOGGING_DATA settled where the connect dies:
+        # bssCandidateCount 1, roamAPRankIndex 0xffffffff,
+        # bestCandidateRank 0, connectJobStartTime equal to
+        # connectJobEndTime and connectRoamTaskStartTime zero. One
+        # candidate, ranked unusable, job over in zero time, and the
+        # task that would issue OID_WDI_TASK_CONNECT never started.
         #
-        # CPort carries m_pConnectHistory (CNetworkHistoryList),
-        # m_pBssidConnectHistory (CBssidConnectHistory) and
-        # m_pRoamTraceLoggingData. A component that refuses a connect in
-        # two milliseconds and reports a reason upward has to get that
-        # reason from somewhere, and these are the only places on this
-        # side that look like they keep one.
+        # So the entry IS examined and IS rejected, and what ranking
+        # reads is what wdiwifi extracted from the frame we handed it --
+        # not the TLVs we filled in, the parse of the beacon body. That
+        # object is the last thing between our bytes and the verdict.
         #
-        # m_PortPropertyCache and m_AdapterPropertyCache are the
-        # assembled connect parameters -- desired SSID, BSS type, auth
-        # and cipher as wdiwifi resolved them. If its view of the
-        # request differs from what wlansvc asked for, that is visible
-        # here and nowhere else we have looked.
+        # Several list forms, because CBSSEntry's link member name is
+        # not known and the cheapest way to find out is to let the
+        # debugger answer.
+        "dx -r1 ($a)->m_ExtStaBSSList",
+        "dx -r1 ($a)->m_ExtStaBSSList.m_BSSEntryList",
+        "dx -r2 (wdiwifi!CBSSEntry*)(($a)->m_ExtStaBSSList.m_BSSEntryList.Flink)",
+        "dx -r1 Debugger.Utility.Collections.FromListEntry(($a)->m_ExtStaBSSList.m_BSSEntryList, \"wdiwifi!CBSSEntry\", \"m_Link\")",
+        "dx -r1 ($a)->m_ExtStaBSSList.m_BSSEntryFactory",
+
+        # Depth 1 throughout. Every -r2 so far on something whose first
+        # member is a back-pointer -- m_pAdapter, m_pChangeCallback --
+        # has expanded the whole parent object again and pushed the
+        # fields actually wanted off the end of the output.
         "dx -r1 ($a)->m_pPortList[0]",
-        "dx -r2 ($a)->m_pPortList[0]->m_PortPropertyCache",
-        "dx -r3 ($a)->m_pPortList[0]->m_pConnectHistory",
-        "dx -r3 ($a)->m_pPortList[0]->m_pBssidConnectHistory",
-        "dx -r2 ($a)->m_pPortList[0]->m_pRoamTraceLoggingData",
-        "dx -r2 ($a)->m_AdapterPropertyCache",
-        "dx -r2 ($a)->m_ServicesManager",
-        "dx -r2 ($a)->m_ExtStaBSSList"
+        "dx -r1 ($a)->m_pPortList[0]->m_pRoamTraceLoggingData"
     ) -join ';')
     Write-Host "      $log3 ($($out3.Count) lines)"
 } else {

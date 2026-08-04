@@ -478,7 +478,9 @@ driver was examining it and finding it wanting: the beacon frame, the
 age timestamp, the algorithm pairs, the band and channel, who owns the
 BSS list. Each of those found a real bug. None of them was this bug.
 
-The measurement that settled it took one command:
+That reading was WRONG, and how it was wrong is the more useful lesson
+-- see below. The measurement that seemed to settle it took one
+command:
 
 ```
 trace-wdi.cmd -Ssid foobar -Wait 45
@@ -499,6 +501,33 @@ first find a control case that isolates *which layer* is refusing.
 Testing hypotheses inside a layer that turns out not to be involved
 produces real fixes and no progress, and it is slow to notice because
 each fix is defensible on its own.
+
+### The control case that could not tell two answers apart
+
+The `foobar` result above was over-read. Identical failures are
+consistent with "no candidate was found" AND with "a candidate was
+found and rejected", because both end the connect job instantly with
+the same status. The control separated *timing*, not *cause*, and the
+conclusion drawn from it -- that no BSS is ever examined -- sent several
+rounds looking at port and adapter state that was fine all along.
+
+What actually settled it was wdiwifi's own record, read out of
+`CPort::m_pRoamTraceLoggingData` with `dx`:
+
+    bssCandidateCount        : 1
+    roamAPRankIndex          : 0xffffffff
+    bestCandidateRank        : 0
+    roamWabiReason           : WDI_ASSOC_STATUS_FAILURE
+    connectJobStartTime      : equal to connectJobEndTime
+    connectRoamTaskStartTime : 0
+
+One candidate, ranked unusable, connect job over in zero elapsed time,
+and the task that would have issued `OID_WDI_TASK_CONNECT` never
+started. The BSS entry is examined and rejected -- the opposite of what
+the control appeared to show.
+
+A control case only rules out what its two outcomes would actually
+differ on. Check that before trusting it.
 
 Ruled out for the connect refusal, each against the generated headers
 or `WABIModel.xml` rather than by inference: BSS entry completeness and
