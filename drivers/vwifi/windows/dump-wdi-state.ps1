@@ -460,8 +460,19 @@ if ($wdiState) {
     # dx resolved the same type happily, so dx is what the public PDB
     # actually supports.
     $a = "(wdiwifi!CAdapter*)0x$wdiState"
+    # Force wdiwifi's symbols in before asking dx for its types.
+    #
+    # Module symbols load lazily, and dx does a qualified type lookup
+    # that does NOT trigger the load -- it just answers "Unable to find
+    # module 'wdiwifi' for qualified type lookup". The previous run only
+    # worked by accident: it happened to run `dt wdiwifi!CAdapter` first,
+    # which failed with "Symbol not found" but pulled the symbols in as
+    # a side effect, so every dx after it succeeded. Dropping the dt
+    # removed the side effect and every dx failed.
     $out3 = Invoke-Kd -Kd $kd -Sym $sym -LogFile $log3 -Commands (@(
         $load,
+        '.reload /f wdiwifi.sys',
+        'lm vm wdiwifi',
         "dx -r1 $a",
         "dx -r2 ($a)->m_ExtStaBSSList",
         "dx -r3 ($a)->m_ExtStaBSSList.m_BSSEntryList",
