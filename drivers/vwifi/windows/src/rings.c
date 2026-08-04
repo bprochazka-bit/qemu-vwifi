@@ -550,6 +550,14 @@ VwifiCtrlRspDrain(_Inout_ PVWIFI_ADAPTER Adapter)
 
     /* Ack the vector by writing head back. */
     VwifiWrite32(Adapter, ring->RegHead, ring->NextIndex);
+
+    /* Everything the device had to say has now been consumed, so the
+     * scan's staged batch is at its most complete. Deciding whether to
+     * indicate here rather than inside VwifiScanOnBssFound is what
+     * keeps a BSS's beacon and probe response in the same entry -- the
+     * device posts them as two consecutive events, and a throttle
+     * evaluated between them would indicate the first alone. */
+    VwifiScanFlushBatch(Adapter);
 }
 
 /* ============================================================

@@ -55,16 +55,30 @@ NDIS_STATUS VwifiTlvParseScanRequest(
 /* One BSS to report. Points into the device's event payload; the shim
  * copies what it needs during generation.
  *
- * `Frame` is the WHOLE beacon or probe-response frame as seen on the
- * air, NOT just the IE tail. WABIModel's BSSEntryContainer carries
- * WDI_TLV_BEACON_FRAME / WDI_TLV_PROBE_RESPONSE_FRAME as raw byte
- * blobs and the OS parses the IEs itself. Entry->ie_len is the frame
- * length; Entry->capability_info bit 16 (VWIFI_BSS_F_BEACON) says
- * which of the two TLVs to emit. */
+ * `Beacon` and `Probe` are WHOLE frames as seen on the air, NOT just
+ * the IE tails. WABIModel's BSSEntryContainer carries
+ * WDI_TLV_BEACON_FRAME and WDI_TLV_PROBE_RESPONSE_FRAME as two
+ * separate raw byte blobs and the OS parses the IEs itself.
+ *
+ * Two pointers, not one plus a discriminator. This was a single
+ * `Frame` with the kind taken from Entry->capability_info, which made
+ * the two TLVs mutually exclusive -- an entry could report a beacon or
+ * a probe response but never both, and since the probe response is
+ * always the one that arrives during a scan, BEACON_FRAME was in
+ * practice never emitted at all. Either may be NULL / zero-length;
+ * whichever is present is emitted, and an entry may carry both.
+ *
+ * Lengths are explicit rather than read from Entry->ie_len: a merged
+ * entry holds two frames of two different lengths, and the device's
+ * ie_len describes only whichever event happened to arrive last. */
 typedef struct _VWIFI_TLV_BSS_ITEM
 {
     const struct vwifi_bss_entry *Entry;
-    const UCHAR                  *Frame;    /* Entry->ie_len bytes */
+
+    const UCHAR                  *Beacon;     /* BeaconLen bytes, or NULL */
+    ULONG                         BeaconLen;
+    const UCHAR                  *Probe;      /* ProbeLen bytes, or NULL */
+    ULONG                         ProbeLen;
 
     /* When this entry was discovered, in *host system time*.
      *

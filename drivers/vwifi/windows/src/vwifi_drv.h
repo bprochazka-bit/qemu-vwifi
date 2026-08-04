@@ -538,6 +538,10 @@ VOID        VwifiScanOnBssFound(_Inout_ PVWIFI_ADAPTER Adapter,
 VOID        VwifiScanOnComplete(_Inout_ PVWIFI_ADAPTER Adapter,
                                 _In_reads_bytes_(PayloadLen) const VOID *Payload,
                                 _In_ ULONG PayloadLen);
+/* Called once at the end of every ctrl-rsp drain, after all of that
+ * drain's BSS_FOUND events have been staged. Applies the documented
+ * batch throttle. */
+VOID        VwifiScanFlushBatch(_Inout_ PVWIFI_ADAPTER Adapter);
 
 /* wdi_connect.c — Phase 3 connect task. */
 NDIS_STATUS VwifiConnectTaskCreate(_Inout_ PVWIFI_ADAPTER Adapter);

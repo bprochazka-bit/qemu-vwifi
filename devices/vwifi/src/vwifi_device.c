@@ -90,18 +90,42 @@ struct vwifi_bss {
     uint16_t ssid_len;
     uint8_t  ssid[33];
 
-    /* The complete beacon or probe-response frame as seen on the air.
-     * WDI's BSS entry TLV wants the whole frame (WDI_TLV_BEACON_FRAME /
-     * WDI_TLV_PROBE_RESPONSE_FRAME as byte blobs) and the OS parses the
-     * IEs itself — so keep the frame, not just the IE tail. */
-    uint16_t frame_len;
-    uint8_t  frame[VWIFI_BSS_FRAME_MAX];
-    bool     is_beacon;      /* false => probe response */
+    /* The complete beacon AND probe-response frames as seen on the air,
+     * kept apart rather than one overwriting the other.
+     *
+     * WDI's BSS entry has a separate byte blob for each --
+     * WDI_TLV_BEACON_FRAME and WDI_TLV_PROBE_RESPONSE_FRAME -- and the
+     * OS parses the IEs itself, so keep whole frames rather than IE
+     * tails.
+     *
+     * One slot used to hold whichever arrived last, and during a scan
+     * that is always the probe response: the probe request goes out at
+     * the start of the dwell and the reply follows immediately, while
+     * the beacon is somewhere in the next beacon interval. So every BSS
+     * this device has ever reported was a probe response, and the
+     * Windows driver has never once had a beacon to hand up. */
+    uint16_t beacon_len;
+    uint8_t  beacon[VWIFI_BSS_FRAME_MAX];
+    uint16_t probe_len;
+    uint8_t  probe[VWIFI_BSS_FRAME_MAX];
 
-    /* Set when reported during the current scan, so we emit one
-     * BSS_FOUND per BSS per scan rather than one per beacon. */
-    bool     reported_this_scan;
+    /* Which frame types have already been reported during the current
+     * scan, so we emit per BSS per frame type rather than one event per
+     * beacon received.
+     *
+     * A bitmask rather than a bool because the two frames do not arrive
+     * together. A scan dwell gets the probe response immediately -- it
+     * is a reply to our own probe request -- and the beacon somewhere
+     * in the following beacon interval, which for a 100 TU AP is 102.4
+     * ms against a 100 ms dwell. With a single "reported" flag the
+     * probe response always won the race and the beacon, when one was
+     * heard at all, was held back until some later scan. */
+    uint8_t  reported_this_scan;
 };
+
+#define VWIFI_BSS_RPT_BEACON  0x1
+#define VWIFI_BSS_RPT_PROBE   0x2
+#define VWIFI_BSS_RPT_ALL     (VWIFI_BSS_RPT_BEACON | VWIFI_BSS_RPT_PROBE)
 
 /* Scan state machine. */
 enum vwifi_scan_state {
@@ -991,9 +1015,15 @@ static struct vwifi_bss *bss_alloc(struct vwifi_dev *d, uint64_t now_us)
     return oldest;   /* table full — recycle the least-recently-seen */
 }
 
-/* Emit a BSS_FOUND event for one table entry. The payload is a
- * vwifi_bss_entry followed by ie_len bytes of raw IEs. */
-static bool bss_emit(struct vwifi_dev *d, const struct vwifi_bss *b)
+/* Emit a BSS_FOUND event carrying one frame. The payload is a
+ * vwifi_bss_entry followed by ie_len bytes of that raw frame.
+ *
+ * One event per frame type, so a BSS the device has both a beacon and
+ * a probe response for produces two. The driver merges them by BSSID;
+ * VWIFI_BSS_F_BEACON in capability_info says which is which. */
+static bool bss_emit_frame(struct vwifi_dev *d, const struct vwifi_bss *b,
+                           const uint8_t *frame, uint16_t frame_len,
+                           bool is_beacon)
 {
     uint8_t payload[sizeof(struct vwifi_bss_entry) + VWIFI_BSS_FRAME_MAX];
     struct vwifi_bss_entry *e = (struct vwifi_bss_entry *)payload;
@@ -1011,21 +1041,39 @@ static bool bss_emit(struct vwifi_dev *d, const struct vwifi_bss *b)
     memcpy(e->ssid, b->ssid, sizeof(e->ssid));
     /* ie_len carries the FULL frame length; the driver hands the whole
      * frame to WDI as WDI_TLV_BEACON_FRAME / _PROBE_RESPONSE_FRAME. */
-    e->ie_len           = b->frame_len;
-    if (b->is_beacon) e->capability_info |= VWIFI_BSS_F_BEACON;
+    e->ie_len           = frame_len;
+    if (is_beacon) e->capability_info |= VWIFI_BSS_F_BEACON;
 
-    memcpy(payload + sizeof(*e), b->frame, b->frame_len);
-    total = sizeof(*e) + b->frame_len;
+    memcpy(payload + sizeof(*e), frame, frame_len);
+    total = sizeof(*e) + frame_len;
 
     VWIFI_TRACE(d, "BSS_FOUND %02x:%02x:%02x:%02x:%02x:%02x "
                    "ssid='%s' freq=%u rssi=%d frame=%u (%s)",
                 b->bssid[0], b->bssid[1], b->bssid[2],
                 b->bssid[3], b->bssid[4], b->bssid[5],
                 b->ssid_len ? (const char *)b->ssid : "<hidden>",
-                b->channel_freq, b->rssi, b->frame_len,
-                b->is_beacon ? "beacon" : "probe-resp");
+                b->channel_freq, b->rssi, frame_len,
+                is_beacon ? "beacon" : "probe-resp");
 
     return vwifi_post_event(d, VWIFI_EV_BSS_FOUND, payload, total);
+}
+
+/* Report everything held for this BSS: the beacon if one has been
+ * heard, the probe response if one has, or both.
+ *
+ * False only if an event could not be posted, so a caller counting
+ * against a budget still sees a full ring as a failure. */
+static bool bss_emit(struct vwifi_dev *d, const struct vwifi_bss *b)
+{
+    bool ok = true;
+
+    if (b->beacon_len) {
+        ok = bss_emit_frame(d, b, b->beacon, b->beacon_len, true);
+    }
+    if (ok && b->probe_len) {
+        ok = bss_emit_frame(d, b, b->probe, b->probe_len, false);
+    }
+    return ok;
 }
 
 /*
@@ -1098,19 +1146,40 @@ static void bss_observe(struct vwifi_dev *d,
     b->capability_info  = get_le16(fixed + 10);
     b->ssid_len         = ssid_len;
     memcpy(b->ssid, ssid, sizeof(b->ssid));
-    b->is_beacon        = (subtype == IEEE80211_SUBTYPE_BEACON);
+    /* Keep the whole frame — WDI wants it verbatim — in the slot for
+     * its own type, so a probe response never displaces a beacon. */
+    {
+        uint16_t keep = frame_len;
+        if (keep > VWIFI_BSS_FRAME_MAX) keep = VWIFI_BSS_FRAME_MAX;
 
-    /* Keep the whole frame — WDI wants it verbatim. */
-    b->frame_len = frame_len;
-    if (b->frame_len > VWIFI_BSS_FRAME_MAX) b->frame_len = VWIFI_BSS_FRAME_MAX;
-    memcpy(b->frame, frame, b->frame_len);
+        if (subtype == IEEE80211_SUBTYPE_BEACON) {
+            b->beacon_len = keep;
+            memcpy(b->beacon, frame, keep);
+        } else {
+            b->probe_len = keep;
+            memcpy(b->probe, frame, keep);
+        }
+    }
 
-    /* Report during an active scan, once per BSS per scan. */
-    if (d->scan.state == VWIFI_SCAN_DWELL &&
-        !b->reported_this_scan &&
-        bss_matches_scan_ssids(d, b)) {
-        b->reported_this_scan = true;
-        bss_emit(d, b);
+    /* Report during an active scan, once per BSS per frame type.
+     *
+     * bss_emit sends everything held, not just the frame that arrived,
+     * so when the beacon lands after the probe response has already
+     * been reported the pair goes out back to back. The driver stages
+     * one ring drain at a time and merges by BSSID, so consecutive
+     * events become a single BSS entry carrying both blobs -- which is
+     * what WDI_TLV_BSS_ENTRY is shaped for. Re-sending the probe
+     * response costs one event and overwrites itself on arrival. */
+    {
+        uint8_t bit = (subtype == IEEE80211_SUBTYPE_BEACON)
+                          ? VWIFI_BSS_RPT_BEACON : VWIFI_BSS_RPT_PROBE;
+
+        if (d->scan.state == VWIFI_SCAN_DWELL &&
+            !(b->reported_this_scan & bit) &&
+            bss_matches_scan_ssids(d, b)) {
+            b->reported_this_scan |= bit;
+            bss_emit(d, b);
+        }
     }
 }
 
@@ -1226,11 +1295,16 @@ static void scan_send_probe_req(struct vwifi_dev *d, unsigned ssid_idx)
 static void scan_report_cached(struct vwifi_dev *d)
 {
     uint64_t now = d->ops->now_us(d->be);
-    unsigned reported = 0, skipped = 0;
+    unsigned posted = 0, reported = 0, skipped = 0;
     /* Leave half the response ring for SCAN_COMPLETE and for whatever
      * else the device needs to tell the driver while it drains this
      * burst. The driver cannot run concurrently with us, so everything
-     * posted here lands before it gets a chance to free a slot. */
+     * posted here lands before it gets a chance to free a slot.
+     *
+     * Counted in EVENTS, not BSSes: a BSS the device has heard both a
+     * beacon and a probe response from costs two. Counting BSSes here
+     * would let a full table post twice the budget and use up the half
+     * of the ring this reservation exists to protect. */
     unsigned budget = (d->ctrl_rsp.mask + 1) / 2;
 
     for (unsigned i = 0; i < VWIFI_BSS_MAX; i++) {
@@ -1254,17 +1328,27 @@ static void scan_report_cached(struct vwifi_dev *d)
         /* Never silently truncate: anything the budget or a full ring
          * costs us gets counted and logged. A short scan that looks
          * complete is the bug this function exists to fix. */
-        if (reported >= budget || !bss_emit(d, b)) {
-            skipped++;
-            continue;
+        {
+            unsigned need = (b->beacon_len ? 1u : 0u) +
+                            (b->probe_len  ? 1u : 0u);
+
+            if (need == 0) continue;   /* nothing to report it with */
+
+            if (posted + need > budget || !bss_emit(d, b)) {
+                skipped++;
+                continue;
+            }
+            posted += need;
         }
-        b->reported_this_scan = true;
+        /* bss_emit sent every frame this entry holds, so nothing is
+         * left for the dwell path above to add. */
+        b->reported_this_scan = VWIFI_BSS_RPT_ALL;
         reported++;
     }
 
     if (reported || skipped) {
-        VWIFI_TRACE(d, "scan: reported %u cached BSS, %u withheld",
-                    reported, skipped);
+        VWIFI_TRACE(d, "scan: reported %u cached BSS (%u events), "
+                       "%u withheld", reported, posted, skipped);
     }
 }
 
@@ -1459,7 +1543,7 @@ static int32_t op_scan(struct vwifi_dev *d, const void *in_buf, uint32_t in_len)
 
     /* Clear per-scan reporting flags so every live BSS is re-reported. */
     for (unsigned i = 0; i < VWIFI_BSS_MAX; i++) {
-        d->bss[i].reported_this_scan = false;
+        d->bss[i].reported_this_scan = 0;
     }
 
     d->scan.saved_channel = d->channel;

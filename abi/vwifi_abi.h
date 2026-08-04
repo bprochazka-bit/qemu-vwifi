@@ -376,7 +376,19 @@ struct vwifi_scan_req {
  * whether the attached frame is a Beacon or a Probe Response — WDI has
  * a separate TLV for each (WDI_TLV_BEACON_FRAME vs
  * WDI_TLV_PROBE_RESPONSE_FRAME). Low 16 bits stay the 802.11 capability
- * field. */
+ * field.
+ *
+ * One event carries one frame, so a BSS the device has heard both a
+ * beacon and a probe response from produces TWO VWIFI_EV_BSS_FOUND
+ * events with the same BSSID, emitted back to back and distinguished
+ * only by this bit. Drivers merge them by BSSID: cfg80211 does it for
+ * free in cfg80211_inform_bss_frame_data(), and the WDI driver folds
+ * them into one WDI_TLV_BSS_ENTRY carrying both blobs.
+ *
+ * That is the point of the split. The two frames are separate facts
+ * about a BSS and the host consumes them separately, so a single frame
+ * slot per BSS -- which is what this ABI used to imply -- silently
+ * threw one of them away. */
 #define VWIFI_BSS_F_BEACON   (1u << 16)
 
 struct vwifi_bss_entry {

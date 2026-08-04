@@ -255,13 +255,30 @@ VwifiTlvGenerateBssEntryList(
         w->EntryAgeInfo.CachedInformation = Items[i].Cached;
         w->Optional.EntryAgeInfo_IsPresent = TRUE;
 
-        /* The beacon / probe-response frame BODY -- MAC header removed.
+        /* The beacon and probe-response frame BODIES -- MAC header
+         * removed from each.
          *
-         * Per WABIModel.xml, BSSEntryContainer carries the raw frame as
-         * a byte blob, in one of two TLVs:
+         * Per WABIModel.xml, BSSEntryContainer carries raw frames as
+         * byte blobs, in two independent TLVs:
          *   WDI_TLV_BEACON_FRAME          name="BeaconFrame"
          *   WDI_TLV_PROBE_RESPONSE_FRAME  name="ProbeResponseFrame"
          * both type="ByteBlob", both optional.
+         *
+         * INDEPENDENT is the word that matters, and this code used to
+         * get it wrong: it picked one of the two from a flag and emitted
+         * exactly that one. Since a scan gets a probe response from
+         * every BSS it probes, and a beacon only if one happens to land
+         * inside the dwell, the flag said "probe response" essentially
+         * always -- BEACON_FRAME has never been present in a BSS entry
+         * this driver produced.
+         *
+         * "Optional" in this interface has repeatedly meant "the host
+         * copes without it but does not do the thing you wanted": the
+         * same was true of band and PHY info, of the datapath
+         * attributes, and of the entry age. A BSS the host will list
+         * but will not build a connect candidate from is the same
+         * shape of symptom. Both are emitted now whenever both are
+         * held.
          *
          * The OS parses the body itself -- SSID, RSN, rates, HT/VHT caps
          * -- so the whole thing is handed over rather than a
@@ -283,25 +300,28 @@ VwifiTlvGenerateBssEntryList(
          *
          * WDI_BYTE_BLOB is ArrayOfElements<UINT8>: the bytes go directly
          * in ElementCount/pElements, with no Payload indirection. */
-        if (e->ie_len > VWIFI_80211_MGMT_HDR_LEN) {
-            UINT8 *body = const_cast<UINT8 *>(Items[i].Frame) +
-                          VWIFI_80211_MGMT_HDR_LEN;
-            UINT32 bodyLen = e->ie_len - VWIFI_80211_MGMT_HDR_LEN;
-
-            if (e->capability_info & VWIFI_BSS_F_BEACON) {
-                w->BeaconFrame.ElementCount = bodyLen;
-                w->BeaconFrame.pElements    = body;
-                w->Optional.BeaconFrame_IsPresent = TRUE;
-            } else {
-                w->ProbeResponseFrame.ElementCount = bodyLen;
-                w->ProbeResponseFrame.pElements    = body;
-                w->Optional.ProbeResponseFrame_IsPresent = TRUE;
-            }
+        if (Items[i].Beacon != nullptr &&
+            Items[i].BeaconLen > VWIFI_80211_MGMT_HDR_LEN) {
+            w->BeaconFrame.pElements =
+                const_cast<UINT8 *>(Items[i].Beacon) + VWIFI_80211_MGMT_HDR_LEN;
+            w->BeaconFrame.ElementCount =
+                Items[i].BeaconLen - VWIFI_80211_MGMT_HDR_LEN;
+            w->Optional.BeaconFrame_IsPresent = TRUE;
         }
-        /* Too short to hold a MAC header: no blob, and both presence
-         * bits stay clear. The entry still carries BSSID, signal and
-         * channel, so the BSS is reported -- as hidden, which is the
-         * honest answer for a frame we cannot read. */
+
+        if (Items[i].Probe != nullptr &&
+            Items[i].ProbeLen > VWIFI_80211_MGMT_HDR_LEN) {
+            w->ProbeResponseFrame.pElements =
+                const_cast<UINT8 *>(Items[i].Probe) + VWIFI_80211_MGMT_HDR_LEN;
+            w->ProbeResponseFrame.ElementCount =
+                Items[i].ProbeLen - VWIFI_80211_MGMT_HDR_LEN;
+            w->Optional.ProbeResponseFrame_IsPresent = TRUE;
+        }
+        /* Neither held, or both too short to hold a MAC header: no
+         * blob, and both presence bits stay clear. The entry still
+         * carries BSSID, signal and channel, so the BSS is reported --
+         * as hidden, which is the honest answer for a BSS we have no
+         * readable frame for. */
     }
 
     /* The list member is called DeviceDescriptor, not BSSEntries, and it

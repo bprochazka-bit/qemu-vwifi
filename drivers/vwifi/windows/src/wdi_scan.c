@@ -36,13 +36,36 @@
 
 #include "vwifi_drv.h"
 
-/* One staged BSS: the device's own record plus the frame it came in.
- * Shared by the pending batch and the cache below, which hold exactly
- * the same thing for different lengths of time. */
+/* One staged BSS: the device's own record plus the frames it was seen
+ * in. Shared by the pending batch and the cache below, which hold
+ * exactly the same thing for different lengths of time.
+ *
+ * TWO frames, not one, and they are not interchangeable.
+ *
+ * WDI_TLV_BSS_ENTRY carries WDI_TLV_BEACON_FRAME and
+ * WDI_TLV_PROBE_RESPONSE_FRAME as separate optional sub-TLVs, and the
+ * host treats them as separate facts about the BSS -- a probe response
+ * is a reply to us, a beacon is what the AP broadcasts to everyone.
+ * This stage used to hold a single frame with a flag saying which kind
+ * it was, so whichever arrived second overwrote the first. In practice
+ * that was always the probe response (the probe request goes out at the
+ * start of the dwell and the reply is immediate; the beacon lands up to
+ * a beacon interval later), so BEACON_FRAME was never once populated in
+ * any scan this driver has ever reported.
+ *
+ * Keeping both means an entry can carry both, which is what real
+ * hardware reports and what the host expects to be able to ask for. */
 typedef struct _VWIFI_BSS_STAGE
 {
     struct vwifi_bss_entry Entry;
-    UCHAR                  Frame[VWIFI_SCAN_MAX_FRAME];
+
+    /* Whole frames, MAC header included -- the shim trims the header
+     * off when it builds the blob, because WDI's beacon and probe
+     * blobs are bodies. Zero length means "not seen in that form". */
+    USHORT                 BeaconLen;
+    USHORT                 ProbeLen;
+    UCHAR                  Beacon[VWIFI_SCAN_MAX_FRAME];
+    UCHAR                  Probe[VWIFI_SCAN_MAX_FRAME];
 
     /* System time when the frame arrived, for the entry's age info.
      * Recorded here rather than at indication time because the cache
@@ -152,9 +175,26 @@ VwifiIndicateBssEntryList(_Inout_ PVWIFI_ADAPTER Adapter)
 
     for (ULONG i = 0; i < n; i++) {
         items[i].Entry         = &task->Pending[i].Entry;
-        items[i].Frame         = task->Pending[i].Frame;
+        items[i].Beacon        = task->Pending[i].Beacon;
+        items[i].BeaconLen     = task->Pending[i].BeaconLen;
+        items[i].Probe         = task->Pending[i].Probe;
+        items[i].ProbeLen      = task->Pending[i].ProbeLen;
         items[i].HostTimeStamp = task->Pending[i].SeenSystemTime;
         items[i].Cached        = FALSE;   /* live: a scan is running */
+
+        /* Per entry, because "did the beacon go out" is exactly the
+         * question this change exists to answer, and an aggregate count
+         * would not say which BSS was short of one. */
+        VWIFI_INFO("BSS entry %u: %02x:%02x:%02x:%02x:%02x:%02x "
+                   "beacon=%u probe=%u",
+                   i,
+                   task->Pending[i].Entry.bssid[0],
+                   task->Pending[i].Entry.bssid[1],
+                   task->Pending[i].Entry.bssid[2],
+                   task->Pending[i].Entry.bssid[3],
+                   task->Pending[i].Entry.bssid[4],
+                   task->Pending[i].Entry.bssid[5],
+                   task->Pending[i].BeaconLen, task->Pending[i].ProbeLen);
     }
 
     status = VwifiTlvGenerateBssEntryList(Adapter->WdiPeerVersion,
@@ -362,6 +402,47 @@ VwifiScanTraceFrameBody(_In_reads_bytes_(BodyLen) const UCHAR *Body,
                ies);
 }
 
+/* Fold one received frame into a stage slot.
+ *
+ * The frame goes in the slot for its own kind, so a probe response can
+ * never displace a beacon or the other way round, and a slot that has
+ * seen both keeps both. Everything else in the entry is overwritten
+ * from the newest report: signal and channel are receive-side facts and
+ * the newest one is the true one.
+ *
+ * Fresh slots must have both lengths cleared before the first call --
+ * see the two callers below, which do it as part of claiming the
+ * slot. */
+static VOID
+VwifiBssStageStore(_Inout_ PVWIFI_BSS_STAGE Stage,
+                   _In_ const struct vwifi_bss_entry *Bss,
+                   _In_reads_bytes_(FrameLen) const UCHAR *Frame,
+                   _In_ USHORT FrameLen,
+                   _In_ BOOLEAN IsBeacon,
+                   _In_ ULONGLONG SeenSystemTime)
+{
+    Stage->Entry          = *Bss;
+    Stage->SeenSystemTime = SeenSystemTime;
+
+    if (IsBeacon) {
+        RtlCopyMemory(Stage->Beacon, Frame, FrameLen);
+        Stage->BeaconLen = FrameLen;
+    } else {
+        RtlCopyMemory(Stage->Probe, Frame, FrameLen);
+        Stage->ProbeLen = FrameLen;
+    }
+
+    /* The device ABI overloads ie_len as the length of the frame that
+     * came with THIS event, and capability_info bit 16 as which kind it
+     * was. Neither describes the merged slot -- which may now hold two
+     * frames of two different lengths -- so both are stripped rather
+     * than left to be read as if they still meant something. The frame
+     * lengths above are the record; capability_info keeps its low 16
+     * bits, which are the real 802.11 capability field. */
+    Stage->Entry.ie_len = 0;
+    Stage->Entry.capability_info &= ~VWIFI_BSS_F_BEACON;
+}
+
 VOID
 VwifiScanOnBssFound(_Inout_ PVWIFI_ADAPTER Adapter,
                     _In_reads_bytes_(PayloadLen) const VOID *Payload,
@@ -371,6 +452,7 @@ VwifiScanOnBssFound(_Inout_ PVWIFI_ADAPTER Adapter,
     PVWIFI_SCAN_TASK task = Adapter->ScanTask;
     const UCHAR *frame;
     USHORT frameLen;
+    BOOLEAN isBeacon;
     LARGE_INTEGER now;
 
     if (!task) return;
@@ -393,6 +475,11 @@ VwifiScanOnBssFound(_Inout_ PVWIFI_ADAPTER Adapter,
         frameLen = VWIFI_SCAN_MAX_FRAME;
     }
     frame = (const UCHAR *)Payload + sizeof(*bss);
+
+    /* The device sets this bit in capability_info on the way out; it is
+     * the only thing distinguishing the two events it now emits for the
+     * same BSS. */
+    isBeacon = (bss->capability_info & VWIFI_BSS_F_BEACON) ? TRUE : FALSE;
 
     /* Stamped once, here, and carried by both copies below. This is the
      * value WDI_TLV_BSS_ENTRY_AGE_INFO is specified to want -- system
@@ -446,12 +533,16 @@ VwifiScanOnBssFound(_Inout_ PVWIFI_ADAPTER Adapter,
                                   sizeof(task->Cache[0]));
                 slot = task->CacheCapacity - 1;
             }
+            /* Claiming a slot: clear both frames, so a new BSS cannot
+             * inherit the beacon of whatever used to live here. A slot
+             * we matched by BSSID keeps what it has -- that is the
+             * merge. */
+            task->Cache[slot].BeaconLen = 0;
+            task->Cache[slot].ProbeLen  = 0;
         }
 
-        task->Cache[slot].Entry = *bss;
-        task->Cache[slot].Entry.ie_len = frameLen;
-        task->Cache[slot].SeenSystemTime = (ULONGLONG)now.QuadPart;
-        RtlCopyMemory(task->Cache[slot].Frame, frame, frameLen);
+        VwifiBssStageStore(&task->Cache[slot], bss, frame, frameLen,
+                           isBeacon, (ULONGLONG)now.QuadPart);
     }
 
     /* The device parses the SSID out of the beacon for its own BSS
@@ -466,8 +557,7 @@ VwifiScanOnBssFound(_Inout_ PVWIFI_ADAPTER Adapter,
                bss->bssid[3], bss->bssid[4], bss->bssid[5],
                bss->ssid_len > 32 ? 32 : bss->ssid_len, bss->ssid,
                bss->channel_freq, bss->rssi, frameLen,
-               (bss->capability_info & VWIFI_BSS_F_BEACON)
-                   ? "beacon" : "probe-resp");
+               isBeacon ? "beacon" : "probe-resp");
 
     /* And the body the host actually parses, which is the only thing
      * that decides whether it will treat this BSS as connectable. */
@@ -485,18 +575,83 @@ VwifiScanOnBssFound(_Inout_ PVWIFI_ADAPTER Adapter,
      * asks, through OID_WDI_GET_BSS_ENTRY_LIST. */
     if (!task->Active) return;
 
-    /* Flush first if the accumulator is full. */
-    if (task->PendingCount >= task->PendingCapacity) {
-        VwifiIndicateBssEntryList(Adapter);
+    /* Merge into the batch by BSSID, the same way the cache does.
+     *
+     * This used to append unconditionally, which was harmless while the
+     * device emitted one event per BSS per scan. It emits two now --
+     * beacon and probe response -- and appending would put the same
+     * BSSID in the batch twice, as two entries each carrying half of
+     * what we know.
+     *
+     * Whether the host would merge those two entries or let the second
+     * supersede the first is not documented, and guessing is what this
+     * whole line of work has been paying for. What IS documented is
+     * that one WDI_TLV_BSS_ENTRY has room for both blobs -- so the
+     * entry that can carry both is the one to send. */
+    {
+        ULONG slot = task->PendingCount;
+
+        for (ULONG i = 0; i < task->PendingCount; i++) {
+            if (RtlCompareMemory(task->Pending[i].Entry.bssid,
+                                 bss->bssid, 6) == 6) {
+                slot = i;
+                break;
+            }
+        }
+
+        if (slot == task->PendingCount) {
+            /* Flush first if the accumulator is full -- which resets
+             * PendingCount, so the new entry lands at 0. */
+            if (task->PendingCount >= task->PendingCapacity) {
+                VwifiIndicateBssEntryList(Adapter);
+                slot = task->PendingCount;      /* now 0 */
+            }
+            task->Pending[slot].BeaconLen = 0;
+            task->Pending[slot].ProbeLen  = 0;
+            task->PendingCount++;
+        }
+
+        VwifiBssStageStore(&task->Pending[slot], bss, frame, frameLen,
+                           isBeacon, (ULONGLONG)now.QuadPart);
     }
 
-    task->Pending[task->PendingCount].Entry = *bss;
-    task->Pending[task->PendingCount].Entry.ie_len = frameLen;
-    task->Pending[task->PendingCount].SeenSystemTime = (ULONGLONG)now.QuadPart;
-    RtlCopyMemory(task->Pending[task->PendingCount].Frame, frame, frameLen);
-    task->PendingCount++;
+    /* No throttle check here. See VwifiScanFlushBatch: the decision to
+     * indicate belongs at the end of the ring drain, not in the middle
+     * of one. */
+}
 
-    /* The documented throttle: 3+ staged, or 500ms since last update. */
+/* Apply the documented throttle, once, after a drain has delivered
+ * everything the device had to say.
+ *
+ * "The port should throttle indications and send updates to the host
+ * only when it has discovered 3 or more, or when it has discovered less
+ * than 3 entries but has not reported them to the host for more than
+ * 500 milliseconds."
+ *
+ * This used to run at the bottom of VwifiScanOnBssFound, per event,
+ * which was correct while one BSS meant one event. It no longer does:
+ * the device emits the beacon and the probe response for a BSS as two
+ * consecutive events, and the 500 ms rule fires on essentially every
+ * first event of a scan -- so the beacon would be indicated on its own
+ * and the probe response would land in the *next* batch as a second
+ * entry for the same BSSID. That is the split this change exists to
+ * close, reappearing one layer up.
+ *
+ * Deferring to the end of the drain closes it, because the device posts
+ * a BSS's two events back to back and a drain that sees the first
+ * almost always sees the second. Almost: if the device posts them
+ * either side of an interrupt the two frames still end up in separate
+ * entries. That is a benign outcome -- two valid entries for one BSSID,
+ * which is also what real hardware produces when a beacon arrives after
+ * the probe response has already been reported -- and it is rare, not
+ * the every-scan certainty it was before. */
+VOID
+VwifiScanFlushBatch(_Inout_ PVWIFI_ADAPTER Adapter)
+{
+    PVWIFI_SCAN_TASK task = Adapter->ScanTask;
+
+    if (!task || !task->Active || task->PendingCount == 0) return;
+
     if (task->PendingCount >= VWIFI_SCAN_BATCH_THRESHOLD ||
         (VwifiGetTickCountMs() - task->LastIndicationTimeMs)
             >= VWIFI_SCAN_FLUSH_INTERVAL_MS) {
@@ -830,7 +985,10 @@ VwifiScanIndicateCachedBss(_Inout_ PVWIFI_ADAPTER Adapter,
 
     for (ULONG i = 0; i < n; i++) {
         items[i].Entry         = &task->Cache[i].Entry;
-        items[i].Frame         = task->Cache[i].Frame;
+        items[i].Beacon        = task->Cache[i].Beacon;
+        items[i].BeaconLen     = task->Cache[i].BeaconLen;
+        items[i].Probe         = task->Cache[i].Probe;
+        items[i].ProbeLen      = task->Cache[i].ProbeLen;
         items[i].HostTimeStamp = task->Cache[i].SeenSystemTime;
         /* 1, not 0: these come out of the adapter's own BSS list, which
          * is exactly what the TLV's second field distinguishes. */

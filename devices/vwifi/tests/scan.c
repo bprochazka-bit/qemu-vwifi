@@ -334,6 +334,64 @@ int main(void)
     assert(n == 0);
     printf("  duplicate beacon suppressed within one scan: PASS\n");
 
+    /* ---- 4b. Probe response for the SAME AP -> a second event, and
+     * the beacon comes back out with it ----
+     *
+     * The two frames are separate facts about the BSS and WDI carries
+     * them in separate TLVs, so one must not displace the other. The
+     * device used to keep a single frame per BSS and a single "already
+     * reported" flag, which meant the probe response overwrote the
+     * beacon and no second event was emitted -- the beacon was lost
+     * before the driver ever saw it.
+     *
+     * Both frames go out together so the driver, which merges by BSSID
+     * within one ring drain, can put both blobs in one BSS entry. */
+    drain_rsp_ring();
+    {
+        uint8_t probe[128];
+        uint16_t plen;
+
+        plen = build_beacon(probe, ap1, "vwifi-test",
+                            0x0123456789ABCDEFULL, 100, 0x0431);
+        probe[0] = 0x50;                    /* mgmt, subtype 5 = probe resp */
+        memcpy(probe + 4, sta_mac, 6);      /* addr1 = us, it is a reply */
+
+        medium_rx(probe, plen, 2412, -55, ap1);
+
+        n = collect_events(VWIFI_EV_BSS_FOUND, evs, 8);
+        assert(n == 2);
+
+        /* Beacon first, then probe response -- bss_emit's order. */
+        for (int i = 0; i < 2; i++) {
+            uint32_t slot = (uint32_t)((evs[i]->payload_addr - g_ram
+                                        - RSP_PAYLOAD_OFFSET) / RSP_PAYLOAD_STRIDE);
+            struct vwifi_bss_entry *e = (struct vwifi_bss_entry *)
+                (g_ram_va + RSP_PAYLOAD_OFFSET
+                 + (uint64_t)slot * RSP_PAYLOAD_STRIDE);
+            const uint8_t *f = (const uint8_t *)e + sizeof(*e);
+
+            assert(memcmp(e->bssid, ap1, 6) == 0);
+            if (i == 0) {
+                assert(e->capability_info & VWIFI_BSS_F_BEACON);
+                assert(f[0] == 0x80);
+                assert(e->ie_len == blen);
+            } else {
+                assert(!(e->capability_info & VWIFI_BSS_F_BEACON));
+                assert(f[0] == 0x50);
+                assert(e->ie_len == plen);
+            }
+        }
+        printf("  probe response kept alongside beacon, both emitted: PASS\n");
+
+        /* And neither kind re-reports after that. */
+        drain_rsp_ring();
+        medium_rx(probe, plen, 2412, -55, ap1);
+        medium_rx(beacon, blen, 2412, -55, ap1);
+        n = collect_events(VWIFI_EV_BSS_FOUND, evs, 8);
+        assert(n == 0);
+        printf("  both frame types deduped for the rest of the scan: PASS\n");
+    }
+
     /* ---- 5. Hop to channel 6 ---- */
     drain_rsp_ring();
     mock_backend_clear_events(g_mock);
@@ -397,9 +455,14 @@ int main(void)
     blen2 = build_beacon(beacon, ap2, "other-net", 0xFEEDFACEULL, 200, 0x0011);
     medium_rx(beacon, blen2, 2437, -70, ap2);
 
+    /* Three events for two BSSes: ap1 has been heard both as a beacon
+     * and as a probe response (step 4b), and an entry reports every
+     * frame it holds, not just the one that woke it. ap2 has only ever
+     * beaconed, so it is worth one. */
     n = collect_events(VWIFI_EV_BSS_FOUND, evs, 8);
-    assert(n == 2);
-    printf("  second scan re-reports both BSSes: PASS\n");
+    assert(n == 3);
+    printf("  second scan re-reports both BSSes, ap1 with both frames: "
+           "PASS\n");
 
     /* Abort mid-scan and confirm the channel is restored to 2462. */
     assert(ctrl_send(VWIFI_OP_SCAN_ABORT, NULL, 0) == 0);
@@ -430,8 +493,10 @@ int main(void)
                             0x0123456789ABCDEFULL, 100, 0x0431);
         medium_rx(beacon, blen, 2412, -55, ap1);
 
+        /* Two events, one BSS: ap1 is held as both a beacon and a
+         * probe response and both are reported. */
         n = collect_events(VWIFI_EV_BSS_FOUND, evs, 8);
-        assert(n == 1);
+        assert(n == 2);
         assert(ctrl_send(VWIFI_OP_SCAN_ABORT, NULL, 0) == 0);
         printf("  wildcard SSID entry still reports named BSS: PASS\n");
     }
@@ -485,8 +550,10 @@ int main(void)
         assert(mock_backend_advance_to_timer(g_mock));
         vwifi_timer_expired(g_dev);
 
+        /* Three events, two APs: the cached report sends every frame
+         * each entry holds, and ap1 holds two. */
         n = collect_events(VWIFI_EV_BSS_FOUND, evs, 8);
-        assert(n == 2);          /* both APs, from the table */
+        assert(n == 3);
         assert(collect_events(VWIFI_EV_SCAN_COMPLETE, evs, 8) == 1);
         printf("  silent scan still reports both cached BSSes: PASS\n");
     }
