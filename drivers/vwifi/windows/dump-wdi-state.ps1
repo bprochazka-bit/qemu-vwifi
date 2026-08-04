@@ -42,6 +42,12 @@
     Print the symbol-server URLs for the modules this needs, then exit.
     Run this first if the machine has no internet.
 
+.PARAMETER MiniportHandle
+    Skip discovery and dump this handle. Read it out of
+    wdi-state-miniports.txt when the -Adapter match does not find the
+    row; that file always has the answer even when the matching does
+    not.
+
 .PARAMETER Adapter
     Substring matched against the miniport list. Default 'vwifi'.
 
@@ -62,6 +68,7 @@ param(
     [switch] $ShowSymbolKeys,
     [string] $SymbolPath,
     [string] $Adapter = 'vwifi',
+    [string] $MiniportHandle,
     [string] $OutDir  = '.'
 )
 
@@ -209,12 +216,50 @@ function Find-MiniportHandle {
     # !ndiskd.miniports prints a table whose rows carry the miniport
     # handle and the adapter's friendly name. Match the row by name,
     # then take the first pointer-width hex token on it.
+    #
+    # ndiskd emits its handles as DML links, so in a log the row can
+    # read `<link cmd="...">ffffe00...</link>`; the hex is still there,
+    # which is why this scrapes for hex rather than parsing columns.
     foreach ($l in $Lines) {
         if ($l -notmatch [regex]::Escape($Adapter)) { continue }
         $m = [regex]::Match($l, '\b([0-9a-fA-F]{8,16})\b')
         if ($m.Success) { return $m.Groups[1].Value }
     }
     return $null
+}
+
+# Say why the match failed, using the output we already have.
+#
+# "No miniport matching vwifi" is useless on its own: it does not
+# distinguish a name this script guessed wrongly from ndiskd never
+# having run. Both look the same from outside and need opposite fixes.
+function Show-MiniportDiagnosis {
+    param([string[]] $Lines, [string] $LogFile)
+
+    $loadFailed = $Lines | Select-String -Pattern 'Unable to load|No export|not found|cannot find|is not a valid'
+    $anyRows    = $Lines | Select-String -Pattern '\b[0-9a-fA-F]{12,16}\b'
+
+    Write-Host ''
+    if (-not $Lines -or $Lines.Count -lt 5) {
+        Write-Warning "kd produced almost nothing. Check $LogFile -- local KD may not be active."
+    } elseif ($loadFailed) {
+        Write-Warning 'ndiskd did not load. It ships as ndiskd.dll beside kd.exe:'
+        Write-Warning 'copying kd.exe alone is not enough, the whole Debuggers\x64 folder is needed.'
+        $loadFailed | Select-Object -First 3 | ForEach-Object { Write-Host "      $_" }
+    } elseif (-not $anyRows) {
+        Write-Warning 'ndiskd loaded but listed no adapters, which is what it does'
+        Write-Warning 'without ndis.sys symbols. Re-run with -SymbolPath pointing at ndis.pdb.'
+    } else {
+        Write-Warning "ndiskd listed adapters, but none matched '$Adapter'."
+        Write-Host   '      Rows that carry a handle:'
+        $anyRows | Select-Object -First 15 | ForEach-Object { Write-Host "      $($_.Line.Trim())" }
+        Write-Host ''
+        Write-Host   '      Pick the vwifi row and re-run with either:'
+        Write-Host   '        -Adapter <substring of its name>'
+        Write-Host   '        -MiniportHandle <the hex handle>'
+    }
+    Write-Host ''
+    Write-Host "      Full output: $LogFile"
 }
 
 # ---------------------------------------------------------------- main
@@ -262,14 +307,20 @@ if ($out1 -match 'Unable to (?:load|resolve)|symbol.*not found|\*\*\* ERROR') {
     Write-Warning 'Fetch ndis.sys symbols (-ShowSymbolKeys) and pass -SymbolPath.'
 }
 
-$handle = Find-MiniportHandle -Lines $out1
-if (-not $handle) {
-    Write-Warning "no miniport matching '$Adapter' in $log1"
-    Write-Host   'Open that file, find the adapter row, and re-run with -Adapter <substring>.'
-    return
+if ($MiniportHandle) {
+    # Explicit handle: skip discovery entirely. The point is that
+    # reading the table yourself always works, whatever this script's
+    # matching does or does not manage.
+    $handle = $MiniportHandle -replace '^0x', ''
+    Write-Host "      miniport handle (given): $handle"
+} else {
+    $handle = Find-MiniportHandle -Lines $out1
+    if (-not $handle) {
+        Show-MiniportDiagnosis -Lines $out1 -LogFile $log1
+        return
+    }
+    Write-Host "      miniport handle: $handle"
 }
-Write-Host "      miniport handle: $handle"
-
 # Pass two: everything worth knowing about that miniport. Each command
 # is independent, so one that this ndiskd build does not have costs its
 # own output and nothing else.
