@@ -267,6 +267,76 @@ VwifiScanWatchdog(_In_ PVOID SystemSpecific1,
  * Device events — DPC context
  * ============================================================ */
 
+/* Decode the management-frame body exactly as the OS will.
+ *
+ * WDI hands the raw beacon or probe-response body to the host and the
+ * host parses it -- BSS type, SSID, rates, channel, security all come
+ * from these bytes and from nothing this driver says. That makes the
+ * body the one thing worth reading byte for byte when the host lists a
+ * network happily and then declines to connect to it: whatever it
+ * objects to is in here.
+ *
+ * Body layout after the 24-byte MAC header:
+ *   0..7   timestamp
+ *   8..9   beacon interval (TU)
+ *   10..11 capability information  -- bit 0 ESS, bit 1 IBSS, bit 4 Privacy
+ *   12..   information elements, each id(1) len(1) data(len)
+ *
+ * Logged as "cap=0x.... bi=... ies: id(len) id(len) ..." so a trace can
+ * be decoded without the frame itself. */
+static VOID
+VwifiScanTraceFrameBody(_In_reads_bytes_(BodyLen) const UCHAR *Body,
+                        _In_ ULONG BodyLen)
+{
+    CHAR  ies[160];
+    ULONG w = 0;
+    ULONG off;
+    USHORT cap, bi;
+
+    if (BodyLen < 12) {
+        VWIFI_WARN("BSS body only %u bytes -- no fixed fields", BodyLen);
+        return;
+    }
+
+    bi  = (USHORT)(Body[8]  | (Body[9]  << 8));
+    cap = (USHORT)(Body[10] | (Body[11] << 8));
+
+    ies[0] = '\0';
+    for (off = 12; off + 2 <= BodyLen; ) {
+        UCHAR id  = Body[off];
+        UCHAR len = Body[off + 1];
+
+        if (off + 2 + len > BodyLen) {
+            (VOID)RtlStringCchPrintfA(ies + w, RTL_NUMBER_OF(ies) - w,
+                                      " !truncated@%u", off);
+            break;
+        }
+        if (w + 12 >= RTL_NUMBER_OF(ies)) {
+            (VOID)RtlStringCchPrintfA(ies + w, RTL_NUMBER_OF(ies) - w, " ...");
+            break;
+        }
+        (VOID)RtlStringCchPrintfA(ies + w, RTL_NUMBER_OF(ies) - w,
+                                  " %u(%u)", id, len);
+        {
+            size_t used = 0;
+            (VOID)RtlStringCchLengthA(ies, RTL_NUMBER_OF(ies), &used);
+            w = (ULONG)used;
+        }
+        off += 2u + len;
+    }
+
+    /* ESS and IBSS are what the host turns into "infrastructure" or
+     * "ad hoc", and it will not connect an infrastructure request to a
+     * BSS that does not claim ESS. */
+    VWIFI_INFO("BSS body: %u bytes cap=0x%04x (ESS=%u IBSS=%u Privacy=%u) "
+               "bi=%u ies:%s",
+               BodyLen, cap,
+               (cap & 0x0001) ? 1u : 0u,
+               (cap & 0x0002) ? 1u : 0u,
+               (cap & 0x0010) ? 1u : 0u,
+               bi, ies);
+}
+
 VOID
 VwifiScanOnBssFound(_Inout_ PVWIFI_ADAPTER Adapter,
                     _In_reads_bytes_(PayloadLen) const VOID *Payload,
@@ -373,6 +443,13 @@ VwifiScanOnBssFound(_Inout_ PVWIFI_ADAPTER Adapter,
                bss->channel_freq, bss->rssi, frameLen,
                (bss->capability_info & VWIFI_BSS_F_BEACON)
                    ? "beacon" : "probe-resp");
+
+    /* And the body the host actually parses, which is the only thing
+     * that decides whether it will treat this BSS as connectable. */
+    if (frameLen > VWIFI_80211_MGMT_HDR_LEN) {
+        VwifiScanTraceFrameBody(frame + VWIFI_80211_MGMT_HDR_LEN,
+                                (ULONG)(frameLen - VWIFI_80211_MGMT_HDR_LEN));
+    }
 
     /* Everything past here is the running scan's business. Outside a
      * scan the cache above is the whole job: there is no scan for these
