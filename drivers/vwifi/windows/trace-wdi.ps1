@@ -64,13 +64,25 @@
 .PARAMETER DecodeOnly
     Skip capture and decode an existing -EtlPath.
 
+.NOTES
+    Needs tracepdb.exe and tracefmt.exe, which only exist once an
+    EWDK/WDK build environment is set up -- run LaunchBuildEnv first.
+    It does NOT need symchk.exe: the EWDK carries the build tools but
+    not the Debugging Tools, so the PDB is fetched from the symbol
+    server directly, using the GUID and age read out of wdiwifi.sys.
+
+    LaunchBuildEnv leaves you in cmd, so use the wrapper rather than
+    remembering -File and an execution-policy override:
+
+        trace-wdi.cmd -Ssid vwifi-open
+
 .EXAMPLE
-    # Fully automatic, elevated:
-    .\trace-wdi.ps1 -Ssid vwifi-open
+    # Fully automatic, elevated, from inside the build environment:
+    .\trace-wdi.cmd -Ssid vwifi-open
 
 .EXAMPLE
     # Capture while you click the tray icon yourself:
-    .\trace-wdi.ps1
+    .\trace-wdi.cmd
 #>
 [CmdletBinding()]
 param(
@@ -109,20 +121,128 @@ function Find-Tool([string] $Name) {
     $cmd = Get-Command $Name -ErrorAction SilentlyContinue
     if ($cmd) { return $cmd.Source }
 
-    # tracefmt/tracepdb live under bin\<ver>\<arch>; symchk under
-    # Debuggers\<arch>. Search both rather than guessing a version.
+    # tracefmt/tracepdb live under bin\<ver>\<arch>; symchk, when it
+    # exists at all, under Debuggers\<arch>. The EWDK is the common case
+    # here and it carries the build tools but not the Debugging Tools,
+    # so symchk is routinely absent -- see Get-SymbolFile, which is why
+    # that is no longer fatal. WindowsSdkDir is set by LaunchBuildEnv.
     $roots = @(
+        $env:WindowsSdkVerBinPath,
+        $env:WindowsSdkDir,
         "${env:ProgramFiles(x86)}\Windows Kits\10\bin",
         "${env:ProgramFiles(x86)}\Windows Kits\10\Debuggers",
         "${env:ProgramFiles}\Windows Kits\10\bin",
         "${env:ProgramFiles}\Windows Kits\10\Debuggers"
-    ) | Where-Object { Test-Path $_ }
+    ) | Where-Object { $_ -and (Test-Path $_) }
 
     foreach ($r in $roots) {
         $hit = Get-ChildItem -Path $r -Filter $Name -Recurse -ErrorAction SilentlyContinue |
                Sort-Object FullName -Descending | Select-Object -First 1
         if ($hit) { return $hit.FullName }
     }
+    return $null
+}
+
+# ------------------------------------------------------------- symbols
+# Read the CodeView (RSDS) record out of a PE image.
+#
+# This is what symchk does before it talks to the symbol server, and
+# doing it here means the EWDK's lack of Debugging Tools stops mattering.
+# A symbol server request is fully determined by three things found in
+# the binary itself: the PDB's base name, its GUID, and its age. The
+# request is then just
+#
+#   .../download/symbols/<pdb>/<GUID-no-dashes-uppercase><age-hex>/<pdb>
+#
+# and it is exact -- the key identifies one specific build. That matters
+# more than convenience here: WPP message ids are assigned per build, so
+# a near-miss PDB decodes to text that is plausible and wrong.
+function Get-PeCodeViewInfo([string] $Path) {
+    $b = [IO.File]::ReadAllBytes($Path)
+    if ($b.Length -lt 0x40 -or $b[0] -ne 0x4D -or $b[1] -ne 0x5A) { return $null }
+
+    $peOff = [BitConverter]::ToInt32($b, 0x3C)
+    if ($peOff -le 0 -or ($peOff + 24) -gt $b.Length) { return $null }
+    if ([BitConverter]::ToUInt32($b, $peOff) -ne 0x00004550) { return $null }
+
+    $coff      = $peOff + 4
+    $nSections = [BitConverter]::ToUInt16($b, $coff + 2)
+    $optSize   = [BitConverter]::ToUInt16($b, $coff + 16)
+    $opt       = $coff + 20
+    $magic     = [BitConverter]::ToUInt16($b, $opt)
+
+    # Data directory 6 is Debug. Its offset differs between PE32 and
+    # PE32+ because of the wider fields in the 64-bit optional header.
+    $ddOff = if ($magic -eq 0x20B) { $opt + 112 } else { $opt + 96 }
+    $dbgRva  = [BitConverter]::ToUInt32($b, $ddOff + 48)
+    $dbgSize = [BitConverter]::ToUInt32($b, $ddOff + 52)
+    if ($dbgRva -eq 0 -or $dbgSize -lt 28) { return $null }
+
+    $secTab = $opt + $optSize
+    $dbgOff = 0
+    for ($i = 0; $i -lt $nSections; $i++) {
+        $s    = $secTab + $i * 40
+        $vsz  = [BitConverter]::ToUInt32($b, $s + 8)
+        $va   = [BitConverter]::ToUInt32($b, $s + 12)
+        $rsz  = [BitConverter]::ToUInt32($b, $s + 16)
+        $praw = [BitConverter]::ToUInt32($b, $s + 20)
+        $span = [Math]::Max($vsz, $rsz)
+        if ($dbgRva -ge $va -and $dbgRva -lt ($va + $span)) {
+            $dbgOff = $praw + ($dbgRva - $va); break
+        }
+    }
+    if ($dbgOff -eq 0) { return $null }
+
+    for ($i = 0; $i -lt [int]($dbgSize / 28); $i++) {
+        $e = $dbgOff + $i * 28
+        if (($e + 28) -gt $b.Length) { break }
+        if ([BitConverter]::ToUInt32($b, $e + 12) -ne 2) { continue }  # CODEVIEW
+        $raw = [BitConverter]::ToUInt32($b, $e + 24)
+        if ($raw -eq 0 -or ($raw + 24) -ge $b.Length) { continue }
+        if ([Text.Encoding]::ASCII.GetString($b, $raw, 4) -ne 'RSDS') { continue }
+
+        $guid = [guid]::new([byte[]]$b[($raw + 4)..($raw + 19)])
+        $age  = [BitConverter]::ToUInt32($b, $raw + 20)
+
+        $p = $raw + 24; $q = $p
+        while ($q -lt $b.Length -and $b[$q] -ne 0) { $q++ }
+        $name = [IO.Path]::GetFileName([Text.Encoding]::ASCII.GetString($b, $p, $q - $p))
+
+        return [pscustomobject]@{
+            PdbName = $name
+            Key     = ('{0}{1:X}' -f $guid.ToString('N').ToUpper(), $age)
+        }
+    }
+    return $null
+}
+
+function Get-SymbolFile([string] $ImagePath, [string] $DestDir) {
+    $cv = Get-PeCodeViewInfo $ImagePath
+    if (-not $cv) {
+        Write-Warning "could not read a CodeView record from $ImagePath"
+        return $null
+    }
+
+    $dest = Join-Path $DestDir $cv.PdbName
+    if (Test-Path $dest) { return $dest }
+    New-Item -ItemType Directory -Force -Path $DestDir | Out-Null
+
+    $url = 'https://msdl.microsoft.com/download/symbols/{0}/{1}/{0}' -f $cv.PdbName, $cv.Key
+    Write-Host "      GET $($cv.PdbName) [$($cv.Key)]"
+
+    try {
+        # PowerShell 5.1 still defaults to TLS 1.0, which msdl refuses.
+        [Net.ServicePointManager]::SecurityProtocol =
+            [Net.SecurityProtocolType]::Tls12
+        Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing `
+            -UserAgent 'Microsoft-Symbol-Server/10.0.0.0' -TimeoutSec 120
+    } catch {
+        Write-Warning "symbol download failed: $($_.Exception.Message)"
+        Remove-Item $dest -ErrorAction SilentlyContinue
+        return $null
+    }
+
+    if (Test-Path $dest) { return $dest }
     return $null
 }
 
@@ -151,19 +271,23 @@ function Get-TmfDirectory {
 
     New-Item -ItemType Directory -Force -Path $tmf, $sym | Out-Null
 
-    $symchk   = Find-Tool 'symchk.exe'
     $tracepdb = Find-Tool 'tracepdb.exe'
     if (-not $tracepdb) {
-        Write-Warning 'tracepdb.exe not found (WDK); WPP records will stay as raw ids'
+        Write-Warning 'tracepdb.exe not found. Run this from an EWDK/WDK build environment (LaunchBuildEnv).'
         return $null
     }
 
+    Write-Host "      Fetching symbols for wdiwifi.sys $ver (once; cached after this)"
+
+    # symchk if it happens to be here, otherwise fetch it ourselves. The
+    # EWDK carries the build tools but not the Debugging Tools, so
+    # symchk is usually absent and its absence must not stop the run.
+    $symchk = Find-Tool 'symchk.exe'
     if ($symchk) {
-        Write-Host "      Fetching symbols for wdiwifi.sys $ver (once; cached after this)"
         & $symchk /r $wdiSys /s "srv*$sym*https://msdl.microsoft.com/download/symbols" 2>&1 |
             Select-Object -Last 2 | ForEach-Object { Write-Host "        $_" }
     } else {
-        Write-Warning 'symchk.exe not found; relying on any PDB already in the symbol path'
+        (Get-SymbolFile -ImagePath $wdiSys -DestDir $sym) | Out-Null
     }
 
     $pdbs = @(Get-ChildItem -Path $sym -Filter '*.pdb' -Recurse -ErrorAction SilentlyContinue)
