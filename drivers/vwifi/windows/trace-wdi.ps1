@@ -90,7 +90,8 @@ param(
     [int]    $Wait = 15,
     [string] $EtlPath = 'C:\vwifi-wdi.etl',
     [switch] $NoDecode,
-    [switch] $DecodeOnly
+    [switch] $DecodeOnly,
+    [switch] $ListProviders
 )
 
 $ErrorActionPreference = 'Stop'
@@ -310,8 +311,31 @@ function Get-TmfDirectory {
     return $tmf
 }
 
+# Every WPP control GUID that wdiwifi.sys actually registers.
+#
+# tracepdb names each file it emits after the trace provider GUID it
+# came from, so once the PDB has been turned into TMFs the filenames
+# are the answer -- no guessing, no enumeration, and it works offline.
+#
+# This exists because the documented WDILib GUID
+# ({21ba7b61-05f8-41f1-9048-c09493dcfe38}) produced a completely silent
+# capture: 8820 decoded lines, all of them NDIS, WLAN-AutoConfig or
+# NWiFi, and not one undecodable record either. WDILib is a helper
+# library that IHV drivers link against rather than something inside
+# the port driver, so on a miniport that does not use it there is
+# nothing for that provider to say. The port driver's own GUIDs are
+# these.
+function Get-WppGuidsFromTmf([string] $TmfDir) {
+    if (-not $TmfDir -or -not (Test-Path $TmfDir)) { return @() }
+    $guids = Get-ChildItem $TmfDir -Filter '*.tmf' -ErrorAction SilentlyContinue |
+             ForEach-Object { [IO.Path]::GetFileNameWithoutExtension($_.Name) } |
+             Where-Object { $_ -match '^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$' } |
+             Sort-Object -Unique
+    return @($guids)
+}
+
 # ------------------------------------------------------------- capture
-function Invoke-Capture {
+function Invoke-Capture([string[]] $WppGuids) {
     Assert-Admin
 
     # An interrupted run leaves the session registered, and logman
@@ -345,7 +369,21 @@ function Invoke-Capture {
         $out | ForEach-Object { Write-Host "      $_" }
         throw "logman create failed ($LASTEXITCODE)"
     }
-    Write-Host '        + WDILib (the WDI port driver)'
+    Write-Host '        + WDILib (documented, but silent unless the miniport links it)'
+
+    # The port driver's real control GUIDs, recovered from its own PDB.
+    # This is the part that matters; the WDILib GUID above is kept only
+    # because it costs nothing and would carry an IHV driver that does
+    # link the library.
+    foreach ($g in $WppGuids) {
+        if ($g -eq ($wdiGuid -replace '[{}]', '')) { continue }
+        & logman update trace $session -p "{$g}" 0xffffffff 0xff -ets | Out-Null
+        if ($LASTEXITCODE -eq 0) { Write-Host "        + wdiwifi {$g}" }
+        else { Write-Warning "could not add {$g}" }
+    }
+    if ($WppGuids.Count -eq 0) {
+        Write-Warning 'no wdiwifi control GUIDs known -- capture will miss the port driver'
+    }
 
     foreach ($p in $manifestProviders) {
         & logman update trace $session -p $p.Name 0xffffffffffffffff 0xff -ets | Out-Null
@@ -421,7 +459,8 @@ function Invoke-Decode {
     $sumOut  = "$base-summary.txt"
 
     Write-Host '[5/5] Decoding'
-    $tmf = Get-TmfDirectory
+    $tmf = $script:TmfDir
+    if (-not $tmf) { $tmf = Get-TmfDirectory }   # -DecodeOnly path
 
     # WPP and manifest events share the ETL but need different decoders,
     # and both read the same file, so their timestamps line up exactly.
@@ -465,23 +504,87 @@ function Write-Summary([string] $WppFile, [string] $SummaryFile) {
         return
     }
 
-    $pat = 'connect|Connect|CONNECT|assoc|Assoc|ASSOC|bss|BSS|Bss|unreachable|UNREACHABLE|' +
-           'fail|Fail|FAIL|error|Error|ERROR|reject|Reject|0xC000023C|c000023c|port|Port'
-    $hits = $lines | Select-String -Pattern $pat
+    # Which components actually spoke, before any filtering.
+    #
+    # This is the first thing to read, because a filtered excerpt cannot
+    # distinguish "the port driver explained itself and none of it
+    # matched my keywords" from "the port driver was never captured at
+    # all" -- and the run that motivated this reported 8820 confident
+    # lines while containing nothing whatsoever from the port driver.
+    # tracefmt prefixes every line with the CPU number in brackets --
+    # "[1]0F24.1E30::...[Microsoft-Windows-NDIS]..." -- so the first
+    # bracketed token is a digit, not a provider. Take the first
+    # non-numeric one instead of blindly taking match zero.
+    $byProvider = $lines |
+        ForEach-Object {
+            foreach ($m in [regex]::Matches($_, '\[([A-Za-z0-9_.-]+)\]')) {
+                $v = $m.Groups[1].Value
+                if ($v -notmatch '^\d+$') { $v; break }
+            }
+        } |
+        Group-Object | Sort-Object Count -Descending
+
+    $known = @('Microsoft-Windows-NDIS', 'Microsoft-Windows-WLAN-AutoConfig',
+               'Microsoft-Windows-NWiFi', 'Microsoft-Windows-OneX')
+    $fromPortDriver = @($byProvider | Where-Object { $known -notcontains $_.Name })
+
+    $pat = 'connect|assoc|bss|unreachable|fail|error|reject|refus|invalid|' +
+           'denied|status|state|port|scan|c000023c|38002'
+    $hits = $lines | Select-String -Pattern $pat -CaseSensitive:$false
 
     $out = @()
-    $out += "vwifi WDI port driver trace summary"
+    $out += 'vwifi WDI port driver trace summary'
     $out += "source: $WppFile ($($lines.Count) lines)"
-    $out += "matched: $($hits.Count)"
+    $out += ''
+    $out += 'providers seen:'
+    $out += $byProvider | ForEach-Object { '  {0,8}  {1}' -f $_.Count, $_.Name }
+    $out += ''
+    if ($fromPortDriver.Count -eq 0) {
+        $out += '*** NOTHING from the WDI port driver in this capture. ***'
+        $out += '*** Only the manifest providers above responded, so the  ***'
+        $out += '*** control GUIDs used did not match wdiwifi.sys.        ***'
+        $out += '*** Re-run with -ListProviders to see what its PDB says. ***'
+        $out += ''
+    }
+    $out += "matched $($hits.Count) line(s) on: $pat"
     $out += ''
     $out += $hits | ForEach-Object { $_.Line }
     Set-Content -Path $SummaryFile -Value $out -Encoding UTF8
 
+    Write-Host ''
+    foreach ($g in $byProvider) { Write-Host ('      {0,8}  {1}' -f $g.Count, $g.Name) }
+    if ($fromPortDriver.Count -eq 0) {
+        Write-Warning 'nothing from the WDI port driver -- the control GUIDs did not match wdiwifi.sys'
+    }
     Write-Host ("      {0} ({1} matching line(s))" -f $SummaryFile, $hits.Count)
     Write-Host ''
     Write-Host '      Send the -summary.txt first; the full -wdi.txt if asked.'
 }
 
 # ---------------------------------------------------------------- main
-if (-not $DecodeOnly) { Invoke-Capture }
+#
+# Symbols are prepared BEFORE the capture, not after. The TMFs are what
+# name the port driver's control GUIDs, and the GUIDs have to be known
+# at logman-create time -- preparing them afterwards, as this did while
+# it was trusting the documented WDILib GUID, means every run captures
+# the wrong providers and only finds out during decode.
+$script:TmfDir = $null
+if (-not $DecodeOnly -or $ListProviders) {
+    Write-Host '[0/5] Preparing symbols'
+    $script:TmfDir = Get-TmfDirectory
+}
+$guids = Get-WppGuidsFromTmf $script:TmfDir
+
+if ($ListProviders) {
+    Write-Host ''
+    Write-Host 'WPP control GUIDs registered by wdiwifi.sys:'
+    if ($guids.Count -eq 0) {
+        Write-Host '  (none -- no TMFs, so either no symbols or no WPP metadata in the PDB)'
+    } else {
+        $guids | ForEach-Object { Write-Host "  {$_}" }
+    }
+    return
+}
+
+if (-not $DecodeOnly) { Invoke-Capture -WppGuids $guids }
 if (-not $NoDecode)   { Invoke-Decode }
