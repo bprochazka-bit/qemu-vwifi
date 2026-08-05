@@ -593,45 +593,70 @@ if ($wdiState) {
     # connectTrigger and roamConfigFlags are populated in a dump whose
     # timestamps predate the scan sitting next to them.
     #
-    # What is left, and is not explainable this way, is
-    # connectRoamTaskStartTime 0: the task that would issue
-    # OID_WDI_TASK_CONNECT never started, with a ranked candidate in
-    # hand. Listing CConnectJob's methods named every step of the job,
-    # and one of them answers the question exactly:
+    # The connect job discards its own candidate list.
     #
-    #   CConnectJob::CheckAndStartConnectProcess(_WDI_ASSOC_STATUS *)
+    # CheckAndStartConnectProcess, at +0x1a3, immediately after
+    # CheckAndUpdateCandidates returns success:
     #
-    # Its out-parameter is the association status, and the failure we
-    # have been chasing since the beginning reports assocStatus 0x2 --
-    # WDI_ASSOC_STATUS_UNREACHABLE -- which is what wlansvc turns into
-    # the STATUS_NETWORK_UNREACHABLE (0xC000023C) it hands back. So this
-    # routine is where "unreachable" is decided, and the branch that
-    # writes 2 into that pointer is the whole answer.
+    #     cmp  dword ptr [rbx+26Ch],r13d     ; job candidateCount vs 0
+    #     jbe  +0x65f                        ; zero -> skip the connect
+    #   +0x1b0:
+    #     inc  dword ptr [rbx+6E8h]          ; attempt++
+    #     mov  dword ptr [r12],r13d          ; *pAssocStatus = SUCCESS
+    #     ...
+    #   +0x5d9:
+    #     call CConnectJob::StartConnectRoamTask   ; OID_WDI_TASK_CONNECT
     #
-    # StartConnectRoamTask is the step it would otherwise reach: the one
-    # that fills WDI_CONNECT_PARAMETERS_CONTAINER and an
-    # ArrayOfElements<WDI_CONNECT_BSS_ENTRY_CONTAINER> and sends
-    # OID_WDI_TASK_CONNECT.
+    # +0x65f, with roamConfigFlags bit 3 clear, falls straight through to
+    # the epilogue. So a zero candidate count means the connect task is
+    # never started -- exactly what the driver sees. And *pAssocStatus is
+    # still 6 from the entry check at +0xa1, WDI_ASSOC_STATUS_
+    # CANDIDATE_LIST_EXHAUSTED, which is a much better description of
+    # this failure than anything considered so far.
     #
-    # GetSupportedAssociationMethods is here because it is small, it is
-    # static, it takes the port, the adapter and the profile, and it
-    # answers in booleans. A routine that derives from OUR advertised
-    # capabilities which association methods exist is exactly the shape
-    # of thing that can make a reachable AP unreachable. Both overloads
-    # are disassembled by module-relative address because the name alone
-    # is ambiguous and kd cannot pick between them; `x` is run first so
-    # the addresses in this build can be checked against the RVAs.
+    # But PickCandidates wrote 1 into that count. CheckAndUpdateCandidates
+    # zeroes it, and with roamConfigFlags 0x2021 exactly one of its three
+    # zeroing paths can be reached:
+    #
+    #   +0x244  test byte ptr [rbx+260h],1        ; RC_CONNECT, set
+    #   +0x251  cmp  dword ptr [rbx+218h],0
+    #           jne  +0x2af
+    #   +0x277  now - port->m_ullLastNloDiscoverTime < 1s ?
+    #           m_ullLastNloDiscoverTime is 0 in every dump, so no
+    #   +0x2af  GetPropertyBuffer(portPropertyCache, 0x47, &buf, &len)
+    #           cmp  eax,0C0000184h               ; STATUS_INVALID_DEVICE_STATE
+    #           jne  +0x396                       ; property readable -> keep
+    #   +0x2d7  <WPP id 0x9a>
+    #   +0x317  mov  dword ptr [rbx+26Ch],r13d    ; candidateCount = 0
+    #
+    # So: port property 0x47 fails to read with STATUS_INVALID_DEVICE_
+    # STATE, and wdiwifi throws away a perfectly good candidate list.
+    # Everything else -- the beacon, the ranking, the matching -- was
+    # never the problem.
+    #
+    # What is left is to name property 0x47 and find out why it is
+    # unreadable. The cache entry itself carries Name, Type and
+    # IsPopulated, so read index 0x47 directly, with its neighbours as a
+    # stride check (Name should equal the index). Disassemble
+    # GetPropertyBuffer for the exact condition behind 0xC0000184, and
+    # sweep for whatever enum names these properties.
     Write-Host '[4/5] Reading the decision'
     $log4 = Join-Path $OutDir 'wdi-state-decide.txt'
+    $pt   = "($a)->m_pPortList[0]->m_PortPropertyCache.m_PropertyTable"
     $out4 = Invoke-Kd -Kd $kd -Sym $sym -LogFile $log4 -Commands (@(
         '.reload /f wdiwifi.sys',
-        'lm vm wdiwifi',
-        'x wdiwifi!CConnectHelpers::*',
-        'dt wdiwifi!_WDI_ASSOC_STATUS',
-        'uf wdiwifi!CConnectJob::CheckAndStartConnectProcess',
-        'uf wdiwifi+0x8307c',
-        'uf wdiwifi+0x83174',
-        'uf wdiwifi!CConnectJob::StartConnectRoamTask'
+        'dt wdiwifi!_WFC_PROPERTY_ENTRY',
+        'dt wdiwifi!_WFC_PROPERTY_TYPE',
+        "dx -r2 ($pt)[0x45]",
+        "dx -r2 ($pt)[0x46]",
+        "dx -r2 ($pt)[0x47]",
+        "dx -r2 ($pt)[0x48]",
+        "dx -r2 ($pt)[0x49]",
+        'uf wdiwifi!CPropertyCache::GetPropertyBuffer',
+        'x wdiwifi!CPropertyCache::*',
+        'x wdiwifi!CPortPropertyCache::*',
+        'x wdiwifi!*PropertyName*',
+        'x wdiwifi!*WFC_PORT_PROPERTY*'
     ) -join ';')
     Write-Host "      $log4 ($($out4.Count) lines)"
 } else {
@@ -646,6 +671,6 @@ Write-Host '[5/5] Done'
 Write-Host "      $log1 ($($out1.Count) lines)"
 Write-Host "      $log2 ($($out2.Count) lines)"
 Write-Host ''
-Write-Host '      Send wdi-state-decide.txt. CheckAndStartConnectProcess is the'
-Write-Host '      routine that writes WDI_ASSOC_STATUS_UNREACHABLE, which is the'
-Write-Host '      status wlansvc has been reporting from the very first attempt.'
+Write-Host '      Send wdi-state-decide.txt. The connect job throws away its own'
+Write-Host '      candidate list when port property 0x47 will not read; this names'
+Write-Host '      that property and shows why it fails.'
