@@ -3,9 +3,24 @@
 Phase 1 skeleton of the Windows kernel driver that binds to the
 `vwifi-virt` QEMU PCI device and presents a WDI miniport to Windows.
 
-Status: **loads cleanly under test-signing, probes the device, reads
-capabilities, no user-facing Wi-Fi yet.** The scan/connect/key path
-and monitor-mode RX indications land in Phases 2 and 1.5 respectively.
+Status: **loads, scans, and connects.** The adapter appears in the
+Windows network list, `netsh wlan show networks` finds the AP, and a
+connect runs end to end:
+
+```
+OID: method 0xe4400006 WDI_TASK_CONNECT
+connect parsed: bssid 02:11:22:33:44:01 ssid='vwifi-open'
+indicating ASSOCIATION_RESULT status=0 aid=1 ies=25
+indicating CONNECT_COMPLETE (0x0)
+IND: LINK_STATE connected on ndisport 0
+alive: beat 3, scan 0, conn 0x0, assoc 1, port 1, opmode 1
+```
+
+**No traffic yet.** The association holds, but
+`NdisWdiPeerCreateIndication`/`PeerDeleteIndication` are never called
+and the TAL per-frame TX/RX path is still stubbed, so nothing flows over
+the link. That is the next piece of work, and it is a build rather than
+a debugging round. Monitor-mode RX indications are Phase 1.5.
 
 ## Layout
 
@@ -825,6 +840,40 @@ enumerator for any of them --- `WDI_AUTH_ALGO_80211_OPEN` is 1,
 `UNCHANGED` 2, `UNKNOWN` 3 with no zero at all. Only
 `WDI_CIPHER_ALGO_NONE` is genuinely 0. A zeroed struct is a valid
 starting point only for the fields whose zero means something.
+
+With that, the connect completes:
+
+    OID: method 0xe4400006 WDI_TASK_CONNECT
+    connect parsed: bssid 02:11:22:33:44:01 ssid='vwifi-open'
+    indicating ASSOCIATION_RESULT status=0 aid=1 ies=25
+    IND: 0x4005004c wdiport 0x0000 ndisport 0 txn 0 status 0x0, 119 bytes
+    indicating CONNECT_COMPLETE (0x0)
+    IND: LINK_STATE connected on ndisport 0
+    alive: beat 3, scan 0, conn 0x0, assoc 1, port 1, opmode 1
+
+and holds, across heartbeats, with no disconnect.
+
+### What is left, and one thing left deliberately unfixed
+
+The association carries no traffic.
+`NdisWdiPeerCreateIndication`/`PeerDeleteIndication` are never called
+and the TAL per-frame TX/RX path is stubbed, so the link is up and
+empty. That is the next piece of work.
+
+Still in the log, and still not acted on:
+
+    device rejected SCAN: 0xc0000001 (a connect is in flight; the
+    device will not sweep while associating)
+
+wdiwifi scans as part of the connect flow and the device refuses to
+sweep while associating. It does not block anything -- the connect
+above has two of these in the middle of it -- but the rejection returns
+a failure status *synchronously*, and a task OID's return value is what
+`CScanJob::FinishJob` reads as the job's outcome. That is precisely the
+mechanism that suppressed `WfcPortPropertyGoodScanStartTime` for the
+whole life of this project. It is harmless only because the next
+successful background scan rewrites the property. If connects ever
+start failing every other attempt, look here first.
 
 ### When the driver log is silent, the problem is above the driver
 
