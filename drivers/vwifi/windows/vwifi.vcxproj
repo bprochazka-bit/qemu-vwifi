@@ -167,6 +167,7 @@
     <ClCompile Include="src\wdi_connect.c" />
     <ClCompile Include="src\wdi_keys.c" />
     <ClCompile Include="src\wdi_ops.c" />
+    <ClCompile Include="src\wdi_peer.c" />
     <ClCompile Include="src\wdi_scan.c" />
     <ClCompile Include="src\wdi_tal.c" />
     <!-- The WDI TLV generator/parser is C++ templates. These two

@@ -34,17 +34,36 @@
  * component needs in order to bring an adapter up, and they are cheap
  * for a device whose queueing lives on the other side of a ring.
  *
- * The per-frame TX and RX paths are honest stubs. This driver's data
- * path runs over the vwifi rings (see rings.c and data.c), not the TAL,
- * so nothing here moves a frame. Every stub is written so the component
- * cannot be misled by it: no NBL is accepted and silently dropped, no
- * output parameter is left uninitialised, and RxGetMpdus hands back
- * NULL rather than whatever was on the stack.
+ * Peers are no longer a stub. The peer callbacks -- PeerConfig and
+ * PeerDeleteConfirm -- are the component's half of a handshake whose
+ * other half is NdisWdiPeerCreateIndication/PeerDeleteIndication, and
+ * both halves now run. See wdi_peer.c for what a peer is and why
+ * nothing can be sent without one.
+ *
+ * The per-frame TX and RX paths are still honest stubs. Every stub is
+ * written so the component cannot be misled by it: no NBL is accepted
+ * and silently dropped, no output parameter is left uninitialised, and
+ * RxGetMpdus hands back NULL rather than whatever was on the stack.
  *
  * That means TX from the WDI data path does not work yet. It is a real
  * limitation, not a temporary shim that happens to work — anything sent
  * this way stays queued in the component. Scanning and connecting are
  * control-path operations and do not go through here.
+ *
+ * What is missing to finish it
+ * ----------------------------
+ * One contract, and it is not in this header's kit. A TX NBL arrives
+ * from NdisWdiTxDequeueIndication carrying a WDI_FRAME_METADATA -- the
+ * struct is defined in dot11wdi.h, has a pNBL back-pointer, and holds
+ * the WDI_FRAME_ID that NdisWdiTxSendCompleteIndication is fed -- but
+ * nothing in dot11wdi.h says WHERE on the NBL to find it. Guessing at a
+ * kernel ABI is how this project has lost rounds before, so it is being
+ * read out of wdiwifi.sys instead: see the TxMgr disassembly pass in
+ * dump-wdi-state.ps1.
+ *
+ * The TxDataSend and RxGetMpdus stubs log their first calls in full
+ * rather than announcing themselves once, because whether they fire at
+ * all is the measurement that says the peer indication took.
  *
  * Every handler traces
  * --------------------
@@ -90,6 +109,21 @@
         }                                                           \
     } while (0)
 
+/* The first few calls in full, then silence.
+ *
+ * For the handlers whose SHAPE is the open question rather than their
+ * existence: one line says they started firing, and a handful says what
+ * the component is actually asking for -- which peer, which TID, how
+ * many frames -- without turning the trace into a firehose at rate.
+ * Eight is enough to see a pattern and few enough to read. */
+#define VWIFI_TAL_FIRST(n, fmt, ...)                                \
+    do {                                                            \
+        static LONG _vwifi_n = 0;                                   \
+        if (InterlockedIncrement(&_vwifi_n) <= (n)) {               \
+            VWIFI_INFO(fmt, ##__VA_ARGS__);                         \
+        }                                                           \
+    } while (0)
+
 /* ============================================================
  * TAL lifecycle
  * ============================================================ */
@@ -100,12 +134,21 @@ VwifiTalStart(
     _In_ PWDI_TXRX_TARGET_CONFIGURATION pWifiTxRxConfiguration,
     _Out_ PTAL_TXRX_PARAMETERS pTalTxRxParameters)
 {
-    UNREFERENCED_PARAMETER(MiniportTalTxRxContext);
+    PVWIFI_ADAPTER adapter = (PVWIFI_ADAPTER)MiniportTalTxRxContext;
 
     VWIFI_INFO("TAL start: max %u ports, %u peers, params %u bytes",
                pWifiTxRxConfiguration ? pWifiTxRxConfiguration->MaxNumPorts : 0,
                pWifiTxRxConfiguration ? pWifiTxRxConfiguration->MaxNumPeers : 0,
                (ULONG)sizeof(*pTalTxRxParameters));
+
+    /* Kept, because peer ids are the miniport's to assign and the
+     * component sizes its own per-peer state from this number. Handing
+     * back an id at or past it is handing it an index into an array it
+     * did not allocate. See VwifiPeerCreate. */
+    if (adapter != NULL && pWifiTxRxConfiguration != NULL) {
+        adapter->MaxPeers = pWifiTxRxConfiguration->MaxNumPeers;
+        adapter->MaxPorts = pWifiTxRxConfiguration->MaxNumPorts;
+    }
 
     /* Zero the whole block before writing the one field we know about.
      *
@@ -133,8 +176,14 @@ VwifiTalStart(
 static VOID
 VwifiTalStop(_In_ TAL_TXRX_HANDLE MiniportTalTxRxContext)
 {
-    UNREFERENCED_PARAMETER(MiniportTalTxRxContext);
+    PVWIFI_ADAPTER adapter = (PVWIFI_ADAPTER)MiniportTalTxRxContext;
+
     VWIFI_INFO("TAL stop");
+
+    /* Forget rather than delete. The data path is being torn down, so
+     * indicating a delete into it is a call through an API table that
+     * is on its way out -- and there is nothing left to tell anyway. */
+    VwifiPeerForgetAll(adapter);
 }
 
 /* ============================================================
@@ -250,6 +299,17 @@ VwifiTalAddPort(
 
     /* The call that could not happen before this file existed. */
     VWIFI_INFO("TAL add port %u, opmode 0x%x", PortId, OpMode);
+
+    /* The authoritative WDI port id, and the first place it is stated.
+     *
+     * Adapter->WdiPortId has existed since the adapter struct did and
+     * has never been assigned -- it worked only because this device has
+     * one port and its id happens to be 0, so the zeroed field read
+     * correctly by accident. Peers are addressed by port, which makes
+     * that accident load-bearing, so it is written down here where the
+     * component actually says what the id is. */
+    adapter->WdiPortId = PortId;
+
     VwifiTalApplyOpMode(adapter, OpMode);
 }
 
@@ -258,8 +318,15 @@ VwifiTalDeletePort(
     _In_ TAL_TXRX_HANDLE MiniportTalTxRxContext,
     _In_ WDI_PORT_ID PortId)
 {
-    UNREFERENCED_PARAMETER(MiniportTalTxRxContext);
+    PVWIFI_ADAPTER adapter = (PVWIFI_ADAPTER)MiniportTalTxRxContext;
+
     VWIFI_INFO("TAL delete port %u", PortId);
+
+    /* A port's peers cannot outlive it. In practice the disconnect that
+     * precedes a port delete has already taken them, and this is the
+     * backstop for the paths that do not go through one -- an adapter
+     * disabled or removed while associated. */
+    VwifiPeerDeleteAll(adapter);
 }
 
 static VOID
@@ -279,10 +346,20 @@ VwifiTalResetPort(
     _In_ TAL_TXRX_HANDLE MiniportTalTxRxContext,
     _In_ WDI_PORT_ID PortId)
 {
-    UNREFERENCED_PARAMETER(MiniportTalTxRxContext);
+    PVWIFI_ADAPTER adapter = (PVWIFI_ADAPTER)MiniportTalTxRxContext;
+
     VWIFI_INFO("TAL reset port %u", PortId);
+
+    /* A dot11 reset puts the port back to disconnected, so any peer it
+     * had is gone. Usually a no-op: this fires at the START of a connect
+     * too, when there is nothing to delete. */
+    VwifiPeerDeleteAll(adapter);
 }
 
+/* The component's half of peer creation: it has finished setting up
+ * whatever per-peer state it keeps, and data may now flow to this peer.
+ * Both of these used to log and drop the fact on the floor, which was
+ * harmless only because no peer was ever created. */
 static VOID
 VwifiTalPeerConfig(
     _In_ TAL_TXRX_HANDLE MiniportTalTxRxContext,
@@ -290,19 +367,24 @@ VwifiTalPeerConfig(
     _In_ WDI_PEER_ID PeerId,
     _In_ PWDI_TXRX_PEER_CFG pPeerCfg)
 {
-    UNREFERENCED_PARAMETER(MiniportTalTxRxContext);
-    UNREFERENCED_PARAMETER(pPeerCfg);
+    PVWIFI_ADAPTER adapter = (PVWIFI_ADAPTER)MiniportTalTxRxContext;
+
     VWIFI_INFO("TAL peer config: port %u peer %u", PortId, PeerId);
+    VwifiPeerOnConfig(adapter, PortId, PeerId, pPeerCfg);
 }
 
+/* The other half of a delete. VwifiPeerDelete only indicates it; the
+ * slot is not reusable until this arrives. */
 static VOID
 VwifiTalPeerDeleteConfirm(
     _In_ TAL_TXRX_HANDLE MiniportTalTxRxContext,
     _In_ WDI_PORT_ID PortId,
     _In_ WDI_PEER_ID PeerId)
 {
-    UNREFERENCED_PARAMETER(MiniportTalTxRxContext);
+    PVWIFI_ADAPTER adapter = (PVWIFI_ADAPTER)MiniportTalTxRxContext;
+
     VWIFI_INFO("TAL peer delete confirm: port %u peer %u", PortId, PeerId);
+    VwifiPeerOnDeleteConfirm(adapter, PortId, PeerId);
 }
 
 /* ============================================================
@@ -361,19 +443,23 @@ VwifiTalTxDataSend(
     _In_ BOOLEAN bRobustnessFlag)
 {
     UNREFERENCED_PARAMETER(MiniportTalTxRxContext);
-    UNREFERENCED_PARAMETER(PortId);
-    UNREFERENCED_PARAMETER(PeerId);
-    UNREFERENCED_PARAMETER(ExTid);
-    UNREFERENCED_PARAMETER(NumActiveFrames);
     UNREFERENCED_PARAMETER(bRobustnessFlag);
 
     /* The component is telling us frames are queued and we should come
-     * and get them. We do not, so they stay queued. Said out loud once,
+     * and get them. We do not, so they stay queued. Said out loud,
      * because a silently stalled TX path looks exactly like a working
-     * one until something tries to use it. */
-    VWIFI_TAL_ONCE("TAL TxDataSend: %u frames queued -- the TAL TX path "
-                   "is not implemented, frames will not be sent",
-                   NumQueueFrames);
+     * one until something tries to use it.
+     *
+     * This handler had never fired in any trace before peers existed,
+     * and that was not a coincidence: WDI addresses data by (port,
+     * peer, TID) and holds TX paused on WDI_TX_PAUSE_REASON_PEER_CREATE
+     * until a peer exists. Whether it fires NOW is the measurement that
+     * says the peer indication took, so the first calls are logged in
+     * full rather than announced once. */
+    VWIFI_TAL_FIRST(8, "TAL TxDataSend: port %u peer %u tid %u -- %u queued, "
+                       "%u active. The TAL TX path is not implemented yet, "
+                       "so these stay queued.",
+                    PortId, PeerId, ExTid, NumQueueFrames, NumActiveFrames);
 }
 
 static VOID
@@ -387,14 +473,11 @@ VwifiTalTxTalSend(
     _In_ BOOLEAN bRobustnessFlag)
 {
     UNREFERENCED_PARAMETER(MiniportTalTxRxContext);
-    UNREFERENCED_PARAMETER(PortId);
-    UNREFERENCED_PARAMETER(PeerId);
-    UNREFERENCED_PARAMETER(ExTid);
-    UNREFERENCED_PARAMETER(NumActiveFrames);
     UNREFERENCED_PARAMETER(bRobustnessFlag);
 
-    VWIFI_TAL_ONCE("TAL TxTalSend: %u frames queued -- not implemented",
-                   NumQueueFrames);
+    VWIFI_TAL_FIRST(8, "TAL TxTalSend: port %u peer %u tid %u -- %u queued, "
+                       "%u active. Not implemented.",
+                    PortId, PeerId, ExTid, NumQueueFrames, NumActiveFrames);
 }
 
 static VOID
@@ -538,13 +621,13 @@ VwifiTalRxGetMpdus(
     _Out_ PNET_BUFFER_LIST *ppNBL)
 {
     UNREFERENCED_PARAMETER(MiniportTalTxRxContext);
-    UNREFERENCED_PARAMETER(PeerId);
-    UNREFERENCED_PARAMETER(ExTid);
 
     /* NULL, explicitly. This is an _Out_ pointer the component will
      * walk; leaving it as whatever was on the stack is the difference
      * between "no frames" and a bugcheck. */
-    VWIFI_TAL_ONCE("TAL RxGetMpdus (first call) -- returning no frames");
+    VWIFI_TAL_FIRST(8, "TAL RxGetMpdus: peer %u tid %u -- no frames "
+                       "(the TAL RX path is not implemented yet)",
+                    PeerId, ExTid);
     *ppNBL = NULL;
 }
 

@@ -976,6 +976,40 @@ if ($wdiState) {
     $cmds5 += 'x wdiwifi!*SendOid*'
     $cmds5 += 'x wdiwifi!*OidJob*'
 
+    # The data path's one unread contract.
+    #
+    # A TX NBL arrives from NdisWdiTxDequeueIndication carrying a
+    # WDI_FRAME_METADATA. dot11wdi.h defines the struct -- LIST_ENTRY,
+    # pNBL back-pointer, WDI_FRAME_ID, then a TX/RX union -- and defines
+    # AllocateWiFiFrameMetaData to make one, and TalTxRxInitialize even
+    # lets the miniport ask for extra space inside it. What it never says
+    # is where on the NBL the pointer lives, so a miniport that has been
+    # handed an NBL cannot get from one to the other.
+    #
+    # The convention in IHV samples is MiniportReserved[0], but
+    # MiniportReserved is by definition the MINIPORT's scratch space,
+    # which argues the port driver would not put its own bookkeeping
+    # there. That is an argument, not a fact, and this project has
+    # already lost rounds to arguments about undocumented contracts --
+    # the INDICATION_REQUIRED build, and MaxCommandSize before it.
+    #
+    # wdiwifi.sys knows. It is the code that attaches the metadata and
+    # the code that reads it back in TxSendComplete, so the offset is a
+    # constant in its disassembly. Reading it is the same move that named
+    # port property 0x47 and adapter property 0x10.
+    #
+    # The symbol names are unknown, hence the wildcards first: whatever
+    # `x` turns up here becomes the `uf` in the next round. Dequeue and
+    # send-complete are the two ends -- one stores the link, the other
+    # follows it -- and either one alone pins the offset.
+    $cmds5 += 'x wdiwifi!*TxDequeue*'
+    $cmds5 += 'x wdiwifi!*FrameMetadata*'
+    $cmds5 += 'x wdiwifi!*FrameMetaData*'
+    $cmds5 += 'x wdiwifi!*TxSendComplete*'
+    $cmds5 += 'x wdiwifi!*PeerCreate*'
+    $cmds5 += 'dt wdiwifi!_WDI_FRAME_METADATA'
+    $cmds5 += 'dt wdiwifi!_WDI_TX_METADATA'
+
     # The one that is actually failing.
     #
     # The --tlv-stages ladder ran and stopped on the third rung:

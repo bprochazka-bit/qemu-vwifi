@@ -855,10 +855,67 @@ and holds, across heartbeats, with no disconnect.
 
 ### What is left, and one thing left deliberately unfixed
 
-The association carries no traffic.
-`NdisWdiPeerCreateIndication`/`PeerDeleteIndication` are never called
-and the TAL per-frame TX/RX path is stubbed, so the link is up and
-empty. That is the next piece of work.
+The association carries no traffic yet. Peers now exist -- see below --
+but the TAL per-frame TX/RX path is still stubbed, so the link is up and
+empty.
+
+### Nothing can be sent to a port. Only to a peer
+
+WDI does not address data by port. It addresses it by **(port, peer,
+TID)**: `MiniportWdiTxDataSend` takes all three, RX indications carry
+the peer id, and `WDI_TX_METADATA` names the peer on every frame. Until
+the miniport says a peer exists, the component holds its TX queues
+paused, and `dot11wdi.h` names the reason:
+
+```c
+WDI_TX_PAUSE_REASON_PEER_CREATE = 0x00000002
+```
+
+Which explains something that had been sitting in every trace unread:
+`TxDataSend` had *never fired*, not once, in any log this project has
+collected. That looked like "the component has nothing to send". It was
+"the component has nobody to send it to".
+
+A station has exactly one peer -- the AP -- created at association and
+deleted at disconnect. The id is the **miniport's** to assign:
+`NdisWdiPeerCreateIndication` takes `WDI_PEER_ID` as an input and the
+component uses it verbatim afterwards. Its only constraint is
+`MaxNumPeers` from `TalTxRxStart` (eight here), which the component
+sizes its own per-peer state from.
+
+Create is synchronous and delete is not. `PeerCreateIndication` returns
+`void` with no status: once it returns, the peer exists.
+`PeerDeleteIndication` has an `_Out_ NDIS_STATUS` *and* a matching
+`TalTxRxPeerDeleteConfirmHandler` callback, so a slot is not reusable
+until the confirmation arrives. Read the return type before assuming a
+handshake has one half.
+
+The create runs **before** `CONNECT_COMPLETE`, so the component has
+somewhere to send before it is told it may; the delete runs **before**
+the disassociation, for the mirror-image reason.
+
+### The one contract that is still unread
+
+Finishing the per-frame path needs one fact that `dot11wdi.h` does not
+state. A TX NBL arrives from `NdisWdiTxDequeueIndication` carrying a
+`WDI_FRAME_METADATA` -- the struct is defined, it has a `pNBL`
+back-pointer, and it holds the `WDI_FRAME_ID` that
+`NdisWdiTxSendCompleteIndication` is fed. Nothing says **where on the
+NBL to find it**.
+
+The convention in IHV samples is `MiniportReserved[0]`. But
+`MiniportReserved` is by definition the *miniport's* scratch space,
+which argues the port driver would not keep its own bookkeeping there.
+That is an argument, not a fact, and arguments about undocumented
+contracts are what cost this project the `INDICATION_REQUIRED` build and
+the `MaxCommandSize` round before it.
+
+`wdiwifi.sys` knows: it is both the code that attaches the metadata and
+the code that reads it back at send-complete, so the offset is a
+constant in its disassembly. `dump-wdi-state` pass five now lists the
+`TxDequeue` / `FrameMetadata` / `TxSendComplete` symbols so the next
+round can `uf` the right one — the same move that named port property
+`0x47` and adapter property `0x10`.
 
 Still in the log, and still not acted on:
 

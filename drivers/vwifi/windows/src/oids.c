@@ -67,8 +67,14 @@ VwifiOidSetNeeded(_Inout_ PNDIS_OID_REQUEST Req, _In_ ULONG Needed)
 
 /* The statuses the TLV generator and parser actually return. A bare
  * 0xc0010015 costs a trip to the headers at exactly the moment the log
- * is meant to be answering a question. */
-static PCSTR
+ * is meant to be answering a question.
+ *
+ * External linkage, not static. It was static here and wdi_peer.c
+ * wanted it -- the same shape as the VwifiWdiAckHeaderOnly build break,
+ * where a helper this file happened to own was reached for from another
+ * and the build was the first to say so. A status-name table is not
+ * OID-dispatch's private business. */
+PCSTR
 VwifiNdisStatusName(_In_ NDIS_STATUS Status)
 {
     switch (Status) {

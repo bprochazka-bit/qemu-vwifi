@@ -443,9 +443,23 @@ VwifiConnectOnAssocResult(_Inout_ PVWIFI_ADAPTER Adapter,
     VwifiIndicateAssociationResult(Adapter, res, &task->AssocParams, ies);
 
     if (res->status_code == 0) {
+        WDI_PEER_ID peerId = WDI_PEER_ANY;
+
         task->Associated = TRUE;
         Adapter->Associated = TRUE;
         RtlCopyMemory(Adapter->Bssid, res->bssid, 6);
+
+        /* The AP is now a peer, and this is the moment to say so.
+         *
+         * Before CONNECT_COMPLETE, deliberately. The WDI data path is
+         * addressed by (port, peer, TID) and the component keeps its TX
+         * queues paused on WDI_TX_PAUSE_REASON_PEER_CREATE until a peer
+         * exists -- so a connect completed with no peer is a link the
+         * OS believes is up and cannot send a byte over. Creating the
+         * peer first means the component has somewhere to send to
+         * before it is told it may. */
+        (VOID)VwifiPeerCreate(Adapter, task->WdiPortId, res->bssid,
+                              &peerId);
 
         /* ORDERING: complete the task now, before any EAPOL. See the
          * comment block at the top of this file. */
@@ -471,6 +485,12 @@ VwifiConnectOnDisconnected(_Inout_ PVWIFI_ADAPTER Adapter,
 
     Adapter->Associated = FALSE;
     RtlZeroMemory(Adapter->Bssid, 6);
+
+    /* The peer goes with the association. Indicated before the
+     * disassociation and the link-state change for the same reason the
+     * create runs before CONNECT_COMPLETE: the component should stop
+     * having somewhere to send before it is told the link is down. */
+    VwifiPeerDeleteAll(Adapter);
 
     if (task && task->ConnectPending) {
         /* Disconnected while a connect was still in flight. */

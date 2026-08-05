@@ -190,6 +190,34 @@ typedef struct _VWIFI_PENDING_REQ
 } VWIFI_PENDING_REQ, *PVWIFI_PENDING_REQ;
 
 /* ============================================================
+ * WDI peers
+ *
+ * One entry per peer the WLAN component has been told about. See
+ * wdi_peer.c for what a peer is for and why the id is ours to pick.
+ *
+ * Eight because that is the MaxNumPeers this device's component
+ * reports in TalTxRxStart ("TAL start: max 5 ports, 8 peers"), and a
+ * station needs exactly one. The array is sized to the ceiling and the
+ * runtime value clamps allocation, so a component that reports fewer
+ * cannot be handed an id it has no room for.
+ * ============================================================ */
+#define VWIFI_MAX_PEERS 8
+
+typedef struct _VWIFI_PEER
+{
+    BOOLEAN     InUse;
+    /* Told to the component, not yet confirmed gone. The slot cannot be
+     * reused in this state: the component still has state for it. */
+    BOOLEAN     DeletePending;
+    /* TalTxRxPeerConfigHandler has run, so the component has finished
+     * setting the peer up and data may flow to it. */
+    BOOLEAN     Configured;
+    WDI_PEER_ID PeerId;
+    WDI_PORT_ID WdiPortId;
+    UCHAR       Mac[6];
+} VWIFI_PEER, *PVWIFI_PEER;
+
+/* ============================================================
  * Adapter context
  *
  * Allocated in MiniportWdiAllocateAdapter, freed in
@@ -319,6 +347,21 @@ typedef struct _VWIFI_ADAPTER
      * DISCONNECTED events. Gates the STA data path. */
     BOOLEAN             Associated;
     UCHAR               Bssid[6];
+
+    /* WDI peers. See wdi_peer.c.
+     *
+     * The WDI data path is addressed by (port, peer, TID), never by
+     * port alone, and until the component is told a peer exists its TX
+     * queues stay paused on WDI_TX_PAUSE_REASON_PEER_CREATE. A station
+     * has exactly one peer -- the AP -- but the table is a table
+     * because the ids are ours to assign and the delete is
+     * asynchronous, so a slot outlives the association that made it.
+     *
+     * MaxPeers/MaxPorts come from the component in TalTxRxStart and
+     * bound what may be handed back to it. */
+    VWIFI_PEER          Peers[VWIFI_MAX_PEERS];
+    UINT8               MaxPeers;
+    UINT8               MaxPorts;
 
     /* The periodic heartbeat: a timer this driver owns, and the count
      * of beats it has printed. See VwifiHeartbeatStart in driver.c for
@@ -509,6 +552,10 @@ VOID        VwifiSendWdiIndication(_Inout_ PVWIFI_ADAPTER Adapter,
                                    _In_ UINT32 TransactionId,
                                    _In_reads_bytes_opt_(TlvLength) PVOID TlvBuffer,
                                    _In_ ULONG TlvLength);
+/* oids.c — the NDIS statuses this driver actually sees, by name. For
+ * logs: a bare 0xc0010015 costs a trip to the headers at exactly the
+ * moment the log is meant to be answering a question. */
+PCSTR       VwifiNdisStatusName(_In_ NDIS_STATUS Status);
 ULONG       VwifiRssiToLinkQuality(_In_ CHAR Rssi);
 ULONGLONG   VwifiGetTickCountMs(VOID);
 
@@ -592,6 +639,32 @@ NDIS_STATUS VwifiHandleTaskDisconnect(_Inout_ PVWIFI_ADAPTER Adapter,
 #define VWIFI_TASK_CONNECT_PENDING     0x1
 #define VWIFI_TASK_DISCONNECT_PENDING  0x2
 ULONG       VwifiConnectTaskState(_In_ PVWIFI_ADAPTER Adapter);
+
+/* wdi_peer.c — the WDI peer table.
+ *
+ * VwifiPeerCreate assigns the id and tells the component. Delete is
+ * two-step: VwifiPeerDelete indicates it, and the slot is only
+ * released when the component calls back through
+ * VwifiPeerOnDeleteConfirm. VwifiPeerForgetAll skips both, for
+ * teardown once the data-path API is no longer callable. */
+NDIS_STATUS VwifiPeerCreate(_Inout_ PVWIFI_ADAPTER Adapter,
+                            _In_ WDI_PORT_ID WdiPortId,
+                            _In_reads_bytes_(6) const UCHAR *Mac,
+                            _Out_ WDI_PEER_ID *PeerIdOut);
+VOID        VwifiPeerDelete(_Inout_ PVWIFI_ADAPTER Adapter,
+                            _In_ WDI_PEER_ID PeerId);
+VOID        VwifiPeerDeleteAll(_Inout_ PVWIFI_ADAPTER Adapter);
+VOID        VwifiPeerForgetAll(_Inout_ PVWIFI_ADAPTER Adapter);
+VOID        VwifiPeerOnConfig(_Inout_ PVWIFI_ADAPTER Adapter,
+                              _In_ WDI_PORT_ID PortId,
+                              _In_ WDI_PEER_ID PeerId,
+                              _In_opt_ const WDI_TXRX_PEER_CFG *Cfg);
+VOID        VwifiPeerOnDeleteConfirm(_Inout_ PVWIFI_ADAPTER Adapter,
+                                     _In_ WDI_PORT_ID PortId,
+                                     _In_ WDI_PEER_ID PeerId);
+PVWIFI_PEER VwifiPeerFind(_In_ PVWIFI_ADAPTER Adapter,
+                          _In_ WDI_PEER_ID PeerId);
+PVWIFI_PEER VwifiPeerFirstActive(_In_ PVWIFI_ADAPTER Adapter);
 VOID        VwifiConnectOnAssocResult(_Inout_ PVWIFI_ADAPTER Adapter,
                                       _In_reads_bytes_(PayloadLen) const VOID *Payload,
                                       _In_ ULONG PayloadLen);
