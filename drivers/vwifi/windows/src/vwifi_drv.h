@@ -516,16 +516,17 @@ ULONGLONG   VwifiGetTickCountMs(VOID);
 NDIS_STATUS VwifiHandleTaskChangeOpMode(_Inout_ PVWIFI_ADAPTER Adapter,
                                         _In_ PNDIS_OID_REQUEST Req);
 
-/* Accept a WDI task: write the M2 into the OID's output buffer and
- * complete the OID with NDIS_STATUS_SUCCESS.
+/* Accept a WDI task: write the M2 into the OID's output buffer with a
+ * Status of SUCCESS, and return NDIS_STATUS_INDICATION_REQUIRED as the
+ * OID's own status.
  *
- * Every task handler must return through this rather than a status of
- * its own. Returning NDIS_STATUS_INDICATION_REQUIRED instead --
- * 0x40230001, a plain NDIS status that merely READS like a description
- * of WDI's M1/M2/M3 shape and appears nowhere in WDI itself -- put a
- * non-zero value where the port driver reads the task's outcome, and
- * broke every connect this driver ever attempted. See oids.c for the
- * breakpoint that caught it. */
+ * Those are two different fields and both matter. Every task handler
+ * must return through this rather than a status of its own. Completing
+ * the OID with SUCCESS instead -- tried for one build -- makes wdiwifi
+ * treat the scan as already finished, so it polls an empty BSS cache
+ * ten times and stops merging scan tasks. See oids.c for the
+ * measurement, and for why NDIS_STATUS_PENDING is the next thing to
+ * try. */
 NDIS_STATUS VwifiWdiTaskAccepted(_In_ PNDIS_OID_REQUEST Req);
 
 /* wdi_scan.c — Phase 2 scan task. */

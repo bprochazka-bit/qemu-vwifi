@@ -539,52 +539,69 @@ documents `WDI_TRANSACTION_ID_UNSOLICIT` for every indication except
 contents; `WDI_OPERATION_MODE_STA` being `0x01`; and station and
 interface capabilities field by field.
 
-### A status code that reads like the protocol is not the protocol
+### One breakpoint hit is a sample, not a rule
 
-Every task handler in this driver returned `NDIS_STATUS_INDICATION_REQUIRED`,
-and a long comment explained why: a WDI task is accepted by its OID and
-completed later by an indication, and that status says exactly that.
-The reasoning was tidy, the name fits perfectly, and it was wrong. It
-broke every connect the driver ever attempted.
+Everything still open about the connect failure is a runtime fact, and
+local kernel debugging (`kd -kl`) reads and disassembles but cannot stop
+the machine. QEMU's `-gdb tcp::1234` can. Use `hbreak`, not `break` -- a
+software breakpoint writes `0xCC` into wdiwifi's code, which is exactly
+the kernel modification PatchGuard bugchecks for.
 
-A hardware breakpoint on `wdiwifi!CScanJob::FinishJob`, set from the
-Linux host through QEMU's gdbstub, caught it in one hit:
+The first harness broke on `wdiwifi!CScanJob::FinishJob`, printed one
+hit, and detached:
 
     gate 1  status        = 0x40230001
     gate 2  m_bCancelled  = 0x0
     gate 3  port id       = 0x0
 
-`0x40230001` is `STATUS_NDIS_INDICATION_REQUIRED` -- severity
-informational, facility `0x23` `FACILITY_NDIS`, code 1. It is the value
-the OID handler returned, arriving as the scan job's completion status.
-`FinishJob` writes `WfcPortPropertyGoodScanStartTime` only when that
-status is zero, so the property was never written; without it
-`CConnectJob::CheckAndUpdateCandidates` zeroes the candidate list,
-`CheckAndStartConnectProcess` skips `StartConnectRoamTask`, and
-`OID_WDI_TASK_CONNECT` is never sent. Scanning worked, the network list
-filled, and connecting was refused -- with no connect task ever
-reaching the driver to explain it.
+`0x40230001` is `STATUS_NDIS_INDICATION_REQUIRED`, the value every task
+handler here returns from its OID, and `FinishJob` writes
+`WfcPortPropertyGoodScanStartTime` only when its status argument is
+zero. That much is real: the OID's return value does reach that gate.
 
-The tell was available the whole time and cost nothing to check:
+The conclusion drawn from it -- "so the property is never written, which
+is why the connect is refused" -- was not. One hit cannot establish
+"never": `FinishJob` runs more than once per job, and the call driven by
+our `SCAN_COMPLETE` indication, the one that would carry status 0, was
+not in the sample. **A single-shot breakpoint answers "does this
+happen", never "is this all that happens".**
 
-    grep -i INDICATION_REQUIRED dot11wdi.h WABIModel.xml wditypes.hpp
+Completing the OID with `NDIS_STATUS_SUCCESS` instead settled it, and
+settled it against. Same guest, same profile, one value different:
 
-returns nothing. WDI expresses "an indication follows" *structurally* --
-by defining a task's `FromIhv` message as a bare header and its
-completion as a separate indication -- and never as a status code. A
-constant whose name describes your protocol, but which your protocol's
-own headers never mention, belongs to some other contract.
+| OID return | driver's own debugcon trace |
+| --- | --- |
+| `INDICATION_REQUIRED` | one `GET_BSS_ENTRY_LIST` after `SCAN_COMPLETE`; `SCAN_COMPLETE` "for 3 task(s)" -- merged |
+| `SUCCESS` | **ten** `GET_BSS_ENTRY_LIST` in 80 ms, all *before* `SCAN_COMPLETE`, every one answered "cache is empty"; `SCAN_COMPLETE` "for 1 task(s)", never merged |
 
-Correct shape for a WDI task: complete the OID with
-`NDIS_STATUS_SUCCESS`, write the `WDI_MESSAGE_HEADER` into its output
-buffer as the M2, and send the outcome later as the M3 indication.
+`SUCCESS` makes wdiwifi believe the scan finished the moment the OID
+completed: it polls for results that do not exist yet and stops holding
+scan tasks open. Our M3 then arrives 1.6 s later for a job the port
+driver has already closed. And the connect still failed -- so it fixed
+nothing and broke the scan job's lifetime.
 
-Two notes on getting the breakpoint. Local kernel debugging (`kd -kl`)
-reads and disassembles but cannot stop the machine, which is why this
-took so long to find by reading alone; QEMU's `-gdb tcp::1234` can, and
-`scripts/gdb-wdi-finishjob.sh` drives it. Use `hbreak`, not `break` --
-a software breakpoint writes `0xCC` into wdiwifi's code, which is
-exactly the kernel modification PatchGuard bugchecks for.
+Which makes the result more interesting than a plain no. Under `SUCCESS`
+gate 1 reads 0 and gates 2 and 3 had already passed, so the good-scan
+property should have been written and the connect should have gone
+ahead. It did not. Either the property is still not written, or it is
+not the only thing the connect job is waiting on.
+
+There is a third reading of the same evidence, and it is the one to test
+next: `NDIS_STATUS_PENDING`, with a later `NdisMOidRequestComplete`.
+That keeps the job open the way `INDICATION_REQUIRED` does *and*
+completes it with a zero status the way `SUCCESS` does -- the pair of
+properties no single return value can carry.
+
+`scripts/gdb-wdi-connect.sh` is what decides it. It replaces the
+single-shot script, stays attached, and prints every hit at four points:
+`CScanJob::FinishJob`, the store inside
+`CConnectJob::CheckAndUpdateCandidates` that discards the candidate
+list, the compare in `CheckAndStartConnectProcess` that reads the count,
+and `StartConnectRoamTask` itself. Four is also the ceiling -- hardware
+breakpoints use the four x86 debug registers.
+
+`dump-wdi-state.cmd` prints the whole command line, addresses filled in.
+They are valid for one boot; wdiwifi is relocated on every reboot.
 
 ### When the driver log is silent, the problem is above the driver
 

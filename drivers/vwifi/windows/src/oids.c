@@ -468,58 +468,90 @@ VwifiHandleSetAdapterConfiguration(_Inout_ PVWIFI_ADAPTER Adapter,
     return VwifiWdiAckHeaderOnly(Req, NDIS_STATUS_SUCCESS);
 }
 
-/* Accept a task: write the M2, complete the OID with SUCCESS.
+/* Accept a task: write the M2, return NDIS_STATUS_INDICATION_REQUIRED.
  *
- * SUCCESS, not NDIS_STATUS_INDICATION_REQUIRED. This file used to
- * assert the opposite at length -- that a task "is accepted by the OID
- * and completed by an indication", that INDICATION_REQUIRED is how a
- * miniport says exactly that, and that SUCCESS would be a double
- * completion. Every word of that was reasoning about what the status
- * name sounds like. It was wrong, and it cost this driver its connect
- * path for the entire life of the project.
+ * A task acknowledgement has two independent status fields and this
+ * function used to conflate them:
  *
- * A hardware breakpoint on wdiwifi!CScanJob::FinishJob, taken from the
- * host through QEMU's gdbstub, caught it:
+ *   the M2 header's Status   what the port driver reads out of the
+ *                            output buffer. SUCCESS: the request was
+ *                            understood.
+ *   the OID's return value   what MiniportOidRequest hands back to
+ *                            NDIS. INDICATION_REQUIRED: accepted, the
+ *                            outcome follows as the M3.
+ *
+ * VwifiWdiAckHeaderOnly only writes the first. It ALWAYS returns
+ * NDIS_STATUS_SUCCESS, whatever it was passed, so the OID's return
+ * value has to be stated separately -- which is why this reads as two
+ * statements rather than one `return`.
+ *
+ * The previous build returned SUCCESS from both. That came from a
+ * hardware breakpoint on wdiwifi!CScanJob::FinishJob, taken from the
+ * host through QEMU's gdbstub:
  *
  *   gate 1  status        = 0x40230001
  *   gate 2  m_bCancelled  = 0x0
  *   gate 3  port id       = 0x0
  *
- * 0x40230001 is STATUS_NDIS_INDICATION_REQUIRED -- severity
- * informational, facility 0x23 FACILITY_NDIS, code 1. It is the value
- * this function returned, arriving as the scan job's completion status.
- * FinishJob writes WfcPortPropertyGoodScanStartTime only when that
- * status is zero:
+ * 0x40230001 is STATUS_NDIS_INDICATION_REQUIRED, and FinishJob writes
+ * WfcPortPropertyGoodScanStartTime only when its status argument is
+ * zero:
  *
- *   +0x98  test ebp,ebp / jne skip          <- fails here, always
+ *   +0x98  test ebp,ebp / jne skip
  *   +0xa6  cmp byte ptr [rbx+78Ah],bpl
  *   +0xd2  SetPropertyBuffer(cache, 0x47, 8, &startTime)
  *
- * and without that property CConnectJob::CheckAndUpdateCandidates
- * zeroes the candidate list, CheckAndStartConnectProcess skips
- * StartConnectRoamTask, and OID_WDI_TASK_CONNECT is never sent. Which
- * is precisely the symptom: scanning works, the network list fills, and
- * connecting is refused with no task ever reaching this driver.
+ * That sample is real and it does prove the OID's return value reaches
+ * that gate. What it does not prove is that this is the only FinishJob
+ * call for the job: the harness detached after the FIRST hit, so the
+ * scan's real completion -- driven by our M3, and the one that would
+ * carry status 0 -- was never in the sample.
  *
- * The name was the trap. NDIS_STATUS_INDICATION_REQUIRED is a plain
- * NDIS status that reads like a description of WDI's own M1/M2/M3
- * shape, and it appears NOWHERE in WDI -- not in dot11wdi.h, not in
- * WABIModel.xml, not in wditypes.hpp. WDI says "an indication follows"
- * structurally, by defining a task's FromIhv message as a bare header
- * and its completion as a separate indication. There was never a status
- * code carrying that meaning, and inventing one put a non-zero value
- * where the port driver reads success.
+ * Returning SUCCESS settled it, against. The driver's own debugcon
+ * trace, same guest, same profile, differing only in this value:
  *
- * So the M2 is the whole acknowledgement: the OID completes with
- * SUCCESS, and its output buffer carries the WDI_MESSAGE_HEADER that
- * WABIModel defines for every task --
+ *   INDICATION_REQUIRED   one GET_BSS_ENTRY_LIST after SCAN_COMPLETE
+ *                         SCAN_COMPLETE "for 3 task(s)" -- merged
+ *   SUCCESS               TEN GET_BSS_ENTRY_LIST in 80 ms, all BEFORE
+ *                         SCAN_COMPLETE, all answered "cache is empty"
+ *                         SCAN_COMPLETE "for 1 task(s)", never merged
+ *
+ * SUCCESS makes wdiwifi believe the scan finished the instant the OID
+ * completed: it polls for results that do not exist yet and stops
+ * holding scan tasks open, which is why they stop merging. Our M3 then
+ * arrives 1.6 s later for a job the port driver has already closed. And
+ * the connect still failed -- so SUCCESS fixed nothing and broke the
+ * scan job's lifetime.
+ *
+ * That is also the interesting part of the result. Under SUCCESS gate 1
+ * reads 0 and gates 2 and 3 already passed, so the good-scan property
+ * should have been written on that early FinishJob and the connect
+ * should have gone ahead. It did not. Either the property is still not
+ * written, or it is not the only thing the connect job is waiting on.
+ *
+ * Which leaves a third reading of the same evidence, and it is the one
+ * to test next: the right answer may be neither, but plain
+ * NDIS_STATUS_PENDING with a later NdisMOidRequestComplete. PENDING
+ * keeps the job open the way INDICATION_REQUIRED does, and completes it
+ * with a status of 0 the way SUCCESS does, which is exactly the pair of
+ * properties no single-value return can give. It is not being changed
+ * in the same build as this revert -- two variants at once and neither
+ * result can be attributed.
+ *
+ * scripts/gdb-wdi-connect.sh is what decides it. It stays attached and
+ * prints EVERY hit, so one run says whether FinishJob is called a
+ * second time with status 0 under INDICATION_REQUIRED. If it is not,
+ * PENDING is the answer.
+ *
+ * The M2 itself is unchanged and not in doubt. WABIModel gives every
+ * task a FromIhv message --
  *
  *   <message commandId="WDI_TASK_SCAN" type="WDI_SCAN_RESULTS"
  *            description="No TLV data needed, header is sufficient"
  *            direction="FromIhv" />
  *
  * -- where "header is sufficient" means the header is required, not
- * that nothing is. The task's real outcome travels later, in the M3.
+ * that nothing is.
  *
  * Callers `return VwifiWdiTaskAccepted(Req)` rather than calling it and
  * returning a status of their own, so the next task handler cannot
@@ -528,7 +560,13 @@ VwifiHandleSetAdapterConfiguration(_Inout_ PVWIFI_ADAPTER Adapter,
 NDIS_STATUS
 VwifiWdiTaskAccepted(_In_ PNDIS_OID_REQUEST Req)
 {
-    return VwifiWdiAckHeaderOnly(Req, NDIS_STATUS_SUCCESS);
+    /* Two statements, not one `return`. The M2's own Status stays
+     * SUCCESS -- "the request was understood" -- and
+     * VwifiWdiAckHeaderOnly writes only that: it ALWAYS returns
+     * NDIS_STATUS_SUCCESS whatever it is passed. The OID's own return
+     * value is a separate field and has to be stated separately. */
+    (VOID)VwifiWdiAckHeaderOnly(Req, NDIS_STATUS_SUCCESS);
+    return NDIS_STATUS_INDICATION_REQUIRED;
 }
 
 /* ============================================================

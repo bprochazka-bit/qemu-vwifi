@@ -792,50 +792,108 @@ if ($wdiState) {
     # port driver's state machine forward, so plain NdisMIndicateStatusEx
     # does reach the task machinery).
     #
-    # So this pass no longer reads state. It prints the one number
-    # needed to set a breakpoint from outside the guest, using QEMU's
-    # gdbstub -- see scripts/gdb-wdi-finishjob.sh. At FinishJob's first
-    # instruction every gate input is still in a register or reachable
-    # from rcx, so one hit answers all three at once.
+    # ONE breakpoint was not enough, and the way it was not enough is
+    # worth recording. The first host-side harness broke on FinishJob,
+    # printed one hit and detached. It reported status 0x40230001,
+    # STATUS_NDIS_INDICATION_REQUIRED -- the driver's own task return
+    # value -- and that was read as "gate 1 fails, always". A single
+    # sample cannot say "always": FinishJob runs more than once per job,
+    # and the call driven by our SCAN_COMPLETE indication was never in
+    # it. Acting on that reading cost a build and broke the scan job's
+    # lifetime, without touching the connect failure.
+    #
+    # So this pass prints FOUR addresses, and the harness that consumes
+    # them stays attached and reports every hit:
+    #
+    #   CScanJob::FinishJob                       is the property
+    #                                             written, and on which
+    #                                             call
+    #   CConnectJob::CheckAndUpdateCandidates     +0x317, the store that
+    #                                             discards the list
+    #   CConnectJob::CheckAndStartConnectProcess  +0x1a3, the compare
+    #                                             that reads the count
+    #   CConnectJob::StartConnectRoamTask         did the connect task
+    #                                             go out at all
+    #
+    # Four is also the ceiling: they have to be hardware breakpoints
+    # (a software one writes 0xCC into wdiwifi and PatchGuard bugchecks
+    # for that) and x86 has four debug registers.
     #
     # One command per kd invocation. The previous batched pass hung:
     # `x ndis!*Wdi*` derailed kd's parser, it echoed the whole -c string
     # back as an unresolved symbol, and sat at a prompt forever with the
     # script blocked behind it. Split, a bad command costs only itself.
-    Write-Host '[4/5] Locating the breakpoint'
+    Write-Host '[4/5] Locating the breakpoints'
     $log4 = Join-Path $OutDir 'wdi-state-decide.txt'
+
+    # Ordered, because the composed command line below reads them back
+    # by name and the order it prints them in should be stable.
+    $wanted = [ordered]@{
+        'CScanJob::FinishJob'                      = '--finish-job'
+        'CConnectJob::CheckAndUpdateCandidates'    = '--update-candidates'
+        'CConnectJob::CheckAndStartConnectProcess' = '--start-connect'
+        'CConnectJob::StartConnectRoamTask'        = '--roam-task'
+    }
+
+    # Built up rather than written as one parenthesised expression: a
+    # comment between a line-trailing `+` and its operand is legal but
+    # not worth relying on in a script nobody can syntax-check on the
+    # host it is written on.
+    $cmds4 = @('lm vm wdiwifi')
+    foreach ($name in $wanted.Keys) { $cmds4 += "x wdiwifi!$name" }
+    # The M3's own landing point. If FinishJob turns out never to be
+    # called a second time, this is the function that received the
+    # SCAN_COMPLETE and decided not to finish the job, and it is where
+    # the next disassembly starts.
+    $cmds4 += 'x wdiwifi!CScanJob::CompleteScanTask'
+
     $out4 = Invoke-KdEach -Kd $kd -Sym $sym -LogFile $log4 `
-                          -Prologue '.reload /f wdiwifi.sys' -Commands @(
-        'lm vm wdiwifi',
-        'x wdiwifi!CScanJob::FinishJob',
-        'x wdiwifi!CScanJob::StartScanTask',
-        'x wdiwifi!CConnectJob::CheckAndUpdateCandidates'
-    )
+                          -Prologue '.reload /f wdiwifi.sys' -Commands $cmds4
     Write-Host "      $log4 ($($out4.Count) lines)"
 
-    # Say something either way. A silent no-op here reads exactly like a
-    # pass that worked, which is how the last two rounds were lost.
-    $addr = $null
-    foreach ($l in $out4) {
-        if ($l -match '^(fffff[0-9a-f`]+)\s+wdiwifi!CScanJob::FinishJob') {
-            $addr = $Matches[1] -replace '`',''
-            break
+    # kd prints `fffff804`505d02bc wdiwifi!Sym (private: void ...)`.
+    # The tick is kd's 32-bit grouping separator and has to come out
+    # before anything else can use the number.
+    function Get-KdSymbol {
+        param([string[]] $Lines, [string] $Name)
+        $rx = '^([0-9a-f`]{8,})\s+wdiwifi!' + [regex]::Escape($Name) + '\b'
+        foreach ($l in $Lines) {
+            $m = [regex]::Match($l, $rx)
+            if ($m.Success) { return '0x' + ($m.Groups[1].Value -replace '`','') }
         }
+        return $null
     }
+
+    # Say something either way. A silent no-op here reads exactly like a
+    # pass that worked, which is how two rounds were lost.
+    $found   = [ordered]@{}
+    $missing = @()
+    foreach ($name in $wanted.Keys) {
+        $a = Get-KdSymbol -Lines $out4 -Name $name
+        if ($a) { $found[$name] = $a } else { $missing += $name }
+    }
+
     Write-Host ''
-    if ($addr) {
-        Write-Host '      BREAKPOINT ADDRESS'
-        Write-Host "        wdiwifi!CScanJob::FinishJob = 0x$addr"
+    if ($found.Count -gt 0) {
+        Write-Host '      BREAKPOINT ADDRESSES (this boot only -- wdiwifi relocates)'
+        foreach ($name in $found.Keys) {
+            Write-Host ("        {0,-42} {1}" -f $name, $found[$name])
+        }
         Write-Host ''
         Write-Host '      On the Linux host, with the guest started with -gdb tcp::1234:'
-        Write-Host "        scripts/gdb-wdi-finishjob.sh 0x$addr"
         Write-Host ''
-        Write-Host '      Then trigger a scan in the guest. Valid for THIS BOOT only.'
-    } else {
-        Write-Warning 'could not find CScanJob::FinishJob in the pass-four output.'
-        Write-Warning "Look in $log4 for a line like"
+        $parts = @()
+        foreach ($name in $found.Keys) { $parts += ("{0} {1}" -f $wanted[$name], $found[$name]) }
+        Write-Host ("        scripts/gdb-wdi-connect.sh " + ($parts -join ' '))
+        Write-Host ''
+        Write-Host '      Then attempt the connection in the guest. Ctrl-C, then'
+        Write-Host '      "detach" and "quit", once it has failed.'
+    }
+    if ($missing.Count -gt 0) {
+        Write-Warning ("not found in the pass-four output: " + ($missing -join ', '))
+        Write-Warning "Look in $log4 for lines like"
         Write-Warning '  fffff804`505d02bc wdiwifi!CScanJob::FinishJob (private: void ...)'
-        Write-Warning 'and pass that address to scripts/gdb-wdi-finishjob.sh by hand.'
+        Write-Warning 'and pass those addresses to scripts/gdb-wdi-connect.sh by hand.'
         Write-Warning 'If instead it says "Couldnt resolve x wdiwifi", the module'
         Write-Warning 'symbols did not load and the .reload prologue is not working.'
     }
@@ -851,6 +909,6 @@ Write-Host '[5/5] Done'
 Write-Host "      $log1 ($($out1.Count) lines)"
 Write-Host "      $log2 ($($out2.Count) lines)"
 Write-Host ''
-Write-Host '      wdi-state-decide.txt holds the breakpoint address. The remaining'
-Write-Host '      question is a runtime one and needs a break at'
-Write-Host '      CScanJob::FinishJob -- see scripts/gdb-wdi-finishjob.sh.'
+Write-Host '      wdi-state-decide.txt holds the breakpoint addresses. What is'
+Write-Host '      left is a runtime question and needs the guest stopped, which'
+Write-Host '      local KD cannot do -- see scripts/gdb-wdi-connect.sh.'
