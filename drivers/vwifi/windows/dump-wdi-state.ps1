@@ -245,6 +245,29 @@ function Get-ShortPath {
     return $Path
 }
 
+# One native argument, quoted so the CRT puts it back together as one.
+#
+# Start-Process -ArgumentList takes EITHER an array, which it joins with
+# spaces and does NOT quote, or a single string used verbatim. The array
+# form turned
+#
+#   -c ".load ...;.chain;!ndiskd.miniports"
+#
+# into a bare `-c .load ...` followed by loose words, and kd answered
+# with its usage text. PowerShell's call operator (& exe @args) quotes
+# each element itself, which is why the previous version worked and why
+# this one has to do the quoting by hand.
+function ConvertTo-QuotedArg {
+    param([Parameter(Mandatory)][AllowEmptyString()][string] $Value)
+    # A trailing backslash immediately before the closing quote is read
+    # as an escaped quote, which would swallow it and everything after.
+    $v = $Value -replace '\\+$',''
+    if ($v -match '"') {
+        throw "cannot pass an argument containing a double quote: $v"
+    }
+    return '"' + $v + '"'
+}
+
 function Invoke-Kd {
     param(
         [Parameter(Mandatory)][string] $Kd,
@@ -257,37 +280,61 @@ function Invoke-Kd {
     # -kl local kernel debug, and a trailing q so the session exits
     # instead of sitting at a prompt no one is at.
     #
-    # -logo truncates, -loga appends. Appending is what lets a pass be
+    # -logo truncates, -loga appends. Appending is what lets one pass be
     # split across several kd invocations into one readable file.
     $logSwitch = if ($Append) { '-loga' } else { '-logo' }
 
-    # Run it under a timeout, because kd does not always take the
-    # trailing q.
-    #
-    # A single malformed command is enough: `x ndis!*Wdi*` left the
-    # session echoing the whole -c string back as an unresolved symbol
-    # and then waiting at a prompt forever, with the script blocked on a
-    # process that was never going to exit. A dump tool that can hang
-    # the machine it is diagnosing is worse than one that returns
-    # nothing, so it now gets killed and says so.
-    $proc = Start-Process -FilePath $Kd -PassThru -NoNewWindow -ArgumentList @(
-        '-kl','-y',$Sym,$logSwitch,$LogFile,'-c',"$Commands;q")
+    $argLine = @(
+        '-kl',
+        '-y',       (ConvertTo-QuotedArg $Sym),
+        $logSwitch, (ConvertTo-QuotedArg $LogFile),
+        '-c',       (ConvertTo-QuotedArg "$Commands;q")
+    ) -join ' '
+
+    # kd's console output goes to a file beside the log rather than the
+    # screen: it duplicates the log and would bury the progress lines.
+    # It is kept because it is the ONLY place a failure to start shows
+    # up -- kd printing its usage text writes no log at all, so an empty
+    # log plus a console capture is how that gets diagnosed instead of
+    # looking like a debugger that found nothing.
+    $conFile = "$LogFile.console.txt"
+
+    # Under a timeout, because kd does not always take the trailing q.
+    # One malformed command is enough: `x ndis!*Wdi*` left the session
+    # echoing the whole -c string back as an unresolved symbol and
+    # waiting at a prompt forever, with the script blocked on a process
+    # that was never going to exit. A dump tool that can hang the
+    # machine it is diagnosing is worse than one that returns nothing.
+    $proc = Start-Process -FilePath $Kd -PassThru -NoNewWindow `
+                          -RedirectStandardOutput $conFile `
+                          -ArgumentList $argLine
     if (-not $proc.WaitForExit($TimeoutSec * 1000)) {
         Write-Warning "kd did not exit within ${TimeoutSec}s -- killing it."
-        Write-Warning 'Whatever it managed to write is still in the log.'
+        Write-Warning "  command: $Commands"
+        Write-Warning '  whatever it managed to write is still in the log.'
         try { $proc.Kill() } catch { }
         try { $proc.WaitForExit(5000) | Out-Null } catch { }
     }
-    if (Test-Path $LogFile) { return Get-Content $LogFile }
-    return @()
+
+    if ((-not (Test-Path $LogFile)) -or ((Get-Item $LogFile).Length -eq 0)) {
+        Write-Warning 'kd wrote no log. Its console output was:'
+        if (Test-Path $conFile) {
+            Get-Content $conFile -TotalCount 15 | ForEach-Object { Write-Warning "  $_" }
+        } else {
+            Write-Warning '  (nothing)'
+        }
+        Write-Warning "  argument line was: $argLine"
+        return @()
+    }
+    return Get-Content $LogFile
 }
 
 # Run commands one kd invocation at a time, appending to one log.
 #
-# Slower than a single `;`-joined string, and worth it wherever a
+# Slower than a single ';'-joined string, and worth it wherever a
 # command might not come back: one that hangs or derails the parser
 # takes down only itself, and every command before it is already on
-# disk. Used for exploratory passes; the settled ones stay batched.
+# disk. Used for exploratory passes; settled ones stay batched.
 function Invoke-KdEach {
     param(
         [Parameter(Mandatory)][string]   $Kd,
