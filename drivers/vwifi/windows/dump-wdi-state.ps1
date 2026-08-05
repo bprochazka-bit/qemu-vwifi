@@ -573,37 +573,54 @@ if ($wdiState) {
     ) -join ';')
     Write-Host "      $log3 ($($out3.Count) lines)"
 
-    # Pass four: the decision itself.
+    # Pass four: what happens after the candidate is chosen.
     #
-    # The last round read the whole decision down to one call.
+    # Candidate selection is now read end to end and it WORKS.
     #
-    # CheckAndUpdateCandidates calls PickCandidates and branches on the
-    # return: zero goes to the success path, which sets roamOccured and
-    # then, if the candidate count is zero, writes roamDebugCode = 5
-    # (NoCandidatesFound). Non-zero logs WPP id 0x96 at level 2 with the
-    # status as an argument and leaves immediately.
+    # FindMatchingBSSEntriesForConnect has exactly two failure returns:
+    # 0xC001001B when no port in m_pPortList[0..4] has a m_WfcPortType
+    # matching the list manager's m_PortType, and 0xC000000D when the
+    # criteria or the count pointer is null. Both leave before *pCount
+    # is ever written. Every other path falls through to
     #
-    # PickCandidates itself is a wrapper. It builds the criteria on the
-    # stack, picks m_ExtStaBSSList, presets the candidate capacity to
-    # 0x28, calls CBSSListManager::FindMatchingBSSEntriesForConnect,
-    # copies the resulting count into roamTraceLoggingData+0x44 --
-    # bssCandidateCount -- and returns that function's status unchanged.
+    #     mov [r15],ebx        ; *pCount = matched
+    #     ...
+    #     mov eax,r12d         ; r12d still 0
     #
-    # Our dump has bssCandidateCount 1 with roamOccured false and
-    # roamDebugCode NotSet. One entry matched, and the success path that
-    # would have set roamOccured did not run. So the matcher found our
-    # BSS *and returned a failure status anyway*, and that status is the
-    # only number left to read.
+    # and returns SUCCESS. So bssCandidateCount 1 is proof the matcher
+    # succeeded: the count is only written on the path that returns 0.
+    # CBSSEntry::IsMatchingBssEntryForConnect accepted our entry,
+    # CalculateRank scored it, qsort ordered it.
     #
-    # Hence: disassemble the matcher, and list CBSSListManager's methods
-    # in case the failure is in something it calls.
+    # Which also disposes of the two fields this was chasing.
+    # bestCandidateRank is written at CheckAndUpdateCandidates+0x4c0 and
+    # roamAPRankIndex on the roam paths, both inside a block guarded by
+    # roamConfigFlags bit 8, RC_CHECK_GOOD_ENOUGH_AP. Our flags are
+    # 0x2021, bit 8 clear, so the block is skipped and both fields stay
+    # at their initial 0 and 0xffffffff. They were never symptoms; a
+    # first-time connect simply does not fill them in.
+    #
+    # roamOccured false is not evidence either. It is set on the success
+    # path, but every dump is taken well after the attempt and a later
+    # CRoamReconnectJob::Initialize re-stamps the struct -- which is why
+    # connectTrigger and roamConfigFlags are populated in a dump whose
+    # timestamps predate the scan sitting next to them.
+    #
+    # What is left, and is not explainable this way, is
+    # connectRoamTaskStartTime 0: the task that would issue
+    # OID_WDI_TASK_CONNECT never started, with a ranked candidate in
+    # hand. So the failure is downstream of selection, in the job step
+    # machine. List CConnectJob's methods -- the names are the steps --
+    # and disassemble the three routines that drive them.
     Write-Host '[4/6] Reading the decision'
     $log4 = Join-Path $OutDir 'wdi-state-decide.txt'
     $out4 = Invoke-Kd -Kd $kd -Sym $sym -LogFile $log4 -Commands (@(
         '.reload /f wdiwifi.sys',
-        'x wdiwifi!CBSSListManager::*',
-        'x wdiwifi!*MatchingBSS*',
-        'uf wdiwifi!CBSSListManager::FindMatchingBSSEntriesForConnect'
+        'x wdiwifi!CConnectJob::*',
+        'x wdiwifi!CConnectHelpers::*',
+        'uf wdiwifi!CRoamReconnectJob::StartConnectJob',
+        'uf wdiwifi!CRoamReconnectJob::OnJobStepCompleted',
+        'uf wdiwifi!CRoamReconnectJob::CompleteConnectJob'
     ) -join ';')
     Write-Host "      $log4 ($($out4.Count) lines)"
 
@@ -618,15 +635,29 @@ if ($wdiState) {
     # local kernel debugger can read directly.
     #
     # Without TMF files the entries come out as raw ids and arguments,
-    # which is enough: id 0x96 is the PickCandidates failure and its
-    # argument is the status.
+    # which is enough -- every branch worth distinguishing logs a
+    # different id, and the interesting ones carry their status as an
+    # argument.
+    #
+    # .reload FIRST. The previous attempt answered "unable to find
+    # [wdiwifi] in module list hr=0x80070057" with the extension's own
+    # hint being "try .reload": rcdrkd resolves the module by name
+    # against the debugger's list, and this is a separate kd invocation
+    # from the one where wdiwifi was reloaded.
+    #
+    # The other complaint that run, "Driver is not built with autologger
+    # support", is about WppRecorder!_WPP_AUTOLOG_GLOBALS -- the
+    # system-wide autolog. It is not the per-driver recorder buffer and
+    # does not mean there is nothing to read.
     Write-Host '[5/6] Dumping wdiwifi''s WPP recorder'
     $log5 = Join-Path $OutDir 'wdi-state-wpp.txt'
     $out5 = Invoke-Kd -Kd $kd -Sym $sym -LogFile $log5 -Commands (@(
+        '.reload /f wdiwifi.sys',
+        'lm vm wdiwifi',
         $loadRcdrkd,
-        '.chain',
         '!rcdrkd.rcdrloglist',
-        '!rcdrkd.rcdrlogdump wdiwifi'
+        '!rcdrkd.rcdrlogdump wdiwifi',
+        '!rcdrkd.rcdrlogdump wdiwifi.sys'
     ) -join ';')
     Write-Host "      $log5 ($($out5.Count) lines)"
 } else {
