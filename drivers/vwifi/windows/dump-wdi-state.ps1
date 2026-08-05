@@ -634,29 +634,57 @@ if ($wdiState) {
     # Everything else -- the beacon, the ranking, the matching -- was
     # never the problem.
     #
-    # What is left is to name property 0x47 and find out why it is
-    # unreadable. The cache entry itself carries Name, Type and
-    # IsPopulated, so read index 0x47 directly, with its neighbours as a
-    # stride check (Name should equal the index). Disassemble
-    # GetPropertyBuffer for the exact condition behind 0xC0000184, and
-    # sweep for whatever enum names these properties.
+    # Property 0x47 is simply NOT POPULATED:
+    #
+    #   [0x45] Name 0x45  WfcPropertyTypeVariableBuffer  IsPopulated true
+    #   [0x46] Name 0x00  WfcPropertyTypeInvalid         IsPopulated false
+    #   [0x47] Name 0x00  WfcPropertyTypeInvalid         IsPopulated false
+    #   [0x48] Name 0x48  WfcPropertyTypeBoolean         IsPopulated true
+    #   [0x49] Name 0x00  WfcPropertyTypeInvalid         IsPopulated false
+    #
+    # Name equals the index wherever a slot is populated and is zero
+    # where it is not, so the stride and the index are both right, and
+    # the table is sparse -- a slot is filled in only when something
+    # sets that property.
+    #
+    # GetPropertyBuffer is a thin wrapper:
+    #
+    #   r9b = 1;  [rsp+20] = &entry
+    #   call GetPropertyEntryForPropertyName
+    #   test eax,eax / jne ret            ; failure returns verbatim
+    #   *pLength = entry->BufferProperty.m_CurrentBufferLength
+    #   *pBuffer = entry->BufferProperty.m_PropertyBuffer
+    #
+    # so the 0xC0000184 that decides this comes straight out of
+    # GetPropertyEntryForPropertyName. Disassembling it is what turns
+    # "0x47 is unpopulated" into "an unpopulated property is exactly
+    # what returns STATUS_INVALID_DEVICE_STATE" -- without that, the
+    # chain still has a guess in it.
+    #
+    # And the property needs a name. The symbol sweep turned up
+    # CPortPropertyCache::AddCiphersToSupportedList taking a
+    # _WFC_ADAPTER_PROPERTY_NAME, so these enums exist as types; `x`
+    # could never have found them because it searches symbols, not
+    # types. dt can.
+    #
+    # The whole table goes out as raw bytes too. At 0x38 per entry and
+    # m_PropertyNameMax 0x86 that is 7504 bytes, and Name/Type/
+    # IsPopulated sit in the first nine of each -- enough to list every
+    # property this port has and every one it does not, which is the
+    # difference between fixing 0x47 and fixing whatever else is
+    # missing alongside it.
     Write-Host '[4/5] Reading the decision'
     $log4 = Join-Path $OutDir 'wdi-state-decide.txt'
     $pt   = "($a)->m_pPortList[0]->m_PortPropertyCache.m_PropertyTable"
     $out4 = Invoke-Kd -Kd $kd -Sym $sym -LogFile $log4 -Commands (@(
         '.reload /f wdiwifi.sys',
-        'dt wdiwifi!_WFC_PROPERTY_ENTRY',
-        'dt wdiwifi!_WFC_PROPERTY_TYPE',
-        "dx -r2 ($pt)[0x45]",
-        "dx -r2 ($pt)[0x46]",
-        "dx -r2 ($pt)[0x47]",
-        "dx -r2 ($pt)[0x48]",
-        "dx -r2 ($pt)[0x49]",
-        'uf wdiwifi!CPropertyCache::GetPropertyBuffer',
-        'x wdiwifi!CPropertyCache::*',
-        'x wdiwifi!CPortPropertyCache::*',
-        'x wdiwifi!*PropertyName*',
-        'x wdiwifi!*WFC_PORT_PROPERTY*'
+        'dt wdiwifi!_WFC_PORT_PROPERTY_NAME',
+        'dt wdiwifi!_WFC_ADAPTER_PROPERTY_NAME',
+        'dt wdiwifi!_WFC_PROPERTY_NAME',
+        'uf wdiwifi!CPropertyCache::GetPropertyEntryForPropertyName',
+        "db @@c++($pt) L0n7504",
+        "dx -r1 ($a)->m_pPortList[0]->m_PortPropertyCache",
+        "dx -r1 ($a)->m_AdapterPropertyCache"
     ) -join ';')
     Write-Host "      $log4 ($($out4.Count) lines)"
 } else {
@@ -671,6 +699,6 @@ Write-Host '[5/5] Done'
 Write-Host "      $log1 ($($out1.Count) lines)"
 Write-Host "      $log2 ($($out2.Count) lines)"
 Write-Host ''
-Write-Host '      Send wdi-state-decide.txt. The connect job throws away its own'
-Write-Host '      candidate list when port property 0x47 will not read; this names'
-Write-Host '      that property and shows why it fails.'
+Write-Host '      Send wdi-state-decide.txt. Port property 0x47 is unpopulated,'
+Write-Host '      and that is what makes the connect job discard its candidates.'
+Write-Host '      This names the property and lists every other one the port has.'
