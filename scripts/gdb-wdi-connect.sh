@@ -142,6 +142,7 @@ UPDATE_CANDIDATES=
 START_CONNECT=
 ROAM_TASK=
 TLV_STAGES=
+TLV_LIMIT=
 ROAM_STATUS=
 AT_LABELS=()
 AT_ADDRS=()
@@ -177,6 +178,19 @@ OFF_TLV_FITTED=0x1ee
 OFF_TLV_MSGLEN=0xD0       # dword, relative to rbp
 OFF_TLV_MSGBUF=0x50       # qword, relative to rsp
 
+# The instruction right after GetPropertyULongOrDefault(cache, 0x10, -1)
+# returns, so eax is still the size limit about to be handed to
+# FitMessageToBufferSize:
+#
+#   +0x14d  lea  edx,[rbx-24h]        ; 0x10, the property name
+#   +0x150  call CPropertyCache::GetPropertyULongOrDefault
+#   +0x155  mov  edx,[rbp+0D0h]       <- eax is the limit
+#
+# The default is 0xFFFFFFFF, so an unpopulated property reads as "no
+# limit" and 0xFFFFFFFF here means the size is not what is being
+# rejected.
+OFF_TLV_LIMIT=0x155
+
 # CConnectJob::StartConnectRoamTask's epilogue, `mov eax,ebx`. ebx is
 # the status the whole function is about to return -- 0 on success, and
 # on failure whichever of Task::Initialize, get_TaskDeviceCommand,
@@ -196,6 +210,7 @@ while [[ $# -gt 0 ]]; do
         --start-connect)     START_CONNECT="${2:-}";     shift 2 ;;
         --roam-task)         ROAM_TASK="${2:-}";         shift 2 ;;
         --tlv-stages)        TLV_STAGES="${2:-}";        shift 2 ;;
+        --tlv-limit)         TLV_LIMIT="${2:-}";         shift 2 ;;
         --roam-status)       ROAM_STATUS="${2:-}";       shift 2 ;;
         --port)              PORT="${2:-1234}";          shift 2 ;;
         --at)
@@ -230,13 +245,14 @@ UPDATE_CANDIDATES=$(norm "$UPDATE_CANDIDATES")
 START_CONNECT=$(norm "$START_CONNECT")
 ROAM_TASK=$(norm "$ROAM_TASK")
 TLV_STAGES=$(norm "$TLV_STAGES")
+TLV_LIMIT=$(norm "$TLV_LIMIT")
 ROAM_STATUS=$(norm "$ROAM_STATUS")
 
 for i in "${!AT_ADDRS[@]}"; do
     AT_ADDRS[$i]=$(norm "${AT_ADDRS[$i]}")
 done
 
-if [[ -z "$FINISH_JOB$UPDATE_CANDIDATES$START_CONNECT$ROAM_TASK$TLV_STAGES$ROAM_STATUS" &&
+if [[ -z "$FINISH_JOB$UPDATE_CANDIDATES$START_CONNECT$ROAM_TASK$TLV_STAGES$TLV_LIMIT$ROAM_STATUS" &&
       ${#AT_ADDRS[@]} -eq 0 ]]; then
     echo "error: no addresses given -- nothing to break on." >&2
     echo "" >&2
@@ -250,7 +266,7 @@ fi
 # target silently never stops there, which reads exactly like "that
 # function was never called". Refuse instead.
 NBP=${#AT_ADDRS[@]}
-for a in "$FINISH_JOB" "$UPDATE_CANDIDATES" "$START_CONNECT" "$ROAM_TASK" "$ROAM_STATUS"; do
+for a in "$FINISH_JOB" "$UPDATE_CANDIDATES" "$START_CONNECT" "$ROAM_TASK" "$ROAM_STATUS" "$TLV_LIMIT"; do
     if [[ -n "$a" ]]; then NBP=$((NBP + 1)); fi
 done
 # --tlv-stages is three of the four on its own.
@@ -359,6 +375,19 @@ end
 EOF
     fi
 
+    if [[ -n "$TLV_LIMIT" ]]; then
+        cat <<EOF
+hbreak *($TLV_LIMIT + $OFF_TLV_LIMIT)
+commands
+  silent
+  printf "\n[tlv limit] adapter property 0x10 = 0x%x (%u)  msglen=%u\n", (unsigned int)\$rax, (unsigned int)\$rax, *(unsigned int *)(\$rbp + $OFF_TLV_MSGLEN)
+  printf "    0xffffffff means unpopulated -- size is not the objection. at: "
+  x/1i \$pc
+  continue
+end
+EOF
+    fi
+
     if [[ -n "$ROAM_STATUS" ]]; then
         cat <<EOF
 hbreak *($ROAM_STATUS + $OFF_ROAM_RET)
@@ -401,6 +430,7 @@ if [[ -n "$UPDATE_CANDIDATES" ]]; then echo "  [2] CheckAndUpdateCandidates+$OFF
 if [[ -n "$START_CONNECT"     ]]; then echo "  [3] CheckAndStartConnectProcess+$OFF_DECIDE       $START_CONNECT"; fi
 if [[ -n "$ROAM_TASK"         ]]; then echo "  [4] StartConnectRoamTask                       $ROAM_TASK"; fi
 if [[ -n "$TLV_STAGES"        ]]; then echo "  [tlv 1-3] GenerateConnectTaskTlv +$OFF_TLV_FILLED/+$OFF_TLV_SERIALISED/+$OFF_TLV_FITTED  $TLV_STAGES"; fi
+if [[ -n "$TLV_LIMIT"         ]]; then echo "  [tlv limit] GenerateConnectTaskTlv+$OFF_TLV_LIMIT              $TLV_LIMIT"; fi
 if [[ -n "$ROAM_STATUS"       ]]; then echo "  [ret] StartConnectRoamTask+$OFF_ROAM_RET               $ROAM_STATUS"; fi
 for i in "${!AT_ADDRS[@]}"; do
     printf '  [%s] %s\n' "${AT_LABELS[$i]}" "${AT_ADDRS[$i]}"

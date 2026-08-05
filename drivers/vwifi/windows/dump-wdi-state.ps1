@@ -967,13 +967,37 @@ if ($wdiState) {
     $cmds5 += 'uf wdiwifi!CConnectJob::FillConnectionProfileParameters'
     $cmds5 += 'uf wdiwifi!CConnectJob::ReorderAssociationPhyTypesList'
     $cmds5 += 'uf wdiwifi!CConnectJob::CheckAndStartConnectProcess'
-    # Whatever actually posts a task OID. The name is not known yet and
-    # these three patterns are how to find it -- once it is known, it
-    # becomes the fourth breakpoint and "did the OID even get built"
-    # stops being a guess.
+    # Whatever actually posts a task OID: CJobBase::StartTask, called
+    # from StartConnectRoamTask+0x658, after Task::Initialize,
+    # get_TaskDeviceCommand and DeviceCommand::Initialize. Kept listed
+    # because the four are the fallback if the failure moves past the
+    # TLV.
     $cmds5 += 'x wdiwifi!*DeviceCommand*'
     $cmds5 += 'x wdiwifi!*SendOid*'
     $cmds5 += 'x wdiwifi!*OidJob*'
+
+    # The one that is actually failing.
+    #
+    # The --tlv-stages ladder ran and stopped on the third rung:
+    #
+    #   [tlv 1/3] FillConnectRoamTaskParameters returned 0
+    #   [tlv 2/3] GenerateWdiTaskConnectToIhv returned 0 -- msglen=368
+    #   [tlv 3/3] never fired
+    #   [ret]     StartConnectRoamTask returns 0xc0010015
+    #
+    # 0xc0010015 is NDIS_STATUS_INVALID_DATA -- the same status this
+    # driver's own TLV generator returns for a malformed message, not a
+    # size complaint. So the connect message IS built, 368 bytes of it,
+    # and CMessageHelper::FitMessageToBufferSize then rejects it. What
+    # it objects to is the question, and only its own code says.
+    #
+    # GetPropertyULongOrDefault(adapterCache, 0x10, 0xFFFFFFFF) supplies
+    # the size limit it works against, so _WFC_ADAPTER_PROPERTY_NAME
+    # names the property, the way _WFC_PORT_PROPERTY_NAME named 0x47 as
+    # WfcPortPropertyGoodScanStartTime.
+    $cmds5 += 'uf wdiwifi!CMessageHelper::FitMessageToBufferSize'
+    $cmds5 += 'x wdiwifi!CMessageHelper::*'
+    $cmds5 += 'dt wdiwifi!_WFC_ADAPTER_PROPERTY_NAME'
 
     $out5 = Invoke-KdEach -Kd $kd -Sym $sym -LogFile $log5 `
                           -Prologue '.reload /f wdiwifi.sys' -Commands $cmds5 `
@@ -1001,14 +1025,19 @@ if ($wdiState) {
         # return-side one.
         $gen  = $chainFound['CConnectJob::GenerateConnectTaskTlv']
         $roam = $chainFound['CConnectJob::StartConnectRoamTask']
-        if ($gen -and $roam) {
-            Write-Host ("        scripts/gdb-wdi-connect.sh --tlv-stages {0} --roam-status {1}" -f $gen, $roam)
+        if ($gen) {
+            Write-Host ("        scripts/gdb-wdi-connect.sh --tlv-stages {0} --tlv-limit {0}" -f $gen)
             Write-Host ''
-            Write-Host '      Three rungs inside GenerateConnectTaskTlv, each on the path'
-            Write-Host '      taken when one of its three calls returned zero, plus the'
-            Write-Host '      status StartConnectRoamTask ends up returning. The last rung'
-            Write-Host '      that fires names the call that failed. Four breakpoints, which'
-            Write-Host '      is the whole budget.'
+            Write-Host '      The ladder already stopped on rung three -- '
+            Write-Host '      FitMessageToBufferSize returns NDIS_STATUS_INVALID_DATA for a'
+            Write-Host '      368-byte message -- so this run adds the size limit it was'
+            Write-Host '      given. 0xffffffff there means the property is unpopulated and'
+            Write-Host '      size is not what is being objected to.'
+        }
+        if ($gen -and $roam) {
+            Write-Host ''
+            Write-Host '      The ladder plus the returned status, if it needs re-running:'
+            Write-Host ("        scripts/gdb-wdi-connect.sh --tlv-stages {0} --roam-status {1}" -f $gen, $roam)
         }
 
         Write-Host ''

@@ -712,6 +712,30 @@ adapter property `0x10` as the size limit and defaults it to `-1` when
 unpopulated, so that one should be unfailable, and if it is not, the
 assumption is wrong.
 
+The assumption is wrong. The ladder ran and stopped on the third rung:
+
+    [tlv 1/3] FillConnectRoamTaskParameters returned 0
+    [tlv 2/3] GenerateWdiTaskConnectToIhv returned 0 -- msglen=368
+    [tlv 3/3] never fired
+    [ret]     StartConnectRoamTask returns 0xc0010015
+
+`0xc0010015` is `NDIS_STATUS_INVALID_DATA` -- the same status this
+driver's own TLV generator returns when a mandatory container is left
+empty, and not a size complaint. The connect message **is** built: the
+parameters are filled from our capabilities and the BSS entry, the
+serialiser turns them into 368 bytes, and then
+`CMessageHelper::FitMessageToBufferSize` refuses the result.
+
+Which is the first status in this whole investigation that points back
+at the message rather than at a state machine. Something in what this
+driver advertises produces a connect message wdiwifi's own helper will
+not accept -- so `FitMessageToBufferSize`'s code, and the name of
+adapter property `0x10`, are the next two things to read.
+
+`--tlv-limit` prints that property's value at the instruction after it
+is read. `0xFFFFFFFF` there means unpopulated, the limit is infinite,
+and the objection is to the message's contents rather than its length.
+
 ### When the driver log is silent, the problem is above the driver
 
 The 0xE9 trace records everything the driver is asked to do. That makes
