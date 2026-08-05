@@ -7,20 +7,27 @@
     OID_WDI_TASK_CONNECT has never reached this miniport. wdiwifi.sys
     accepts OID_DOT11_CONNECT_REQUEST, returns success, and about two
     milliseconds later reports STATUS_NETWORK_UNREACHABLE back up the
-    stack. Connecting to an SSID that exists nowhere fails identically
-    -- same status, same timing, the same OIDs in the same order -- so
-    the refusal happens before any BSS is considered, and nothing about
-    the BSS entry can explain it.
+    stack.
 
-    What is left is state we cannot see: how wdiwifi has recorded this
-    adapter, its ports, and the capabilities we reported. !ndiskd prints
-    exactly that, and it prints it statically -- no reproduction to time,
-    no race to catch.
+    Connecting to an SSID that exists nowhere fails identically -- same
+    status, same timing, the same OIDs in the same order. That was once
+    read here as proof that the refusal happens before any BSS is
+    considered. It is not: the control separated the two cases in
+    TIMING, not in CAUSE, and _ROAM_TRACELOGGING_DATA later showed
+    bssCandidateCount 1. A BSS is considered, matched, and the connect
+    job ends anyway.
 
-    Two passes, because the interesting commands need a handle that only
-    the first pass can tell us. Pass one lists miniports; the handle for
-    the adapter matching -Adapter is pulled out of that output and fed
-    to pass two.
+    So what this collects is the state we cannot otherwise see: how
+    wdiwifi has recorded this adapter and its ports, what it parsed out
+    of the frames we handed it, and -- since public PDBs carry function
+    names even without type layout -- the code of the routines that
+    decide. All of it static: no reproduction to time, no race to catch.
+
+    Six steps. Pass one lists miniports, because everything after needs
+    a handle only it can supply. Pass two dumps the miniport. Pass three
+    dumps wdiwifi's own CAdapter, whose pointer only pass two prints.
+    Pass four disassembles the candidate matcher. Pass five dumps
+    wdiwifi's WPP recorder buffer.
 
     ---------------------------------------------------------------
     !ndiskd NEEDS ndis.sys SYMBOLS. It walks NDIS structures by symbol
@@ -202,10 +209,16 @@ function Get-SymbolPathArg {
 # search path being right, which is exactly the thing that fails when
 # the tools have been copied around rather than installed. Finding the
 # DLL and loading it by full path removes the guess.
-function Find-NdiskdDll {
-    param([Parameter(Mandatory)][string] $KdPath)
+function Find-KdExtension {
+    param(
+        [Parameter(Mandatory)][string] $KdPath,
+        [Parameter(Mandatory)][string] $Name
+    )
+    # Recursive, because the extensions do not sit next to kd.exe -- the
+    # run that found no ndiskd.dll was looking only in kd's own folder,
+    # and it lives one level down in winxp\.
     $root = Split-Path $KdPath -Parent
-    $hit = Get-ChildItem -Path $root -Filter 'ndiskd.dll' -Recurse -File -ErrorAction SilentlyContinue |
+    $hit = Get-ChildItem -Path $root -Filter $Name -Recurse -File -ErrorAction SilentlyContinue |
            Sort-Object FullName | Select-Object -First 1
     if ($hit) { return $hit.FullName }
     return $null
@@ -330,7 +343,7 @@ SDK installer (winsdksetup.exe), or copy a Debuggers\x64 directory onto
 this machine and put it on PATH.
 '@
 }
-Write-Host "[1/4] kd: $kd"
+Write-Host "[1/6] kd: $kd"
 
 $state = Test-LocalKdEnabled
 if (-not $state.DebugOn -or -not $state.TypeLocal) {
@@ -343,18 +356,39 @@ $sym    = Get-SymbolPathArg
 
 # Pass one: what miniports exist, and does ndiskd work at all.
 $log1 = Join-Path $OutDir 'wdi-state-miniports.txt'
-Write-Host '[2/4] Listing miniports'
+Write-Host '[2/6] Listing miniports'
 # Semicolons, not newlines. kd's -c takes ONE command string with ';'
 # separators; a multi-line string is not parsed as successive commands,
 # which is why the first version of this loaded nothing and then blamed
 # a missing extension for it.
-$ndiskd = Find-NdiskdDll -KdPath $kd
+$ndiskd = Find-KdExtension -KdPath $kd -Name 'ndiskd.dll'
 $load   = if ($ndiskd) {
     Write-Host "      ndiskd: $ndiskd"
     ".load $(Get-ShortPath $ndiskd)"
 } else {
     Write-Warning 'ndiskd.dll not found near kd.exe; relying on the extension search path'
     '.load ndiskd'
+}
+
+# rcdrkd dumps WPP *recorder* buffers -- the in-memory circular log a
+# driver keeps whether or not anyone is tracing it.
+#
+# wdiwifi's WPP is not compiled out. Every routine in the pass-four
+# disassembly is full of WPP_RECORDER_INITIALIZED / WPP_GLOBAL_Control
+# checks and WPP_RECORDER_SF_* calls; the reason no ETW session ever
+# showed a wdiwifi message is that the recorder writes to memory, not to
+# a provider. That memory is readable from a local kernel debugger.
+#
+# No TMF files, so messages come out as raw ids and arguments. That is
+# enough here: CheckAndUpdateCandidates logs id 0x96 at level 2 with the
+# failure status as an argument, which is the number this whole exercise
+# is trying to read.
+$rcdrkd     = Find-KdExtension -KdPath $kd -Name 'rcdrkd.dll'
+$loadRcdrkd = if ($rcdrkd) {
+    Write-Host "      rcdrkd: $rcdrkd"
+    ".load $(Get-ShortPath $rcdrkd)"
+} else {
+    '.load rcdrkd'
 }
 $out1 = Invoke-Kd -Kd $kd -Sym $sym -LogFile $log1 `
             -Commands (@($load, '.chain',
@@ -403,7 +437,7 @@ if ($MiniportHandle) {
 # is independent, so one that this ndiskd build does not have costs its
 # own output and nothing else.
 $log2 = Join-Path $OutDir 'wdi-state-detail.txt'
-Write-Host '[3/4] Dumping adapter, port and WDI state'
+Write-Host '[3/6] Dumping adapter, port and WDI state'
 # Two commands were removed after a run showed them to be inventions
 # of mine rather than things this ndiskd has: `!ndiskd.miniports -wdi`
 # answered "Unknown parameter wdi", and `!ndiskd.pendingoids` answered
@@ -541,38 +575,60 @@ if ($wdiState) {
 
     # Pass four: the decision itself.
     #
-    # The symbol sweep named the whole path. CRoamReconnectJob
-    # ::StartConnectJob runs CConnectJob::PickCandidates, which takes a
-    # _WFC_CONNECTION_PROFILE_PARAMETERS and scores entries with
-    # CBSSEntry::CalculateRank, which takes a
-    # _BSS_ENTRY_CONNECT_MATCHING_CRITERIA. Those two struct names are
-    # the question stated in wdiwifi's own words: the criteria struct is
-    # a field-by-field list of what a BSS is required to match, and the
-    # profile struct is what the match is against.
+    # The last round read the whole decision down to one call.
     #
-    # dt first, because a named field list may settle it outright and
-    # costs a dozen lines. uf second, because if it does not, the
-    # branches in PickCandidates are the only remaining authority --
-    # m_CachedRank is 0x64 while bestCandidateRank is 0, which says the
-    # entry is rejected by a filter that runs BEFORE ranking, and a
-    # filter that never runs cannot be read out of any struct.
+    # CheckAndUpdateCandidates calls PickCandidates and branches on the
+    # return: zero goes to the success path, which sets roamOccured and
+    # then, if the candidate count is zero, writes roamDebugCode = 5
+    # (NoCandidatesFound). Non-zero logs WPP id 0x96 at level 2 with the
+    # status as an argument and leaves immediately.
     #
-    # Separate kd invocation and separate log. uf on two routines can
-    # run to a thousand lines and would push everything above it out of
-    # the pass-three file.
+    # PickCandidates itself is a wrapper. It builds the criteria on the
+    # stack, picks m_ExtStaBSSList, presets the candidate capacity to
+    # 0x28, calls CBSSListManager::FindMatchingBSSEntriesForConnect,
+    # copies the resulting count into roamTraceLoggingData+0x44 --
+    # bssCandidateCount -- and returns that function's status unchanged.
+    #
+    # Our dump has bssCandidateCount 1 with roamOccured false and
+    # roamDebugCode NotSet. One entry matched, and the success path that
+    # would have set roamOccured did not run. So the matcher found our
+    # BSS *and returned a failure status anyway*, and that status is the
+    # only number left to read.
+    #
+    # Hence: disassemble the matcher, and list CBSSListManager's methods
+    # in case the failure is in something it calls.
+    Write-Host '[4/6] Reading the decision'
     $log4 = Join-Path $OutDir 'wdi-state-decide.txt'
     $out4 = Invoke-Kd -Kd $kd -Sym $sym -LogFile $log4 -Commands (@(
         '.reload /f wdiwifi.sys',
-        'dt wdiwifi!_BSS_ENTRY_CONNECT_MATCHING_CRITERIA',
-        'dt wdiwifi!_WFC_CONNECTION_PROFILE_PARAMETERS',
-        'dt wdiwifi!_ROAM_CONTROL_PARAMETERS',
-        'dt wdiwifi!_WFC_CONNECT_SCAN_TYPE',
-        'dt wdiwifi!_BSS_ENTRY_BLOCKED_INFO',
-        'uf wdiwifi!CBSSEntry::CalculateRank',
-        'uf wdiwifi!CConnectJob::PickCandidates',
-        'uf wdiwifi!CConnectJob::CheckAndUpdateCandidates'
+        'x wdiwifi!CBSSListManager::*',
+        'x wdiwifi!*MatchingBSS*',
+        'uf wdiwifi!CBSSListManager::FindMatchingBSSEntriesForConnect'
     ) -join ';')
     Write-Host "      $log4 ($($out4.Count) lines)"
+
+    # Pass five: wdiwifi's own trace buffer.
+    #
+    # The disassembly settled a thing that had been assumed and was
+    # wrong: wdiwifi's WPP is compiled in, not out. Every routine is
+    # threaded with WPP_RECORDER_INITIALIZED and WPP_GLOBAL_Control
+    # checks and WPP_RECORDER_SF_* calls. No ETW session ever showed a
+    # wdiwifi message because the recorder writes into a circular buffer
+    # in the driver's own memory, which no provider carries and which a
+    # local kernel debugger can read directly.
+    #
+    # Without TMF files the entries come out as raw ids and arguments,
+    # which is enough: id 0x96 is the PickCandidates failure and its
+    # argument is the status.
+    Write-Host '[5/6] Dumping wdiwifi''s WPP recorder'
+    $log5 = Join-Path $OutDir 'wdi-state-wpp.txt'
+    $out5 = Invoke-Kd -Kd $kd -Sym $sym -LogFile $log5 -Commands (@(
+        $loadRcdrkd,
+        '.chain',
+        '!rcdrkd.rcdrloglist',
+        '!rcdrkd.rcdrlogdump wdiwifi'
+    ) -join ';')
+    Write-Host "      $log5 ($($out5.Count) lines)"
 } else {
     Write-Warning 'no "WDI state" pointer in pass two; skipping the adapter dump'
     Write-Warning 'If -MiniportHandle was given: handles are reassigned every'
@@ -581,10 +637,10 @@ if ($wdiState) {
     Write-Warning 'one find the adapter itself.'
 }
 
-Write-Host '[4/4] Done'
+Write-Host '[6/6] Done'
 Write-Host "      $log1 ($($out1.Count) lines)"
 Write-Host "      $log2 ($($out2.Count) lines)"
 Write-Host ''
-Write-Host '      Send wdi-state-adapter.txt. That is the one that matters now:'
-Write-Host '      the beacon and probe bytes wdiwifi holds, the cached profile it'
-Write-Host '      ranks them against, and the names of the routines that decide.'
+Write-Host '      Send wdi-state-decide.txt and wdi-state-wpp.txt. The first is'
+Write-Host '      the matcher that found our BSS and failed anyway; the second is'
+Write-Host '      wdiwifi telling you why, in its own trace buffer.'
