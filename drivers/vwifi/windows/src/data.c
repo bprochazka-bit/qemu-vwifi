@@ -137,6 +137,52 @@ VwifiRxDrainSta(_Inout_ PVWIFI_ADAPTER Adapter)
             PUCHAR frame_va = (PUCHAR)Adapter->RxBufferPoolVa
                             + (SIZE_T)idx * VWIFI_RX_BUFFER_SIZE;
 
+            /* What is actually arriving, and in what shape.
+             *
+             * TX turned out to be the opposite of what this driver
+             * assumed -- the component hands down 802.11 MPDUs, not
+             * 802.3 -- and RX is the same contract read the other way,
+             * so "the device converts to 802.3 and we pass it up" is an
+             * assumption of exactly the kind that was wrong last time.
+             * The dump settles it instead of arguing it.
+             *
+             * It also says what the frame IS. An associated link that
+             * cannot complete DHCP has two very different explanations
+             * -- the offer never arrives, or it arrives and the
+             * component discards it -- and "UDP 67->68" in this line
+             * tells them apart in one look. */
+            if (d->frame_len >= 42) {
+                VWIFI_TAL_FIRST(4,
+                    "rx(sta): frame %u bytes: dst %02x:%02x:%02x:%02x:%02x:%02x "
+                    "src %02x:%02x:%02x:%02x:%02x:%02x type %02x%02x -- %s",
+                    d->frame_len,
+                    frame_va[0], frame_va[1], frame_va[2],
+                    frame_va[3], frame_va[4], frame_va[5],
+                    frame_va[6], frame_va[7], frame_va[8],
+                    frame_va[9], frame_va[10], frame_va[11],
+                    frame_va[12], frame_va[13],
+                    (frame_va[12] == 0x08 && frame_va[13] == 0x06)
+                        ? "802.3 ARP"
+                        : (frame_va[12] == 0x08 && frame_va[13] == 0x00)
+                            ? ((frame_va[23] == 17) ? "802.3 IPv4/UDP"
+                                                    : "802.3 IPv4")
+                            : (frame_va[12] == 0x86 && frame_va[13] == 0xdd)
+                                ? "802.3 IPv6"
+                                : (((frame_va[0] >> 2) & 0x3) == 2)
+                                    ? "NOT 802.3 -- this is an 802.11 DATA "
+                                      "MPDU and is being passed up as an MSDU"
+                                    : "802.3 with an unrecognised EtherType");
+                /* Ports second, and only when they exist, rather than
+                 * widening the line above for every frame. 67 -> 68 is
+                 * the DHCP offer this link keeps not getting. */
+                if (frame_va[12] == 0x08 && frame_va[13] == 0x00 &&
+                    frame_va[23] == 17 && d->frame_len >= 38) {
+                    VWIFI_TAL_FIRST(4, "rx(sta):   UDP %u -> %u",
+                                    (ULONG)((frame_va[34] << 8) | frame_va[35]),
+                                    (ULONG)((frame_va[36] << 8) | frame_va[37]));
+                }
+            }
+
             PMDL mdl = NdisAllocateMdl(Adapter->MiniportAdapterHandle,
                                        frame_va, d->frame_len);
             if (!mdl) {

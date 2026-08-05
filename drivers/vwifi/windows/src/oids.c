@@ -89,7 +89,18 @@ VwifiNdisStatusName(_In_ NDIS_STATUS Status)
     case NDIS_STATUS_INVALID_OID:       return "INVALID_OID";
     case NDIS_STATUS_INVALID_PARAMETER: return "INVALID_PARAMETER";
     case NDIS_STATUS_BAD_VERSION:       return "BAD_VERSION";
-    default:                            return "?";
+    /* The facility-0x23 block, which is where the statuses the WDI data
+     * path returns actually live. NDIS_STATUS_PAUSED came back from
+     * RxInorderDataIndication and printed as "?", which is worse than
+     * useless: an unnamed hex code reads as an unknown failure when it
+     * is a specific and recoverable one. */
+    case NDIS_STATUS_PAUSED:               return "PAUSED";
+    case NDIS_STATUS_INVALID_PORT:         return "INVALID_PORT";
+    case NDIS_STATUS_INVALID_PORT_STATE:   return "INVALID_PORT_STATE";
+    case NDIS_STATUS_LOW_POWER_STATE:      return "LOW_POWER_STATE";
+    case NDIS_STATUS_UNSUPPORTED_REVISION: return "UNSUPPORTED_REVISION";
+    case NDIS_STATUS_REQUEST_ABORTED:      return "REQUEST_ABORTED";
+    default:                               return "?";
     }
 }
 
