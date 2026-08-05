@@ -652,70 +652,48 @@ if ($wdiState) {
     # StartConnectRoamTask, so OID_WDI_TASK_CONNECT never goes out and
     # *pAssocStatus is left at WDI_ASSOC_STATUS_CANDIDATE_LIST_EXHAUSTED.
     #
-    # The chain from our SCAN_COMPLETE to the refused connect, read out
-    # of the binary end to end:
+    # GetStatusFromTaskOutput, in full:
     #
-    #   CScanJob::OnJobStepCompleted(status)
-    #     step = [job+0x78C]
-    #     if (step == 1)  edi = CompleteScanTask(status)
-    #     ...
-    #     +0xd3  FinishJob(edi)
+    #   call Task::get_OutputBuffer(&len, &buf)
+    #   test eax,eax / jne  -> return eax        ; no output at all
+    #   cmp  dword ptr [len],30h                 ; 48 bytes minimum
+    #   jb   -> ebx = 0xC0010014                 ; NDIS_STATUS_INVALID_LENGTH
+    #   mov  rcx,[buf]
+    #   mov  ebx,dword ptr [rcx+24h]             ; status at buf+0x24
+    #   return ebx
     #
-    #   CScanJob::CompleteScanTask(status)
-    #     if (status != 0)                    return status
-    #     edi = CMessageHelper::GetStatusFromTaskOutput(&job->m_Task, &out)
-    #     if (edi != 0)                       return edi        <-- HERE
-    #     notify the BSS-list-changed callback
-    #     return edi
+    # Our SCAN_COMPLETE indication carries 16 bytes: a bare
+    # WDI_MESSAGE_HEADER, which is what WABIModel asks for. Two readings
+    # fit, and they call for opposite fixes, so neither gets acted on
+    # until Task::get_OutputBuffer says which:
     #
-    #   CScanJob::FinishJob(status)
-    #     if (status != 0)          -> no write
-    #     if (job->m_bCancelled)    -> no write
-    #     SetPropertyBuffer(portCache, 0x47, 8, &job->m_StartTime)
+    #   (a) The task output is our payload as received. 16 < 48, so
+    #       every header-only task completion fails this check, and the
+    #       driver has to send something longer.
     #
-    #   CConnectJob::CheckAndUpdateCandidates
-    #     GetPropertyBuffer(portCache, 0x47) == 0xC0000184
-    #       -> job->candidateCount = 0
+    #   (b) wdiwifi prepends its own metadata. A 0x20-byte prefix plus
+    #       our 0x10 header is exactly 0x30, and puts WDI_MESSAGE_HEADER
+    #       .Status at exactly 0x24 -- PortId 0x20, Reserved 0x22,
+    #       Status 0x24, TransactionId 0x28, IhvSpecificId 0x2c. The
+    #       arithmetic fits far too well to be coincidence, and under
+    #       this reading our 16 bytes are correct and the failure is
+    #       that get_OutputBuffer returns nothing at all.
     #
-    #   CConnectJob::CheckAndStartConnectProcess
-    #     candidateCount == 0 -> skip StartConnectRoamTask
-    #       -> OID_WDI_TASK_CONNECT never sent
-    #
-    # The cancelled flag is ruled out. Searching the displacement showed
-    # CScanJob+0x78A is written in exactly two places: zeroed in the
-    # constructor, and set to 1 in OnJobCancelled and nowhere else. It
-    # is a plain "this job was cancelled" bool. Nothing cancels our scan
-    # jobs -- OID_WDI_ABORT_TASK never reaches the driver in any failing
-    # trace -- and a job cancelled before it starts never issues its
-    # task at all, because OnJobStarted checks the same byte and bails
-    # with 0xC001000C. Our TASK_SCAN OIDs do arrive.
-    #
-    # So FinishJob is being handed a non-zero status, and the only
-    # source of it is GetStatusFromTaskOutput failing to read a status
-    # out of the completed task. That is the last unread link.
-    #
-    # It also explains the shape of the bug in a way nothing else has.
-    # A scan that reports failure here still populates the BSS list,
-    # because entries arrive on a separate unsolicited
-    # BSS_ENTRY_LIST indication rather than through the task output --
-    # which is exactly what we see: scanning works, `netsh wlan show
-    # networks` works, and only connecting is refused.
-    #
-    # Our side of the contract checks out. WDI_MESSAGE_HEADER is
-    # {PortId, Reserved, Status, TransactionId, IhvSpecificId} and
-    # dot11wdi.h says MessageId and MessageLength come from the NDIS
-    # fields, not the header; we fill all four and pass the length as
-    # StatusBufferSize. WABIModel wants nothing more: WDI_TASK_SCAN
-    # FromIhv and WDI_INDICATION_SCAN_COMPLETE are both "No TLV data
-    # needed, header is sufficient".
+    # get_OutputBuffer and OnTaskCompletedHandler settle it: the first
+    # shows where the length and buffer come from, the second shows what
+    # a completing task stores. OnDeviceIndicationArrived is the entry
+    # point from our indication, and _WFC_MESSAGE_METADATA is the type
+    # reading (b) depends on -- CMessageHelper::FitMessageToBufferSize
+    # takes one, so it exists.
     Write-Host '[4/5] Reading the decision'
     $log4 = Join-Path $OutDir 'wdi-state-decide.txt'
     $out4 = Invoke-Kd -Kd $kd -Sym $sym -LogFile $log4 -Commands (@(
         '.reload /f wdiwifi.sys',
-        'uf wdiwifi!CMessageHelper::GetStatusFromTaskOutput',
-        'x wdiwifi!CMessageHelper::*',
-        'x wdiwifi!Task::*',
-        'uf wdiwifi!Task::CancelTask'
+        'uf wdiwifi!Task::get_OutputBuffer',
+        'uf wdiwifi!Task::OnTaskCompletedHandler',
+        'uf wdiwifi!Task::OnDeviceIndicationArrived',
+        'dt wdiwifi!_WFC_MESSAGE_METADATA',
+        'dt wdiwifi!_WDI_INDICATION_TYPE'
     ) -join ';')
     Write-Host "      $log4 ($($out4.Count) lines)"
 } else {
@@ -730,5 +708,5 @@ Write-Host '[5/5] Done'
 Write-Host "      $log1 ($($out1.Count) lines)"
 Write-Host "      $log2 ($($out2.Count) lines)"
 Write-Host ''
-Write-Host '      Send wdi-state-decide.txt. GetStatusFromTaskOutput is the last'
-Write-Host '      unread link between our SCAN_COMPLETE and the refused connect.'
+Write-Host '      Send wdi-state-decide.txt. Task::get_OutputBuffer decides'
+Write-Host '      whether our 16-byte SCAN_COMPLETE is too short or never arrived.'
