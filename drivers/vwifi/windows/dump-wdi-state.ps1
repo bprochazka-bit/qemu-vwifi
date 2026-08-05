@@ -23,10 +23,25 @@
     names even without type layout -- the code of the routines that
     decide. All of it static: no reproduction to time, no race to catch.
 
+    That method has now found and closed one link of the chain. The scan
+    job's completion status was the task OID's return value, so
+    WfcPortPropertyGoodScanStartTime was never recorded and the connect
+    job discarded a candidate list of exactly one. With
+    OID_WDI_TASK_SCAN returning NDIS_STATUS_PENDING and completed when
+    the sweep really ends, the property is written, the candidate
+    survives, and CConnectJob::StartConnectRoamTask runs.
+
+    OID_WDI_TASK_CONNECT still does not arrive, so the same two tools
+    now point one function further in: pass five disassembles the
+    connect-task chain and prints the host-side trace command for its
+    entry points.
+
     Pass one lists miniports, because everything after needs a handle
     only it can supply. Pass two dumps the miniport. Pass three dumps
     wdiwifi's own CAdapter, whose pointer only pass two prints. Pass
-    four disassembles the routines that decide.
+    four resolves the breakpoint addresses for the scan and candidate
+    path. Pass five does the same for the connect task, with the
+    disassembly beside it.
 
     There is no WPP pass. wdiwifi's WPP is compiled in -- every routine
     is threaded with WPP_RECORDER_INITIALIZED checks and
@@ -461,7 +476,7 @@ SDK installer (winsdksetup.exe), or copy a Debuggers\x64 directory onto
 this machine and put it on PATH.
 '@
 }
-Write-Host "[1/5] kd: $kd"
+Write-Host "[1/6] kd: $kd"
 
 $state = Test-LocalKdEnabled
 if (-not $state.DebugOn -or -not $state.TypeLocal) {
@@ -474,7 +489,7 @@ $sym    = Get-SymbolPathArg
 
 # Pass one: what miniports exist, and does ndiskd work at all.
 $log1 = Join-Path $OutDir 'wdi-state-miniports.txt'
-Write-Host '[2/5] Listing miniports'
+Write-Host '[2/6] Listing miniports'
 # Semicolons, not newlines. kd's -c takes ONE command string with ';'
 # separators; a multi-line string is not parsed as successive commands,
 # which is why the first version of this loaded nothing and then blamed
@@ -535,7 +550,7 @@ if ($MiniportHandle) {
 # is independent, so one that this ndiskd build does not have costs its
 # own output and nothing else.
 $log2 = Join-Path $OutDir 'wdi-state-detail.txt'
-Write-Host '[3/5] Dumping adapter, port and WDI state'
+Write-Host '[3/6] Dumping adapter, port and WDI state'
 # Two commands were removed after a run showed them to be inventions
 # of mine rather than things this ndiskd has: `!ndiskd.miniports -wdi`
 # answered "Unknown parameter wdi", and `!ndiskd.pendingoids` answered
@@ -823,7 +838,7 @@ if ($wdiState) {
     # `x ndis!*Wdi*` derailed kd's parser, it echoed the whole -c string
     # back as an unresolved symbol, and sat at a prompt forever with the
     # script blocked behind it. Split, a bad command costs only itself.
-    Write-Host '[4/5] Locating the breakpoints'
+    Write-Host '[4/6] Locating the breakpoints'
     $log4 = Join-Path $OutDir 'wdi-state-decide.txt'
 
     # Ordered, because the composed command line below reads them back
@@ -897,6 +912,99 @@ if ($wdiState) {
         Write-Warning 'If instead it says "Couldnt resolve x wdiwifi", the module'
         Write-Warning 'symbols did not load and the .reload prologue is not working.'
     }
+
+    # Pass five: the connect task itself.
+    #
+    # The four breakpoints above have done their job and the answer they
+    # gave moved the question. With OID_WDI_TASK_SCAN returning
+    # NDIS_STATUS_PENDING:
+    #
+    #   [1] CScanJob::FinishJob  status=0x0            (was 0x40230001)
+    #   [2] CheckAndUpdateCandidates  never fired      (was 1 -> 0)
+    #   [3] CheckAndStartConnectProcess  candidates=1  (was 0)
+    #   [4] StartConnectRoamTask -- CONNECT TASK GOING OUT
+    #
+    # The good-scan chain is closed. But OID_WDI_TASK_CONNECT still does
+    # not reach the driver: the debugcon trace for the same attempt runs
+    # DOT11_RESET, SET_PRIVACY_EXEMPTION_LIST, three GET_STATISTICS, a
+    # full TASK_SCAN, one more GET_BSS_ENTRY_LIST -- and stops. So
+    # StartConnectRoamTask is entered and gives up somewhere between
+    # there and the OID.
+    #
+    # This is exactly the position the good-scan chain was in one round
+    # ago, and it yielded to the same two things together: the branches,
+    # from a disassembly local KD can take without stopping the machine,
+    # and which branch ran, from a host-side trace. So this pass writes
+    # `uf` for the whole chain and prints a --at command line for its
+    # entry points.
+    #
+    # Four entry points, because four is all the debug registers allow.
+    # The last label the trace prints is how far the chain got; the
+    # disassembly beside it says what the next branch tests.
+    Write-Host '[5/6] Disassembling the connect task chain'
+    $log5 = Join-Path $OutDir 'wdi-state-connecttask.txt'
+
+    # Ordered by where each sits in the chain, so the printed --at line
+    # reads in call order and the trace can be compared against it
+    # directly.
+    $chain = @(
+        'CConnectJob::StartConnectRoamTask',
+        'CConnectJob::FillConnectRoamTaskParameters',
+        'CConnectJob::GenerateConnectTaskTlv',
+        'CConnectJob::GenerateRoamTaskTlv'
+    )
+
+    # `x` before `uf`. uf's output starts with a bare label line and then
+    # raw instructions, none of which carry the `ADDR wdiwifi!Name` shape
+    # Get-KdSymbol matches -- so the disassembly alone would leave the
+    # --at line with no addresses to print.
+    $cmds5 = @()
+    foreach ($name in $chain) { $cmds5 += "x wdiwifi!$name" }
+    foreach ($name in $chain) { $cmds5 += "uf wdiwifi!$name" }
+    # Read but not broken on: these are the rest of what the chain
+    # touches, and an early return in the middle of one of them is the
+    # kind of thing only the disassembly shows.
+    $cmds5 += 'uf wdiwifi!CConnectJob::FillConnectionProfileParameters'
+    $cmds5 += 'uf wdiwifi!CConnectJob::ReorderAssociationPhyTypesList'
+    $cmds5 += 'uf wdiwifi!CConnectJob::CheckAndStartConnectProcess'
+    # Whatever actually posts a task OID. The name is not known yet and
+    # these three patterns are how to find it -- once it is known, it
+    # becomes the fourth breakpoint and "did the OID even get built"
+    # stops being a guess.
+    $cmds5 += 'x wdiwifi!*DeviceCommand*'
+    $cmds5 += 'x wdiwifi!*SendOid*'
+    $cmds5 += 'x wdiwifi!*OidJob*'
+
+    $out5 = Invoke-KdEach -Kd $kd -Sym $sym -LogFile $log5 `
+                          -Prologue '.reload /f wdiwifi.sys' -Commands $cmds5 `
+                          -TimeoutSec 120
+    Write-Host "      $log5 ($($out5.Count) lines)"
+
+    $chainFound = [ordered]@{}
+    foreach ($name in $chain) {
+        $a = Get-KdSymbol -Lines $out4 -Name $name
+        if (-not $a) { $a = Get-KdSymbol -Lines $out5 -Name $name }
+        if ($a) { $chainFound[$name] = $a }
+    }
+
+    Write-Host ''
+    if ($chainFound.Count -gt 0) {
+        Write-Host '      CONNECT TASK TRACE (this boot only)'
+        Write-Host ''
+        $atParts = @()
+        foreach ($name in $chainFound.Keys) {
+            # Short label: the class prefix is the same for all of them
+            # and only makes the trace lines harder to scan.
+            $short = ($name -split '::')[-1]
+            $atParts += ("--at {0}={1}" -f $short, $chainFound[$name])
+        }
+        Write-Host ("        scripts/gdb-wdi-connect.sh " + ($atParts -join ' '))
+        Write-Host ''
+        Write-Host '      Attempt the connection, then send back this trace AND'
+        Write-Host "      $log5"
+    } else {
+        Write-Warning 'none of the connect-task symbols resolved; see the log.'
+    }
 } else {
     Write-Warning 'no "WDI state" pointer in pass two; skipping the adapter dump'
     Write-Warning 'If -MiniportHandle was given: handles are reassigned every'
@@ -905,10 +1013,11 @@ if ($wdiState) {
     Write-Warning 'one find the adapter itself.'
 }
 
-Write-Host '[5/5] Done'
+Write-Host '[6/6] Done'
 Write-Host "      $log1 ($($out1.Count) lines)"
 Write-Host "      $log2 ($($out2.Count) lines)"
 Write-Host ''
-Write-Host '      wdi-state-decide.txt holds the breakpoint addresses. What is'
-Write-Host '      left is a runtime question and needs the guest stopped, which'
-Write-Host '      local KD cannot do -- see scripts/gdb-wdi-connect.sh.'
+Write-Host '      wdi-state-decide.txt holds the scan-path breakpoint addresses;'
+Write-Host '      wdi-state-connecttask.txt holds the connect-task disassembly.'
+Write-Host '      What is left is a runtime question and needs the guest stopped,'
+Write-Host '      which local KD cannot do -- see scripts/gdb-wdi-connect.sh.'

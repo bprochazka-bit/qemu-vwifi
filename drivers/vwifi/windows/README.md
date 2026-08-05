@@ -633,6 +633,40 @@ use after free, and never completing leaves the WLAN component blocked
 on a request that can no longer be answered -- the same shape as the
 disconnect-task bug that used to hang adapter removal.
 
+The same four breakpoints then confirmed the fix, and moved the
+question:
+
+| | `INDICATION_REQUIRED` | `PENDING` + complete |
+| --- | --- | --- |
+| `[1]` FinishJob status | `0x40230001` ×3 | **`0x0`** ×3 |
+| `[2]` candidates discarded | `1 -> 0` | never fires |
+| `[3]` candidates at the decision | `0` | **`1`** |
+| `[4]` StartConnectRoamTask | never | **CONNECT TASK GOING OUT** |
+
+So the good-scan chain is closed. `WfcPortPropertyGoodScanStartTime` is
+recorded, the candidate list survives, and the connect job starts its
+connect task -- the first time this driver has got that far.
+
+`OID_WDI_TASK_CONNECT` still does not arrive. The debugcon trace for the
+same attempt runs `DOT11_RESET`, `SET_PRIVACY_EXEMPTION_LIST`, three
+`GET_STATISTICS`, a full `TASK_SCAN`, one more `GET_BSS_ENTRY_LIST` --
+and stops. `StartConnectRoamTask` is entered and gives up somewhere
+between there and the OID.
+
+That is the same position the good-scan chain was in one round earlier,
+and it yields to the same pair of tools: `uf` from local KD for the
+branches, and a host-side trace for which branch ran. `dump-wdi-state`
+pass five writes the disassembly of the connect-task chain and prints a
+`--at` command line for its entry points; `--at LABEL=ADDRESS` is
+`gdb-wdi-connect.sh`'s generic breakpoint, which assumes nothing about
+the function and just reports that it was entered, with `rcx`/`rdx`/`r8`/`r9`.
+The last label printed is how far the chain got.
+
+Four `--at` breakpoints is the maximum, and asking for a fifth now fails
+loudly. gdb accepts it, the target silently never stops there, and the
+output reads exactly like "that function was never called" -- a false
+negative in the shape of a result.
+
 ### When the driver log is silent, the problem is above the driver
 
 The 0xE9 trace records everything the driver is asked to do. That makes

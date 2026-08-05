@@ -50,25 +50,41 @@
 # wdiwifi's code, which PatchGuard treats as exactly the kind of kernel
 # modification it bugchecks for.
 #
-# WHAT THE OUTPUT MEANS
+# WHAT THE FOUR NAMED BREAKPOINTS FOUND, AND WHY THEY ARE STILL HERE
 #
-#   [1] once, status non-zero, and never again
-#       the M3 does not drive FinishJob at all. Neither
-#       INDICATION_REQUIRED nor SUCCESS can be right, and the task OID
-#       should return NDIS_STATUS_PENDING and be completed later with
-#       NdisMOidRequestComplete.
-#   [1] twice, the second with status 0
-#       the good-scan property is being written and is not the problem.
-#       Whatever discards the candidates is somewhere else.
-#   [2] hit
-#       the property read failed and the candidate list was discarded.
-#       That is the good-scan chain, confirmed at runtime.
-#   [3] reporting 0 without [2] having been hit
-#       the count was never filled in. PickCandidates is then the place
-#       to look, not the property.
-#   [4] hit
-#       the connect task went out and the failure is downstream of
-#       everything above.
+# Before, with the task OIDs returning INDICATION_REQUIRED:
+#
+#   [1] status=0x40230001  x3, never 0
+#   [2] DISCARDING CANDIDATES  1 -> 0
+#   [3] candidates=0
+#   [4] never
+#
+# After, with OID_WDI_TASK_SCAN returning NDIS_STATUS_PENDING and being
+# completed when the sweep ends:
+#
+#   [1] status=0x0  x3
+#   [2] never
+#   [3] candidates=1
+#   [4] CONNECT TASK GOING OUT
+#
+# So the good-scan chain is closed: the property is recorded, the
+# candidate list survives, and the connect job starts its connect task.
+# They stay because they are the regression test for that -- if a later
+# change breaks the scan job's lifetime again, [2] firing says so
+# immediately.
+#
+# What they also established is where the failure went. StartConnectRoamTask
+# runs and OID_WDI_TASK_CONNECT still never reaches the driver, so
+# something between that call and the OID going out gives up. Nothing
+# named here can see that, which is what --at is for.
+#
+# --at LABEL=ADDRESS, repeatable, is the generic form: it prints the
+# label, rcx/rdx/r8/r9 and the instruction it landed on, and assumes
+# nothing about the function. Point it at a chain of entry points and
+# the last label printed is how far the chain got. Combine with the
+# `uf` disassembly dump-wdi-state.cmd writes for the same functions:
+# the disassembly gives the early-return branches, the trace says which
+# one was taken.
 #
 # USAGE
 #
@@ -105,6 +121,8 @@ FINISH_JOB=
 UPDATE_CANDIDATES=
 START_CONNECT=
 ROAM_TASK=
+AT_LABELS=()
+AT_ADDRS=()
 
 # Offsets into the two functions whose interesting point is not their
 # entry. Both come from disassembling this guest's wdiwifi.sys, so a
@@ -128,6 +146,20 @@ while [[ $# -gt 0 ]]; do
         --start-connect)     START_CONNECT="${2:-}";     shift 2 ;;
         --roam-task)         ROAM_TASK="${2:-}";         shift 2 ;;
         --port)              PORT="${2:-1234}";          shift 2 ;;
+        --at)
+            # LABEL=ADDR. The generic form, for tracing a chain whose
+            # shape is not yet known: it prints the label, the first
+            # four Microsoft x64 argument registers, and the instruction
+            # it landed on, and knows nothing about the function. Which
+            # entry points get hit, and in what order, is the whole
+            # answer when the question is "how far does this get".
+            if [[ "${2:-}" != *=* ]]; then
+                echo "error: --at wants LABEL=ADDRESS, got '${2:-}'" >&2
+                exit 2
+            fi
+            AT_LABELS+=( "${2%%=*}" )
+            AT_ADDRS+=( "${2#*=}" )
+            shift 2 ;;
         -h|--help)           usage 0 ;;
         *) echo "unknown argument: $1" >&2; usage 2 ;;
     esac
@@ -146,11 +178,30 @@ UPDATE_CANDIDATES=$(norm "$UPDATE_CANDIDATES")
 START_CONNECT=$(norm "$START_CONNECT")
 ROAM_TASK=$(norm "$ROAM_TASK")
 
-if [[ -z "$FINISH_JOB$UPDATE_CANDIDATES$START_CONNECT$ROAM_TASK" ]]; then
+for i in "${!AT_ADDRS[@]}"; do
+    AT_ADDRS[$i]=$(norm "${AT_ADDRS[$i]}")
+done
+
+if [[ -z "$FINISH_JOB$UPDATE_CANDIDATES$START_CONNECT$ROAM_TASK" &&
+      ${#AT_ADDRS[@]} -eq 0 ]]; then
     echo "error: no addresses given -- nothing to break on." >&2
     echo "" >&2
     echo "Run dump-wdi-state.cmd in the guest; it prints the whole" >&2
     echo "command line for this script, addresses included." >&2
+    exit 2
+fi
+
+# Four x86 debug registers, and these must be hardware breakpoints.
+# Asking for a fifth does not fail loudly -- gdb accepts it and the
+# target silently never stops there, which reads exactly like "that
+# function was never called". Refuse instead.
+NBP=${#AT_ADDRS[@]}
+for a in "$FINISH_JOB" "$UPDATE_CANDIDATES" "$START_CONNECT" "$ROAM_TASK"; do
+    if [[ -n "$a" ]]; then NBP=$((NBP + 1)); fi
+done
+if [[ $NBP -gt 4 ]]; then
+    echo "error: $NBP breakpoints asked for; x86 has four debug registers." >&2
+    echo "A fifth would silently never fire and read as 'never called'." >&2
     exit 2
 fi
 
@@ -223,6 +274,19 @@ end
 EOF
     fi
 
+    for i in "${!AT_ADDRS[@]}"; do
+        cat <<EOF
+hbreak *${AT_ADDRS[$i]}
+commands
+  silent
+  printf "\n[${AT_LABELS[$i]}] rcx=0x%lx rdx=0x%lx r8=0x%lx r9=0x%lx\n", (unsigned long)\$rcx, (unsigned long)\$rdx, (unsigned long)\$r8, (unsigned long)\$r9
+  printf "    at: "
+  x/1i \$pc
+  continue
+end
+EOF
+    done
+
     cat <<'EOF'
 printf "\n=== attached. Attempt the connection in the guest now.    ===\n"
 printf "=== Ctrl-C, then 'detach' and 'quit', once it has failed. ===\n\n"
@@ -238,6 +302,9 @@ if [[ -n "$FINISH_JOB"        ]]; then echo "  [1] CScanJob::FinishJob          
 if [[ -n "$UPDATE_CANDIDATES" ]]; then echo "  [2] CheckAndUpdateCandidates+$OFF_ZERO_COUNT         $UPDATE_CANDIDATES"; fi
 if [[ -n "$START_CONNECT"     ]]; then echo "  [3] CheckAndStartConnectProcess+$OFF_DECIDE       $START_CONNECT"; fi
 if [[ -n "$ROAM_TASK"         ]]; then echo "  [4] StartConnectRoamTask                       $ROAM_TASK"; fi
+for i in "${!AT_ADDRS[@]}"; do
+    printf '  [%s] %s\n' "${AT_LABELS[$i]}" "${AT_ADDRS[$i]}"
+done
 echo
 
 exec "$GDB" -q -nx -x "$CMDS"
