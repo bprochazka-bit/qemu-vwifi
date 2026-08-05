@@ -486,6 +486,36 @@ VwifiHandleSetAdapterConfiguration(_Inout_ PVWIFI_ADAPTER Adapter,
  * because it is wrong, not because a trace pointed at it.
  */
 
+/* Accept a task: write the M2, then say the completion follows.
+ *
+ * The status is only half of a task acknowledgement. WABIModel gives
+ * every task a FromIhv message of its own --
+ *
+ *   <message commandId="WDI_TASK_SCAN" type="WDI_SCAN_RESULTS"
+ *            description="No TLV data needed, header is sufficient"
+ *            direction="FromIhv" />
+ *
+ * -- and "header is sufficient" says the header is REQUIRED, not that
+ * nothing is. That message is the M2, and it goes in the OID's output
+ * buffer. The port driver sizes that buffer for it: every task OID in
+ * the trace arrives with `out 2046 bytes`.
+ *
+ * Every task handler here returned INDICATION_REQUIRED without writing
+ * a byte of it, leaving BytesWritten at zero. The port driver was being
+ * handed an empty response to a message it defines as always having
+ * one.
+ *
+ * Returns INDICATION_REQUIRED so callers can `return
+ * VwifiWdiTaskAccepted(Req)` in place of the bare status, which is what
+ * makes it hard for the next task handler to forget.
+ */
+NDIS_STATUS
+VwifiWdiTaskAccepted(_In_ PNDIS_OID_REQUEST Req)
+{
+    (VOID)VwifiWdiAckHeaderOnly(Req, NDIS_STATUS_SUCCESS);
+    return NDIS_STATUS_INDICATION_REQUIRED;
+}
+
 /* ============================================================
  * OID_WDI_TASK_CREATE_PORT / OID_WDI_TASK_DELETE_PORT
  *
@@ -562,7 +592,7 @@ VwifiHandleTaskCreatePort(_Inout_ PVWIFI_ADAPTER Adapter,
                 Adapter, VwifiGetWdiPortId(Req), Req->PortNumber,
                 NDIS_STATUS_WDI_INDICATION_CREATE_PORT_COMPLETE,
                 status, VwifiGetWdiTransactionId(Req), NULL, 0);
-            return NDIS_STATUS_INDICATION_REQUIRED;
+            return VwifiWdiTaskAccepted(Req);
         }
     }
 
@@ -615,7 +645,7 @@ VwifiHandleTaskCreatePort(_Inout_ PVWIFI_ADAPTER Adapter,
                                blob, blobLen);
         VwifiTlvFreeGenerated(blob);
     }
-    return NDIS_STATUS_INDICATION_REQUIRED;
+    return VwifiWdiTaskAccepted(Req);
 }
 
 static NDIS_STATUS
@@ -651,7 +681,7 @@ VwifiHandleTaskDeletePort(_Inout_ PVWIFI_ADAPTER Adapter,
                            NDIS_STATUS_SUCCESS,
                            VwifiGetWdiTransactionId(Req),
                            NULL, 0);
-    return NDIS_STATUS_INDICATION_REQUIRED;
+    return VwifiWdiTaskAccepted(Req);
 }
 
 /* ============================================================
@@ -813,7 +843,7 @@ VwifiHandleTaskDot11Reset(_Inout_ PVWIFI_ADAPTER Adapter,
                            NDIS_STATUS_SUCCESS,
                            VwifiGetWdiTransactionId(Req),
                            NULL, 0);
-    return NDIS_STATUS_INDICATION_REQUIRED;
+    return VwifiWdiTaskAccepted(Req);
 }
 
 /* ============================================================
@@ -955,7 +985,7 @@ VwifiHandleTaskSetRadioState(_Inout_ PVWIFI_ADAPTER Adapter,
                            NDIS_STATUS_SUCCESS,
                            VwifiGetWdiTransactionId(Req),
                            NULL, 0);
-    return NDIS_STATUS_INDICATION_REQUIRED;
+    return VwifiWdiTaskAccepted(Req);
 }
 
 /* ============================================================
@@ -1279,5 +1309,5 @@ VwifiHandleTaskChangeOpMode(_Inout_ PVWIFI_ADAPTER Adapter,
      * handler. This one was missed when the other four task handlers
      * were corrected: it sends its completion indication and then
      * returned SUCCESS as well, which is the same double completion. */
-    return NDIS_STATUS_INDICATION_REQUIRED;
+    return VwifiWdiTaskAccepted(Req);
 }

@@ -782,7 +782,7 @@ VwifiHandleTaskScan(_Inout_ PVWIFI_ADAPTER Adapter,
             due.QuadPart = -((LONGLONG)VWIFI_SCAN_STALE_MS * 10000LL);
             NdisSetTimerObject(task->Watchdog, due, 0, NULL);
         }
-        return NDIS_STATUS_INDICATION_REQUIRED;
+        return VwifiWdiTaskAccepted(Req);
     }
 
     /* The OID buffer is [WDI_MESSAGE_HEADER][TLV blob]; the parser
@@ -867,7 +867,7 @@ VwifiHandleTaskScan(_Inout_ PVWIFI_ADAPTER Adapter,
     /* WDI_SCAN_RESULTS (the M0) needs no TLV data — the header alone is
      * the "task started" acknowledgement. INDICATION_REQUIRED tells
      * NDIS the real completion arrives later as an indication. */
-    return NDIS_STATUS_INDICATION_REQUIRED;
+    return VwifiWdiTaskAccepted(Req);
 }
 
 /* For the heartbeat in MiniportCheckForHangEx, which lives in driver.c

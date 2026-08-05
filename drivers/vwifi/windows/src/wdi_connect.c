@@ -532,11 +532,11 @@ VwifiHandleTaskConnect(_Inout_ PVWIFI_ADAPTER Adapter,
             }
             return status;
         }
-        return NDIS_STATUS_INDICATION_REQUIRED;
+        return VwifiWdiTaskAccepted(Req);
     }
 
     /* The device runs Auth/Assoc; ASSOC_RESULT completes the task. */
-    return NDIS_STATUS_INDICATION_REQUIRED;
+    return VwifiWdiTaskAccepted(Req);
 }
 
 NDIS_STATUS
@@ -575,11 +575,11 @@ VwifiHandleTaskDisconnect(_Inout_ PVWIFI_ADAPTER Adapter,
         RtlZeroMemory(Adapter->Bssid, 6);
         VwifiIndicateDisconnectComplete(Adapter, NDIS_STATUS_SUCCESS);
         VwifiIndicateLinkState(Adapter, FALSE);
-        return NDIS_STATUS_INDICATION_REQUIRED;
+        return VwifiWdiTaskAccepted(Req);
     }
 
     /* The device emits DISCONNECTED, which drives the indications. */
-    return NDIS_STATUS_INDICATION_REQUIRED;
+    return VwifiWdiTaskAccepted(Req);
 }
 
 /* For the heartbeat in MiniportCheckForHangEx, which lives in driver.c
