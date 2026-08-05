@@ -250,11 +250,60 @@ function Invoke-Kd {
         [Parameter(Mandatory)][string] $Kd,
         [Parameter(Mandatory)][string] $Sym,
         [Parameter(Mandatory)][string] $Commands,
-        [Parameter(Mandatory)][string] $LogFile
+        [Parameter(Mandatory)][string] $LogFile,
+        [int] $TimeoutSec = 180,
+        [switch] $Append
     )
-    # -kl local kernel debug, -logo overwrite log, and a trailing q so
-    # the session exits instead of sitting at a prompt no one is at.
-    (Invoke-Native $Kd @('-kl','-y',$Sym,'-logo',$LogFile,'-c',"$Commands;q")) | Out-Null
+    # -kl local kernel debug, and a trailing q so the session exits
+    # instead of sitting at a prompt no one is at.
+    #
+    # -logo truncates, -loga appends. Appending is what lets a pass be
+    # split across several kd invocations into one readable file.
+    $logSwitch = if ($Append) { '-loga' } else { '-logo' }
+
+    # Run it under a timeout, because kd does not always take the
+    # trailing q.
+    #
+    # A single malformed command is enough: `x ndis!*Wdi*` left the
+    # session echoing the whole -c string back as an unresolved symbol
+    # and then waiting at a prompt forever, with the script blocked on a
+    # process that was never going to exit. A dump tool that can hang
+    # the machine it is diagnosing is worse than one that returns
+    # nothing, so it now gets killed and says so.
+    $proc = Start-Process -FilePath $Kd -PassThru -NoNewWindow -ArgumentList @(
+        '-kl','-y',$Sym,$logSwitch,$LogFile,'-c',"$Commands;q")
+    if (-not $proc.WaitForExit($TimeoutSec * 1000)) {
+        Write-Warning "kd did not exit within ${TimeoutSec}s -- killing it."
+        Write-Warning 'Whatever it managed to write is still in the log.'
+        try { $proc.Kill() } catch { }
+        try { $proc.WaitForExit(5000) | Out-Null } catch { }
+    }
+    if (Test-Path $LogFile) { return Get-Content $LogFile }
+    return @()
+}
+
+# Run commands one kd invocation at a time, appending to one log.
+#
+# Slower than a single `;`-joined string, and worth it wherever a
+# command might not come back: one that hangs or derails the parser
+# takes down only itself, and every command before it is already on
+# disk. Used for exploratory passes; the settled ones stay batched.
+function Invoke-KdEach {
+    param(
+        [Parameter(Mandatory)][string]   $Kd,
+        [Parameter(Mandatory)][string]   $Sym,
+        [Parameter(Mandatory)][string[]] $Commands,
+        [Parameter(Mandatory)][string]   $LogFile,
+        [int] $TimeoutSec = 60
+    )
+    Remove-Item $LogFile -ErrorAction SilentlyContinue
+    $first = $true
+    foreach ($c in $Commands) {
+        Write-Host "      kd: $c"
+        (Invoke-Kd -Kd $Kd -Sym $Sym -LogFile $LogFile -TimeoutSec $TimeoutSec `
+                   -Commands $c -Append:(-not $first)) | Out-Null
+        $first = $false
+    }
     if (Test-Path $LogFile) { return Get-Content $LogFile }
     return @()
 }
@@ -652,59 +701,68 @@ if ($wdiState) {
     # StartConnectRoamTask, so OID_WDI_TASK_CONNECT never goes out and
     # *pAssocStatus is left at WDI_ASSOC_STATUS_CANDIDATE_LIST_EXHAUSTED.
     #
-    # Where this stands, so the next reader does not re-derive it.
+    # Static reading has gone as far as it goes.
     #
-    # PROVEN, end to end, out of the binary:
-    #   WfcPortPropertyGoodScanStartTime (port property 71) is
-    #   unpopulated -> CheckAndUpdateCandidates zeroes the candidate
-    #   count -> CheckAndStartConnectProcess skips StartConnectRoamTask
-    #   -> OID_WDI_TASK_CONNECT is never sent.
+    # PROVEN out of the binary: WfcPortPropertyGoodScanStartTime (port
+    # property 71) is unpopulated -> CheckAndUpdateCandidates zeroes the
+    # candidate count -> CheckAndStartConnectProcess skips
+    # StartConnectRoamTask -> OID_WDI_TASK_CONNECT is never sent.
     #
-    # The sole writer is CScanJob::FinishJob, behind three gates:
-    #   1. status == 0
-    #   2. job->m_bCancelled (+0x78A) == 0
-    #   3. the port property cache for the job's port id resolves
-    # and it is NOT KNOWN which of the three fails. That is a runtime
-    # question and local kernel debugging cannot set a breakpoint.
+    # Its only writer is CScanJob::FinishJob, behind three gates:
     #
-    # What the property table does show: 106 of 134 port properties are
-    # populated, including CurrentChannelNumber and CurrentBandID. Among
-    # scan-related properties GoodScanStartTime is the only one missing,
-    # so this is not a port whose properties are broadly unset.
+    #   +0x98  test ebp,ebp                    ; status
+    #          jne  skip
+    #   +0xa6  cmp  byte ptr [rbx+78Ah],bpl    ; m_bCancelled
+    #          jne  skip
+    #   +0xaf  resolve the port property cache for [rbx+34h]
+    #          null -> skip
     #
-    # FinishJob definitely RUNS -- it clears m_ScanInProgress at +0x55,
-    # before any gate, and m_ScanInProgress reads false in every dump.
-    # So the scan job completes and one of the three gates rejects it.
+    # FinishJob demonstrably runs -- it clears m_ScanInProgress at
+    # +0x55, ahead of every gate, and that reads false in every dump --
+    # so the scan job completes and one of the three rejects it. WHICH
+    # one is a runtime fact, and local kernel debugging cannot break.
     #
-    # Gate 2 is nearly excluded: +0x78A is written in exactly two places,
-    # zeroed in the constructor and set in OnJobCancelled, and nothing
-    # cancels our scans -- OID_WDI_ABORT_TASK never arrives, and a job
-    # cancelled before it starts never issues its task at all.
+    # Ruled out along the way, so nobody re-runs them: the M1 addressing
+    # (transaction ids and port ids echo exactly, per the driver's own
+    # OID M1 trace); the M2 (now written, no change); and the Wdi_Ndis*
+    # entry points (we call NdisMRegisterWdiMiniportDriver out of
+    # ndis.lib, and the CREATE_PORT completion demonstrably drives the
+    # port driver's state machine forward, so plain NdisMIndicateStatusEx
+    # does reach the task machinery).
     #
-    # Two cheap things left to check before reaching for a real
-    # debugger. First, dot11wdi.h declares Wdi_NdisMIndicateStatusEx and
-    # Wdi_NdisMOidRequestComplete under a comment reading "TODO:
-    # Temporary Completion handlers for OIDs and Indications". This
-    # driver calls plain NdisMIndicateStatusEx. If the Wdi_ variants are
-    # what actually feed the port driver's task machinery, that is the
-    # whole bug and a one-line fix; if they are not exported at all,
-    # they are vestigial and the question is closed. `x` answers it
-    # either way.
+    # So this pass no longer reads state. It prints the one number
+    # needed to set a breakpoint from outside the guest, using QEMU's
+    # gdbstub -- see scripts/gdb-wdi-finishjob.sh. At FinishJob's first
+    # instruction every gate input is still in a register or reachable
+    # from rcx, so one hit answers all three at once.
     #
-    # Second, CScanJob::OnJobStarted reads +0x78A and its neighbours,
-    # and its tail was never disassembled -- it is the one routine on
-    # the scan path still unread.
-    Write-Host '[4/5] Reading the decision'
+    # One command per kd invocation. The previous batched pass hung:
+    # `x ndis!*Wdi*` derailed kd's parser, it echoed the whole -c string
+    # back as an unresolved symbol, and sat at a prompt forever with the
+    # script blocked behind it. Split, a bad command costs only itself.
+    Write-Host '[4/5] Locating the breakpoint'
     $log4 = Join-Path $OutDir 'wdi-state-decide.txt'
-    $out4 = Invoke-Kd -Kd $kd -Sym $sym -LogFile $log4 -Commands (@(
-        '.reload /f wdiwifi.sys',
-        'x wdiwifi!Wdi_Ndis*',
-        'x ndis!Wdi_Ndis*',
-        'x ndis!*Wdi*',
-        'dt wdiwifi!WFC_MESSAGE_TYPE',
-        'uf wdiwifi!CScanJob::OnJobStarted'
-    ) -join ';')
+    $out4 = Invoke-KdEach -Kd $kd -Sym $sym -LogFile $log4 -Commands @(
+        'lm vm wdiwifi',
+        'x wdiwifi!CScanJob::FinishJob',
+        'x wdiwifi!CScanJob::StartScanTask',
+        'x wdiwifi!CConnectJob::CheckAndUpdateCandidates'
+    )
     Write-Host "      $log4 ($($out4.Count) lines)"
+
+    foreach ($l in $out4) {
+        if ($l -match '^(fffff[0-9a-f`]+)\s+wdiwifi!CScanJob::FinishJob') {
+            $addr = $Matches[1] -replace '`',''
+            Write-Host ''
+            Write-Host '      BREAKPOINT ADDRESS'
+            Write-Host "        wdiwifi!CScanJob::FinishJob = 0x$addr"
+            Write-Host ''
+            Write-Host '      On the Linux host, with the guest started with -gdb tcp::1234:'
+            Write-Host "        scripts/gdb-wdi-finishjob.sh 0x$addr"
+            Write-Host ''
+            Write-Host '      Then trigger a scan in the guest. Valid only for this boot.'
+        }
+    }
 } else {
     Write-Warning 'no "WDI state" pointer in pass two; skipping the adapter dump'
     Write-Warning 'If -MiniportHandle was given: handles are reassigned every'
@@ -717,6 +775,6 @@ Write-Host '[5/5] Done'
 Write-Host "      $log1 ($($out1.Count) lines)"
 Write-Host "      $log2 ($($out2.Count) lines)"
 Write-Host ''
-Write-Host '      Send wdi-state-decide.txt. Two cheap checks remain before this'
-Write-Host '      needs a breakpoint: whether Wdi_NdisMIndicateStatusEx exists, and'
-Write-Host '      the one routine on the scan path still unread.'
+Write-Host '      wdi-state-decide.txt holds the breakpoint address. The remaining'
+Write-Host '      question is a runtime one and needs a break at'
+Write-Host '      CScanJob::FinishJob -- see scripts/gdb-wdi-finishjob.sh.'
