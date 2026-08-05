@@ -174,6 +174,9 @@ VwifiAdapterCreate(
     adapter->PendingOpMode = -1;
     InitializeListHead(&adapter->PendingReqList);
     KeInitializeSpinLock(&adapter->PendingReqLock);
+    /* Guards the frames indicated to the WLAN component but not yet
+     * collected through RxGetMpdusHandler. See wdi_data.c. */
+    KeInitializeSpinLock(&adapter->RxQueueLock);
 
     /* Pick up the WDI version the OS reported in AllocateAdapter, which
      * ran immediately before us. Every TLV_CONTEXT carries this. Getting

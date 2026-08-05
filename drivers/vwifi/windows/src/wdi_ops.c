@@ -299,6 +299,24 @@ VwifiWdiTalTxRxInitialize(
     adapter->DataPathHandle = NdisMiniportDataPathHandle;
     adapter->DataPathApi    = NdisWdiDataPathApi;
 
+    /* Logged because the table is versioned and reading past its end is
+     * silent. Revision 1 ends at FreeWiFiFrameMetaData; everything this
+     * driver calls -- dequeue, transfer/send complete, the RX
+     * indication, the confirms, peer create/delete, the metadata
+     * allocator -- is inside that, so a revision-1 table is enough.
+     * Every call site still null-checks its own entry. */
+    if (NdisWdiDataPathApi != NULL) {
+        VWIFI_INFO("WdiTalTxRxInitialize: data API header type 0x%x rev %u "
+                   "size %u (revision 1 needs %u)",
+                   NdisWdiDataPathApi->Header.Type,
+                   NdisWdiDataPathApi->Header.Revision,
+                   NdisWdiDataPathApi->Header.Size,
+                   (ULONG)NDIS_SIZEOF_WDI_DATA_API_REVISION_1);
+    } else {
+        VWIFI_ERR("WdiTalTxRxInitialize: no data API table -- no frame will "
+                  "move in either direction");
+    }
+
     /* Fill in all twenty-five handlers. Leaving them NULL is what kept
      * the adapter from ever getting a port -- see the header comment in
      * wdi_tal.c. */

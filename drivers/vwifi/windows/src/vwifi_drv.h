@@ -363,6 +363,17 @@ typedef struct _VWIFI_ADAPTER
     UINT8               MaxPeers;
     UINT8               MaxPorts;
 
+    /* RX frames indicated to the component and not yet collected.
+     *
+     * WDI's RX is two calls, not one: RxInorderDataIndication says
+     * frames exist for a (peer, TID) and the component then calls back
+     * through RxGetMpdusHandler to take them. They have to be parked
+     * somewhere in between, and that is here. */
+    PNET_BUFFER_LIST    RxQueueHead;
+    PNET_BUFFER_LIST    RxQueueTail;
+    ULONG               RxQueueCount;
+    KSPIN_LOCK          RxQueueLock;
+
     /* The periodic heartbeat: a timer this driver owns, and the count
      * of beats it has printed. See VwifiHeartbeatStart in driver.c for
      * why the beat is not driven by MiniportCheckForHangEx. */
@@ -639,6 +650,69 @@ NDIS_STATUS VwifiHandleTaskDisconnect(_Inout_ PVWIFI_ADAPTER Adapter,
 #define VWIFI_TASK_CONNECT_PENDING     0x1
 #define VWIFI_TASK_DISCONNECT_PENDING  0x2
 ULONG       VwifiConnectTaskState(_In_ PVWIFI_ADAPTER Adapter);
+
+/* Rate-limited tracing for the per-frame handlers.
+ *
+ * Shared between wdi_tal.c and wdi_data.c: both sit on paths that can
+ * run at DISPATCH_LEVEL and at whatever rate the component likes, and
+ * logging every call would drown the trace that made either file
+ * necessary. ONCE announces a path exists; FIRST(n) shows the first n
+ * calls in full, for the handlers whose SHAPE is the open question. */
+#define VWIFI_TAL_ONCE(fmt, ...)                                    \
+    do {                                                            \
+        static LONG _vwifi_once = 0;                                \
+        if (InterlockedCompareExchange(&_vwifi_once, 1, 0) == 0) {  \
+            VWIFI_INFO(fmt, ##__VA_ARGS__);                         \
+        }                                                           \
+    } while (0)
+
+#define VWIFI_TAL_FIRST(n, fmt, ...)                                \
+    do {                                                            \
+        static LONG _vwifi_n = 0;                                   \
+        if (InterlockedIncrement(&_vwifi_n) <= (n)) {               \
+            VWIFI_INFO(fmt, ##__VA_ARGS__);                         \
+        }                                                           \
+    } while (0)
+
+/* How many transfers we tell the component it may have outstanding.
+ *
+ * This was 1, with the comment "the TAL TX path is not implemented, so
+ * there is no depth to offer". It is implemented now, and 1 is a
+ * throttle rather than a promise: the trace showed TxTargetDescInit
+ * followed immediately by TxPeerBacklog(backlogged=1) and then nothing
+ * at all, which is the shape of a component that prepared a frame and
+ * found the miniport with no room for it.
+ *
+ * Well under the 256-slot TX ring, because a transfer here is a memcpy
+ * into a ring slot and is complete by the time the handler returns --
+ * the depth that matters is the component's willingness to hand frames
+ * over, not our ability to hold them. */
+#define VWIFI_TAL_MAX_OUTSTANDING_TRANSFERS 64
+
+/* monitor.c — NDIS's return path for RX NBLs, and the only code that
+ * frees an RX NBL and re-arms the ring slot behind it. Declared here
+ * because wdi_data.c needs it too: a frame handed back through the TAL
+ * has to go through the same reclaim, and a second copy of it is how
+ * the two drift apart. (Third time a helper has had to come out of the
+ * file that happened to own it -- see VwifiWdiAckHeaderOnly and
+ * VwifiNdisStatusName.) */
+MINIPORT_RETURN_NET_BUFFER_LISTS VwifiMiniportReturnNetBufferLists;
+
+/* wdi_data.c — the WDI per-frame data path.
+ *
+ * TX is a pull: the component queues frames and the miniport comes and
+ * takes them. RX is a two-step push: indicate that frames exist, then
+ * hand them over when the component asks. */
+VOID        VwifiTalTxPump(_Inout_ PVWIFI_ADAPTER Adapter);
+VOID        VwifiTalRxIndicate(_Inout_ PVWIFI_ADAPTER Adapter,
+                               _In_ PNET_BUFFER_LIST Nbl,
+                               _In_ WDI_PEER_ID PeerId,
+                               _In_ WDI_EXTENDED_TID ExTid);
+VOID        VwifiTalRxTakeQueued(_Inout_ PVWIFI_ADAPTER Adapter,
+                                 _Outptr_result_maybenull_ PNET_BUFFER_LIST *Out);
+VOID        VwifiTalRxReturn(_Inout_ PVWIFI_ADAPTER Adapter,
+                             _In_ PNET_BUFFER_LIST Nbl);
+VOID        VwifiTalRxFlushQueued(_Inout_ PVWIFI_ADAPTER Adapter);
 
 /* wdi_peer.c — the WDI peer table.
  *

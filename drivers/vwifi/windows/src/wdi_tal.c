@@ -40,30 +40,17 @@
  * both halves now run. See wdi_peer.c for what a peer is and why
  * nothing can be sent without one.
  *
- * The per-frame TX and RX paths are still honest stubs. Every stub is
- * written so the component cannot be misled by it: no NBL is accepted
- * and silently dropped, no output parameter is left uninitialised, and
- * RxGetMpdus hands back NULL rather than whatever was on the stack.
+ * The per-frame paths are implemented too, in wdi_data.c. TX is a
+ * pull -- TxDataSend and TxPeerBacklog are notifications that frames
+ * are waiting, and the miniport goes and takes them through
+ * NdisWdiTxDequeueIndication. RX is a two-step push: indicate that
+ * frames exist for a (peer, TID), then hand them over when
+ * RxGetMpdusHandler asks. Neither goes anywhere near
+ * MiniportSendNetBufferLists or NdisMIndicateReceiveNetBufferLists,
+ * which in WDI are not the data path for station traffic.
  *
- * That means TX from the WDI data path does not work yet. It is a real
- * limitation, not a temporary shim that happens to work — anything sent
- * this way stays queued in the component. Scanning and connecting are
- * control-path operations and do not go through here.
- *
- * What is missing to finish it
- * ----------------------------
- * One contract, and it is not in this header's kit. A TX NBL arrives
- * from NdisWdiTxDequeueIndication carrying a WDI_FRAME_METADATA -- the
- * struct is defined in dot11wdi.h, has a pNBL back-pointer, and holds
- * the WDI_FRAME_ID that NdisWdiTxSendCompleteIndication is fed -- but
- * nothing in dot11wdi.h says WHERE on the NBL to find it. Guessing at a
- * kernel ABI is how this project has lost rounds before, so it is being
- * read out of wdiwifi.sys instead: see the TxMgr disassembly pass in
- * dump-wdi-state.ps1.
- *
- * The TxDataSend and RxGetMpdus stubs log their first calls in full
- * rather than announcing themselves once, because whether they fire at
- * all is the measurement that says the peer indication took.
+ * The handlers here are thin on purpose: which notification arrived is
+ * this file's business, and what to do about it is wdi_data.c's.
  *
  * Every handler traces
  * --------------------
@@ -98,31 +85,8 @@
 
 #include "vwifi_drv.h"
 
-/* Per-frame handlers can be called at DISPATCH_LEVEL and at whatever
- * rate the component likes. Logging every call would drown the trace
- * that made this file necessary, so they announce themselves once. */
-#define VWIFI_TAL_ONCE(fmt, ...)                                    \
-    do {                                                            \
-        static LONG _vwifi_once = 0;                                \
-        if (InterlockedCompareExchange(&_vwifi_once, 1, 0) == 0) {  \
-            VWIFI_INFO(fmt, ##__VA_ARGS__);                         \
-        }                                                           \
-    } while (0)
-
-/* The first few calls in full, then silence.
- *
- * For the handlers whose SHAPE is the open question rather than their
- * existence: one line says they started firing, and a handful says what
- * the component is actually asking for -- which peer, which TID, how
- * many frames -- without turning the trace into a firehose at rate.
- * Eight is enough to see a pattern and few enough to read. */
-#define VWIFI_TAL_FIRST(n, fmt, ...)                                \
-    do {                                                            \
-        static LONG _vwifi_n = 0;                                   \
-        if (InterlockedIncrement(&_vwifi_n) <= (n)) {               \
-            VWIFI_INFO(fmt, ##__VA_ARGS__);                         \
-        }                                                           \
-    } while (0)
+/* VWIFI_TAL_ONCE / VWIFI_TAL_FIRST live in vwifi_drv.h: wdi_data.c
+ * is on the same per-frame paths and needs the same rate limiting. */
 
 /* ============================================================
  * TAL lifecycle
@@ -166,10 +130,13 @@ VwifiTalStart(
      * the kit actually has. */
     RtlZeroMemory(pTalTxRxParameters, sizeof(*pTalTxRxParameters));
 
-    /* One outstanding transfer: the TAL TX path is not implemented, so
-     * there is no depth to offer and claiming otherwise would invite
-     * the component to queue work that never completes. */
-    pTalTxRxParameters->MaxOutstandingTransfers = 1;
+    /* Was 1, with the reasoning that an unimplemented TX path has no
+     * depth to offer. It is implemented now, and 1 turned out to be a
+     * throttle rather than modesty: the trace showed TxTargetDescInit
+     * and then TxPeerBacklog(backlogged=1) and then nothing, which is a
+     * component that prepared a frame and found the miniport full. */
+    pTalTxRxParameters->MaxOutstandingTransfers =
+        VWIFI_TAL_MAX_OUTSTANDING_TRANSFERS;
     return NDIS_STATUS_SUCCESS;
 }
 
@@ -457,9 +424,9 @@ VwifiTalTxDataSend(
      * says the peer indication took, so the first calls are logged in
      * full rather than announced once. */
     VWIFI_TAL_FIRST(8, "TAL TxDataSend: port %u peer %u tid %u -- %u queued, "
-                       "%u active. The TAL TX path is not implemented yet, "
-                       "so these stay queued.",
+                       "%u active",
                     PortId, PeerId, ExTid, NumQueueFrames, NumActiveFrames);
+    VwifiTalTxPump((PVWIFI_ADAPTER)MiniportTalTxRxContext);
 }
 
 static VOID
@@ -472,12 +439,12 @@ VwifiTalTxTalSend(
     _In_ UINT32 NumActiveFrames,
     _In_ BOOLEAN bRobustnessFlag)
 {
-    UNREFERENCED_PARAMETER(MiniportTalTxRxContext);
     UNREFERENCED_PARAMETER(bRobustnessFlag);
 
     VWIFI_TAL_FIRST(8, "TAL TxTalSend: port %u peer %u tid %u -- %u queued, "
-                       "%u active. Not implemented.",
+                       "%u active",
                     PortId, PeerId, ExTid, NumQueueFrames, NumActiveFrames);
+    VwifiTalTxPump((PVWIFI_ADAPTER)MiniportTalTxRxContext);
 }
 
 static VOID
@@ -515,6 +482,15 @@ VwifiTalTxPeerBacklog(
 
     VWIFI_INFO("TAL TxPeerBacklog: port %u peer %u backlogged %u",
                PortId, PeerId, bBacklogged ? 1u : 0u);
+
+    /* "Backlogged" is the component saying this peer has frames it has
+     * not been able to hand over. Before the TX path existed that was
+     * simply true and stayed true; now it is a reason to go and look,
+     * and it is the ONLY notification that arrived in the trace where
+     * TxDataSend never did. */
+    if (bBacklogged) {
+        VwifiTalTxPump((PVWIFI_ADAPTER)MiniportTalTxRxContext);
+    }
 }
 
 static VOID
@@ -584,20 +560,20 @@ VwifiTalRxFlush(
      * there: no connect task, no more scans, wlansvc holding its
      * interface lock, and netsh and Device Manager blocking behind it.
      *
-     * Nothing to discard before confirming: no frame has ever been
-     * indicated to the component through the TAL. The RX path runs over
-     * the vwifi rings, and there is no RxEngine here holding anything.
-     * So the confirmation is immediate and it is honest.
-     *
-     * The API table comes from MiniportWdiTalTxRxInitialize and has been
-     * captured and unused since it was first stored. This is the first
-     * call this driver makes into it. */
+     * The API table comes from MiniportWdiTalTxRxInitialize and was
+     * captured and unused until this call. */
     if (adapter == NULL || adapter->DataPathApi == NULL ||
         adapter->DataPathApi->RxFlushConfirm == NULL) {
         VWIFI_ERR("TAL RxFlush: no RxFlushConfirm available -- the "
                   "component will wait for this flush forever");
         return;
     }
+
+    /* Now there IS something to discard. "The RxEngine must have
+     * finished discarding all matching RX data frames before invoking
+     * this function", and frames indicated but not yet collected are
+     * exactly that -- each one also holding an RX ring slot. */
+    VwifiTalRxFlushQueued(adapter);
 
     adapter->DataPathApi->RxFlushConfirm(adapter->DataPathHandle);
     VWIFI_INFO("TAL RxFlush: confirmed");
@@ -620,15 +596,13 @@ VwifiTalRxGetMpdus(
     _In_ WDI_EXTENDED_TID ExTid,
     _Out_ PNET_BUFFER_LIST *ppNBL)
 {
-    UNREFERENCED_PARAMETER(MiniportTalTxRxContext);
-
-    /* NULL, explicitly. This is an _Out_ pointer the component will
+    /* Explicitly written in every path. This is an _Out_ pointer the component will
      * walk; leaving it as whatever was on the stack is the difference
      * between "no frames" and a bugcheck. */
-    VWIFI_TAL_FIRST(8, "TAL RxGetMpdus: peer %u tid %u -- no frames "
-                       "(the TAL RX path is not implemented yet)",
-                    PeerId, ExTid);
-    *ppNBL = NULL;
+    VwifiTalRxTakeQueued((PVWIFI_ADAPTER)MiniportTalTxRxContext, ppNBL);
+    VWIFI_TAL_FIRST(8, "TAL RxGetMpdus: peer %u tid %u -- %s",
+                    PeerId, ExTid, (*ppNBL != NULL) ? "handing frames over"
+                                                    : "nothing queued");
 }
 
 static VOID
@@ -636,13 +610,20 @@ VwifiTalRxReturnFrames(
     _In_ TAL_TXRX_HANDLE MiniportTalTxRxContext,
     _In_ PNET_BUFFER_LIST pNBL)
 {
-    UNREFERENCED_PARAMETER(MiniportTalTxRxContext);
-    UNREFERENCED_PARAMETER(pNBL);
+    PVWIFI_ADAPTER adapter = (PVWIFI_ADAPTER)MiniportTalTxRxContext;
+    ULONG n = 0;
 
-    /* Nothing was ever indicated through the TAL, so nothing can come
-     * back through here. */
-    VWIFI_TAL_ONCE("TAL RxReturnFrames (first call) -- unexpected, nothing "
-                   "was indicated through the TAL");
+    /* One at a time, unlinking as we go: each NBL's ring slot is
+     * re-armed as it is released and the chain cannot be walked once
+     * its head has been freed. */
+    while (pNBL != NULL) {
+        PNET_BUFFER_LIST next = NET_BUFFER_LIST_NEXT_NBL(pNBL);
+
+        VwifiTalRxReturn(adapter, pNBL);
+        pNBL = next;
+        n++;
+    }
+    VWIFI_TAL_FIRST(8, "TAL RxReturnFrames: %u frame(s) back", n);
 }
 
 static VOID

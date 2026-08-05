@@ -139,9 +139,41 @@ VwifiRxDrainSta(_Inout_ PVWIFI_ADAPTER Adapter)
 
     VwifiWrite32(Adapter, ring->RegHead, ring->NextIndex);
 
-    if (indicated) {
-        NdisMIndicateReceiveNetBufferLists(
-            Adapter->MiniportAdapterHandle, indicate_head,
-            NDIS_DEFAULT_PORT_NUMBER, indicated, 0);
+    if (!indicated) return;
+
+    /* Through the TAL when there is a peer to attribute the frames to,
+     * and only then.
+     *
+     * NdisMIndicateReceiveNetBufferLists is the plain-NDIS receive and
+     * in WDI it is not the receive path for station data: wdiwifi's
+     * RxMgr is, and it learns about a frame only through
+     * NdisWdiRxInorderDataIndication. Indicating up the NDIS way on an
+     * associated link put frames somewhere nothing was listening --
+     * which is why an associated adapter still could not complete DHCP.
+     *
+     * The fallback is not dead code. Monitor mode has no peer and no
+     * WDI port to receive on, and the frames still have to go
+     * somewhere; VwifiRxDrainMonitor uses the same call for the same
+     * reason. */
+    {
+        PVWIFI_PEER peer = VwifiPeerFirstActive(Adapter);
+
+        if (peer != NULL) {
+            while (indicate_head != NULL) {
+                PNET_BUFFER_LIST nbl = indicate_head;
+
+                indicate_head = NET_BUFFER_LIST_NEXT_NBL(nbl);
+                NET_BUFFER_LIST_NEXT_NBL(nbl) = NULL;
+                /* Best-effort TID. This device does no QoS and the
+                 * component told us nothing per-frame, so every MSDU is
+                 * best-effort -- which is what TID 0 means. */
+                VwifiTalRxIndicate(Adapter, nbl, peer->PeerId, 0);
+            }
+            return;
+        }
     }
+
+    NdisMIndicateReceiveNetBufferLists(
+        Adapter->MiniportAdapterHandle, indicate_head,
+        NDIS_DEFAULT_PORT_NUMBER, indicated, 0);
 }

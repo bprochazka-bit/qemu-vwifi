@@ -923,7 +923,37 @@ leaves the port permanently shut. The AKM is the discriminator, not the
 cipher and not the auth algorithm -- WPA2-PSK authenticates over the air
 as Open System, so auth alone cannot tell them apart.
 
-### The one contract that is still unread
+### In WDI, NDIS is not the data path
+
+`MiniportSendNetBufferLists` and `NdisMIndicateReceiveNetBufferLists`
+are the whole data path for an ordinary NDIS miniport. For station
+traffic under WDI they are neither end of it. `wdiwifi.sys` owns both
+directions: NDIS hands sends to **it**, its TxMgr queues them per
+(port, peer, TID), and the miniport is expected to come and take them
+through `NdisWdiTxDequeueIndication`. Receives go the other way, into
+its RxMgr via `NdisWdiRxInorderDataIndication`.
+
+So an implemented `VwifiTxDataFrame`, a working RX ring drain, a
+created peer and a connected link still moved nothing — the frames were
+never offered to one and the other put them where nobody was listening.
+`wdi_data.c` is the plumbing between the component and the rings the
+driver already had.
+
+Two shapes worth knowing, because they are not symmetrical:
+
+- **TX is a pull.** `TxDataSend` and `TxPeerBacklog` are only
+  *notifications* that frames are waiting. Nothing arrives with them.
+- **RX is a two-step push.** `RxInorderDataIndication` says frames exist
+  for a (peer, TID); the component decides when to take them and calls
+  back through `RxGetMpdusHandler`. They have to be parked in between.
+
+`MaxOutstandingTransfers` was 1, on the reasoning that an unimplemented
+TX path has no depth to offer. That turned out to be a throttle rather
+than modesty — the trace showed `TxTargetDescInit`, then
+`TxPeerBacklog(backlogged=1)`, then nothing at all, which is a component
+that prepared a frame and found the miniport full.
+
+### The contract that is not in the header, and how to act on one anyway
 
 Finishing the per-frame path needs one fact that `dot11wdi.h` does not
 state. A TX NBL arrives from `NdisWdiTxDequeueIndication` carrying a
@@ -962,8 +992,26 @@ rather than another guess:
 
 A candidate pointer can be *checked* before it is trusted: read it,
 follow `+0x10`, and see whether it points back at the NBL it came from.
-`dump-wdi-state` pass five now `uf`s `CTxMgr::TxDequeueInd` — the same
-move that named port property `0x47` and adapter property `0x10`.
+
+And the **RX direction settles the argument**. The miniport creates
+those NBLs, so it must attach the metadata somewhere the port driver
+will look — and the only field of a `NET_BUFFER_LIST` a miniport is
+permitted to write is `MiniportReserved`. There is nowhere else it
+could be, and TX is the same contract read the other way.
+
+That is still an argument, and this driver has been wrong about
+arguments twice. So it is not trusted, it is **checked at runtime**:
+`VwifiTxMetadata` confirms the candidate is a plausible kernel address,
+confirms it is readable, and confirms that following its `pNBL` leads
+back to the NBL it came from. A metadata that fails is not used, and the
+frame is *still sent and still completed* — the transfer completion
+takes the NBL, not the metadata — so a wrong guess degrades to "no
+send-completion, said out loud in the log" rather than to a bugcheck.
+
+**When a contract cannot be read, make the code prove it at runtime and
+degrade safely when the proof fails.** That is available far more often
+than it looks: `pNBL` exists precisely so the link can be verified from
+either end.
 
 Still in the log, and still not acted on:
 
