@@ -86,6 +86,26 @@
 # the disassembly gives the early-return branches, the trace says which
 # one was taken.
 #
+# An --at pass over the connect chain answered the first half:
+#
+#   [StartConnectRoamTask]        rcx=job rdx=1
+#   [GenerateConnectTaskTlv]      rcx=job
+#   [FillConnectRoamTaskParameters] rcx=job
+#   [GenerateRoamTaskTlv]         never -- correct, this is a connect
+#
+# Entry points only, so it says the chain is entered and nothing about
+# what any of them returned. --tlv-stages and --roam-status are the
+# follow-up, and both are RETURN-side:
+#
+#   --tlv-stages ADDR   three rungs inside GenerateConnectTaskTlv, each
+#                       on the path taken when one of its three calls
+#                       returned zero. The last rung that fires names
+#                       the call that failed.
+#   --roam-status ADDR  StartConnectRoamTask's epilogue, printing the
+#                       status it is about to return.
+#
+# Together they are exactly four breakpoints, which is the whole budget.
+#
 # USAGE
 #
 #   1. Start the guest with a gdbstub. Add to the QEMU command line:
@@ -121,6 +141,8 @@ FINISH_JOB=
 UPDATE_CANDIDATES=
 START_CONNECT=
 ROAM_TASK=
+TLV_STAGES=
+ROAM_STATUS=
 AT_LABELS=()
 AT_ADDRS=()
 
@@ -134,6 +156,34 @@ OFF_ZERO_COUNT=0x317      # mov dword ptr [rbx+26Ch],r13d
 OFF_DECIDE=0x1a3          # cmp dword ptr [rbx+26Ch],r13d
 OFF_CANDIDATE_COUNT=0x26C # CConnectJob's candidate count
 
+# CConnectJob::GenerateConnectTaskTlv, as a ladder. Each of these is the
+# instruction immediately after one of the three calls that build the
+# connect task, on the path taken when that call returned zero:
+#
+#   +0x70   call CConnectJob::FillConnectRoamTaskParameters
+#   +0xc8   mov  r8,[rdi+200h]        <- it succeeded
+#   +0xf8   call GenerateWdiTaskConnectToIhv
+#   +0x12d  mov  rcx,[rdi+1F0h]       <- it succeeded
+#   +0x16c  call CMessageHelper::FitMessageToBufferSize
+#   +0x1ee  mov  rax,[rsp+50h]        <- it succeeded, message is built
+#
+# So the LAST rung that fires names the call that failed, without
+# needing to know what any of them do. rbp is the frame pointer for the
+# whole function, so the message length at [rbp+0D0h] is readable at
+# every rung.
+OFF_TLV_FILLED=0xc8
+OFF_TLV_SERIALISED=0x12d
+OFF_TLV_FITTED=0x1ee
+OFF_TLV_MSGLEN=0xD0       # dword, relative to rbp
+OFF_TLV_MSGBUF=0x50       # qword, relative to rsp
+
+# CConnectJob::StartConnectRoamTask's epilogue, `mov eax,ebx`. ebx is
+# the status the whole function is about to return -- 0 on success, and
+# on failure whichever of Task::Initialize, get_TaskDeviceCommand,
+# DeviceCommand::Initialize or CJobBase::StartTask produced it. One
+# breakpoint, and the value names the stage.
+OFF_ROAM_RET=0x762
+
 usage() {
     sed -n '3,/^set -euo/p' "$0" | sed 's/^#\{0,1\} \{0,1\}//;$d'
     exit "${1:-2}"
@@ -145,6 +195,8 @@ while [[ $# -gt 0 ]]; do
         --update-candidates) UPDATE_CANDIDATES="${2:-}"; shift 2 ;;
         --start-connect)     START_CONNECT="${2:-}";     shift 2 ;;
         --roam-task)         ROAM_TASK="${2:-}";         shift 2 ;;
+        --tlv-stages)        TLV_STAGES="${2:-}";        shift 2 ;;
+        --roam-status)       ROAM_STATUS="${2:-}";       shift 2 ;;
         --port)              PORT="${2:-1234}";          shift 2 ;;
         --at)
             # LABEL=ADDR. The generic form, for tracing a chain whose
@@ -177,12 +229,14 @@ FINISH_JOB=$(norm "$FINISH_JOB")
 UPDATE_CANDIDATES=$(norm "$UPDATE_CANDIDATES")
 START_CONNECT=$(norm "$START_CONNECT")
 ROAM_TASK=$(norm "$ROAM_TASK")
+TLV_STAGES=$(norm "$TLV_STAGES")
+ROAM_STATUS=$(norm "$ROAM_STATUS")
 
 for i in "${!AT_ADDRS[@]}"; do
     AT_ADDRS[$i]=$(norm "${AT_ADDRS[$i]}")
 done
 
-if [[ -z "$FINISH_JOB$UPDATE_CANDIDATES$START_CONNECT$ROAM_TASK" &&
+if [[ -z "$FINISH_JOB$UPDATE_CANDIDATES$START_CONNECT$ROAM_TASK$TLV_STAGES$ROAM_STATUS" &&
       ${#AT_ADDRS[@]} -eq 0 ]]; then
     echo "error: no addresses given -- nothing to break on." >&2
     echo "" >&2
@@ -196,9 +250,11 @@ fi
 # target silently never stops there, which reads exactly like "that
 # function was never called". Refuse instead.
 NBP=${#AT_ADDRS[@]}
-for a in "$FINISH_JOB" "$UPDATE_CANDIDATES" "$START_CONNECT" "$ROAM_TASK"; do
+for a in "$FINISH_JOB" "$UPDATE_CANDIDATES" "$START_CONNECT" "$ROAM_TASK" "$ROAM_STATUS"; do
     if [[ -n "$a" ]]; then NBP=$((NBP + 1)); fi
 done
+# --tlv-stages is three of the four on its own.
+if [[ -n "$TLV_STAGES" ]]; then NBP=$((NBP + 3)); fi
 if [[ $NBP -gt 4 ]]; then
     echo "error: $NBP breakpoints asked for; x86 has four debug registers." >&2
     echo "A fifth would silently never fire and read as 'never called'." >&2
@@ -274,6 +330,48 @@ end
 EOF
     fi
 
+    if [[ -n "$TLV_STAGES" ]]; then
+        cat <<EOF
+hbreak *($TLV_STAGES + $OFF_TLV_FILLED)
+commands
+  silent
+  printf "\n[tlv 1/3] FillConnectRoamTaskParameters returned 0 -- parameters filled\n"
+  printf "    at: "
+  x/1i \$pc
+  continue
+end
+hbreak *($TLV_STAGES + $OFF_TLV_SERIALISED)
+commands
+  silent
+  printf "\n[tlv 2/3] GenerateWdiTaskConnectToIhv returned 0 -- msglen=%u\n", *(unsigned int *)(\$rbp + $OFF_TLV_MSGLEN)
+  printf "    at: "
+  x/1i \$pc
+  continue
+end
+hbreak *($TLV_STAGES + $OFF_TLV_FITTED)
+commands
+  silent
+  printf "\n[tlv 3/3] FitMessageToBufferSize returned 0 -- msglen=%u buf=0x%lx\n", *(unsigned int *)(\$rbp + $OFF_TLV_MSGLEN), *(unsigned long *)(\$rsp + $OFF_TLV_MSGBUF)
+  printf "    at: "
+  x/1i \$pc
+  continue
+end
+EOF
+    fi
+
+    if [[ -n "$ROAM_STATUS" ]]; then
+        cat <<EOF
+hbreak *($ROAM_STATUS + $OFF_ROAM_RET)
+commands
+  silent
+  printf "\n[ret] StartConnectRoamTask returns 0x%x\n", (unsigned int)\$rbx
+  printf "    at: "
+  x/1i \$pc
+  continue
+end
+EOF
+    fi
+
     for i in "${!AT_ADDRS[@]}"; do
         cat <<EOF
 hbreak *${AT_ADDRS[$i]}
@@ -302,6 +400,8 @@ if [[ -n "$FINISH_JOB"        ]]; then echo "  [1] CScanJob::FinishJob          
 if [[ -n "$UPDATE_CANDIDATES" ]]; then echo "  [2] CheckAndUpdateCandidates+$OFF_ZERO_COUNT         $UPDATE_CANDIDATES"; fi
 if [[ -n "$START_CONNECT"     ]]; then echo "  [3] CheckAndStartConnectProcess+$OFF_DECIDE       $START_CONNECT"; fi
 if [[ -n "$ROAM_TASK"         ]]; then echo "  [4] StartConnectRoamTask                       $ROAM_TASK"; fi
+if [[ -n "$TLV_STAGES"        ]]; then echo "  [tlv 1-3] GenerateConnectTaskTlv +$OFF_TLV_FILLED/+$OFF_TLV_SERIALISED/+$OFF_TLV_FITTED  $TLV_STAGES"; fi
+if [[ -n "$ROAM_STATUS"       ]]; then echo "  [ret] StartConnectRoamTask+$OFF_ROAM_RET               $ROAM_STATUS"; fi
 for i in "${!AT_ADDRS[@]}"; do
     printf '  [%s] %s\n' "${AT_LABELS[$i]}" "${AT_ADDRS[$i]}"
 done

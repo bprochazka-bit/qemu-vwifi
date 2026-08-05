@@ -991,6 +991,28 @@ if ($wdiState) {
     if ($chainFound.Count -gt 0) {
         Write-Host '      CONNECT TASK TRACE (this boot only)'
         Write-Host ''
+
+        # The --at pass over these four entry points has already run, and
+        # it said the chain IS entered: StartConnectRoamTask ->
+        # GenerateConnectTaskTlv -> FillConnectRoamTaskParameters, with
+        # GenerateRoamTaskTlv correctly skipped for a connect. Entry
+        # points cannot say what any of them RETURNED, which is the
+        # remaining question, so the command printed first is the
+        # return-side one.
+        $gen  = $chainFound['CConnectJob::GenerateConnectTaskTlv']
+        $roam = $chainFound['CConnectJob::StartConnectRoamTask']
+        if ($gen -and $roam) {
+            Write-Host ("        scripts/gdb-wdi-connect.sh --tlv-stages {0} --roam-status {1}" -f $gen, $roam)
+            Write-Host ''
+            Write-Host '      Three rungs inside GenerateConnectTaskTlv, each on the path'
+            Write-Host '      taken when one of its three calls returned zero, plus the'
+            Write-Host '      status StartConnectRoamTask ends up returning. The last rung'
+            Write-Host '      that fires names the call that failed. Four breakpoints, which'
+            Write-Host '      is the whole budget.'
+        }
+
+        Write-Host ''
+        Write-Host '      Entry points only, if the chain needs re-walking:'
         $atParts = @()
         foreach ($name in $chainFound.Keys) {
             # Short label: the class prefix is the same for all of them
@@ -1000,7 +1022,7 @@ if ($wdiState) {
         }
         Write-Host ("        scripts/gdb-wdi-connect.sh " + ($atParts -join ' '))
         Write-Host ''
-        Write-Host '      Attempt the connection, then send back this trace AND'
+        Write-Host '      Attempt the connection, then send back the trace AND'
         Write-Host "      $log5"
     } else {
         Write-Warning 'none of the connect-task symbols resolved; see the log.'

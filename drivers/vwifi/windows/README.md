@@ -667,6 +667,51 @@ loudly. gdb accepts it, the target silently never stops there, and the
 output reads exactly like "that function was never called" -- a false
 negative in the shape of a result.
 
+That pass answered half the question:
+
+    [StartConnectRoamTask]          rcx=job rdx=1
+    [GenerateConnectTaskTlv]        rcx=job
+    [FillConnectRoamTaskParameters] rcx=job
+    [GenerateRoamTaskTlv]           never -- correct, this is a connect
+
+The chain is entered, three deep, and the radio-state checks at
+`StartConnectRoamTask+0x135` and `+0x164` (both of which return
+`STATUS_NDIS_DOT11_POWER_STATE_INVALID`) are behind it.
+
+### Entry points say a function ran; they cannot say what it returned
+
+That is the whole limitation of the pass above, and the `uf` output says
+where to put the return-side breakpoints instead.
+`CConnectJob::GenerateConnectTaskTlv` is three calls in a row, each
+tested for zero:
+
+    +0x70   call CConnectJob::FillConnectRoamTaskParameters
+    +0xc8   mov  r8,[rdi+200h]        <- reached only if it returned 0
+    +0xf8   call GenerateWdiTaskConnectToIhv
+    +0x12d  mov  rcx,[rdi+1F0h]       <- reached only if it returned 0
+    +0x16c  call CMessageHelper::FitMessageToBufferSize
+    +0x1ee  mov  rax,[rsp+50h]        <- reached only if it returned 0
+
+Breaking on the three *landing* instructions turns "how far did it get"
+into a ladder: the last rung that fires names the call that failed, with
+no need to know what any of them do. That is `--tlv-stages`.
+
+`--roam-status` is the fourth, at `StartConnectRoamTask`'s epilogue
+(`mov eax,ebx`), printing the status the function is about to return --
+zero, or whichever of `Task::Initialize`, `get_TaskDeviceCommand`,
+`DeviceCommand::Initialize` and `CJobBase::StartTask` produced it.
+`CJobBase::StartTask` is the call that actually posts the OID.
+
+Which of the three TLV calls fails matters, because they fail on
+different things. `FillConnectRoamTaskParameters` calls
+`CDot11ToWabiConverter::MapAuthAlgorithm`, `MapCipherAlgorithm`,
+`CConnectHelpers::GetSupportedAssociationMethods` and
+`FillConnectBSSEntryTLV` -- all of which read what this driver
+advertises, so a failure there is ours. `FitMessageToBufferSize` reads
+adapter property `0x10` as the size limit and defaults it to `-1` when
+unpopulated, so that one should be unfailable, and if it is not, the
+assumption is wrong.
+
 ### When the driver log is silent, the problem is above the driver
 
 The 0xE9 trace records everything the driver is asked to do. That makes
