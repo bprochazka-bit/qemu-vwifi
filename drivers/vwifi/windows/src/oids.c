@@ -569,6 +569,75 @@ VwifiWdiTaskAccepted(_In_ PNDIS_OID_REQUEST Req)
     return NDIS_STATUS_INDICATION_REQUIRED;
 }
 
+/* Accept a task and keep its OID outstanding: write the M2, return
+ * NDIS_STATUS_PENDING. The caller owns Req from here until it calls
+ * VwifiWdiTaskComplete on it, exactly once.
+ *
+ * This is the third reading described above, and the measurement that
+ * forced it. A four-point breakpoint trace over a whole failed connect,
+ * with the task OIDs returning INDICATION_REQUIRED:
+ *
+ *   [1] CScanJob::FinishJob  status=0x40230001 cancelled=0x0 portid=0x0
+ *   [2] CheckAndUpdateCandidates+0x317  DISCARDING CANDIDATES  1 -> 0
+ *   [3] CheckAndStartConnectProcess+0x1a3  candidates=0
+ *   [1] CScanJob::FinishJob  status=0x40230001
+ *   [1] CScanJob::FinishJob  status=0x40230001
+ *       StartConnectRoamTask -- never reached
+ *
+ * Every scan job in the window finished with status 0x40230001, our own
+ * OID return value, and none with 0. One FinishJob per scan completion,
+ * so there is no second, later call carrying the real outcome -- the
+ * possibility that made the earlier single-shot sample unsafe to act on
+ * is now closed by measurement rather than by argument. The chain the
+ * disassembly predicted then ran in front of the breakpoints: the
+ * property read fails, a candidate list of exactly 1 is thrown away,
+ * and the connect task is never started.
+ *
+ * So the job's completion status is the OID's, and a task's OID has to
+ * end up completed with zero without being completed early. PENDING is
+ * the only NDIS return that does both: NDIS records the request as
+ * outstanding -- the scan job stays open, tasks still merge, no premature
+ * BSS polling -- and NdisMOidRequestComplete supplies the final status
+ * later.
+ *
+ * ORDER, which is the part that is a judgement rather than a
+ * measurement: the OID is completed BEFORE the M3 goes out. FinishJob's
+ * status argument is not our M3's (that has been 0 in every build,
+ * including the ones that failed), so it must be read from the request,
+ * and it has to be 0 by the time the M3 drives the job to finish. The
+ * results are already indicated by then, so completing first does not
+ * repeat what NDIS_STATUS_SUCCESS did -- there the OID completed before
+ * the sweep had found anything at all.
+ *
+ * Only OID_WDI_TASK_SCAN uses this so far. The other twelve task
+ * handlers still return INDICATION_REQUIRED: the scan job is the one
+ * whose FinishJob was measured, and changing all of them at once would
+ * make the next result unattributable again.
+ */
+NDIS_STATUS
+VwifiWdiTaskPending(_In_ PNDIS_OID_REQUEST Req)
+{
+    (VOID)VwifiWdiAckHeaderOnly(Req, NDIS_STATUS_SUCCESS);
+    return NDIS_STATUS_PENDING;
+}
+
+/* Complete a task OID that VwifiWdiTaskPending left outstanding.
+ *
+ * Exactly once per request. NDIS owns the NDIS_OID_REQUEST until this
+ * is called and frees it afterwards, so a second call is a use after
+ * free and a missing one leaves the WLAN component waiting on a request
+ * that will never come back -- which is how the disconnect task used to
+ * hang adapter teardown. Every path that abandons a scan must come
+ * through here. */
+VOID
+VwifiWdiTaskComplete(_Inout_ PVWIFI_ADAPTER Adapter,
+                     _In_ PNDIS_OID_REQUEST Req,
+                     _In_ NDIS_STATUS Status)
+{
+    if (Req == NULL) return;
+    NdisMOidRequestComplete(Adapter->MiniportAdapterHandle, Req, Status);
+}
+
 /* ============================================================
  * OID_WDI_TASK_CREATE_PORT / OID_WDI_TASK_DELETE_PORT
  *

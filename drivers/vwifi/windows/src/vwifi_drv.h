@@ -529,6 +529,24 @@ NDIS_STATUS VwifiHandleTaskChangeOpMode(_Inout_ PVWIFI_ADAPTER Adapter,
  * try. */
 NDIS_STATUS VwifiWdiTaskAccepted(_In_ PNDIS_OID_REQUEST Req);
 
+/* Accept a task and leave its OID outstanding: write the M2, return
+ * NDIS_STATUS_PENDING, and complete it later with VwifiWdiTaskComplete.
+ *
+ * Used only by OID_WDI_TASK_SCAN. A breakpoint trace over a whole
+ * failed connect showed every scan job finishing with status
+ * 0x40230001 -- the INDICATION_REQUIRED this driver returns -- and
+ * never with 0, which is the one value that lets FinishJob record
+ * WfcPortPropertyGoodScanStartTime. PENDING keeps the job open the way
+ * INDICATION_REQUIRED does and still completes with zero. See oids.c. */
+NDIS_STATUS VwifiWdiTaskPending(_In_ PNDIS_OID_REQUEST Req);
+
+/* Complete an OID left outstanding by VwifiWdiTaskPending. Exactly once
+ * per request: NDIS frees it here, and never calling it leaves the WLAN
+ * component waiting forever. */
+VOID        VwifiWdiTaskComplete(_Inout_ PVWIFI_ADAPTER Adapter,
+                                 _In_ PNDIS_OID_REQUEST Req,
+                                 _In_ NDIS_STATUS Status);
+
 /* wdi_scan.c — Phase 2 scan task. */
 /* Re-indicate everything the scan cache holds, for
  * OID_WDI_GET_BSS_ENTRY_LIST. */

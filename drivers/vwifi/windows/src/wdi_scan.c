@@ -122,11 +122,20 @@ typedef struct _VWIFI_SCAN_TASK
      * differs, leaving the task with no output at all. Sending every
      * merged completion with the first requester's port id was
      * therefore a real bug, invisible only because every scan so far
-     * has arrived on port 0. */
+     * has arrived on port 0.
+     *
+     * Request is the OID itself, still outstanding. VwifiHandleTaskScan
+     * returns NDIS_STATUS_PENDING, so NDIS keeps each request alive and
+     * owned by us until VwifiWdiTaskComplete is called on it -- which
+     * is what puts a zero status where CScanJob::FinishJob reads the
+     * job's outcome. Every path that abandons a sweep has to complete
+     * these; a scan task that is dropped instead leaves the WLAN
+     * component waiting on a request that never returns. */
     struct {
-        UINT32      TransactionId;
-        WDI_PORT_ID WdiPortId;
-        ULONG       PortId;
+        UINT32            TransactionId;
+        WDI_PORT_ID       WdiPortId;
+        ULONG             PortId;
+        PNDIS_OID_REQUEST Request;
     }         Requesters[VWIFI_SCAN_MAX_PENDING_TASKS];
     ULONG     TransactionCount;
 
@@ -258,6 +267,22 @@ done:
  * Scan complete — WABIModel: "No TLV data needed, header is
  * sufficient". Nothing to generate; the shim emits a bare header.
  * ============================================================ */
+/* Take ownership of one outstanding scan OID, or get NULL if someone
+ * else already has.
+ *
+ * Interlocked rather than a plain read-and-clear because completing a
+ * request twice is a use after free and never completing it hangs the
+ * WLAN component: those are the two outcomes worth spending an atomic
+ * on. The completion path, the teardown path and the late-merge
+ * recovery below all claim through here, so exactly one of them wins
+ * each slot. */
+static PNDIS_OID_REQUEST
+VwifiScanClaimRequest(_Inout_ PVWIFI_SCAN_TASK Task, _In_ ULONG Index)
+{
+    return (PNDIS_OID_REQUEST)InterlockedExchangePointer(
+        (PVOID volatile *)&Task->Requesters[Index].Request, NULL);
+}
+
 static VOID
 VwifiIndicateScanComplete(_Inout_ PVWIFI_ADAPTER Adapter, _In_ NDIS_STATUS Status)
 {
@@ -274,12 +299,28 @@ VwifiIndicateScanComplete(_Inout_ PVWIFI_ADAPTER Adapter, _In_ NDIS_STATUS Statu
 
     /* One SCAN_COMPLETE per task the sweep was answering, each echoing
      * its own transaction id. SCAN_COMPLETE carries no TLVs at all --
-     * the outcome rides in the message header's Status field. */
+     * the outcome rides in the message header's Status field.
+     *
+     * The OID is completed FIRST and the M3 sent second, per requester.
+     * CScanJob::FinishJob's status argument is not our M3's -- that has
+     * been 0 in every build, including the ones where FinishJob was
+     * measured receiving 0x40230001 -- so it comes from the request, and
+     * it has to already be 0 when the M3 drives the job to finish. The
+     * BSS entries were flushed just above, so by this point the results
+     * are in: completing here is nothing like the NDIS_STATUS_SUCCESS
+     * build, which completed before the sweep had found anything. */
     {
         ULONG n = task->TransactionCount;
 
         if (n > VWIFI_SCAN_MAX_PENDING_TASKS) n = VWIFI_SCAN_MAX_PENDING_TASKS;
         for (ULONG i = 0; i < n; i++) {
+            /* Claimed before the call. NdisMOidRequestComplete can run
+             * the next scan request on another processor before it
+             * returns, and that request writes this same slot. */
+            PNDIS_OID_REQUEST req = VwifiScanClaimRequest(task, i);
+
+            VwifiWdiTaskComplete(Adapter, req, Status);
+
             /* Each requester's OWN port ids, not the sweep's. */
             VwifiSendWdiIndication(Adapter,
                                    task->Requesters[i].WdiPortId,
@@ -293,6 +334,34 @@ VwifiIndicateScanComplete(_Inout_ PVWIFI_ADAPTER Adapter, _In_ NDIS_STATUS Statu
                    Status, n);
         task->TransactionCount = 0;
     }
+}
+
+/* Complete every scan OID still outstanding, without indicating
+ * anything.
+ *
+ * For teardown only. VwifiIndicateScanComplete is the normal path and
+ * completes each request itself; this exists so that halting with a
+ * scan in flight does not leave NDIS holding requests forever, which is
+ * the failure mode that made adapter removal hang before the disconnect
+ * task learned to send its completion. */
+static VOID
+VwifiScanAbandonRequests(_Inout_ PVWIFI_ADAPTER Adapter,
+                         _Inout_ PVWIFI_SCAN_TASK Task,
+                         _In_ NDIS_STATUS Status)
+{
+    ULONG n = Task->TransactionCount;
+
+    if (n > VWIFI_SCAN_MAX_PENDING_TASKS) n = VWIFI_SCAN_MAX_PENDING_TASKS;
+    for (ULONG i = 0; i < n; i++) {
+        PNDIS_OID_REQUEST req = VwifiScanClaimRequest(Task, i);
+
+        if (req) {
+            VWIFI_WARN("abandoning outstanding scan OID txn %u with 0x%08x",
+                       Task->Requesters[i].TransactionId, Status);
+            VwifiWdiTaskComplete(Adapter, req, Status);
+        }
+    }
+    Task->TransactionCount = 0;
 }
 
 /* ============================================================
@@ -722,6 +791,7 @@ VwifiHandleTaskScan(_Inout_ PVWIFI_ADAPTER Adapter,
     ULONG outLen = 0;
     PVOID tlvBuf;
     ULONG tlvLen;
+    ULONG slot;
 
     if (!task) return NDIS_STATUS_RESOURCES;
     if (task->Active) {
@@ -760,21 +830,20 @@ VwifiHandleTaskScan(_Inout_ PVWIFI_ADAPTER Adapter,
             return NDIS_STATUS_REQUEST_ABORTED;
         }
 
-        {
-            ULONG i = task->TransactionCount++;
-            task->Requesters[i].TransactionId = VwifiGetWdiTransactionId(Req);
-            task->Requesters[i].WdiPortId     = VwifiGetWdiPortId(Req);
-            task->Requesters[i].PortId        = Req->PortNumber;
+        slot = task->TransactionCount++;
+        task->Requesters[slot].TransactionId = VwifiGetWdiTransactionId(Req);
+        task->Requesters[slot].WdiPortId     = VwifiGetWdiPortId(Req);
+        task->Requesters[slot].PortId        = Req->PortNumber;
+        task->Requesters[slot].Request       = Req;
 
-            VWIFI_INFO("scan requested %llu ms into one already running -- "
-                       "the running sweep will answer both (%u pending); "
-                       "M1 txn %u wdiport 0x%04x ndisport %u",
-                       VwifiGetTickCountMs() - task->StartedTimeMs,
-                       task->TransactionCount,
-                       task->Requesters[i].TransactionId,
-                       task->Requesters[i].WdiPortId,
-                       task->Requesters[i].PortId);
-        }
+        VWIFI_INFO("scan requested %llu ms into one already running -- "
+                   "the running sweep will answer both (%u pending); "
+                   "M1 txn %u wdiport 0x%04x ndisport %u",
+                   VwifiGetTickCountMs() - task->StartedTimeMs,
+                   task->TransactionCount,
+                   task->Requesters[slot].TransactionId,
+                   task->Requesters[slot].WdiPortId,
+                   task->Requesters[slot].PortId);
 
         /* Re-arm: the watchdog now guards two tasks, not one. */
         if (task->Watchdog) {
@@ -782,7 +851,42 @@ VwifiHandleTaskScan(_Inout_ PVWIFI_ADAPTER Adapter,
             due.QuadPart = -((LONGLONG)VWIFI_SCAN_STALE_MS * 10000LL);
             NdisSetTimerObject(task->Watchdog, due, 0, NULL);
         }
-        return VwifiWdiTaskAccepted(Req);
+
+        /* The sweep can finish between the `task->Active` test above and
+         * the slot being filled in -- the device's completion is a DPC
+         * and can be on another processor. If it did, its completion
+         * loop has already walked past this slot, and a request nobody
+         * completes hangs the caller for good.
+         *
+         * Re-reading Active after the store closes the window: the store
+         * happens before this read and the loop's claim happens after it
+         * clears Active, so whichever order the two take, exactly one of
+         * them finds a request to complete.
+         *
+         * This one is then answered synchronously rather than left
+         * pending. The sweep really has finished and its results are
+         * already indicated, so there is nothing to wait for -- and
+         * completing a request before returning PENDING from the handler
+         * that owns it is a race not worth running for a path this
+         * rare. */
+        if (!task->Active && VwifiScanClaimRequest(task, slot) != NULL) {
+            VWIFI_WARN("scan merged into a sweep that had just finished "
+                       "-- answering txn %u synchronously",
+                       task->Requesters[slot].TransactionId);
+            (VOID)VwifiWdiAckHeaderOnly(Req, NDIS_STATUS_SUCCESS);
+            VwifiSendWdiIndication(Adapter,
+                                   task->Requesters[slot].WdiPortId,
+                                   task->Requesters[slot].PortId,
+                                   NDIS_STATUS_WDI_INDICATION_SCAN_COMPLETE,
+                                   NDIS_STATUS_SUCCESS,
+                                   task->Requesters[slot].TransactionId,
+                                   NULL, 0);
+            return NDIS_STATUS_SUCCESS;
+        }
+
+        /* Outstanding until the running sweep finishes, like the request
+         * that started it. */
+        return VwifiWdiTaskPending(Req);
     }
 
     /* The OID buffer is [WDI_MESSAGE_HEADER][TLV blob]; the parser
@@ -826,6 +930,11 @@ VwifiHandleTaskScan(_Inout_ PVWIFI_ADAPTER Adapter,
     task->Requesters[0].TransactionId = VwifiGetWdiTransactionId(Req);
     task->Requesters[0].WdiPortId     = task->WdiPortId;
     task->Requesters[0].PortId        = task->PortId;
+    /* Not stored yet. The device can still refuse the sweep below, and
+     * that path returns a failure status synchronously -- a request that
+     * is both failed by its return value and sitting in this slot would
+     * be completed twice. It goes in only once the scan is running. */
+    task->Requesters[0].Request       = NULL;
     task->TransactionCount     = 1;
     /* No M1 trace here: VwifiHandleOidRequest prints one for every WDI
      * method request, this one included. */
@@ -856,6 +965,7 @@ VwifiHandleTaskScan(_Inout_ PVWIFI_ADAPTER Adapter,
             task->Watchdog) {
             (VOID)NdisCancelTimerObject(task->Watchdog);
         }
+        task->TransactionCount = 0;
         return status;
     }
 
@@ -864,16 +974,25 @@ VwifiHandleTaskScan(_Inout_ PVWIFI_ADAPTER Adapter,
                (unsigned long long)scanReq->channel_mask_5,
                scanReq->dwell_ms, scanReq->num_ssids);
 
+    /* The sweep is running and cannot fail synchronously any more, so
+     * the request can be adopted. */
+    task->Requesters[0].Request = Req;
+
     /* WDI_SCAN_RESULTS is the M2: no TLV data, the header alone is the
-     * "task accepted" acknowledgement. The scan's real outcome arrives
-     * later as WDI_INDICATION_SCAN_COMPLETE, so the OID itself returns
-     * INDICATION_REQUIRED.
+     * "task accepted" acknowledgement, and it is written now. The OID
+     * itself stays OUTSTANDING -- NDIS_STATUS_PENDING -- until
+     * VwifiIndicateScanComplete completes it with the sweep's real
+     * status, immediately before sending the SCAN_COMPLETE M3.
      *
-     * Completing it with SUCCESS was tried and is worse: wdiwifi then
-     * treats the scan as over the moment this returns, polls the BSS
-     * cache ten times before a single frame has arrived, and stops
-     * merging concurrent scan tasks. See VwifiWdiTaskAccepted. */
-    return VwifiWdiTaskAccepted(Req);
+     * Neither of the two values tried before works. INDICATION_REQUIRED
+     * keeps the job open but is what CScanJob::FinishJob then reads as
+     * the job's outcome -- measured, three times out of three, and it
+     * suppresses WfcPortPropertyGoodScanStartTime, which is what makes
+     * the connect job discard its candidates. SUCCESS zeroes that status
+     * but ends the job the instant this returns, so wdiwifi polls the
+     * BSS cache before a single frame has arrived and stops merging
+     * scans. See VwifiWdiTaskPending. */
+    return VwifiWdiTaskPending(Req);
 }
 
 /* For the heartbeat in MiniportCheckForHangEx, which lives in driver.c
@@ -986,6 +1105,16 @@ VwifiScanTaskDestroy(_Inout_ PVWIFI_ADAPTER Adapter)
         NdisFreeTimerObject(task->Watchdog);
         task->Watchdog = NULL;
     }
+
+    /* After the watchdog is gone, so nothing can hand out a completion
+     * behind this, and before the task memory is freed, since the
+     * requests live in it. A scan OID left outstanding here is not a
+     * leak that shows up later -- it is the WLAN component blocked on a
+     * request that can no longer be answered, which is what made
+     * disabling the adapter hang before the disconnect task learned to
+     * complete itself. */
+    InterlockedExchange(&task->Active, 0);
+    VwifiScanAbandonRequests(Adapter, task, NDIS_STATUS_REQUEST_ABORTED);
 
     if (task->Cache) {
         NdisFreeMemoryWithTagPriority(Adapter->MiniportAdapterHandle,

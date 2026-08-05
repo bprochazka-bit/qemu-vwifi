@@ -586,22 +586,52 @@ property should have been written and the connect should have gone
 ahead. It did not. Either the property is still not written, or it is
 not the only thing the connect job is waiting on.
 
-There is a third reading of the same evidence, and it is the one to test
-next: `NDIS_STATUS_PENDING`, with a later `NdisMOidRequestComplete`.
-That keeps the job open the way `INDICATION_REQUIRED` does *and*
-completes it with a zero status the way `SUCCESS` does -- the pair of
-properties no single return value can carry.
+`scripts/gdb-wdi-connect.sh` replaces the single-shot script. It stays
+attached and prints every hit at four points: `CScanJob::FinishJob`, the
+store inside `CConnectJob::CheckAndUpdateCandidates` that discards the
+candidate list, the compare in `CheckAndStartConnectProcess` that reads
+the count, and `StartConnectRoamTask` itself. Four is also the ceiling
+-- hardware breakpoints use the four x86 debug registers.
+`dump-wdi-state.cmd` prints the whole command line with the addresses
+filled in; they are valid for one boot, since wdiwifi is relocated on
+every reboot.
 
-`scripts/gdb-wdi-connect.sh` is what decides it. It replaces the
-single-shot script, stays attached, and prints every hit at four points:
-`CScanJob::FinishJob`, the store inside
-`CConnectJob::CheckAndUpdateCandidates` that discards the candidate
-list, the compare in `CheckAndStartConnectProcess` that reads the count,
-and `StartConnectRoamTask` itself. Four is also the ceiling -- hardware
-breakpoints use the four x86 debug registers.
+Over one failed connect, with the task OIDs back on
+`INDICATION_REQUIRED`, it printed the entire chain:
 
-`dump-wdi-state.cmd` prints the whole command line, addresses filled in.
-They are valid for one boot; wdiwifi is relocated on every reboot.
+    [1] CScanJob::FinishJob  status=0x40230001 cancelled=0x0 portid=0x0
+    [2] CheckAndUpdateCandidates+0x317  DISCARDING CANDIDATES  1 -> 0
+        landed on: mov %r13d,0x26c(%rbx)
+    [3] CheckAndStartConnectProcess+0x1a3  candidates=0
+        landed on: cmp %r13d,0x26c(%rbx)
+    [1] CScanJob::FinishJob  status=0x40230001
+    [1] CScanJob::FinishJob  status=0x40230001
+        [4] StartConnectRoamTask -- never reached
+
+Both offset-based breakpoints landed on exactly the instructions the
+disassembly named, so the numbers beside them can be trusted. Every scan
+job in the window finished with `0x40230001` and none with `0`; one
+`FinishJob` per scan completion, so there is no later call carrying the
+real outcome. A candidate list of exactly **1** -- our AP, matched and
+ranked -- is thrown away, and the connect task is never started.
+
+So the job's completion status *is* the OID's, and a task's OID has to
+end up completed with zero without being completed early. Only
+`NDIS_STATUS_PENDING` does both: NDIS keeps the request outstanding, so
+the scan job stays open and tasks still merge, and
+`NdisMOidRequestComplete` supplies the final status later. That is what
+`OID_WDI_TASK_SCAN` now returns. The other twelve task handlers still
+return `INDICATION_REQUIRED` -- the scan job is the one that was
+measured, and changing all of them at once would make the next result
+unattributable again.
+
+A pending OID is owed a completion on **every** path, not just the happy
+one. Each merged requester's `NDIS_OID_REQUEST` is claimed with an
+interlocked exchange so exactly one of the completion path, the teardown
+path, and the late-merge recovery can complete it: completing twice is a
+use after free, and never completing leaves the WLAN component blocked
+on a request that can no longer be answered -- the same shape as the
+disconnect-task bug that used to hang adapter removal.
 
 ### When the driver log is silent, the problem is above the driver
 
