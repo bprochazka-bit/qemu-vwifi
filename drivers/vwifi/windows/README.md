@@ -736,6 +736,50 @@ adapter property `0x10`, are the next two things to read.
 is read. `0xFFFFFFFF` there means unpopulated, the limit is infinite,
 and the objection is to the message's contents rather than its length.
 
+### A nested optional container has two presence bits
+
+    [tlv limit] adapter property 0x10 = 0x0 (0)  msglen=368
+
+Not `0xFFFFFFFF`. `_WFC_ADAPTER_PROPERTY_NAME` names index 16 as
+`WfcAdapterPropertyMaxCommandSize`, and the default handed to
+`GetPropertyULongOrDefault` is `0xFFFFFFFF`, so the property is not
+missing -- it is **present and zero**. 368 bytes into a limit of 0 is
+`NDIS_STATUS_INVALID_DATA`, and that is the whole failure.
+
+This driver advertises `MaxCommandSize = 2048`. The value never
+arrived, because `WABIModel.xml` nests two optional containers:
+
+```xml
+<aggregateContainer name="CommunicationAttributesContainer">
+  <containerRef id="WDI_TLV_COMMUNICATION_CAPABILITIES"
+                name="CommunicationCapabilities"
+                type="CommunicationCapabilitiesContainer"
+                optional="true" />
+```
+
+so `WDI_COMMUNICATION_ATTRIBUTES_CONTAINER` has an `Optional` bitfield
+of its own, holding `CommunicationCapabilities_IsPresent`. The driver
+set `params.Optional.CommunicationAttributes_IsPresent` and stopped
+there, which emits the outer container with nothing inside it.
+
+**Setting the outer presence bit does not make the inner one true.**
+Every other nested container in the capabilities response gets both --
+`StationAttributes.Optional.UnicastAlgorithms_IsPresent`,
+`DatapathAttributes.Optional.DataPathCapabilities_IsPresent` -- and this
+was the one that was missed. When adding an optional TLV, check whether
+its parent is itself optional, and set every bit on the path.
+
+Worth noting how the failure presented: a capability the driver believed
+it had advertised, silently replaced by zero, surfacing four function
+calls away as a status about the *message* rather than about the
+capability. Nothing in any log named `MaxCommandSize`. The only thing
+that found it was reading the value the consumer actually had, at the
+instruction where it read it.
+
+An absent property would have been *safer* than a half-filled one: the
+default is "no limit". Half-filling a container is worse than omitting
+it.
+
 ### When the driver log is silent, the problem is above the driver
 
 The 0xE9 trace records everything the driver is asked to do. That makes

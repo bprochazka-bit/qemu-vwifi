@@ -938,9 +938,49 @@ VwifiTlvGenerateAdapterCapabilities(
     /* Must not exceed the driver's ctrl payload scratch buffer
      * (VWIFI_CTRL_PAYLOAD_SIZE in vwifi_drv.h). That header is C-only
      * and cannot be included here, so the value is asserted against
-     * instead of shared — see the C_ASSERT in wdi_common.c. */
+     * instead of shared — see the C_ASSERT in wdi_common.c.
+     *
+     * BOTH presence bits, and for a long time only the outer one was
+     * set. WABIModel nests two optional containers here:
+     *
+     *   <aggregateContainer name="CommunicationAttributesContainer">
+     *     <containerRef id="WDI_TLV_COMMUNICATION_CAPABILITIES"
+     *                   name="CommunicationCapabilities"
+     *                   type="CommunicationCapabilitiesContainer"
+     *                   optional="true" />
+     *
+     * so WDI_COMMUNICATION_ATTRIBUTES_CONTAINER carries an Optional
+     * bitfield of its own. Setting only params.Optional emitted the
+     * outer container with nothing inside it, and wdiwifi recorded
+     * WfcAdapterPropertyMaxCommandSize as 0 rather than leaving it
+     * unpopulated.
+     *
+     * Zero is not inert. CConnectJob::GenerateConnectTaskTlv reads that
+     * property as the size limit for the connect message it has just
+     * built --
+     *
+     *   GetPropertyULongOrDefault(adapterCache, 0x10, 0xFFFFFFFF)
+     *   CMessageHelper::FitMessageToBufferSize(msg, 368, limit, ...)
+     *
+     * -- and 368 bytes into a limit of 0 comes back
+     * NDIS_STATUS_INVALID_DATA. StartConnectRoamTask returns 0xc0010015
+     * and OID_WDI_TASK_CONNECT is never sent, with nothing anywhere
+     * naming the capability that caused it. Measured with a breakpoint
+     * at the instruction after the property read: 0x10 = 0, msglen 368.
+     *
+     * The default of 0xFFFFFFFF is the tell in hindsight. An absent
+     * property means "no limit"; it was PRESENT and zero that was
+     * fatal, so leaving the whole container out would have worked
+     * better than half-filling it.
+     *
+     * Every other nested container here sets both bits --
+     * StationAttributes.Optional.UnicastAlgorithms_IsPresent,
+     * DatapathAttributes.Optional.DataPathCapabilities_IsPresent. This
+     * was the one that was missed. */
     params.CommunicationAttributes.CommunicationCapabilities.MaxCommandSize =
         VWIFI_TLV_MAX_COMMAND_SIZE;
+    params.CommunicationAttributes.Optional.CommunicationCapabilities_IsPresent =
+        TRUE;
     params.Optional.CommunicationAttributes_IsPresent = TRUE;
 
     {
