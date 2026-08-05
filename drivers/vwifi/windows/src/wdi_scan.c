@@ -95,9 +95,13 @@ typedef struct _VWIFI_SCAN_TASK
      * existed for. */
     NDIS_HANDLE Watchdog;
 
-    /* Both port namespaces. WdiPortId scopes the WDI message
-     * header of every indication this task sends; PortId is the
-     * NDIS port the request arrived on. See VwifiGetWdiPortId. */
+    /* Both port namespaces, from the request that STARTED the sweep.
+     * WdiPortId scopes the WDI message header; PortId is the NDIS port
+     * the request arrived on. See VwifiGetWdiPortId.
+     *
+     * Used for BSS_ENTRY_LIST, which is an event about the sweep rather
+     * than a completion for any one requester. Task completions do NOT
+     * use these -- see Pending[] below. */
     WDI_PORT_ID     WdiPortId;
     ULONG     PortId;
 
@@ -105,11 +109,25 @@ typedef struct _VWIFI_SCAN_TASK
      *
      * Usually one. The host can ask for a second scan a few
      * milliseconds into the first -- it does exactly that as part of a
-     * connect -- and one sweep satisfies both, so both transaction ids
-     * are held here and both get a SCAN_COMPLETE when the sweep really
+     * connect -- and one sweep satisfies both, so all of them are held
+     * here and each gets a SCAN_COMPLETE when the sweep really
      * finishes. Completing one of them early, before the device has
-     * reported anything, tells the host the scan found nothing. */
-    UINT32    TransactionIds[VWIFI_SCAN_MAX_PENDING_TASKS];
+     * reported anything, tells the host the scan found nothing.
+     *
+     * All three fields per entry, not just the transaction id. A task
+     * completion is matched by the port driver on BOTH the transaction
+     * id and the port id -- wdiwifi's Task::OnDeviceIndicationArrived
+     * compares the indication against DeviceCommand::get_CommandToken
+     * and DeviceCommand::get_PortId and returns silently if either
+     * differs, leaving the task with no output at all. Sending every
+     * merged completion with the first requester's port id was
+     * therefore a real bug, invisible only because every scan so far
+     * has arrived on port 0. */
+    struct {
+        UINT32      TransactionId;
+        WDI_PORT_ID WdiPortId;
+        ULONG       PortId;
+    }         Requesters[VWIFI_SCAN_MAX_PENDING_TASKS];
     ULONG     TransactionCount;
 
     ULONG     PendingCount;
@@ -262,9 +280,14 @@ VwifiIndicateScanComplete(_Inout_ PVWIFI_ADAPTER Adapter, _In_ NDIS_STATUS Statu
 
         if (n > VWIFI_SCAN_MAX_PENDING_TASKS) n = VWIFI_SCAN_MAX_PENDING_TASKS;
         for (ULONG i = 0; i < n; i++) {
-            VwifiSendWdiIndication(Adapter, task->WdiPortId, task->PortId,
+            /* Each requester's OWN port ids, not the sweep's. */
+            VwifiSendWdiIndication(Adapter,
+                                   task->Requesters[i].WdiPortId,
+                                   task->Requesters[i].PortId,
                                    NDIS_STATUS_WDI_INDICATION_SCAN_COMPLETE,
-                                   Status, task->TransactionIds[i], NULL, 0);
+                                   Status,
+                                   task->Requesters[i].TransactionId,
+                                   NULL, 0);
         }
         VWIFI_INFO("indicated SCAN_COMPLETE (0x%x) for %u task(s)",
                    Status, n);
@@ -737,13 +760,21 @@ VwifiHandleTaskScan(_Inout_ PVWIFI_ADAPTER Adapter,
             return NDIS_STATUS_REQUEST_ABORTED;
         }
 
-        task->TransactionIds[task->TransactionCount++] =
-            VwifiGetWdiTransactionId(Req);
+        {
+            ULONG i = task->TransactionCount++;
+            task->Requesters[i].TransactionId = VwifiGetWdiTransactionId(Req);
+            task->Requesters[i].WdiPortId     = VwifiGetWdiPortId(Req);
+            task->Requesters[i].PortId        = Req->PortNumber;
 
-        VWIFI_INFO("scan requested %llu ms into one already running -- "
-                   "the running sweep will answer both (%u pending)",
-                   VwifiGetTickCountMs() - task->StartedTimeMs,
-                   task->TransactionCount);
+            VWIFI_INFO("scan requested %llu ms into one already running -- "
+                       "the running sweep will answer both (%u pending); "
+                       "M1 txn %u wdiport 0x%04x ndisport %u",
+                       VwifiGetTickCountMs() - task->StartedTimeMs,
+                       task->TransactionCount,
+                       task->Requesters[i].TransactionId,
+                       task->Requesters[i].WdiPortId,
+                       task->Requesters[i].PortId);
+        }
 
         /* Re-arm: the watchdog now guards two tasks, not one. */
         if (task->Watchdog) {
@@ -792,8 +823,12 @@ VwifiHandleTaskScan(_Inout_ PVWIFI_ADAPTER Adapter,
 
     task->PortId               = Req->PortNumber;
     task->WdiPortId            = VwifiGetWdiPortId(Req);
-    task->TransactionIds[0]    = VwifiGetWdiTransactionId(Req);
+    task->Requesters[0].TransactionId = VwifiGetWdiTransactionId(Req);
+    task->Requesters[0].WdiPortId     = task->WdiPortId;
+    task->Requesters[0].PortId        = task->PortId;
     task->TransactionCount     = 1;
+    /* No M1 trace here: VwifiHandleOidRequest prints one for every WDI
+     * method request, this one included. */
     task->PendingCount         = 0;
     task->LastIndicationTimeMs = VwifiGetTickCountMs();
     task->StartedTimeMs        = task->LastIndicationTimeMs;

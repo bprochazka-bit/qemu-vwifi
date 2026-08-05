@@ -989,6 +989,40 @@ VwifiOidRequest(
                VwifiOidRequestTypeName(OidRequest->RequestType),
                oid, VwifiOidName(oid));
 
+    /* The M1's own addressing, for every WDI method request.
+     *
+     * Everything this driver sends has been traced for a long time;
+     * what arrives never was. So "we echo the request's transaction id
+     * and port" has been a claim about our source rather than an
+     * observation, and it is exactly the claim that matters: wdiwifi's
+     * Task::OnDeviceIndicationArrived matches a task completion on BOTH
+     * the transaction id (against DeviceCommand::get_CommandToken) and
+     * the port id (against DeviceCommand::get_PortId), and on either
+     * mismatch it returns without storing anything -- so the task ends
+     * up with no output, Task::get_OutputBuffer answers
+     * STATUS_INVALID_DEVICE_STATE, and the job completes as failed
+     * while every trace on this side says success.
+     *
+     * Printing both halves is the only way to see that from here. The
+     * indication trace already prints what goes out; this prints what
+     * came in, in the same units, so the two lines can simply be read
+     * against each other. */
+    if (OidRequest->RequestType == NdisRequestMethod &&
+        OidRequest->DATA.METHOD_INFORMATION.InformationBuffer != NULL &&
+        OidRequest->DATA.METHOD_INFORMATION.InputBufferLength >=
+            sizeof(WDI_MESSAGE_HEADER)) {
+        const WDI_MESSAGE_HEADER *m1 = (const WDI_MESSAGE_HEADER *)
+            OidRequest->DATA.METHOD_INFORMATION.InformationBuffer;
+
+        VWIFI_INFO("OID M1: txn %u wdiport 0x%04x ndisport %u "
+                   "status 0x%08x ihv 0x%08x, in %u out %u bytes",
+                   m1->TransactionId, m1->PortId,
+                   (ULONG)OidRequest->PortNumber,
+                   m1->Status, m1->IhvSpecificId,
+                   OidRequest->DATA.METHOD_INFORMATION.InputBufferLength,
+                   OidRequest->DATA.METHOD_INFORMATION.OutputBufferLength);
+    }
+
     /* Answered the same way whichever arm it arrives in. WDI's own OIDs
      * are method requests, but this one is a pure get and the WLAN
      * component is documented loosely enough that it is not worth
