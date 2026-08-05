@@ -894,6 +894,35 @@ The create runs **before** `CONNECT_COMPLETE`, so the component has
 somewhere to send before it is told it may; the delete runs **before**
 the disassociation, for the mirror-image reason.
 
+The peer indication itself works. The proof is not the driver's own log
+line -- that only says we made the call -- but what the component did
+differently afterwards:
+
+    TAL TxAbort: port 0 peer 65535     <- before, always
+    TAL TxAbort: port 0 peer 0         <- after the peer was created
+
+`65535` is `WDI_PEER_ANY`. The component started naming the peer, so it
+had accepted it. **Look for the change in what the other side does, not
+for your own trace saying you did it.**
+
+### An open network's port is authorized the moment it associates
+
+Peers existed and still nothing flowed: no `TalTxRxPeerConfigHandler`,
+no `TxDataSend`, on an open network with a link the OS believed was up.
+
+`WDI_ASSOCIATION_RESULT_PARAMETERS.PortAuthorized` was hard-coded
+`FALSE`. WABIModel: *"Specifies whether port authorization has been
+performed"* -- the dot11 controlled-port flag. An unauthorized port
+passes EAPOL and nothing else.
+
+On a network with an AKM that is correct at association time: the
+four-way handshake runs afterwards over EAPOL and authorizes the port
+when it completes. On an **open** network there is no handshake to wait
+for and nothing that will ever come along to flip the bit, so `FALSE`
+leaves the port permanently shut. The AKM is the discriminator, not the
+cipher and not the auth algorithm -- WPA2-PSK authenticates over the air
+as Open System, so auth alone cannot tell them apart.
+
 ### The one contract that is still unread
 
 Finishing the per-frame path needs one fact that `dot11wdi.h` does not
@@ -912,10 +941,29 @@ the `MaxCommandSize` round before it.
 
 `wdiwifi.sys` knows: it is both the code that attaches the metadata and
 the code that reads it back at send-complete, so the offset is a
-constant in its disassembly. `dump-wdi-state` pass five now lists the
-`TxDequeue` / `FrameMetadata` / `TxSendComplete` symbols so the next
-round can `uf` the right one — the same move that named port property
-`0x47` and adapter property `0x10`.
+constant in its disassembly. The symbols are now named:
+
+```
+wdiwifi!AdapterTxDequeueInd        the NDIS_WDI_DATA_API thunk
+wdiwifi!CTxMgr::TxDequeueInd       where the NBL chain is built
+wdiwifi!CTxMgr::TxSendCompleteInd  where FrameIDs are resolved back
+wdiwifi!AdapterAllocateWifiFrameMetadata
+```
+
+and `dt` gives the layout, which is what makes acting on the answer safe
+rather than another guess:
+
+```
++0x000 Linkage : _LIST_ENTRY
++0x010 pNBL    : Ptr64 _NET_BUFFER_LIST
++0x018 FrameID : Uint2B
++0x020 u       : tx/rx union
+```
+
+A candidate pointer can be *checked* before it is trusted: read it,
+follow `+0x10`, and see whether it points back at the NBL it came from.
+`dump-wdi-state` pass five now `uf`s `CTxMgr::TxDequeueInd` — the same
+move that named port property `0x47` and adapter property `0x10`.
 
 Still in the log, and still not acted on:
 

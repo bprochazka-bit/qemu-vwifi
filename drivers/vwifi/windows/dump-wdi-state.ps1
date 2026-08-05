@@ -998,15 +998,34 @@ if ($wdiState) {
     # constant in its disassembly. Reading it is the same move that named
     # port property 0x47 and adapter property 0x10.
     #
-    # The symbol names are unknown, hence the wildcards first: whatever
-    # `x` turns up here becomes the `uf` in the next round. Dequeue and
-    # send-complete are the two ends -- one stores the link, the other
-    # follows it -- and either one alone pins the offset.
-    $cmds5 += 'x wdiwifi!*TxDequeue*'
-    $cmds5 += 'x wdiwifi!*FrameMetadata*'
-    $cmds5 += 'x wdiwifi!*FrameMetaData*'
-    $cmds5 += 'x wdiwifi!*TxSendComplete*'
-    $cmds5 += 'x wdiwifi!*PeerCreate*'
+    # The wildcards found them, so this is now specific:
+    #
+    #   AdapterTxDequeueInd     the NDIS_WDI_DATA_API thunk
+    #   CTxMgr::TxDequeueInd    where the NBL chain is actually built
+    #   CTxMgr::TxSendCompleteInd  where FrameIDs are turned back into
+    #                              the frames they belong to
+    #
+    # TxDequeueInd is the one that matters. It hands the miniport a
+    # chain of NBLs and it is the code that attaches each NBL to its
+    # WDI_FRAME_METADATA, so the store is in its disassembly and the
+    # offset is a constant in that store. SendCompleteInd is the
+    # confirmation from the other direction: it takes FrameIDs and has
+    # to find its way back, so it does the same walk in reverse.
+    #
+    # dt already answered the layout half:
+    #
+    #   +0x000 Linkage : _LIST_ENTRY
+    #   +0x010 pNBL    : Ptr64 _NET_BUFFER_LIST
+    #   +0x018 FrameID : Uint2B
+    #   +0x020 u       : tx/rx union
+    #
+    # so a candidate pointer can be checked before it is trusted: read
+    # it, follow +0x10, and see whether it points back at the NBL it
+    # came from. That is what makes acting on this safe rather than
+    # another guess.
+    $cmds5 += 'uf wdiwifi!CTxMgr::TxDequeueInd'
+    $cmds5 += 'uf wdiwifi!AdapterTxDequeueInd'
+    $cmds5 += 'uf wdiwifi!CTxMgr::TxSendCompleteInd'
     $cmds5 += 'dt wdiwifi!_WDI_FRAME_METADATA'
     $cmds5 += 'dt wdiwifi!_WDI_TX_METADATA'
 

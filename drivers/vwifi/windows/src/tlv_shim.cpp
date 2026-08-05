@@ -621,7 +621,34 @@ VwifiTlvGenerateAssociationResult(
                                    : WDI_ASSOC_STATUS_FAILURE;
     entry.AssociationResultParameters.StatusCode    = Result->status_code;
     entry.AssociationResultParameters.ReAssociation = FALSE;
-    entry.AssociationResultParameters.PortAuthorized = FALSE;
+
+    /* The 802.1X controlled port, and hard-coding it FALSE is why an
+     * associated link carried nothing.
+     *
+     * WABIModel: "Specifies whether port authorization has been
+     * performed". That is the dot11 controlled/uncontrolled port
+     * distinction -- an unauthorized port passes EAPOL and nothing
+     * else. On a network with an AKM, association is only half the
+     * job: the four-way handshake runs afterwards over EAPOL and the
+     * port is authorized when it completes, so FALSE is correct at
+     * this moment.
+     *
+     * On an OPEN network there is no handshake to wait for and nothing
+     * that will ever come along to flip it. Authorization is complete
+     * the instant the association is, and saying FALSE leaves the port
+     * permanently shut to data.
+     *
+     * Which matches what the trace showed after peers started working:
+     * the peer was created and the component acknowledged it -- TxAbort
+     * changed from peer 65535 to peer 0 -- and then nothing. No
+     * TalTxRxPeerConfigHandler, no TxDataSend, on an open network, with
+     * a link the OS believed was up.
+     *
+     * The AKM is the discriminator, not the cipher: WPA2-PSK
+     * authenticates over the air as Open System (see WdiAuthToVwifi), so
+     * auth alone cannot tell the two apart. */
+    entry.AssociationResultParameters.PortAuthorized =
+        (Params->AkmSuite == VWIFI_AKM_NONE) ? TRUE : FALSE;
 
     /* The negotiated algorithms and the band. All four were left at
      * zero, and zero is not a valid value for three of them:
