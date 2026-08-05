@@ -336,6 +336,30 @@ typedef struct _VWIFI_ADAPTER
 
     /* Phase 1.5 monitor-mode receive. */
     NDIS_HANDLE         RxNblPool;
+
+    /* RX ring slots handed to an NBL and not yet given back.
+     *
+     * The RX drain decides "is there a frame here?" from the
+     * descriptor's OWN bit alone, and that is only sound while every
+     * consumed slot is re-armed before the consumer index laps it. It
+     * is not: a slot stays un-armed until its NBL comes back through
+     * VwifiMiniportReturnNetBufferLists, which can be arbitrarily
+     * later.
+     *
+     * Let enough frames arrive before the returns catch up and the
+     * consumer index wraps onto a slot it already consumed -- OWN
+     * clear, stale frame_len -- which reads exactly like a fresh
+     * frame. It is consumed again, and so is the next, all the way
+     * round a ring in which nothing is armed: an unbounded loop
+     * allocating NBLs at DISPATCH_LEVEL, which takes the machine with
+     * it and leaves no trace, because the loop never returns to
+     * anything that could log.
+     *
+     * Counted so the drain can stop one slot short of exhausting the
+     * ring, which keeps the lap from ever happening. The drain is also
+     * bounded by the descriptor count, so the loop terminates even if
+     * this reasoning is wrong. */
+    volatile LONG       RxOutstanding;
     /* One DOT11_EXTSTA_RECV_CONTEXT per RX slot, referenced by the
      * NBL's MediaSpecificInformation OOB pointer while in flight. */
     struct DOT11_EXTSTA_RECV_CONTEXT *RxRecvContext;

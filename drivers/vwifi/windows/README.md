@@ -1330,6 +1330,64 @@ that had to be a multiple of sixteen and was four, failing identically
 every time since the day it was written. The trace said "alloc failed",
 which reads as memory pressure and is the one thing it never was.
 
+### The OWN bit is not "is there a frame here"
+
+Fixing the NBL context made RX work — `RxGetMpdus` and `RxReturnFrames`
+balanced, frames going up, the AP answering. The same build hung the
+guest hard enough to need a reset, with the 0xE9 log stopping
+mid-flight.
+
+A hard hang with the debug console silent is a short list: almost
+always an unbounded loop or a deadlock at `DISPATCH_LEVEL`, because
+neither ever returns to anything that could log. And the only newly
+live code was everything downstream of an RX NBL that now allocates.
+
+Both RX drains decide "is there a frame in this slot?" from the
+descriptor's `VWIFI_DESC_F_OWN` bit alone:
+
+```c
+if (d->flags & VWIFI_DESC_F_OWN) break;   /* device still owns it */
+```
+
+That is sound only while every consumed slot is re-armed before the
+consumer index laps it. It is not. A slot deliberately stays un-armed
+until its NBL comes back through `VwifiMiniportReturnNetBufferLists` —
+that is the whole point of the design, since the NBL's MDL points into
+the slot's DMA buffer — and the return can be arbitrarily later.
+
+Let enough frames arrive before the returns catch up, and the consumer
+index wraps onto a slot it already consumed: `OWN` clear, `frame_len`
+still set from last time. Indistinguishable from a fresh frame. It gets
+consumed again, and so does the next, all the way round a ring in which
+nothing is armed — an unbounded loop allocating NBLs and MDLs at
+`DISPATCH_LEVEL`.
+
+It could not happen while the NBL allocation was failing, because
+nothing was ever outstanding. **The alignment bug was hiding it.**
+
+Two stops now, deliberately redundant:
+
+- `RxOutstanding` counts slots held by an NBL, and the drain stops one
+  short of the ring, dropping frames and re-arming their slots instead
+  — safe precisely because no NBL has taken those. This keeps the lap
+  unreachable.
+- A `guard` counter bounds each pass to one lap regardless, and says so
+  loudly. This makes the loop terminate even if the reasoning above is
+  wrong.
+
+**A "can't happen" that depends on a rate is a race, not an invariant.**
+The lap needed 256 frames to arrive before their returns landed; at
+DHCP-burst rates that is a fraction of a second, and it had simply
+never been reachable before because the receive path had never once
+succeeded.
+
+**And once again the rate limiter lied.** `rx(sta): descriptor N` is
+`VWIFI_TAL_FIRST(8, …)`, so the log falling silent after eight frames
+says nothing whatever about whether RX stopped — which is exactly the
+trap written up two sections above, walked into again one build later.
+When a trace goes quiet, check what is rate-limited *before* concluding
+anything went quiet.
+
 ### When the driver log is silent, the problem is above the driver
 
 The 0xE9 trace records everything the driver is asked to do. That makes

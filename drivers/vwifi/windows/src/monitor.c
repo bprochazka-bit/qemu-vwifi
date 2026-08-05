@@ -118,11 +118,25 @@ VwifiRxDrainMonitor(_Inout_ PVWIFI_ADAPTER Adapter)
     PNET_BUFFER_LIST indicate_head = NULL;
     PNET_BUFFER_LIST indicate_tail = NULL;
     ULONG indicated = 0;
+    /* Two independent stops, because the loop's own exit condition is
+     * not trustworthy on its own -- see VWIFI_ADAPTER::RxOutstanding.
+     * `guard` bounds the pass to one lap of the ring no matter what the
+     * descriptors say; the outstanding check keeps the lap from being
+     * reachable in the first place. */
+    ULONG guard = 0;
 
     for (;;) {
         ULONG idx = ring->NextIndex & ring->Mask;
         struct vwifi_rx_desc *d = (struct vwifi_rx_desc *)
             ((PUCHAR)ring->VirtualAddress + idx * ring->DescSize);
+
+        if (++guard > ring->NumDescs) {
+            VWIFI_WARN("%s: drained a full ring (%u descriptors) in one "
+                       "pass without finding an armed slot -- stopping. "
+                       "%d slot(s) outstanding",
+                       "rx(mon)", ring->NumDescs, Adapter->RxOutstanding);
+            break;
+        }
 
         if (d->flags & VWIFI_DESC_F_OWN) {
             break;   /* still owned by device */
@@ -132,6 +146,18 @@ VwifiRxDrainMonitor(_Inout_ PVWIFI_ADAPTER Adapter)
          * are Phase 3's path. In Phase 1.5 the device only sets RAW
          * in monitor mode, so anything without it we just re-arm. */
         if (!(d->flags & VWIFI_RX_F_RAW) || d->frame_len == 0) {
+            goto rearm;
+        }
+
+        /* Stop one slot short of owning the whole ring. The frame is
+         * dropped and its slot re-armed -- which is safe precisely
+         * because no NBL has taken it yet -- so the device keeps a
+         * place to write and the drain keeps making progress. Losing
+         * frames while the returns catch up beats lapping. */
+        if (Adapter->RxOutstanding >= (LONG)(ring->NumDescs - 1)) {
+            VWIFI_TAL_ONCE("rx(mon): all but one RX slot outstanding -- "
+                           "dropping frames until the component returns "
+                           "some");
             goto rearm;
         }
 
@@ -202,6 +228,9 @@ VwifiRxDrainMonitor(_Inout_ PVWIFI_ADAPTER Adapter)
             }
             indicate_tail = nbl;
             indicated++;
+            /* The slot now belongs to this NBL and stays un-armed until
+             * VwifiMiniportReturnNetBufferLists gives it back. */
+            InterlockedIncrement(&Adapter->RxOutstanding);
 
             /* NOTE: we do NOT re-arm this slot here — it stays owned by
              * the NBL until VwifiReturnNetBufferLists reclaims it. We
@@ -263,7 +292,10 @@ VwifiMiniportReturnNetBufferLists(
         }
         NdisFreeNetBufferList(nbl);
 
-        /* Re-arm the RX slot so the device can reuse it. */
+        /* Re-arm the RX slot so the device can reuse it, and account
+         * for it: this is the moment the slot stops being outstanding,
+         * and the drain's lap guard reads that count. */
+        InterlockedDecrement(&adapter->RxOutstanding);
         struct vwifi_rx_desc *d = (struct vwifi_rx_desc *)
             ((PUCHAR)adapter->RxRing.VirtualAddress
              + slot * adapter->RxRing.DescSize);
