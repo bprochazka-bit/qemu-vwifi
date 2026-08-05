@@ -943,14 +943,47 @@ VwifiHandleTaskDot11Reset(_Inout_ PVWIFI_ADAPTER Adapter,
 
     /* Back to idle. Best-effort: the device rejects a disconnect when
      * nothing is associated, which is the common case here and not a
-     * reason to fail the reset. */
+     * reason to fail the reset.
+     *
+     * The RESULT is not best-effort, and discarding it was hiding the
+     * one driver-side explanation for an intermittent
+     * ASSOCIATION_RESULT status=16. Every connect is preceded by this
+     * reset, milliseconds earlier. If the device does not actually
+     * leave the association here -- because the disconnect was
+     * rejected, or timed out, or never reached it -- then the next
+     * connect authenticates from a device that already believes it is
+     * associated, and an AP that agrees has no reason to answer. That
+     * is exactly what "the AP never answered" looks like from inside
+     * the guest, and it is indistinguishable from a medium fault
+     * without this line.
+     *
+     * Logged at INFO when it succeeds and WARN when it does not,
+     * because "rejected, nothing was associated" and "rejected, and we
+     * were" are the same status from here and only the surrounding
+     * trace can tell them apart. */
     {
         ULONG out_len = 0;
         struct vwifi_disconnect_req dreq;
+        NDIS_STATUS dst;
+        BOOLEAN wasAssociated = Adapter->Associated;
 
         RtlZeroMemory(&dreq, sizeof(dreq));
-        (VOID)VwifiCtrlSendSync(Adapter, VWIFI_OP_DISCONNECT,
+        dst = VwifiCtrlSendSync(Adapter, VWIFI_OP_DISCONNECT,
                                 &dreq, sizeof(dreq), NULL, &out_len);
+        if (dst == NDIS_STATUS_SUCCESS) {
+            VWIFI_INFO("OID: dot11 reset: device disconnect accepted "
+                       "(was%s associated)", wasAssociated ? "" : " not");
+        } else if (wasAssociated) {
+            VWIFI_WARN("OID: dot11 reset: device disconnect FAILED 0x%08x %s "
+                       "while associated -- the device may still hold the "
+                       "association, and the next connect will authenticate "
+                       "from a state the AP already thinks is up",
+                       dst, VwifiNdisStatusName(dst));
+        } else {
+            VWIFI_INFO("OID: dot11 reset: device disconnect refused 0x%08x "
+                       "%s, nothing was associated",
+                       dst, VwifiNdisStatusName(dst));
+        }
     }
 
     /* And our own idea of the association, which the device call above
