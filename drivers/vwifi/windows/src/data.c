@@ -26,7 +26,8 @@
 NDIS_STATUS
 VwifiTxDataFrame(_Inout_ PVWIFI_ADAPTER Adapter,
                  _In_reads_bytes_(FrameLen) PUCHAR Frame,
-                 _In_ ULONG FrameLen)
+                 _In_ ULONG FrameLen,
+                 _In_ USHORT ExtraFlags)
 {
     PVWIFI_RING ring = &Adapter->TxRing;
     ULONG slot;
@@ -53,9 +54,11 @@ VwifiTxDataFrame(_Inout_ PVWIFI_ADAPTER Adapter,
     desc->frame_addr = Adapter->TxBufferPoolPa.QuadPart
                      + (LONGLONG)slot * VWIFI_RX_BUFFER_SIZE;
     desc->frame_len  = (USHORT)FrameLen;
-    /* No INJECT flag: in STA mode the device treats this as 802.3 and
-     * builds the 802.11 data frame itself. */
-    desc->flags      = VWIFI_DESC_F_OWN;
+    /* No INJECT flag. Without VWIFI_TX_F_80211 the device treats this
+     * as 802.3 and builds the 802.11 data frame itself; with it, the
+     * frame already has its own header and is sent as it stands --
+     * still association-checked, still encrypted if a key is set. */
+    desc->flags      = (USHORT)(VWIFI_DESC_F_OWN | ExtraFlags);
     KeMemoryBarrier();
 
     VwifiWrite32(Adapter, VWIFI_REG_TX_RING_DOORBELL, slot + 1);

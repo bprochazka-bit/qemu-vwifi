@@ -786,7 +786,12 @@ VOID        VwifiKeysOnInstalled(_Inout_ PVWIFI_ADAPTER Adapter,
                                  _In_ ULONG PayloadLen);
 
 /* data.c — Phase 3 STA data path. */
+/* ExtraFlags is OR'd into the TX descriptor alongside VWIFI_DESC_F_OWN.
+ * Pass 0 for an 802.3 frame the device should encapsulate, or
+ * VWIFI_TX_F_80211 for a frame that already carries its own 802.11
+ * header -- which is what the WDI data path hands down. */
 NDIS_STATUS VwifiTxDataFrame(_Inout_ PVWIFI_ADAPTER Adapter,
                              _In_reads_bytes_(FrameLen) PUCHAR Frame,
-                             _In_ ULONG FrameLen);
+                             _In_ ULONG FrameLen,
+                             _In_ USHORT ExtraFlags);
 VOID        VwifiRxDrainSta(_Inout_ PVWIFI_ADAPTER Adapter);

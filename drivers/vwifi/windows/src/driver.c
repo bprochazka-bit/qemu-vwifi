@@ -340,7 +340,7 @@ VwifiMiniportSendNetBufferLists(
                     flat = NdisGetDataBuffer(nb, len, alloc, 1, 0);
                 }
                 if (flat) {
-                    st = VwifiTxDataFrame(adapter, flat, len);
+                    st = VwifiTxDataFrame(adapter, flat, len, 0);
                 }
                 if (alloc) {
                     NdisFreeMemoryWithTagPriority(

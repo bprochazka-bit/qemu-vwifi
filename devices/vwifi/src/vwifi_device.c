@@ -2337,6 +2337,7 @@ static int32_t op_stop_ap(struct vwifi_dev *d)
 
 static const uint8_t llc_snap_hdr[6] = { 0xAA, 0xAA, 0x03, 0x00, 0x00, 0x00 };
 
+
 /* Convert an 802.3 frame from the driver into an 802.11 data frame.
  * Returns the 802.11 frame length, or 0 if the input is malformed. */
 static uint16_t sta_tx_8023_to_80211(struct vwifi_dev *d,
@@ -2445,6 +2446,31 @@ static bool eth_is_eapol(const uint8_t *eth, uint16_t eth_len)
 {
     if (eth_len < ETH_HDR_LEN) return false;
     return (((uint16_t)eth[12] << 8) | eth[13]) == ETHERTYPE_EAPOL;
+}
+
+/* The same question asked of a frame that is already 802.11.
+ *
+ * A driver that hands over MPDUs (see VWIFI_TX_F_80211) still needs its
+ * EAPOL frames left in the clear, and the EtherType is no longer at
+ * offset 12: it sits after the 802.11 header and the LLC/SNAP header.
+ * Reading offset 12 of an MPDU lands in the middle of addr2 and would
+ * answer "not EAPOL" for the handshake frames -- which encrypts them
+ * with a key the AP has not derived, and deadlocks WPA2 exactly the way
+ * the note above warns about. */
+static bool frame80211_is_eapol(const uint8_t *frame, uint16_t frame_len)
+{
+    uint16_t hdr_len = IEEE80211_DATA_HDR_LEN;
+
+    if (frame_len < IEEE80211_DATA_HDR_LEN) return false;
+    if (((frame[0] >> 2) & 0x3) != 2) return false;      /* not data */
+    if ((frame[0] >> 4) & 0x08) hdr_len += 2;            /* QoS control */
+
+    if (frame_len < hdr_len + LLC_SNAP_LEN) return false;
+    if (memcmp(frame + hdr_len, llc_snap_hdr, sizeof(llc_snap_hdr)) != 0) {
+        return false;
+    }
+    return (((uint16_t)frame[hdr_len + 6] << 8) |
+             frame[hdr_len + 7]) == ETHERTYPE_EAPOL;
 }
 
 static struct vwifi_key_slot *key_slot_for_tx(struct vwifi_dev *d)
@@ -2754,22 +2780,47 @@ static void process_tx_ring(struct vwifi_dev *d)
                         uint8_t frame80211[VWIFI_MAX_FRAME_SIZE];
                         uint16_t len;
 
+                        bool pre80211 =
+                            (desc.flags & VWIFI_TX_F_80211) != 0;
+
                         if (d->conn.state != VWIFI_CONN_ASSOCIATED) {
                             VWIFI_TRACE(d, "tx dropped: not associated");
                             d->drops++;
                         } else {
-                            len = sta_tx_8023_to_80211(d, frame, desc.frame_len,
-                                                       frame80211,
-                                                       sizeof(frame80211));
+                            if (pre80211) {
+                                /* Already an MPDU -- the driver built
+                                 * the header. Encapsulating again would
+                                 * make a frame whose destination MAC is
+                                 * the first six bytes of the original
+                                 * 802.11 header, which the AP silently
+                                 * drops. */
+                                if (desc.frame_len > sizeof(frame80211) ||
+                                    desc.frame_len < IEEE80211_DATA_HDR_LEN) {
+                                    len = 0;
+                                } else {
+                                    memcpy(frame80211, frame, desc.frame_len);
+                                    len = desc.frame_len;
+                                }
+                            } else {
+                                len = sta_tx_8023_to_80211(d, frame,
+                                                           desc.frame_len,
+                                                           frame80211,
+                                                           sizeof(frame80211));
+                            }
                             if (len == 0) {
-                                VWIFI_TRACE(d, "tx dropped: bad 802.3 frame");
+                                VWIFI_TRACE(d, "tx dropped: bad %s frame",
+                                            pre80211 ? "802.11" : "802.3");
                                 d->drops++;
                             } else {
                                 /* Encrypt unless this is EAPOL (the
                                  * handshake must run in the clear) or
                                  * no key is installed yet. */
                                 struct vwifi_key_slot *ks = key_slot_for_tx(d);
-                                bool eapol = eth_is_eapol(frame, desc.frame_len);
+                                bool eapol =
+                                    pre80211
+                                        ? frame80211_is_eapol(frame,
+                                                              desc.frame_len)
+                                        : eth_is_eapol(frame, desc.frame_len);
 
                                 if (ks && !eapol) {
                                     int elen = vwifi_ccmp_encrypt(

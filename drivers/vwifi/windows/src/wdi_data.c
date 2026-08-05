@@ -194,8 +194,12 @@ VwifiTalTxOneNbl(_Inout_ PVWIFI_ADAPTER Adapter, _In_ PNET_BUFFER_LIST Nbl)
                               "-- shape unknown");
         }
 
-        st = (flat != NULL) ? VwifiTxDataFrame(Adapter, flat, len)
-                            : NDIS_STATUS_FAILURE;
+        /* VWIFI_TX_F_80211: what the component hands down is a
+         * complete MPDU, header and all -- confirmed off the wire by
+         * the dump above. The device must not encapsulate it again. */
+        st = (flat != NULL)
+                 ? VwifiTxDataFrame(Adapter, flat, len, VWIFI_TX_F_80211)
+                 : NDIS_STATUS_FAILURE;
 
         if (alloc != NULL) {
             NdisFreeMemoryWithTagPriority(Adapter->MiniportAdapterHandle,

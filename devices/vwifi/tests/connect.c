@@ -453,6 +453,53 @@ int main(void)
     }
     printf("  TX 802.3 -> 802.11 (ToDS, addrs, LLC/SNAP, payload): PASS\n");
 
+    /* ---- 4b. TX: 802.11 in, the same 802.11 out ----
+     *
+     * VWIFI_TX_F_80211 says the driver already built the header, which
+     * is what Windows WDI does: wdiwifi owns the 802.11 MAC state and
+     * hands the miniport complete MPDUs. Encapsulating one of those
+     * again produced a frame whose "destination MAC" was the first six
+     * bytes of the original 802.11 header -- accepted by the ring, sent
+     * to the medium, and silently dropped by the AP. Nothing on either
+     * side reported an error, which is why it took a hex dump of the
+     * first frame to find.
+     *
+     * The frame must come out byte-identical and MUST NOT grow by a
+     * second 24-byte header. */
+    {
+        uint8_t mpdu[64];
+        uint16_t mpdu_len = 24 + 8 + 20;
+
+        memset(mpdu, 0, sizeof(mpdu));
+        mpdu[0] = 0x08;                       /* data, subtype 0 */
+        mpdu[1] = 0x01;                       /* ToDS */
+        memcpy(mpdu + 4,  AP_MAC,   6);       /* addr1 = BSSID */
+        memcpy(mpdu + 10, STA_MAC,  6);       /* addr2 = us */
+        memcpy(mpdu + 16, PEER_MAC, 6);       /* addr3 = DA */
+        mpdu[24] = 0xAA; mpdu[25] = 0xAA; mpdu[26] = 0x03;
+        mpdu[30] = 0x08; mpdu[31] = 0x00;     /* ethertype IPv4 */
+        for (int i = 0; i < 20; i++) mpdu[32 + i] = (uint8_t)(0xC0 + i);
+
+        memcpy(g_ram_va + TX_FRAME_OFFSET, mpdu, mpdu_len);
+        tx = (struct vwifi_tx_desc *)(g_ram_va + TX_OFFSET
+                                      + (g_tx_slot % RING_ENTRIES) * sizeof(*tx));
+        memset(tx, 0, sizeof(*tx));
+        tx->frame_addr = g_ram + TX_FRAME_OFFSET;
+        tx->frame_len  = mpdu_len;
+        tx->flags      = VWIFI_DESC_F_OWN | VWIFI_TX_F_80211;
+        g_tx_slot++;
+
+        mock_backend_clear_events(g_mock);
+        wreg(VWIFI_REG_TX_RING_DOORBELL, g_tx_slot);
+
+        uint16_t len;
+        const uint8_t *f = last_tx_frame(&len);
+        assert(f != NULL);
+        assert(len == mpdu_len);                    /* no second header */
+        assert(memcmp(f, mpdu, mpdu_len) == 0);     /* byte-identical */
+    }
+    printf("  TX 802.11 passthrough (VWIFI_TX_F_80211, no re-encap): PASS\n");
+
     /* ---- 5. RX: 802.11 downlink in, 802.3 out ---- */
     uint8_t payload[20];
     for (int i = 0; i < 20; i++) payload[i] = (uint8_t)(0xB0 + i);

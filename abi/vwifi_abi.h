@@ -267,6 +267,24 @@ struct vwifi_rx_desc {
 #define VWIFI_TX_F_INJECT       (1u << 1)  /* raw injection (monitor-mode or mgmt) */
 #define VWIFI_TX_F_NO_ACK       (1u << 2)  /* do not expect ACK from peer */
 #define VWIFI_TX_F_ENCRYPTED    (1u << 3)  /* frame pre-encrypted by driver */
+/* Payload is already a complete 802.11 frame: do NOT encapsulate it.
+ *
+ * The STA TX path's default contract is that the driver hands over
+ * 802.3 and the device builds the 802.11 header. That is not something
+ * every driver can honour. Windows WDI hands the miniport fully-formed
+ * MPDUs -- wdiwifi owns the 802.11 MAC state, so it has already set
+ * frame control, duration, the three addresses and the sequence number
+ * by the time the miniport sees the frame -- and encapsulating one of
+ * those a second time produces a frame whose "destination MAC" is the
+ * first six bytes of the original 802.11 header. It goes out, the AP
+ * drops it, and nothing anywhere reports an error.
+ *
+ * Distinct from VWIFI_TX_F_INJECT, which also skips the association
+ * check and the cipher. This flag changes the FORMAT of the payload and
+ * nothing else: the frame is still refused when not associated and
+ * still encrypted when a key is installed.
+ */
+#define VWIFI_TX_F_80211        (1u << 4)  /* payload is 802.11, not 802.3 */
 
 /* RX descriptor flags */
 #define VWIFI_RX_F_FCS_OK       (1u << 1)
