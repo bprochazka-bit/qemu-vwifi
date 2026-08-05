@@ -160,12 +160,36 @@ VwifiParseConnectParameters(
         return NDIS_STATUS_NOT_SUPPORTED;
     }
 
+    /* freq is in here for a reason, and it was missing.
+     *
+     * It is the one connect parameter whose being wrong looks exactly
+     * like an association timeout: the device tunes to it to
+     * authenticate, and a zero or wrong channel means the auth frames
+     * go somewhere the AP is not. A run that came back
+     * ASSOCIATION_RESULT status=16 -- "authentication rejected due to
+     * timeout waiting for the next frame in sequence", one clean second
+     * after the request -- could not be told apart from a medium
+     * problem, because the log said everything about that connect
+     * except where it was aimed.
+     *
+     * Zero is legal and is not automatically the fault: it means the
+     * connect request carried no preferred BSS entry with channel
+     * information, and VwifiTlvParseConnectRequest leaves it for the
+     * device to resolve from its own BSS table. It is only a problem if
+     * the device's table has nothing to resolve it against. Either way
+     * the log now says which case it was. */
     VWIFI_INFO("connect parsed: bssid %02x:%02x:%02x:%02x:%02x:%02x "
-               "ssid='%s' auth=%u akm=%u cipher=%u assoc_ies=%u",
+               "ssid='%s' freq=%u auth=%u akm=%u cipher=%u/%u "
+               "assoc_ies=%u%s",
                Req->bssid[0], Req->bssid[1], Req->bssid[2],
                Req->bssid[3], Req->bssid[4], Req->bssid[5],
-               Req->ssid, Req->auth_algo, Req->akm_suite,
-               Req->cipher_pairwise, Req->assoc_ie_len);
+               Req->ssid, Req->channel_freq, Req->auth_algo,
+               Req->akm_suite, Req->cipher_pairwise, Req->cipher_group,
+               Req->assoc_ie_len,
+               (Req->channel_freq == 0)
+                   ? " -- no channel in the request; the device must "
+                     "resolve it from its own BSS table"
+                   : "");
     return NDIS_STATUS_SUCCESS;
 }
 
