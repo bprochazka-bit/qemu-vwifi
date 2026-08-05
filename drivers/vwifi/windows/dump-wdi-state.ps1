@@ -652,60 +652,57 @@ if ($wdiState) {
     # StartConnectRoamTask, so OID_WDI_TASK_CONNECT never goes out and
     # *pAssocStatus is left at WDI_ASSOC_STATUS_CANDIDATE_LIST_EXHAUSTED.
     #
-    # Two things settled, one opened.
+    # Where this stands, so the next reader does not re-derive it.
     #
-    # Settled 1: our 16-byte SCAN_COMPLETE is correct, and the
-    # 48-byte minimum is not about our payload. _WFC_MESSAGE_METADATA is
+    # PROVEN, end to end, out of the binary:
+    #   WfcPortPropertyGoodScanStartTime (port property 71) is
+    #   unpopulated -> CheckAndUpdateCandidates zeroes the candidate
+    #   count -> CheckAndStartConnectProcess skips StartConnectRoamTask
+    #   -> OID_WDI_TASK_CONNECT is never sent.
     #
-    #   +0x00 MessageId  +0x04 MessageLength  +0x08 flags
-    #   +0x0c MessageType
-    #   +0x10 _Command / _Response / _Indication  (union, 0x10)
-    #   +0x20 Message : _WDI_MESSAGE_HEADER
+    # The sole writer is CScanJob::FinishJob, behind three gates:
+    #   1. status == 0
+    #   2. job->m_bCancelled (+0x78A) == 0
+    #   3. the port property cache for the job's port id resolves
+    # and it is NOT KNOWN which of the three fails. That is a runtime
+    # question and local kernel debugging cannot set a breakpoint.
     #
-    # so metadata plus header is exactly 0x30 and Message.Status lands
-    # at exactly 0x24 -- the two constants in GetStatusFromTaskOutput.
-    # wdiwifi wraps what we send. Lengthening our indication would have
-    # been the wrong fix, which is why it was not made last round.
+    # What the property table does show: 106 of 134 port properties are
+    # populated, including CurrentChannelNumber and CurrentBandID. Among
+    # scan-related properties GoodScanStartTime is the only one missing,
+    # so this is not a port whose properties are broadly unset.
     #
-    # Settled 2: a task only accepts an indication that matches it.
-    # Task::OnDeviceIndicationArrived compares
-    # DeviceCommand::get_CommandToken against the indication transaction
-    # id and DeviceCommand::get_PortId against its port id, and returns
-    # silently on either mismatch -- leaving the task with no output, so
-    # get_OutputBuffer answers 0xC0000184, the same code an unpopulated
-    # property gives.
+    # FinishJob definitely RUNS -- it clears m_ScanInProgress at +0x55,
+    # before any gate, and m_ScanInProgress reads false in every dump.
+    # So the scan job completes and one of the three gates rejects it.
     #
-    # Opened: CScanJob has a second step, and it is not the scan.
+    # Gate 2 is nearly excluded: +0x78A is written in exactly two places,
+    # zeroed in the constructor and set in OnJobCancelled, and nothing
+    # cancels our scans -- OID_WDI_ABORT_TASK never arrives, and a job
+    # cancelled before it starts never issues its task at all.
     #
-    #   +0x140  edi = CompleteScanTask(status)
-    #           if (edi != 0) -> FinishJob(edi)
-    #   +0x150  cmp byte ptr [rbx+788h],0
-    #           je  -> FinishJob(0)
-    #   +0x15d  CBSSListUpdateJob::Initialize(...)
-    #   +0x1c6  CJobBase::StartChildJob(job, &m_BssListUpdateJob)
+    # Two cheap things left to check before reaching for a real
+    # debugger. First, dot11wdi.h declares Wdi_NdisMIndicateStatusEx and
+    # Wdi_NdisMOidRequestComplete under a comment reading "TODO:
+    # Temporary Completion handlers for OIDs and Indications". This
+    # driver calls plain NdisMIndicateStatusEx. If the Wdi_ variants are
+    # what actually feed the port driver's task machinery, that is the
+    # whole bug and a one-line fix; if they are not exported at all,
+    # they are vestigial and the question is closed. `x` answers it
+    # either way.
     #
-    # When the child completes, OnJobStepCompleted re-enters with step 2
-    # and calls FinishJob with the CHILD's status. So the status gating
-    # WfcPortPropertyGoodScanStartTime may never have been the scan
-    # task's at all.
-    #
-    # And the byte search's third hit deserved more attention than it
-    # got: CEnumBSSListJob::CompleteBSSListEnum+0x1a1 also loads 0x47
-    # into edx. Two of the four sites that touch this property are on
-    # the BSS-list side, not the scan side -- and with
-    # BSSListCachemanagement TRUE, the BSS list is fetched from us by
-    # OID_WDI_GET_BSS_ENTRY_LIST, which we answer with an unsolicited
-    # indication carrying transaction id 0.
+    # Second, CScanJob::OnJobStarted reads +0x78A and its neighbours,
+    # and its tail was never disassembled -- it is the one routine on
+    # the scan path still unread.
     Write-Host '[4/5] Reading the decision'
     $log4 = Join-Path $OutDir 'wdi-state-decide.txt'
     $out4 = Invoke-Kd -Kd $kd -Sym $sym -LogFile $log4 -Commands (@(
         '.reload /f wdiwifi.sys',
-        'x wdiwifi!CBSSListUpdateJob::*',
-        'x wdiwifi!CEnumBSSListJob::*',
-        'uf wdiwifi!CEnumBSSListJob::CompleteBSSListEnum',
-        'uf wdiwifi!CBSSListUpdateJob::Initialize',
-        'uf wdiwifi!DeviceCommand::get_CommandToken',
-        'uf wdiwifi!DeviceCommand::get_PortId'
+        'x wdiwifi!Wdi_Ndis*',
+        'x ndis!Wdi_Ndis*',
+        'x ndis!*Wdi*',
+        'dt wdiwifi!WFC_MESSAGE_TYPE',
+        'uf wdiwifi!CScanJob::OnJobStarted'
     ) -join ';')
     Write-Host "      $log4 ($($out4.Count) lines)"
 } else {
@@ -720,6 +717,6 @@ Write-Host '[5/5] Done'
 Write-Host "      $log1 ($($out1.Count) lines)"
 Write-Host "      $log2 ($($out2.Count) lines)"
 Write-Host ''
-Write-Host '      Send wdi-state-decide.txt. The scan job has a second step -- a'
-Write-Host '      BSS list update -- and it is that child job whose status gates the'
-Write-Host '      good-scan time.'
+Write-Host '      Send wdi-state-decide.txt. Two cheap checks remain before this'
+Write-Host '      needs a breakpoint: whether Wdi_NdisMIndicateStatusEx exists, and'
+Write-Host '      the one routine on the scan path still unread.'
