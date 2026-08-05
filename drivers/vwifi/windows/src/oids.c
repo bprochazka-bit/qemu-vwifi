@@ -621,6 +621,25 @@ VwifiWdiTaskPending(_In_ PNDIS_OID_REQUEST Req)
     return NDIS_STATUS_PENDING;
 }
 
+/* Answer a task whose work is ALREADY done: write the M2, complete the
+ * OID with SUCCESS, and leave nothing outstanding.
+ *
+ * Not a general-purpose task return -- SUCCESS on a task that has not
+ * finished is what made wdiwifi poll an empty BSS cache ten times and
+ * stop merging scans. It exists for the one path where the outcome is
+ * genuinely known by the time the handler returns: a scan merged into a
+ * sweep that completed underneath it, whose results are already
+ * indicated. Its M3 goes out before the return, so the ordering is the
+ * same as the normal path's.
+ *
+ * Separate from VwifiWdiTaskPending because VwifiWdiAckHeaderOnly is
+ * static to this file, and wdi_scan.c has no other way to write an M2. */
+NDIS_STATUS
+VwifiWdiTaskAnsweredInline(_In_ PNDIS_OID_REQUEST Req)
+{
+    return VwifiWdiAckHeaderOnly(Req, NDIS_STATUS_SUCCESS);
+}
+
 /* Complete a task OID that VwifiWdiTaskPending left outstanding.
  *
  * Exactly once per request. NDIS owns the NDIS_OID_REQUEST until this

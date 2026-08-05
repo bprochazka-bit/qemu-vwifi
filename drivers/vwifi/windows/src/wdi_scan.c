@@ -873,7 +873,6 @@ VwifiHandleTaskScan(_Inout_ PVWIFI_ADAPTER Adapter,
             VWIFI_WARN("scan merged into a sweep that had just finished "
                        "-- answering txn %u synchronously",
                        task->Requesters[slot].TransactionId);
-            (VOID)VwifiWdiAckHeaderOnly(Req, NDIS_STATUS_SUCCESS);
             VwifiSendWdiIndication(Adapter,
                                    task->Requesters[slot].WdiPortId,
                                    task->Requesters[slot].PortId,
@@ -881,7 +880,15 @@ VwifiHandleTaskScan(_Inout_ PVWIFI_ADAPTER Adapter,
                                    NDIS_STATUS_SUCCESS,
                                    task->Requesters[slot].TransactionId,
                                    NULL, 0);
-            return NDIS_STATUS_SUCCESS;
+            /* M3 first and the OID second here, the reverse of
+             * VwifiIndicateScanComplete -- returning a status IS the
+             * completion, so it cannot be moved earlier without
+             * completing the request before the handler that owns it
+             * has returned. The order does not matter on this path: the
+             * sweep is over and its results are already indicated, so
+             * there is no window in which the job could be finished
+             * against a stale status. */
+            return VwifiWdiTaskAnsweredInline(Req);
         }
 
         /* Outstanding until the running sweep finishes, like the request

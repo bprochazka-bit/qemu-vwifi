@@ -540,6 +540,12 @@ NDIS_STATUS VwifiWdiTaskAccepted(_In_ PNDIS_OID_REQUEST Req);
  * INDICATION_REQUIRED does and still completes with zero. See oids.c. */
 NDIS_STATUS VwifiWdiTaskPending(_In_ PNDIS_OID_REQUEST Req);
 
+/* Answer a task whose work is already done: write the M2 and complete
+ * the OID with SUCCESS. For the one path where that is true -- a scan
+ * merged into a sweep that finished underneath it -- and not a general
+ * task return; see oids.c. */
+NDIS_STATUS VwifiWdiTaskAnsweredInline(_In_ PNDIS_OID_REQUEST Req);
+
 /* Complete an OID left outstanding by VwifiWdiTaskPending. Exactly once
  * per request: NDIS frees it here, and never calling it leaves the WLAN
  * component waiting forever. */
