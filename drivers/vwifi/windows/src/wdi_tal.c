@@ -425,7 +425,8 @@ VwifiTalTxDataSend(
     VWIFI_TAL_FIRST(8, "TAL TxDataSend: port %u peer %u tid %u -- %u queued, "
                        "%u active",
                     PortId, PeerId, ExTid, NumQueueFrames, NumActiveFrames);
-    VwifiTalTxPump((PVWIFI_ADAPTER)MiniportTalTxRxContext);
+    VwifiTalTxPump((PVWIFI_ADAPTER)MiniportTalTxRxContext,
+                   PortId, PeerId, 1u << ExTid);
 }
 
 static VOID
@@ -443,7 +444,8 @@ VwifiTalTxTalSend(
     VWIFI_TAL_FIRST(8, "TAL TxTalSend: port %u peer %u tid %u -- %u queued, "
                        "%u active",
                     PortId, PeerId, ExTid, NumQueueFrames, NumActiveFrames);
-    VwifiTalTxPump((PVWIFI_ADAPTER)MiniportTalTxRxContext);
+    VwifiTalTxPump((PVWIFI_ADAPTER)MiniportTalTxRxContext,
+                   PortId, PeerId, 1u << ExTid);
 }
 
 static VOID
@@ -488,7 +490,8 @@ VwifiTalTxPeerBacklog(
      * and it is the ONLY notification that arrived in the trace where
      * TxDataSend never did. */
     if (bBacklogged) {
-        VwifiTalTxPump((PVWIFI_ADAPTER)MiniportTalTxRxContext);
+        VwifiTalTxPump((PVWIFI_ADAPTER)MiniportTalTxRxContext,
+                       PortId, PeerId, VWIFI_TAL_ALL_TIDS);
     }
 }
 

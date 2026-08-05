@@ -251,6 +251,12 @@ VwifiPeerOnConfig(_Inout_ PVWIFI_ADAPTER Adapter,
     p->Configured = TRUE;
     VWIFI_INFO("peer config: id %u port %u -- peer is now configured for data",
                PeerId, PortId);
+
+    /* And now it may actually be sent to. Creating a peer pauses its TX
+     * -- WDI_TX_PAUSE_REASON_PEER_CREATE -- and only the miniport can
+     * lift that. This is the first moment it is true to do so: the
+     * component has just said it has finished setting the peer up. */
+    VwifiTalTxRestartPeer(Adapter, PortId, PeerId);
 }
 
 VOID

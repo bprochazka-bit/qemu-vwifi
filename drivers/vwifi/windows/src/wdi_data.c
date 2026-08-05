@@ -175,10 +175,55 @@ VwifiTalTxOneNbl(_Inout_ PVWIFI_ADAPTER Adapter, _In_ PNET_BUFFER_LIST Nbl)
     return result;
 }
 
+/* Lift the pause the component puts on a peer's TX when it is created.
+ *
+ * dot11wdi.h names the reason and nothing else in the API can clear it:
+ *
+ *     WDI_TX_PAUSE_REASON_PEER_CREATE = 0x00000002
+ *
+ * Pause and restart are the target's to declare -- both are
+ * NDIS_WDI_TX_SEND_*_IND, miniport to component -- so a peer whose
+ * creation paused TX stays paused until the miniport says the target is
+ * ready for it. That is the state the trace was stuck in: peer created,
+ * peer configured, TxTargetDescInit run, TxPeerBacklog(backlogged=1)
+ * raised, and TxDataSend never once fired, because the component had
+ * frames for a peer it had been told nothing about being ready.
+ *
+ * Called from the peer-config callback rather than straight after
+ * PeerCreateIndication: config is the component saying it has finished
+ * setting the peer up, and restarting a peer it has not finished with
+ * would be answering a question it has not asked yet. */
+VOID
+VwifiTalTxRestartPeer(_Inout_ PVWIFI_ADAPTER Adapter,
+                      _In_ WDI_PORT_ID PortId,
+                      _In_ WDI_PEER_ID PeerId)
+{
+    PNDIS_WDI_DATA_API api = Adapter->DataPathApi;
+
+    if (api == NULL || api->TxSendRestartIndication == NULL) {
+        VWIFI_WARN("TAL tx: no TxSendRestartIndication -- peer %u stays "
+                   "paused on WDI_TX_PAUSE_REASON_PEER_CREATE and nothing "
+                   "will ever be sent to it", PeerId);
+        return;
+    }
+
+    VWIFI_INFO("TAL tx: restarting peer %u on port %u (clearing the "
+               "peer-create pause, all TIDs)", PeerId, PortId);
+    api->TxSendRestartIndication(Adapter->DataPathHandle, PortId, PeerId,
+                                 VWIFI_TAL_ALL_TIDS,
+                                 WDI_TX_PAUSE_REASON_PEER_CREATE);
+
+    /* Anything already queued for this peer is waiting right now. */
+    VwifiTalTxPump(Adapter, PortId, PeerId, VWIFI_TAL_ALL_TIDS);
+}
+
 /* Drain whatever the component has queued, for as long as it keeps
  * giving us frames. */
 VOID
-VwifiTalTxPump(_Inout_ PVWIFI_ADAPTER Adapter)
+VwifiTalTxPump(_Inout_ PVWIFI_ADAPTER Adapter,
+               _In_ WDI_PORT_ID PortId,
+               _In_ WDI_PEER_ID PeerId,
+               _In_ UINT32 ExTidBitmask)
 {
     PNDIS_WDI_DATA_API api = Adapter->DataPathApi;
     ULONG rounds = 0;
@@ -196,6 +241,8 @@ VwifiTalTxPump(_Inout_ PVWIFI_ADAPTER Adapter)
         UINT16           nFrameIds = 0;
         ULONG            nFrames = 0;
 
+        PCSTR via = "dequeue";
+
         /* NULL first. TxDequeueIndication is an _Out_ and a component
          * with nothing to give may simply not write it. */
         api->TxDequeueIndication(Adapter->DataPathHandle,
@@ -203,7 +250,42 @@ VwifiTalTxPump(_Inout_ PVWIFI_ADAPTER Adapter)
                                  VWIFI_TAL_DEQUEUE_MAXFRAMES,
                                  VWIFI_TAL_DEQUEUE_CREDIT,
                                  &chain);
-        if (chain == NULL) break;
+
+        /* Then the per-peer pull, if the general one gave nothing.
+         *
+         * These are two different questions and only the second names a
+         * peer. TxDequeueIndication asks "what should the target send
+         * next", scheduled by the component across everything it holds;
+         * TxReleaseFrameIndication asks "release what is queued for
+         * THIS peer and these TIDs". A backlog notification is about one
+         * peer, so if the general form comes back empty for a peer the
+         * component has just called backlogged, the specific form is the
+         * question that was actually being asked.
+         *
+         * Which one produced the frames is logged, because it decides
+         * what this loop should be doing and the answer is not in any
+         * header. */
+        if (chain == NULL && PeerId != WDI_PEER_ANY &&
+            api->TxReleaseFrameIndication != NULL) {
+            api->TxReleaseFrameIndication(Adapter->DataPathHandle,
+                                          PortId, PeerId, ExTidBitmask,
+                                          VWIFI_TAL_DEQUEUE_MAXFRAMES,
+                                          VWIFI_TAL_DEQUEUE_CREDIT,
+                                          &chain);
+            via = "release";
+        }
+
+        if (chain == NULL) {
+            /* The silent case, and it was invisible: this loop only
+             * logged when it sent something, so a pump that dequeued
+             * nothing looked exactly like a pump that was never
+             * called. */
+            VWIFI_TAL_FIRST(8, "TAL tx: nothing to send for port %u peer %u "
+                               "tids 0x%x (neither dequeue nor release "
+                               "returned a frame)",
+                            PortId, PeerId, ExTidBitmask);
+            break;
+        }
 
         while (chain != NULL) {
             PNET_BUFFER_LIST      nbl  = chain;
@@ -245,8 +327,8 @@ VwifiTalTxPump(_Inout_ PVWIFI_ADAPTER Adapter)
                                           nFrameIds, frameIds, NULL);
         }
 
-        VWIFI_TAL_FIRST(8, "TAL tx: sent %u frame(s), %u with a frame id",
-                          nFrames, nFrameIds);
+        VWIFI_TAL_FIRST(8, "TAL tx: sent %u frame(s) via %s, %u with a "
+                           "frame id", nFrames, via, nFrameIds);
 
         /* A component that keeps handing back frames forever would spin
          * this loop at DISPATCH_LEVEL. Bounded, and the next

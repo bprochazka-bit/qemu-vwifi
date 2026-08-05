@@ -977,6 +977,56 @@ outstanding, and `TxPeerBacklog` drives the pump directly.
 
 **Land one variable at a time, or be able to prove which one ran.**
 
+### Creating a peer pauses its TX, and only the miniport can unpause it
+
+With the port authorized, everything the WLAN service does after a
+connect finally happened — `TalTxRxPeerConfigHandler`, the receive
+filter widening to `0x0004000b`, the IPv6 multicast groups,
+`TxTargetDescInit` — and hostapd confirmed the association from the
+other side:
+
+    hostapd: STA 52:54:00:8b:c7:82 IEEE 802.11: associated (aid 1)
+    hostapd: AP-STA-CONNECTED 52:54:00:8b:c7:82 auth_alg=open
+
+And still not a single frame. `TxDataSend` never fired; the only thing
+that arrived was `TxPeerBacklog: port 0 peer 0 backlogged 1` — the
+component holding frames it would not hand over.
+
+`dot11wdi.h` names the reason and nothing else in the API can clear it:
+
+```c
+WDI_TX_PAUSE_REASON_PEER_CREATE = 0x00000002
+```
+
+Pause and restart are the **target's** to declare — both are
+`NDIS_WDI_TX_SEND_*_IND`, miniport to component. So creating a peer
+pauses its TX, and it stays paused until the miniport says the target is
+ready for it. This driver created peers and never restarted them.
+
+The restart goes in the *peer-config* callback rather than straight
+after `PeerCreateIndication`: config is the component saying it has
+finished setting the peer up, and declaring a peer ready that the
+component has not finished with is answering a question it has not asked
+yet.
+
+### Two different pulls, and the header does not say which
+
+`TxDequeueIndication` takes no peer. `TxReleaseFrameIndication` takes a
+port, a peer and a TID bitmask. They are different questions — "what
+should the target send next", scheduled by the component across
+everything it holds, versus "release what is queued for *this* peer" —
+and a backlog notification is about one peer.
+
+Rather than guess, the pump asks the general one first and falls back to
+the specific one, and **logs which produced the frames**. That is not
+hedging: it is one round instead of two, and the answer ends up in the
+trace instead of in an argument.
+
+The same pass fixed a hole in that loop's tracing. It logged only when
+it sent something, so a pump that dequeued nothing looked exactly like a
+pump that was never called — which is precisely the state that had to be
+diagnosed. **A loop that only logs its successes cannot tell you it ran.**
+
 ### The contract that is not in the header, and how to act on one anyway
 
 Finishing the per-frame path needs one fact that `dot11wdi.h` does not

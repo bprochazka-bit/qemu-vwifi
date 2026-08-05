@@ -716,7 +716,20 @@ MINIPORT_RETURN_NET_BUFFER_LISTS VwifiMiniportReturnNetBufferLists;
  * TX is a pull: the component queues frames and the miniport comes and
  * takes them. RX is a two-step push: indicate that frames exist, then
  * hand them over when the component asks. */
-VOID        VwifiTalTxPump(_Inout_ PVWIFI_ADAPTER Adapter);
+/* Every TID at once. The bitmask form the pause/restart and
+ * release-frames indications take; this device does no QoS, so there is
+ * never a reason to name a subset. */
+#define VWIFI_TAL_ALL_TIDS 0xFFFFFFFFu
+
+VOID        VwifiTalTxPump(_Inout_ PVWIFI_ADAPTER Adapter,
+                           _In_ WDI_PORT_ID PortId,
+                           _In_ WDI_PEER_ID PeerId,
+                           _In_ UINT32 ExTidBitmask);
+/* Clear WDI_TX_PAUSE_REASON_PEER_CREATE for a peer the component has
+ * finished configuring, then drain whatever was waiting behind it. */
+VOID        VwifiTalTxRestartPeer(_Inout_ PVWIFI_ADAPTER Adapter,
+                                  _In_ WDI_PORT_ID PortId,
+                                  _In_ WDI_PEER_ID PeerId);
 VOID        VwifiTalRxIndicate(_Inout_ PVWIFI_ADAPTER Adapter,
                                _In_ PNET_BUFFER_LIST Nbl,
                                _In_ WDI_PEER_ID PeerId,
