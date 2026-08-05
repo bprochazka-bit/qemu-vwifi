@@ -154,6 +154,46 @@ VwifiTalTxOneNbl(_Inout_ PVWIFI_ADAPTER Adapter, _In_ PNET_BUFFER_LIST Nbl)
             flat = NdisGetDataBuffer(nb, len, alloc, 1, 0);
         }
 
+        /* What shape is a WDI TX frame?
+         *
+         * The device treats a non-injected STA frame as 802.3 and
+         * builds the 802.11 header itself, so this only works if the
+         * component hands down Ethernet. Nothing in the headers says
+         * which it is, and the failure mode either way is silent: an
+         * 802.11 MPDU fed to sta_tx_8023_to_80211 either fails its
+         * length check or produces a frame with a nonsense EtherType,
+         * and both look from here like a frame that was sent fine.
+         *
+         * So read it off the wire. Bytes 12-13 of an Ethernet II frame
+         * are the EtherType -- 0x0800 for the DHCP that is failing,
+         * 0x0806 for ARP, 0x86dd for v6. An 802.11 data MPDU has
+         * frame-control in bytes 0-1 (0x08 0x0x for data) and its
+         * addresses where Ethernet has none. */
+        if (flat != NULL && len >= 24) {
+            VWIFI_TAL_ONCE(
+                "TAL tx: first frame %u bytes: "
+                "%02x %02x %02x %02x %02x %02x | %02x %02x %02x %02x %02x %02x "
+                "| %02x %02x | %02x %02x %02x %02x %02x %02x %02x %02x -- %s",
+                len,
+                flat[0], flat[1], flat[2], flat[3], flat[4], flat[5],
+                flat[6], flat[7], flat[8], flat[9], flat[10], flat[11],
+                flat[12], flat[13],
+                flat[14], flat[15], flat[16], flat[17],
+                flat[18], flat[19], flat[20], flat[21],
+                (flat[12] == 0x08 && (flat[13] == 0x00 || flat[13] == 0x06))
+                    ? "802.3: EtherType IPv4/ARP at 12 -- the device's "
+                      "assumption holds"
+                    : (flat[12] == 0x86 && flat[13] == 0xdd)
+                        ? "802.3: EtherType IPv6 at 12 -- the device's "
+                          "assumption holds"
+                        : (((flat[0] >> 2) & 0x3) == 2)
+                            ? "NOT 802.3: byte 0 says this is an 802.11 DATA "
+                              "MPDU, and the device is building a second "
+                              "802.11 header on top of it"
+                            : "NOT 802.3 and not an 802.11 data frame either "
+                              "-- shape unknown");
+        }
+
         st = (flat != NULL) ? VwifiTxDataFrame(Adapter, flat, len)
                             : NDIS_STATUS_FAILURE;
 
@@ -240,6 +280,7 @@ VwifiTalTxPump(_Inout_ PVWIFI_ADAPTER Adapter,
         WDI_FRAME_ID     frameIds[VWIFI_TAL_DEQUEUE_MAXFRAMES];
         UINT16           nFrameIds = 0;
         ULONG            nFrames = 0;
+        ULONG            nFailed = 0;
 
         PCSTR via = "dequeue";
 
@@ -301,6 +342,14 @@ VwifiTalTxPump(_Inout_ PVWIFI_ADAPTER Adapter,
             md     = VwifiTxMetadata(nbl);
             status = VwifiTalTxOneNbl(Adapter, nbl);
             nFrames++;
+            /* Counted separately because "sent" was a lie: nFrames
+             * counts frames this loop HANDLED, and a frame refused by
+             * VwifiTxDataFrame -- not associated yet, bad length, ring
+             * full -- incremented it just the same. The per-frame
+             * warning inside VwifiTalTxOneNbl says which, but the
+             * summary line has to stop claiming success it did not
+             * check. */
+            if (status != WDI_TxFrameStatus_Ok) nFailed++;
 
             if (md != NULL && nFrameIds < RTL_NUMBER_OF(frameIds)) {
                 frameIds[nFrameIds++] = md->FrameID;
@@ -327,8 +376,9 @@ VwifiTalTxPump(_Inout_ PVWIFI_ADAPTER Adapter,
                                           nFrameIds, frameIds, NULL);
         }
 
-        VWIFI_TAL_FIRST(8, "TAL tx: sent %u frame(s) via %s, %u with a "
-                           "frame id", nFrames, via, nFrameIds);
+        VWIFI_TAL_FIRST(8, "TAL tx: %u frame(s) via %s, %u accepted by the "
+                           "device, %u refused, %u with a frame id",
+                        nFrames, via, nFrames - nFailed, nFailed, nFrameIds);
 
         /* A component that keeps handing back frames forever would spin
          * this loop at DISPATCH_LEVEL. Bounded, and the next

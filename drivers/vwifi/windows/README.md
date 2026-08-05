@@ -1236,6 +1236,47 @@ fail every other attempt". Connects did not fail, so the note read as
 disproved every time it was reviewed — while the actual damage went to
 a subsystem the note never mentioned.
 
+### The data path moved, and two of its own log lines were lying
+
+Deferring the scan got the connect all the way through, and the TX path
+came alive on its first try:
+
+    TAL TxTargetDescInit (first call)
+    TAL TxPeerBacklog: port 0 peer 0 backlogged 1
+    TAL tx: sent 1 frame(s) via release, 1 with a frame id
+
+Two things were settled by that one line. **`via release`** — so
+`TxReleaseFrameIndication`, the per-peer pull, is what produces frames;
+`TxDequeueIndication` returned nothing every time. And **`1 with a
+frame id`** — so the `MiniportReserved[0]` metadata contract, the one
+that could only ever be argued for and never read, is right. The
+runtime round-trip check passed on a real frame.
+
+DHCP still failed, and reading the same log harder turned up two places
+where the trace was flattering itself.
+
+**"sent" was counting attempts.** `nFrames++` ran once per NBL handled,
+before anything checked what `VwifiTalTxOneNbl` returned. A frame
+refused by `VwifiTxDataFrame` — not associated, bad length, ring full —
+incremented it exactly like a frame that went out. The line now reads
+`N frame(s) via release, N accepted by the device, N refused`. (In this
+particular trace the frames really were accepted: the per-frame warning
+inside `VwifiTalTxOneNbl` fires on every failure and none appeared. But
+that was luck, not evidence — the summary line never checked.)
+
+**Eight of everything, then nothing.** The TX log stopped after eight
+sends while `TxPeerBacklog` kept firing 67 times. That reads exactly
+like a stalled pump, and it was `VWIFI_TAL_FIRST(8, …)` — the rate
+limiter put there to keep the trace readable. A rate-limited line and a
+line that stopped happening are indistinguishable in the output, which
+makes the limiter a trap laid for the person reading it later.
+
+**A log line's job is to be falsifiable.** "sent" that counts attempts,
+and a counter that stops printing without saying so, both survive
+review because they read as true — the way to catch them is to ask what
+each line would look like if the thing it describes had failed, and
+make sure that looks different.
+
 ### When the driver log is silent, the problem is above the driver
 
 The 0xE9 trace records everything the driver is asked to do. That makes

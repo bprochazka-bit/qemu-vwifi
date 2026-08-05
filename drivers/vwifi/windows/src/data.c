@@ -79,12 +79,24 @@ VwifiRxDrainSta(_Inout_ PVWIFI_ADAPTER Adapter)
     PNET_BUFFER_LIST indicate_tail = NULL;
     ULONG indicated = 0;
 
+    /* An associated link that carries no traffic gives two very
+     * different silences, and until now they looked identical in the
+     * trace: the RX interrupt never firing at all, and it firing with
+     * an empty ring every time. The first means nothing is arriving
+     * from the medium; the second means frames are arriving and being
+     * dropped somewhere between here and the component. */
+    VWIFI_TAL_ONCE("rx(sta): the RX DPC has fired at least once");
+
     for (;;) {
         ULONG idx = ring->NextIndex & ring->Mask;
         struct vwifi_rx_desc *d = (struct vwifi_rx_desc *)
             ((PUCHAR)ring->VirtualAddress + idx * ring->DescSize);
 
         if (d->flags & VWIFI_DESC_F_OWN) break;
+
+        VWIFI_TAL_FIRST(8, "rx(sta): descriptor %u: %u bytes flags=0x%04x "
+                           "freq=%u rssi=%d",
+                        idx, d->frame_len, d->flags, d->channel_freq, d->rssi);
 
         /* In STA mode the device delivers 802.3 with RAW clear. If we
          * somehow got a raw frame here, skip it. */
