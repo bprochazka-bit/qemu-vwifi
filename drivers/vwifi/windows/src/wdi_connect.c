@@ -294,6 +294,15 @@ VwifiIndicateConnectComplete(_Inout_ PVWIFI_ADAPTER Adapter,
     VwifiSendWdiIndication(Adapter, task->WdiPortId, task->PortId,
                            NDIS_STATUS_WDI_INDICATION_CONNECT_COMPLETE,
                            Status, task->TransactionId, NULL, 0);
+
+    /* The device refuses to sweep while it is associating, so any scan
+     * that arrived during this connect was held rather than failed or
+     * answered early -- both of those break the connect, in different
+     * places. See the refusal path in VwifiHandleTaskScan. This is the
+     * moment it is safe to let go: after CONNECT_COMPLETE, so finishing
+     * the scan job cannot start a second connect task on top of this
+     * one. No-op if nothing was held. */
+    VwifiScanReleaseDeferred(Adapter);
 }
 
 /* The disconnect task's completion -- and it has to be this message.

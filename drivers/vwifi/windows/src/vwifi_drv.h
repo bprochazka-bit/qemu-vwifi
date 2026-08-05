@@ -627,6 +627,10 @@ VOID        VwifiIndicateLinkState(_Inout_ PVWIFI_ADAPTER Adapter,
 NDIS_STATUS VwifiHandleTaskScanAbort(_Inout_ PVWIFI_ADAPTER Adapter);
 /* 1 if a scan is awaiting its SCAN_COMPLETE. For the heartbeat. */
 ULONG       VwifiScanTaskState(_In_ PVWIFI_ADAPTER Adapter);
+/* Complete any scan held because the device would not sweep while it
+ * was associating. Called from the connect task's completion; a no-op
+ * when nothing is held. */
+VOID        VwifiScanReleaseDeferred(_Inout_ PVWIFI_ADAPTER Adapter);
 VOID        VwifiScanOnBssFound(_Inout_ PVWIFI_ADAPTER Adapter,
                                 _In_reads_bytes_(PayloadLen) const VOID *Payload,
                                 _In_ ULONG PayloadLen);

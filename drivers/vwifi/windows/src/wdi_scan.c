@@ -90,6 +90,19 @@ typedef struct _VWIFI_SCAN_TASK
      * owns the completion. */
     volatile LONG Active;
 
+    /* 1 when this "sweep" has no device sweep behind it: the scan was
+     * refused because a connect is in flight, and its completion is
+     * being held until the connect finishes.
+     *
+     * The task is left Active anyway, so everything downstream -- the
+     * merge path, the watchdog, VwifiIndicateScanComplete -- works
+     * unchanged and a second refused scan merges into this one instead
+     * of needing a parallel queue of its own. This flag exists only so
+     * the two paths that would otherwise complete it with a FAILURE
+     * know that "no results" is the expected answer here rather than a
+     * sweep that went missing. */
+    volatile LONG DeferredForConnect;
+
     /* Fires if SCAN_COMPLETE never arrives. See VwifiScanWatchdog --
      * the lazy check this replaces could not fire in the one case it
      * existed for. */
@@ -294,6 +307,10 @@ VwifiIndicateScanComplete(_Inout_ PVWIFI_ADAPTER Adapter, _In_ NDIS_STATUS Statu
      * both arrive here and only one of them may indicate. */
     if (InterlockedCompareExchange(&task->Active, 0, 1) != 1) return;
 
+    /* Cleared by whoever claims the task, so the next sweep starts
+     * without inheriting this one's deferral. */
+    InterlockedExchange(&task->DeferredForConnect, 0);
+
     /* Flush anything still staged before completing the task. */
     VwifiIndicateBssEntryList(Adapter);
 
@@ -393,6 +410,21 @@ VwifiScanWatchdog(_In_ PVOID SystemSpecific1,
     UNREFERENCED_PARAMETER(SystemSpecific3);
 
     if (!task || !task->Active) return;
+
+    /* A scan deferred behind a connect has no sweep to have gone
+     * missing, so its backstop is not a failure. Failing it here would
+     * re-create the exact bug the deferral exists to avoid: a failed
+     * scan task aborts the connect job's post-connect sequence and the
+     * peer is never configured. The connect must have died without
+     * completing for this to fire at all -- rare, and still no reason
+     * to report a scan as broken. */
+    if (task->DeferredForConnect) {
+        VWIFI_WARN("scan deferred behind a connect never drained after "
+                   "%u ms -- the connect did not complete; answering it "
+                   "as a no-op scan anyway", VWIFI_SCAN_STALE_MS);
+        VwifiIndicateScanComplete(adapter, NDIS_STATUS_SUCCESS);
+        return;
+    }
 
     VWIFI_WARN("no SCAN_COMPLETE after %u ms -- completing the scan so the "
                "next one can be asked for", VWIFI_SCAN_STALE_MS);
@@ -965,18 +997,17 @@ VwifiHandleTaskScan(_Inout_ PVWIFI_ADAPTER Adapter,
         BOOLEAN connecting = (VwifiConnectTaskState(Adapter) &
                               VWIFI_TASK_CONNECT_PENDING) ? TRUE : FALSE;
 
-        /* Rejected before the scan ever started, so no SCAN_COMPLETE is
-         * indicated on the failure path -- returning a failure status
-         * and indicating a completion for the same task is a double
-         * completion. Release the claim either way so the next scan is
-         * not refused as an overlap. */
-        if (InterlockedCompareExchange(&task->Active, 0, 1) == 1 &&
-            task->Watchdog) {
-            (VOID)NdisCancelTimerObject(task->Watchdog);
-        }
-        task->TransactionCount = 0;
-
         if (!connecting) {
+            /* Rejected before the scan ever started, so no SCAN_COMPLETE
+             * is indicated on the failure path -- returning a failure
+             * status and indicating a completion for the same task is a
+             * double completion. Release the claim so the next scan is
+             * not refused as an overlap. */
+            if (InterlockedCompareExchange(&task->Active, 0, 1) == 1 &&
+                task->Watchdog) {
+                (VOID)NdisCancelTimerObject(task->Watchdog);
+            }
+            task->TransactionCount = 0;
             VWIFI_ERR("device rejected SCAN: 0x%x", status);
             return status;
         }
@@ -990,46 +1021,85 @@ VwifiHandleTaskScan(_Inout_ PVWIFI_ADAPTER Adapter,
          * its own connect flow, so the two collide by design rather
          * than by accident.
          *
-         * Failing the task here is what breaks the data path. A task
-         * OID's return value is the job's outcome, and a failed scan
-         * job aborts the post-connect sequence that ends in
-         * TalTxRxPeerConfig. The port still reaches "connected" -- link
-         * state up, association result 0, AP happy -- but the peer is
-         * never configured, so TX stays paused on
+         * Neither failing it nor answering it succeeds. Both were
+         * measured, and each breaks the connect a different way:
+         *
+         * FAILING it (the original behaviour) aborts the connect job.
+         * A task OID's return value is the job's outcome, and a failed
+         * scan job takes the post-connect sequence that ends in
+         * TalTxRxPeerConfig down with it. The port still reaches
+         * "connected" -- link state up, association result 0, AP happy
+         * -- but the peer is never configured, so TX stays paused on
          * WDI_TX_PAUSE_REASON_PEER_CREATE for the life of the
-         * association and DHCP has nowhere to go. That is exactly the
-         * "connects, then shows Unidentified network" symptom.
+         * association. Across five runs: whenever the association
+         * happened to finish before wdiwifi got its scan in, the scan
+         * was accepted and the peer config arrived; whenever it did
+         * not, the scan was refused and it never came. Five for five.
          *
-         * Measured across five runs: whenever the association happened
-         * to complete before wdiwifi got its scan in, the scan was
-         * accepted and TalTxRxPeerConfig arrived; whenever it did not,
-         * the scan was refused and the peer config never came. Five for
-         * five, and nothing else differed between them.
+         * ANSWERING it immediately, as a completed no-op scan, fails
+         * differently and worse. Finishing the scan job synchronously
+         * is what drives CheckAndUpdateCandidates, and a refreshed
+         * candidate list starts a NEW connect task while the first one
+         * is still running. That second task is refused -- one connect
+         * at a time -- with NDIS_STATUS_REQUEST_ABORTED, which fails
+         * the job wlansvc is watching. The device associates anyway and
+         * the link comes up, so the log looks like a success while the
+         * OS puts up "Can't connect to this network". Measured too: a
+         * second WDI_TASK_CONNECT 0 ms behind the first, and the line
+         * "connect task already active", neither of which had ever
+         * appeared in any earlier trace.
          *
-         * So answer it the way a real driver answers a scan it cannot
-         * usefully run: as a scan that completed and found what we
-         * already knew. The BSS cache is live and populated -- wdiwifi
-         * pulls it with WDI_GET_BSS_ENTRY_LIST immediately afterwards
-         * regardless -- so there is nothing to wait for and nothing
-         * lost. Same shape as the late-merge path above: M3 first, then
-         * the M2, because returning a status IS the completion and it
-         * cannot be moved ahead of the handler that owns the request.
+         * So do what the accepted-sweep case does, which is the only
+         * thing observed to work: hold the completion until the connect
+         * is done. In the two runs that reached TalTxRxPeerConfig the
+         * device took the scan, swept for ~1.6 s, and its SCAN_COMPLETE
+         * landed AFTER the connect had completed. That ordering is the
+         * whole difference, and deferring reproduces it deliberately
+         * instead of leaving it to whether the AP happened to answer
+         * inside one timer tick.
+         *
+         * The task stays Active with no sweep behind it, so a second
+         * refused scan merges into it through the ordinary merge path
+         * above and gets its own SCAN_COMPLETE from the same drain.
+         * VwifiIndicateConnectComplete drains it; the watchdog is the
+         * backstop if the connect never completes at all.
          */
+        InterlockedExchange(&task->DeferredForConnect, 1);
+
         VWIFI_INFO("device refused SCAN while a connect is in flight; "
-                   "answering txn %u as a completed no-op scan rather "
-                   "than failing the task (a failed scan job aborts the "
-                   "post-connect sequence and the peer is never "
-                   "configured)",
+                   "holding txn %u until the connect completes (failing "
+                   "it aborts the post-connect sequence; answering it "
+                   "now starts a second connect task)",
                    task->Requesters[0].TransactionId);
 
-        VwifiSendWdiIndication(Adapter,
-                               task->Requesters[0].WdiPortId,
-                               task->Requesters[0].PortId,
-                               NDIS_STATUS_WDI_INDICATION_SCAN_COMPLETE,
-                               NDIS_STATUS_SUCCESS,
-                               task->Requesters[0].TransactionId,
-                               NULL, 0);
-        return VwifiWdiTaskAnsweredInline(Req);
+        /* Adopt the request, then re-read Active.
+         *
+         * The connect can complete on another processor between the
+         * flag above and this store, and its drain would then walk past
+         * an empty slot and leave this request outstanding forever.
+         * Re-reading after the store closes that window exactly as the
+         * late-merge path does: the store happens before this read and
+         * the drain's claim happens after it clears Active, so whichever
+         * order the two take, exactly one of them finds a request to
+         * complete. A claim that comes back NULL means the drain got
+         * there first and has already completed it. */
+        task->Requesters[0].Request = Req;
+
+        if (!task->Active && VwifiScanClaimRequest(task, 0) != NULL) {
+            VWIFI_WARN("connect completed while the refused scan was being "
+                       "held -- answering txn %u synchronously",
+                       task->Requesters[0].TransactionId);
+            VwifiSendWdiIndication(Adapter,
+                                   task->Requesters[0].WdiPortId,
+                                   task->Requesters[0].PortId,
+                                   NDIS_STATUS_WDI_INDICATION_SCAN_COMPLETE,
+                                   NDIS_STATUS_SUCCESS,
+                                   task->Requesters[0].TransactionId,
+                                   NULL, 0);
+            return VwifiWdiTaskAnsweredInline(Req);
+        }
+
+        return VwifiWdiTaskPending(Req);
     }
 
     VWIFI_INFO("scan started (mask24=0x%08x mask5=0x%llx dwell=%u ms ssids=%u)",
@@ -1056,6 +1126,32 @@ VwifiHandleTaskScan(_Inout_ PVWIFI_ADAPTER Adapter,
      * BSS cache before a single frame has arrived and stops merging
      * scans. See VwifiWdiTaskPending. */
     return VwifiWdiTaskPending(Req);
+}
+
+/* Release a scan that was held because the device would not sweep
+ * during an association.
+ *
+ * Called from VwifiIndicateConnectComplete on every outcome, success or
+ * failure: what the held scan is waiting for is the connect being over,
+ * not the connect having worked. The status is SUCCESS either way --
+ * the scan did not fail, it was never run, and the BSS cache it would
+ * have refreshed is still live and still served from
+ * OID_WDI_GET_BSS_ENTRY_LIST.
+ *
+ * A no-op unless a scan is actually being held, so the connect path can
+ * call it unconditionally. */
+VOID
+VwifiScanReleaseDeferred(_Inout_ PVWIFI_ADAPTER Adapter)
+{
+    PVWIFI_SCAN_TASK task = Adapter->ScanTask;
+
+    if (!task || !task->Active || !task->DeferredForConnect) return;
+
+    VWIFI_INFO("connect finished -- releasing the %u scan task(s) held "
+               "behind it", task->TransactionCount);
+
+    if (task->Watchdog) (VOID)NdisCancelTimerObject(task->Watchdog);
+    VwifiIndicateScanComplete(Adapter, NDIS_STATUS_SUCCESS);
 }
 
 /* For the heartbeat in MiniportCheckForHangEx, which lives in driver.c

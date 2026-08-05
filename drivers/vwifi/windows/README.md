@@ -1177,17 +1177,57 @@ perfect — which is why it survived so long as a line worth ignoring.
 
 The fix is not to make the device sweep during association; that
 constraint is real. It is to stop reporting "I could not do this right
-now" as "this failed". The refusal is now answered the way a real
-driver answers a scan it cannot usefully run: as a scan that completed
-and found what we already knew. The BSS cache is live and populated —
-wdiwifi pulls it with `WDI_GET_BSS_ENTRY_LIST` immediately afterwards
-either way — so nothing is waited for and nothing is lost.
+now" as "this failed".
+
+The obvious correction — answer it immediately as a scan that completed
+and found what we already knew — was tried, and it failed *worse*.
+
+Finishing the scan job synchronously is what drives
+`CheckAndUpdateCandidates`, and a refreshed candidate list starts a
+**new connect task while the first one is still running**. One connect
+at a time, so the second is refused with
+`NDIS_STATUS_REQUEST_ABORTED` — and that is the job wlansvc is
+watching. The device associated anyway and the link came up, so the
+driver log read as a clean success while the OS put up "Can't connect
+to this network". Two lines that had never appeared in any earlier
+trace showed up together:
+
+    OID: method 0xe4400006 WDI_TASK_CONNECT     <- 0 ms after the first
+    connect task already active
+
+So both obvious answers are wrong, and they are wrong in opposite
+directions:
+
+| refusal answered as | what breaks |
+| ------------------- | ----------- |
+| failure             | scan job fails → post-connect sequence aborts → no peer config |
+| immediate success   | scan job finishes → second connect task → refused → job fails |
+
+What actually works was in the traces the whole time. In the two runs
+that reached `TalTxRxPeerConfig`, the device *accepted* the scan, swept
+for ~1.6 s, and its `SCAN_COMPLETE` landed **after** the connect had
+completed. The ordering is the entire difference — and it was decided
+by whether the AP happened to answer inside one timer tick.
+
+So the refusal is now **deferred**: the scan task is held, Active with
+no sweep behind it, and drained from `VwifiIndicateConnectComplete` on
+every outcome. A second refused scan merges into it through the
+ordinary merge path and gets its own `SCAN_COMPLETE` from the same
+drain. That reproduces the known-good ordering deliberately instead of
+leaving it to timing.
 
 **A task OID's return value is not a status, it is a verdict on the
 job.** "Busy" and "failed" are the same value to the caller, and the
 caller acts on the verdict, not on your reason for it. Anywhere a
 driver returns a failure for something it merely could not do *yet*,
 the cost lands somewhere downstream and looks nothing like a scan.
+
+**And "not now" has a third answer besides yes and no: later.** Both
+synchronous answers were wrong here because both ended the job at a
+moment the rest of the system was not ready for. The question a task
+completion answers is not only *what* happened but *when* the caller
+is told — and when a fast path and a slow path disagree about the
+outcome, the ordering is usually the variable, not the result.
 
 And the meta-lesson, which is the expensive one: **a known-suspicious
 line you decided not to act on needs a prediction attached that could
