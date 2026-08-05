@@ -634,57 +634,54 @@ if ($wdiState) {
     # Everything else -- the beacon, the ranking, the matching -- was
     # never the problem.
     #
-    # Property 0x47 is simply NOT POPULATED:
+    # Property 0x47 is WfcPortPropertyGoodScanStartTime, and it is not
+    # populated. The chain is now read end to end with nothing inferred:
     #
-    #   [0x45] Name 0x45  WfcPropertyTypeVariableBuffer  IsPopulated true
-    #   [0x46] Name 0x00  WfcPropertyTypeInvalid         IsPopulated false
-    #   [0x47] Name 0x00  WfcPropertyTypeInvalid         IsPopulated false
-    #   [0x48] Name 0x48  WfcPropertyTypeBoolean         IsPopulated true
-    #   [0x49] Name 0x00  WfcPropertyTypeInvalid         IsPopulated false
+    #   GetPropertyEntryForPropertyName:
+    #     if (!outPtr || name >= m_PropertyNameMax)  -> 0xC000000D
+    #     entry = m_PropertyTable + name*0x38
+    #     if (!requirePopulated)      -> return entry
+    #     if (entry->IsPopulated)     -> return entry
+    #     if (entry->pDefaultEntry)   -> return the default
+    #     <WPP 0x14>  ebx = 0xC0000184   ; STATUS_INVALID_DEVICE_STATE
     #
-    # Name equals the index wherever a slot is populated and is zero
-    # where it is not, so the stride and the index are both right, and
-    # the table is sparse -- a slot is filled in only when something
-    # sets that property.
+    # and entry[0x47] reads IsPopulated false with pDefaultEntry 0 --
+    # exactly the pair that produces 0xC0000184. GetPropertyBuffer hands
+    # that back verbatim, CheckAndUpdateCandidates matches it and zeroes
+    # the candidate count, and CheckAndStartConnectProcess skips
+    # StartConnectRoamTask, so OID_WDI_TASK_CONNECT never goes out and
+    # *pAssocStatus is left at WDI_ASSOC_STATUS_CANDIDATE_LIST_EXHAUSTED.
     #
-    # GetPropertyBuffer is a thin wrapper:
+    # The remaining question is the only one worth a round now: what
+    # sets WfcPortPropertyGoodScanStartTime, and why does a scan of ours
+    # not qualify.
     #
-    #   r9b = 1;  [rsp+20] = &entry
-    #   call GetPropertyEntryForPropertyName
-    #   test eax,eax / jne ret            ; failure returns verbatim
-    #   *pLength = entry->BufferProperty.m_CurrentBufferLength
-    #   *pBuffer = entry->BufferProperty.m_PropertyBuffer
+    # The byte search is the direct route. Property names go to the
+    # cache in edx, so both the read site and every write site compile
+    # to `mov edx,47h` -- BA 47 00 00 00. Searching the whole image for
+    # that and running ln on each hit names every routine that touches
+    # this property, including the one that should have set it. `s
+    # -[1]b` prints addresses only, which is what .foreach wants.
     #
-    # so the 0xC0000184 that decides this comes straight out of
-    # GetPropertyEntryForPropertyName. Disassembling it is what turns
-    # "0x47 is unpopulated" into "an unpopulated property is exactly
-    # what returns STATUS_INVALID_DEVICE_STATE" -- without that, the
-    # chain still has a guess in it.
+    # The plain search is repeated without .foreach as a fallback: if
+    # the .foreach form does not parse in this debugger, the raw
+    # addresses still come back and can be resolved by hand.
     #
-    # And the property needs a name. The symbol sweep turned up
-    # CPortPropertyCache::AddCiphersToSupportedList taking a
-    # _WFC_ADAPTER_PROPERTY_NAME, so these enums exist as types; `x`
-    # could never have found them because it searches symbols, not
-    # types. dt can.
-    #
-    # The whole table goes out as raw bytes too. At 0x38 per entry and
-    # m_PropertyNameMax 0x86 that is 7504 bytes, and Name/Type/
-    # IsPopulated sit in the first nine of each -- enough to list every
-    # property this port has and every one it does not, which is the
-    # difference between fixing 0x47 and fixing whatever else is
-    # missing alongside it.
+    # The scan job is listed and disassembled alongside, because that is
+    # where the property has to be set from and the search may find only
+    # the reader if the writer uses a different encoding.
     Write-Host '[4/5] Reading the decision'
     $log4 = Join-Path $OutDir 'wdi-state-decide.txt'
-    $pt   = "($a)->m_pPortList[0]->m_PortPropertyCache.m_PropertyTable"
     $out4 = Invoke-Kd -Kd $kd -Sym $sym -LogFile $log4 -Commands (@(
         '.reload /f wdiwifi.sys',
-        'dt wdiwifi!_WFC_PORT_PROPERTY_NAME',
-        'dt wdiwifi!_WFC_ADAPTER_PROPERTY_NAME',
-        'dt wdiwifi!_WFC_PROPERTY_NAME',
-        'uf wdiwifi!CPropertyCache::GetPropertyEntryForPropertyName',
-        "db @@c++($pt) L0n7504",
-        "dx -r1 ($a)->m_pPortList[0]->m_PortPropertyCache",
-        "dx -r1 ($a)->m_AdapterPropertyCache"
+        'lm vm wdiwifi',
+        's -[1]b wdiwifi L?0xf2000 ba 47 00 00 00',
+        '.foreach (a {s -[1]b wdiwifi L?0xf2000 ba 47 00 00 00}) { ln a }',
+        'x wdiwifi!*ScanJob*',
+        'dt wdiwifi!_WFC_CONNECT_SCAN_TYPE',
+        'dt wdiwifi!_WFC_SCAN_JOB_PARAMETERS',
+        'uf wdiwifi!CConnectJob::CheckAndStartScanProcess',
+        'uf wdiwifi!CConnectJob::CompleteScanJob'
     ) -join ';')
     Write-Host "      $log4 ($($out4.Count) lines)"
 } else {
@@ -699,6 +696,6 @@ Write-Host '[5/5] Done'
 Write-Host "      $log1 ($($out1.Count) lines)"
 Write-Host "      $log2 ($($out2.Count) lines)"
 Write-Host ''
-Write-Host '      Send wdi-state-decide.txt. Port property 0x47 is unpopulated,'
-Write-Host '      and that is what makes the connect job discard its candidates.'
-Write-Host '      This names the property and lists every other one the port has.'
+Write-Host '      Send wdi-state-decide.txt. The connect fails because the port'
+Write-Host '      has no WfcPortPropertyGoodScanStartTime; this finds every routine'
+Write-Host '      that touches that property, including whichever should set it.'
