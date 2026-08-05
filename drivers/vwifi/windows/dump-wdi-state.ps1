@@ -652,46 +652,70 @@ if ($wdiState) {
     # StartConnectRoamTask, so OID_WDI_TASK_CONNECT never goes out and
     # *pAssocStatus is left at WDI_ASSOC_STATUS_CANDIDATE_LIST_EXHAUSTED.
     #
-    # WfcPortPropertyGoodScanStartTime is written by CScanJob::FinishJob,
-    # behind two gates:
+    # The chain from our SCAN_COMPLETE to the refused connect, read out
+    # of the binary end to end:
     #
-    #   +0x98   test ebp,ebp                 ; status
-    #           jne  +0x12b                  ; non-zero -> no write
-    #   +0xa6   cmp  byte ptr [rbx+78Ah],bpl
-    #           jne  +0x12b                  ; flag non-zero -> no write
-    #   +0xd2   mov  edx,47h / lea r9,[rbx+790h] / lea r8d,[rdx-3Fh]
-    #           call CPropertyCache::SetPropertyBuffer
+    #   CScanJob::OnJobStepCompleted(status)
+    #     step = [job+0x78C]
+    #     if (step == 1)  edi = CompleteScanTask(status)
+    #     ...
+    #     +0xd3  FinishJob(edi)
     #
-    # with the time itself stamped in StartScanTask from
-    # KUSER_SHARED_DATA.InterruptTime. Our scans finish with status 0,
-    # so the byte at CScanJob+0x78A is what refuses the write.
+    #   CScanJob::CompleteScanTask(status)
+    #     if (status != 0)                    return status
+    #     edi = CMessageHelper::GetStatusFromTaskOutput(&job->m_Task, &out)
+    #     if (edi != 0)                       return edi        <-- HERE
+    #     notify the BSS-list-changed callback
+    #     return edi
     #
-    # Searching for the displacement 8A 07 00 00 found every instruction
-    # that touches it:
+    #   CScanJob::FinishJob(status)
+    #     if (status != 0)          -> no write
+    #     if (job->m_bCancelled)    -> no write
+    #     SetPropertyBuffer(portCache, 0x47, 8, &job->m_StartTime)
     #
-    #   CScanJob::CScanJob+0xc3              constructor
-    #   CScanJob::FinishJob+0xa9             the gate above
-    #   CScanJob::OnJobStarted+0x66
-    #   CScanJob::OnJobCancelled+0xb
-    #   CScanOidJob::OnJobStepCompleted+0xf5
+    #   CConnectJob::CheckAndUpdateCandidates
+    #     GetPropertyBuffer(portCache, 0x47) == 0xC0000184
+    #       -> job->candidateCount = 0
     #
-    # Three write candidates, and the shape of them is suggestive:
-    # OnJobCancelled setting a "this scan does not count" flag is
-    # exactly what a cancelled scan should do, and CScanOidJob is the
-    # job wrapping a scan request that arrived as an OID from above.
-    # But which one runs, and under what condition, is the question --
-    # so disassemble all three plus the constructor, and list
-    # CScanOidJob so its own step machine is named the way CConnectJob's
-    # was.
+    #   CConnectJob::CheckAndStartConnectProcess
+    #     candidateCount == 0 -> skip StartConnectRoamTask
+    #       -> OID_WDI_TASK_CONNECT never sent
+    #
+    # The cancelled flag is ruled out. Searching the displacement showed
+    # CScanJob+0x78A is written in exactly two places: zeroed in the
+    # constructor, and set to 1 in OnJobCancelled and nowhere else. It
+    # is a plain "this job was cancelled" bool. Nothing cancels our scan
+    # jobs -- OID_WDI_ABORT_TASK never reaches the driver in any failing
+    # trace -- and a job cancelled before it starts never issues its
+    # task at all, because OnJobStarted checks the same byte and bails
+    # with 0xC001000C. Our TASK_SCAN OIDs do arrive.
+    #
+    # So FinishJob is being handed a non-zero status, and the only
+    # source of it is GetStatusFromTaskOutput failing to read a status
+    # out of the completed task. That is the last unread link.
+    #
+    # It also explains the shape of the bug in a way nothing else has.
+    # A scan that reports failure here still populates the BSS list,
+    # because entries arrive on a separate unsolicited
+    # BSS_ENTRY_LIST indication rather than through the task output --
+    # which is exactly what we see: scanning works, `netsh wlan show
+    # networks` works, and only connecting is refused.
+    #
+    # Our side of the contract checks out. WDI_MESSAGE_HEADER is
+    # {PortId, Reserved, Status, TransactionId, IhvSpecificId} and
+    # dot11wdi.h says MessageId and MessageLength come from the NDIS
+    # fields, not the header; we fill all four and pass the length as
+    # StatusBufferSize. WABIModel wants nothing more: WDI_TASK_SCAN
+    # FromIhv and WDI_INDICATION_SCAN_COMPLETE are both "No TLV data
+    # needed, header is sufficient".
     Write-Host '[4/5] Reading the decision'
     $log4 = Join-Path $OutDir 'wdi-state-decide.txt'
     $out4 = Invoke-Kd -Kd $kd -Sym $sym -LogFile $log4 -Commands (@(
         '.reload /f wdiwifi.sys',
-        'uf wdiwifi!CScanJob::CScanJob',
-        'uf wdiwifi!CScanJob::OnJobStarted',
-        'uf wdiwifi!CScanJob::OnJobCancelled',
-        'x wdiwifi!CScanOidJob::*',
-        'uf wdiwifi!CScanOidJob::OnJobStepCompleted'
+        'uf wdiwifi!CMessageHelper::GetStatusFromTaskOutput',
+        'x wdiwifi!CMessageHelper::*',
+        'x wdiwifi!Task::*',
+        'uf wdiwifi!Task::CancelTask'
     ) -join ';')
     Write-Host "      $log4 ($($out4.Count) lines)"
 } else {
@@ -706,5 +730,5 @@ Write-Host '[5/5] Done'
 Write-Host "      $log1 ($($out1.Count) lines)"
 Write-Host "      $log2 ($($out2.Count) lines)"
 Write-Host ''
-Write-Host '      Send wdi-state-decide.txt. Three routines can set CScanJob+0x78A,'
-Write-Host '      the byte that suppresses the good-scan time; this is all three.'
+Write-Host '      Send wdi-state-decide.txt. GetStatusFromTaskOutput is the last'
+Write-Host '      unread link between our SCAN_COMPLETE and the refused connect.'
