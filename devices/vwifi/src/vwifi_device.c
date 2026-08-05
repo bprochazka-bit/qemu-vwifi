@@ -279,8 +279,37 @@ enum vwifi_conn_state {
     VWIFI_CONN_ASSOCIATED,
 };
 
-/* How long to wait for an Auth/Assoc Response before giving up. */
-#define VWIFI_CONN_TIMEOUT_MS  1000
+/* How long to wait for an Auth/Assoc Response before giving up.
+ *
+ * Armed once for the Auth Response and again for the Assoc Response, so
+ * a connect has this long per stage rather than in total.
+ *
+ * It was 1000, and that is too short for a real AP on the other side of
+ * the medium. Measured against OpenWrt/hostapd, with the two clocks
+ * lined up:
+ *
+ *   driver   WDI_TASK_CONNECT                       t
+ *   driver   ASSOCIATION_RESULT status=16           t + 1.000 s
+ *   hostapd  authenticated                          18:27:41
+ *   hostapd  associated (aid 1)                     18:27:43
+ *   hostapd  AP-STA-CONNECTED                       18:27:43
+ *
+ * The AP answered and the association SUCCEEDED. This device gave up at
+ * exactly its one-second mark while hostapd was still working through
+ * an exchange that took about two seconds end to end. The station then
+ * reported a failure for a connection the AP considered up, which is
+ * the worst of both: the guest sees "the AP never answered" and the AP
+ * sees an associated station.
+ *
+ * It presented as an intermittent connect failure -- alternating runs,
+ * identical driver -- because it is a race against however long the AP
+ * happens to take, and hostapd is not always slow.
+ *
+ * Five seconds is well clear of the two observed and still bounded.
+ * A virtual medium carrying frames through a userspace controller to
+ * another VM has no business being held to on-air timings; the point of
+ * this timer is to fail eventually, not quickly. */
+#define VWIFI_CONN_TIMEOUT_MS  5000
 
 /* Max association-response IEs we keep to hand back to the driver. */
 #define VWIFI_ASSOC_IE_MAX  512
@@ -1923,7 +1952,14 @@ static bool conn_rx_mgmt(struct vwifi_dev *d,
 /* Connect timeout — no Auth/Assoc Response arrived in time. */
 static void conn_timeout(struct vwifi_dev *d)
 {
-    VWIFI_TRACE(d, "conn: timeout in state %u", d->conn.state);
+    /* Which stage ran out, by name. "timeout in state 1" needs the
+     * enum to hand at the moment the log is meant to be answering a
+     * question, and the two stages fail for different reasons: no Auth
+     * Response means the AP never engaged, while no Assoc Response
+     * means it did and then went quiet. */
+    VWIFI_TRACE(d, "conn: %s Response timed out after %u ms",
+                (d->conn.state == VWIFI_CONN_AUTH_SENT) ? "Auth" : "Assoc",
+                VWIFI_CONN_TIMEOUT_MS);
     /* 802.11 status 16 = "authentication sequence timeout"; use it for
      * both stages so the driver sees a definite failure code. */
     conn_fail(d, 16);

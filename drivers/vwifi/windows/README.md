@@ -1027,6 +1027,46 @@ it sent something, so a pump that dequeued nothing looked exactly like a
 pump that was never called — which is precisely the state that had to be
 diagnosed. **A loop that only logs its successes cannot tell you it ran.**
 
+### Two clocks are worth more than two theories
+
+`ASSOCIATION_RESULT status=16` came back twice, intermittently, from
+builds that had connected minutes earlier. Two rounds went into reading
+it from inside the guest — was the AP down, was the medium dropping
+beacons, was a stale association confusing hostapd — and none of them
+could have worked, because everything that mattered had already happened
+somewhere the guest cannot see.
+
+Lining the driver's trace up against hostapd's settled it in one pass:
+
+```
+driver   [84130.577]  WDI_TASK_CONNECT
+driver   [84131.577]  ASSOCIATION_RESULT status=16 (AUTH_TIMEOUT)   <- 1.000 s
+
+hostapd  18:27:41     authenticated
+hostapd  18:27:43     associated (aid 1)                            <- 2 s
+hostapd  18:27:43     AP-STA-CONNECTED
+```
+
+**The AP answered and the association succeeded.** The vwifi device's
+`VWIFI_CONN_TIMEOUT_MS` was 1000, armed per stage, and it gave up while
+hostapd was still working through an exchange that took about two
+seconds. The station reported failure for a connection the AP considered
+up — the guest saw "the AP never answered" and the AP saw an associated
+station.
+
+That is also why it looked intermittent across identical driver builds:
+it is a race against however long the AP happens to take, and hostapd is
+not always slow. **An intermittent failure with a suspiciously round
+interval is a timeout, and the thing that timed out is rarely the thing
+reporting it.**
+
+Raised to 5000. A virtual medium carrying frames through a userspace
+controller to another VM has no business being held to on-air timings;
+that timer exists to fail eventually, not quickly. The trace now names
+which stage expired, too — no Auth Response means the AP never engaged,
+no Assoc Response means it did and then went quiet, and "timeout in
+state 1" required the enum to hand.
+
 ### The contract that is not in the header, and how to act on one anyway
 
 Finishing the per-frame path needs one fact that `dot11wdi.h` does not
