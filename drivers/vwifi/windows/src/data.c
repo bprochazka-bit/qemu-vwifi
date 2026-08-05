@@ -119,10 +119,12 @@ VwifiRxDrainSta(_Inout_ PVWIFI_ADAPTER Adapter)
             }
 
             PNET_BUFFER_LIST nbl = NdisAllocateNetBufferAndNetBufferList(
-                Adapter->RxNblPool, sizeof(VWIFI_RX_NBL_CONTEXT), 0,
+                Adapter->RxNblPool, 0, 0,
                 mdl, 0, d->frame_len);
             if (!nbl) {
-                VWIFI_WARN("rx(sta): NBL alloc failed");
+                VWIFI_WARN("rx(sta): NBL alloc failed for %u bytes "
+                           "(pool context %u bytes)",
+                           d->frame_len, VWIFI_RX_NBL_CONTEXT_SIZE);
                 NdisFreeMdl(mdl);
                 goto rearm;
             }

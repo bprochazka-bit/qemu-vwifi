@@ -170,6 +170,23 @@ typedef struct _VWIFI_RX_NBL_CONTEXT
     ULONG SlotIndex;   /* which RX ring slot backs this NBL */
 } VWIFI_RX_NBL_CONTEXT, *PVWIFI_RX_NBL_CONTEXT;
 
+/* The context size actually asked of NDIS.
+ *
+ * Not sizeof(VWIFI_RX_NBL_CONTEXT). That is four bytes, and an NBL
+ * context is required to be a multiple of MEMORY_ALLOCATION_ALIGNMENT
+ * -- sixteen on x64. Requesting four got NULL back from
+ * NdisAllocateNetBufferAndNetBufferList for every RX frame the device
+ * ever delivered, which read in the trace as "rx(sta): NBL alloc
+ * failed" and, one layer up, as an associated link that could not
+ * complete DHCP.
+ *
+ * The pool is created with this size so every NBL it hands out already
+ * carries the context, and the allocation calls ask for none. */
+#define VWIFI_RX_NBL_CONTEXT_SIZE                                     \
+    ((ULONG)(((sizeof(VWIFI_RX_NBL_CONTEXT) +                         \
+               MEMORY_ALLOCATION_ALIGNMENT - 1) /                     \
+              MEMORY_ALLOCATION_ALIGNMENT) * MEMORY_ALLOCATION_ALIGNMENT))
+
 /* ============================================================
  * Pending control-request tracking
  *

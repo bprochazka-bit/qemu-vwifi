@@ -1277,6 +1277,59 @@ review because they read as true — the way to catch them is to ask what
 each line would look like if the thing it describes had failed, and
 make sure that looks different.
 
+### Two bugs that only a hex dump and a counter could tell apart
+
+TX looked healthy for several rounds — frames pulled, accepted by the
+ring, no failures — while RX stayed at *exactly zero frames*. That
+combination has an obvious reading (nothing is coming back from the AP)
+and it was right, but not for the reason it looked like.
+
+**The dump settled it in one line:**
+
+    TAL tx: first frame 360 bytes: 08 01 00 80 02 11 | 22 33 44 01
+    52 54 | 00 8b | c7 82 ff ff ff ff ff ff -- NOT 802.3
+
+Frame control `08 01` is a data frame with ToDS set; addr1 is the
+BSSID, addr2 our station MAC, addr3 broadcast; then LLC/SNAP and a
+328-byte DHCP DISCOVER. 24 + 8 + 328 = 360. **wdiwifi hands the
+miniport complete MPDUs** — it owns the 802.11 MAC state, so frame
+control, duration, addresses and sequence number are set before the
+miniport ever sees the frame.
+
+The device assumed 802.3 and built a second header on top, producing a
+frame whose "destination MAC" was the first six bytes of the original
+802.11 header. It went out, the AP dropped it, nothing reported an
+error. Fixed with `VWIFI_TX_F_80211` — deliberately not
+`VWIFI_TX_F_INJECT`, which also skips the association check and the
+cipher.
+
+**Then the AP answered, and the second bug appeared:**
+
+    rx(sta): descriptor 0: 342 bytes flags=0x0000 freq=2462 rssi=-30
+    rx(sta): NBL alloc failed
+
+342 bytes is the DHCP OFFER. It arrived, and the driver could not build
+an NBL for it — nor for any frame after it. The pool was created with
+`ContextSize = 0` while both RX paths asked
+`NdisAllocateNetBufferAndNetBufferList` for `sizeof(VWIFI_RX_NBL_CONTEXT)`
+bytes of context. That is **four** bytes, and an NBL context must be a
+multiple of `MEMORY_ALLOCATION_ALIGNMENT` — sixteen on x64. Every
+allocation returned NULL. Fixed by sizing the *pool's* context once,
+aligned, and asking for none per allocation.
+
+**Two failures in series look exactly like one failure.** Before the
+format fix there was nothing to receive, so a broken receive path was
+indistinguishable from a working one with no traffic. Neither bug could
+have been found while the other was live — which is the argument for
+diagnostics that make a path *say what it did* rather than for reading
+harder.
+
+**And the shape of the second one is worth keeping:** it was not a
+resource shortage, a race, or a lifetime bug. It was a size argument
+that had to be a multiple of sixteen and was four, failing identically
+every time since the day it was written. The trace said "alloc failed",
+which reads as memory pressure and is the one thing it never was.
+
 ### When the driver log is silent, the problem is above the driver
 
 The 0xE9 trace records everything the driver is asked to do. That makes

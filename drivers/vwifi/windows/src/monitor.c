@@ -38,7 +38,11 @@ VwifiRxNblPoolCreate(_Inout_ PVWIFI_ADAPTER Adapter)
     params.ProtocolId      = NDIS_PROTOCOL_ID_DEFAULT;
     params.fAllocateNetBuffer = TRUE;
     params.PoolTag         = VWIFI_POOL_TAG;
-    params.ContextSize     = 0;
+    /* Sized here, not per allocation. Every NBL from this pool then
+     * carries its context already, and the allocation calls ask for
+     * none -- see VWIFI_RX_NBL_CONTEXT_SIZE for why asking per
+     * allocation failed. */
+    params.ContextSize     = VWIFI_RX_NBL_CONTEXT_SIZE;
 
     Adapter->RxNblPool = NdisAllocateNetBufferListPool(
         Adapter->MiniportAdapterHandle, &params);
@@ -148,7 +152,7 @@ VwifiRxDrainMonitor(_Inout_ PVWIFI_ADAPTER Adapter)
             }
 
             PNET_BUFFER_LIST nbl = NdisAllocateNetBufferAndNetBufferList(
-                Adapter->RxNblPool, sizeof(VWIFI_RX_NBL_CONTEXT), 0,
+                Adapter->RxNblPool, 0, 0,
                 mdl, 0, d->frame_len);
             if (!nbl) {
                 VWIFI_WARN("rx: NBL alloc failed, dropping frame");
