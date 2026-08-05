@@ -23,11 +23,18 @@
     names even without type layout -- the code of the routines that
     decide. All of it static: no reproduction to time, no race to catch.
 
-    Six steps. Pass one lists miniports, because everything after needs
-    a handle only it can supply. Pass two dumps the miniport. Pass three
-    dumps wdiwifi's own CAdapter, whose pointer only pass two prints.
-    Pass four disassembles the candidate matcher. Pass five dumps
-    wdiwifi's WPP recorder buffer.
+    Pass one lists miniports, because everything after needs a handle
+    only it can supply. Pass two dumps the miniport. Pass three dumps
+    wdiwifi's own CAdapter, whose pointer only pass two prints. Pass
+    four disassembles the routines that decide.
+
+    There is no WPP pass. wdiwifi's WPP is compiled in -- every routine
+    is threaded with WPP_RECORDER_INITIALIZED checks and
+    WPP_RECORDER_SF_* calls -- but rcdrkd reports "<Empty log>" for it,
+    both by module name and by file name, on a machine that had just
+    failed a connect. The recorder buffer is never written, so those
+    checks are taking the skip branch at runtime and there is nothing
+    to read. Do not spend another round on it.
 
     ---------------------------------------------------------------
     !ndiskd NEEDS ndis.sys SYMBOLS. It walks NDIS structures by symbol
@@ -343,7 +350,7 @@ SDK installer (winsdksetup.exe), or copy a Debuggers\x64 directory onto
 this machine and put it on PATH.
 '@
 }
-Write-Host "[1/6] kd: $kd"
+Write-Host "[1/5] kd: $kd"
 
 $state = Test-LocalKdEnabled
 if (-not $state.DebugOn -or -not $state.TypeLocal) {
@@ -356,7 +363,7 @@ $sym    = Get-SymbolPathArg
 
 # Pass one: what miniports exist, and does ndiskd work at all.
 $log1 = Join-Path $OutDir 'wdi-state-miniports.txt'
-Write-Host '[2/6] Listing miniports'
+Write-Host '[2/5] Listing miniports'
 # Semicolons, not newlines. kd's -c takes ONE command string with ';'
 # separators; a multi-line string is not parsed as successive commands,
 # which is why the first version of this loaded nothing and then blamed
@@ -370,26 +377,6 @@ $load   = if ($ndiskd) {
     '.load ndiskd'
 }
 
-# rcdrkd dumps WPP *recorder* buffers -- the in-memory circular log a
-# driver keeps whether or not anyone is tracing it.
-#
-# wdiwifi's WPP is not compiled out. Every routine in the pass-four
-# disassembly is full of WPP_RECORDER_INITIALIZED / WPP_GLOBAL_Control
-# checks and WPP_RECORDER_SF_* calls; the reason no ETW session ever
-# showed a wdiwifi message is that the recorder writes to memory, not to
-# a provider. That memory is readable from a local kernel debugger.
-#
-# No TMF files, so messages come out as raw ids and arguments. That is
-# enough here: CheckAndUpdateCandidates logs id 0x96 at level 2 with the
-# failure status as an argument, which is the number this whole exercise
-# is trying to read.
-$rcdrkd     = Find-KdExtension -KdPath $kd -Name 'rcdrkd.dll'
-$loadRcdrkd = if ($rcdrkd) {
-    Write-Host "      rcdrkd: $rcdrkd"
-    ".load $(Get-ShortPath $rcdrkd)"
-} else {
-    '.load rcdrkd'
-}
 $out1 = Invoke-Kd -Kd $kd -Sym $sym -LogFile $log1 `
             -Commands (@($load, '.chain',
                          '!ndiskd.miniports',
@@ -437,7 +424,7 @@ if ($MiniportHandle) {
 # is independent, so one that this ndiskd build does not have costs its
 # own output and nothing else.
 $log2 = Join-Path $OutDir 'wdi-state-detail.txt'
-Write-Host '[3/6] Dumping adapter, port and WDI state'
+Write-Host '[3/5] Dumping adapter, port and WDI state'
 # Two commands were removed after a run showed them to be inventions
 # of mine rather than things this ndiskd has: `!ndiskd.miniports -wdi`
 # answered "Unknown parameter wdi", and `!ndiskd.pendingoids` answered
@@ -609,57 +596,44 @@ if ($wdiState) {
     # What is left, and is not explainable this way, is
     # connectRoamTaskStartTime 0: the task that would issue
     # OID_WDI_TASK_CONNECT never started, with a ranked candidate in
-    # hand. So the failure is downstream of selection, in the job step
-    # machine. List CConnectJob's methods -- the names are the steps --
-    # and disassemble the three routines that drive them.
-    Write-Host '[4/6] Reading the decision'
+    # hand. Listing CConnectJob's methods named every step of the job,
+    # and one of them answers the question exactly:
+    #
+    #   CConnectJob::CheckAndStartConnectProcess(_WDI_ASSOC_STATUS *)
+    #
+    # Its out-parameter is the association status, and the failure we
+    # have been chasing since the beginning reports assocStatus 0x2 --
+    # WDI_ASSOC_STATUS_UNREACHABLE -- which is what wlansvc turns into
+    # the STATUS_NETWORK_UNREACHABLE (0xC000023C) it hands back. So this
+    # routine is where "unreachable" is decided, and the branch that
+    # writes 2 into that pointer is the whole answer.
+    #
+    # StartConnectRoamTask is the step it would otherwise reach: the one
+    # that fills WDI_CONNECT_PARAMETERS_CONTAINER and an
+    # ArrayOfElements<WDI_CONNECT_BSS_ENTRY_CONTAINER> and sends
+    # OID_WDI_TASK_CONNECT.
+    #
+    # GetSupportedAssociationMethods is here because it is small, it is
+    # static, it takes the port, the adapter and the profile, and it
+    # answers in booleans. A routine that derives from OUR advertised
+    # capabilities which association methods exist is exactly the shape
+    # of thing that can make a reachable AP unreachable. Both overloads
+    # are disassembled by module-relative address because the name alone
+    # is ambiguous and kd cannot pick between them; `x` is run first so
+    # the addresses in this build can be checked against the RVAs.
+    Write-Host '[4/5] Reading the decision'
     $log4 = Join-Path $OutDir 'wdi-state-decide.txt'
     $out4 = Invoke-Kd -Kd $kd -Sym $sym -LogFile $log4 -Commands (@(
         '.reload /f wdiwifi.sys',
-        'x wdiwifi!CConnectJob::*',
+        'lm vm wdiwifi',
         'x wdiwifi!CConnectHelpers::*',
-        'uf wdiwifi!CRoamReconnectJob::StartConnectJob',
-        'uf wdiwifi!CRoamReconnectJob::OnJobStepCompleted',
-        'uf wdiwifi!CRoamReconnectJob::CompleteConnectJob'
+        'dt wdiwifi!_WDI_ASSOC_STATUS',
+        'uf wdiwifi!CConnectJob::CheckAndStartConnectProcess',
+        'uf wdiwifi+0x8307c',
+        'uf wdiwifi+0x83174',
+        'uf wdiwifi!CConnectJob::StartConnectRoamTask'
     ) -join ';')
     Write-Host "      $log4 ($($out4.Count) lines)"
-
-    # Pass five: wdiwifi's own trace buffer.
-    #
-    # The disassembly settled a thing that had been assumed and was
-    # wrong: wdiwifi's WPP is compiled in, not out. Every routine is
-    # threaded with WPP_RECORDER_INITIALIZED and WPP_GLOBAL_Control
-    # checks and WPP_RECORDER_SF_* calls. No ETW session ever showed a
-    # wdiwifi message because the recorder writes into a circular buffer
-    # in the driver's own memory, which no provider carries and which a
-    # local kernel debugger can read directly.
-    #
-    # Without TMF files the entries come out as raw ids and arguments,
-    # which is enough -- every branch worth distinguishing logs a
-    # different id, and the interesting ones carry their status as an
-    # argument.
-    #
-    # .reload FIRST. The previous attempt answered "unable to find
-    # [wdiwifi] in module list hr=0x80070057" with the extension's own
-    # hint being "try .reload": rcdrkd resolves the module by name
-    # against the debugger's list, and this is a separate kd invocation
-    # from the one where wdiwifi was reloaded.
-    #
-    # The other complaint that run, "Driver is not built with autologger
-    # support", is about WppRecorder!_WPP_AUTOLOG_GLOBALS -- the
-    # system-wide autolog. It is not the per-driver recorder buffer and
-    # does not mean there is nothing to read.
-    Write-Host '[5/6] Dumping wdiwifi''s WPP recorder'
-    $log5 = Join-Path $OutDir 'wdi-state-wpp.txt'
-    $out5 = Invoke-Kd -Kd $kd -Sym $sym -LogFile $log5 -Commands (@(
-        '.reload /f wdiwifi.sys',
-        'lm vm wdiwifi',
-        $loadRcdrkd,
-        '!rcdrkd.rcdrloglist',
-        '!rcdrkd.rcdrlogdump wdiwifi',
-        '!rcdrkd.rcdrlogdump wdiwifi.sys'
-    ) -join ';')
-    Write-Host "      $log5 ($($out5.Count) lines)"
 } else {
     Write-Warning 'no "WDI state" pointer in pass two; skipping the adapter dump'
     Write-Warning 'If -MiniportHandle was given: handles are reassigned every'
@@ -668,10 +642,10 @@ if ($wdiState) {
     Write-Warning 'one find the adapter itself.'
 }
 
-Write-Host '[6/6] Done'
+Write-Host '[5/5] Done'
 Write-Host "      $log1 ($($out1.Count) lines)"
 Write-Host "      $log2 ($($out2.Count) lines)"
 Write-Host ''
-Write-Host '      Send wdi-state-decide.txt and wdi-state-wpp.txt. The first is'
-Write-Host '      the matcher that found our BSS and failed anyway; the second is'
-Write-Host '      wdiwifi telling you why, in its own trace buffer.'
+Write-Host '      Send wdi-state-decide.txt. CheckAndStartConnectProcess is the'
+Write-Host '      routine that writes WDI_ASSOC_STATUS_UNREACHABLE, which is the'
+Write-Host '      status wlansvc has been reporting from the very first attempt.'
