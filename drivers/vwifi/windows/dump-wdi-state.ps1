@@ -335,20 +335,35 @@ function Invoke-Kd {
 # command might not come back: one that hangs or derails the parser
 # takes down only itself, and every command before it is already on
 # disk. Used for exploratory passes; settled ones stay batched.
+#
+# EVERY invocation gets $Prologue, and for wdiwifi that has to be
+# `.reload /f wdiwifi.sys`. A local kernel session does not have the
+# module in its list until something forces it -- `lm vm wdiwifi`
+# printed its header and no rows, and `x wdiwifi!CScanJob::FinishJob`
+# answered "Couldn't resolve 'x wdiwifi'" with the caret on the `!`,
+# because the module name resolved to nothing. Batched passes got the
+# reload once at the front and every later command rode on it; splitting
+# them up took that away from all of them.
+#
+# The parse error is also why the timeout fired: kd never reached the
+# trailing q, so it sat at the prompt for the full 60 seconds and had to
+# be killed, four times over.
 function Invoke-KdEach {
     param(
         [Parameter(Mandatory)][string]   $Kd,
         [Parameter(Mandatory)][string]   $Sym,
         [Parameter(Mandatory)][string[]] $Commands,
         [Parameter(Mandatory)][string]   $LogFile,
+        [string] $Prologue = '',
         [int] $TimeoutSec = 60
     )
     Remove-Item $LogFile -ErrorAction SilentlyContinue
     $first = $true
     foreach ($c in $Commands) {
+        $full = if ($Prologue) { "$Prologue;$c" } else { $c }
         Write-Host "      kd: $c"
         (Invoke-Kd -Kd $Kd -Sym $Sym -LogFile $LogFile -TimeoutSec $TimeoutSec `
-                   -Commands $c -Append:(-not $first)) | Out-Null
+                   -Commands $full -Append:(-not $first)) | Out-Null
         $first = $false
     }
     if (Test-Path $LogFile) { return Get-Content $LogFile }
@@ -789,7 +804,8 @@ if ($wdiState) {
     # script blocked behind it. Split, a bad command costs only itself.
     Write-Host '[4/5] Locating the breakpoint'
     $log4 = Join-Path $OutDir 'wdi-state-decide.txt'
-    $out4 = Invoke-KdEach -Kd $kd -Sym $sym -LogFile $log4 -Commands @(
+    $out4 = Invoke-KdEach -Kd $kd -Sym $sym -LogFile $log4 `
+                          -Prologue '.reload /f wdiwifi.sys' -Commands @(
         'lm vm wdiwifi',
         'x wdiwifi!CScanJob::FinishJob',
         'x wdiwifi!CScanJob::StartScanTask',
@@ -797,18 +813,31 @@ if ($wdiState) {
     )
     Write-Host "      $log4 ($($out4.Count) lines)"
 
+    # Say something either way. A silent no-op here reads exactly like a
+    # pass that worked, which is how the last two rounds were lost.
+    $addr = $null
     foreach ($l in $out4) {
         if ($l -match '^(fffff[0-9a-f`]+)\s+wdiwifi!CScanJob::FinishJob') {
             $addr = $Matches[1] -replace '`',''
-            Write-Host ''
-            Write-Host '      BREAKPOINT ADDRESS'
-            Write-Host "        wdiwifi!CScanJob::FinishJob = 0x$addr"
-            Write-Host ''
-            Write-Host '      On the Linux host, with the guest started with -gdb tcp::1234:'
-            Write-Host "        scripts/gdb-wdi-finishjob.sh 0x$addr"
-            Write-Host ''
-            Write-Host '      Then trigger a scan in the guest. Valid only for this boot.'
+            break
         }
+    }
+    Write-Host ''
+    if ($addr) {
+        Write-Host '      BREAKPOINT ADDRESS'
+        Write-Host "        wdiwifi!CScanJob::FinishJob = 0x$addr"
+        Write-Host ''
+        Write-Host '      On the Linux host, with the guest started with -gdb tcp::1234:'
+        Write-Host "        scripts/gdb-wdi-finishjob.sh 0x$addr"
+        Write-Host ''
+        Write-Host '      Then trigger a scan in the guest. Valid for THIS BOOT only.'
+    } else {
+        Write-Warning 'could not find CScanJob::FinishJob in the pass-four output.'
+        Write-Warning "Look in $log4 for a line like"
+        Write-Warning '  fffff804`505d02bc wdiwifi!CScanJob::FinishJob (private: void ...)'
+        Write-Warning 'and pass that address to scripts/gdb-wdi-finishjob.sh by hand.'
+        Write-Warning 'If instead it says "Couldnt resolve x wdiwifi", the module'
+        Write-Warning 'symbols did not load and the .reload prologue is not working.'
     }
 } else {
     Write-Warning 'no "WDI state" pointer in pass two; skipping the adapter dump'
