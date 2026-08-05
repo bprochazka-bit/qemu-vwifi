@@ -1127,20 +1127,74 @@ degrade safely when the proof fails.** That is available far more often
 than it looks: `pNBL` exists precisely so the link can be verified from
 either end.
 
-Still in the log, and still not acted on:
+### The line you leave in the log because it looks harmless
+
+This one was in the log for weeks:
 
     device rejected SCAN: 0xc0000001 (a connect is in flight; the
     device will not sweep while associating)
 
-wdiwifi scans as part of the connect flow and the device refuses to
-sweep while associating. It does not block anything -- the connect
-above has two of these in the middle of it -- but the rejection returns
-a failure status *synchronously*, and a task OID's return value is what
-`CScanJob::FinishJob` reads as the job's outcome. That is precisely the
-mechanism that suppressed `WfcPortPropertyGoodScanStartTime` for the
-whole life of this project. It is harmless only because the next
-successful background scan rewrites the property. If connects ever
-start failing every other attempt, look here first.
+wdiwifi scans as part of its own connect flow and the device refuses to
+sweep while associating — it shares the radio and the one-shot timer
+with the auth/assoc exchange. It looked harmless: the connect ran all
+the way to a successful association result with two of these in the
+middle of it. The note here said so, and added that the rejection
+returns a failure status *synchronously*, that a task OID's return
+value is what `CScanJob::FinishJob` reads as the job's outcome, and
+that if connects ever started failing every other attempt this was the
+first place to look.
+
+Connects did not start failing. Something better disguised did.
+
+The symptom was a link that came up perfectly — association result 0,
+`LINK_STATE connected`, the AP logging `AP-STA-CONNECTED` — and then
+sat at "Unidentified network" because DHCP had nowhere to go.
+`TalTxRxPeerConfig` never arrived, so the peer was never configured, so
+TX stayed paused on `WDI_TX_PAUSE_REASON_PEER_CREATE` for the life of
+the association.
+
+What made it findable was that it was **intermittent**, and the thing
+it correlated with was not obvious. Across five captured runs:
+
+| connect → association | scan during connect | `TalTxRxPeerConfig` |
+| --------------------- | ------------------- | ------------------- |
+| 0 ms                  | accepted            | **arrived**         |
+| 0 ms                  | accepted            | **arrived**         |
+| 62 ms                 | refused ×2          | never               |
+| 79 ms                 | refused ×2          | never               |
+| 3437 ms               | refused ×2          | never               |
+
+Five for five, and nothing else differed. When the association happened
+to finish before wdiwifi got its scan in, the device had already
+returned to idle, the scan was accepted, and the peer was configured.
+When it did not, the scan was refused, the scan *job* failed, and the
+post-connect sequence that ends in `TalTxRxPeerConfig` was aborted
+along with it.
+
+So the failing task did not break the connect. It broke everything
+downstream of the connect, while leaving the connect itself looking
+perfect — which is why it survived so long as a line worth ignoring.
+
+The fix is not to make the device sweep during association; that
+constraint is real. It is to stop reporting "I could not do this right
+now" as "this failed". The refusal is now answered the way a real
+driver answers a scan it cannot usefully run: as a scan that completed
+and found what we already knew. The BSS cache is live and populated —
+wdiwifi pulls it with `WDI_GET_BSS_ENTRY_LIST` immediately afterwards
+either way — so nothing is waited for and nothing is lost.
+
+**A task OID's return value is not a status, it is a verdict on the
+job.** "Busy" and "failed" are the same value to the caller, and the
+caller acts on the verdict, not on your reason for it. Anywhere a
+driver returns a failure for something it merely could not do *yet*,
+the cost lands somewhere downstream and looks nothing like a scan.
+
+And the meta-lesson, which is the expensive one: **a known-suspicious
+line you decided not to act on needs a prediction attached that could
+be wrong in more than one way.** The prediction here was "connects will
+fail every other attempt". Connects did not fail, so the note read as
+disproved every time it was reviewed — while the actual damage went to
+a subsystem the note never mentioned.
 
 ### When the driver log is silent, the problem is above the driver
 

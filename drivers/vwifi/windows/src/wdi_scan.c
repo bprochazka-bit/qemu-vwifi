@@ -962,35 +962,74 @@ VwifiHandleTaskScan(_Inout_ PVWIFI_ADAPTER Adapter,
     status = VwifiCtrlSendSync(Adapter, VWIFI_OP_SCAN,
                                scanReq, reqLen, NULL, &outLen);
     if (status != NDIS_STATUS_SUCCESS) {
-        /* Rejected before the scan ever started, so the OID reports it
-         * and no SCAN_COMPLETE is indicated -- returning a failure
-         * status and indicating a completion for the same task is a
-         * double completion. Release the claim so the next scan is not
-         * refused as an overlap. */
-        /* Expected during a connect: the device refuses to sweep while
-         * its association state machine is running, and wdiwifi issues
-         * a scan or two as part of the connect flow. Harmless so far --
-         * a connect has run all the way to its association result with
-         * two of these in the middle of it -- but not obviously safe:
-         * this returns a failure status synchronously, and a task OID's
-         * return value is what CScanJob::FinishJob reads as the job's
-         * outcome, which is exactly the mechanism that used to suppress
-         * WfcPortPropertyGoodScanStartTime. Left alone for now so the
-         * association-result fix can be judged on its own; if connects
-         * start failing every other attempt, this is the first suspect.
-         */
-        VWIFI_ERR("device rejected SCAN: 0x%x%s", status,
-                  (VwifiConnectTaskState(Adapter) &
-                   VWIFI_TASK_CONNECT_PENDING)
-                      ? " (a connect is in flight; the device will not "
-                        "sweep while associating)"
-                      : "");
+        BOOLEAN connecting = (VwifiConnectTaskState(Adapter) &
+                              VWIFI_TASK_CONNECT_PENDING) ? TRUE : FALSE;
+
+        /* Rejected before the scan ever started, so no SCAN_COMPLETE is
+         * indicated on the failure path -- returning a failure status
+         * and indicating a completion for the same task is a double
+         * completion. Release the claim either way so the next scan is
+         * not refused as an overlap. */
         if (InterlockedCompareExchange(&task->Active, 0, 1) == 1 &&
             task->Watchdog) {
             (VOID)NdisCancelTimerObject(task->Watchdog);
         }
         task->TransactionCount = 0;
-        return status;
+
+        if (!connecting) {
+            VWIFI_ERR("device rejected SCAN: 0x%x", status);
+            return status;
+        }
+
+        /*
+         * A connect is in flight, and this refusal is not a failure.
+         *
+         * The device will not hop channels while its auth/assoc
+         * exchange is running -- it shares the radio and the one-shot
+         * timer with it -- and wdiwifi issues a scan or two from inside
+         * its own connect flow, so the two collide by design rather
+         * than by accident.
+         *
+         * Failing the task here is what breaks the data path. A task
+         * OID's return value is the job's outcome, and a failed scan
+         * job aborts the post-connect sequence that ends in
+         * TalTxRxPeerConfig. The port still reaches "connected" -- link
+         * state up, association result 0, AP happy -- but the peer is
+         * never configured, so TX stays paused on
+         * WDI_TX_PAUSE_REASON_PEER_CREATE for the life of the
+         * association and DHCP has nowhere to go. That is exactly the
+         * "connects, then shows Unidentified network" symptom.
+         *
+         * Measured across five runs: whenever the association happened
+         * to complete before wdiwifi got its scan in, the scan was
+         * accepted and TalTxRxPeerConfig arrived; whenever it did not,
+         * the scan was refused and the peer config never came. Five for
+         * five, and nothing else differed between them.
+         *
+         * So answer it the way a real driver answers a scan it cannot
+         * usefully run: as a scan that completed and found what we
+         * already knew. The BSS cache is live and populated -- wdiwifi
+         * pulls it with WDI_GET_BSS_ENTRY_LIST immediately afterwards
+         * regardless -- so there is nothing to wait for and nothing
+         * lost. Same shape as the late-merge path above: M3 first, then
+         * the M2, because returning a status IS the completion and it
+         * cannot be moved ahead of the handler that owns the request.
+         */
+        VWIFI_INFO("device refused SCAN while a connect is in flight; "
+                   "answering txn %u as a completed no-op scan rather "
+                   "than failing the task (a failed scan job aborts the "
+                   "post-connect sequence and the peer is never "
+                   "configured)",
+                   task->Requesters[0].TransactionId);
+
+        VwifiSendWdiIndication(Adapter,
+                               task->Requesters[0].WdiPortId,
+                               task->Requesters[0].PortId,
+                               NDIS_STATUS_WDI_INDICATION_SCAN_COMPLETE,
+                               NDIS_STATUS_SUCCESS,
+                               task->Requesters[0].TransactionId,
+                               NULL, 0);
+        return VwifiWdiTaskAnsweredInline(Req);
     }
 
     VWIFI_INFO("scan started (mask24=0x%08x mask5=0x%llx dwell=%u ms ssids=%u)",
