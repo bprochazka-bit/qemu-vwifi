@@ -517,14 +517,15 @@ NDIS_STATUS VwifiHandleTaskChangeOpMode(_Inout_ PVWIFI_ADAPTER Adapter,
                                         _In_ PNDIS_OID_REQUEST Req);
 
 /* Accept a WDI task: write the M2 into the OID's output buffer and
- * return NDIS_STATUS_INDICATION_REQUIRED.
+ * complete the OID with NDIS_STATUS_SUCCESS.
  *
- * Every task handler must return through this rather than the bare
- * status. WABIModel gives each task a FromIhv message described as "No
- * TLV data needed, header is sufficient" -- which requires the header,
- * and that header is the OID's response. Returning INDICATION_REQUIRED
- * with BytesWritten left at zero answers a defined message with
- * nothing. */
+ * Every task handler must return through this rather than a status of
+ * its own. Returning NDIS_STATUS_INDICATION_REQUIRED instead --
+ * 0x40230001, a plain NDIS status that merely READS like a description
+ * of WDI's M1/M2/M3 shape and appears nowhere in WDI itself -- put a
+ * non-zero value where the port driver reads the task's outcome, and
+ * broke every connect this driver ever attempted. See oids.c for the
+ * breakpoint that caught it. */
 NDIS_STATUS VwifiWdiTaskAccepted(_In_ PNDIS_OID_REQUEST Req);
 
 /* wdi_scan.c — Phase 2 scan task. */

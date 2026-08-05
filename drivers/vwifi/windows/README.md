@@ -539,6 +539,53 @@ documents `WDI_TRANSACTION_ID_UNSOLICIT` for every indication except
 contents; `WDI_OPERATION_MODE_STA` being `0x01`; and station and
 interface capabilities field by field.
 
+### A status code that reads like the protocol is not the protocol
+
+Every task handler in this driver returned `NDIS_STATUS_INDICATION_REQUIRED`,
+and a long comment explained why: a WDI task is accepted by its OID and
+completed later by an indication, and that status says exactly that.
+The reasoning was tidy, the name fits perfectly, and it was wrong. It
+broke every connect the driver ever attempted.
+
+A hardware breakpoint on `wdiwifi!CScanJob::FinishJob`, set from the
+Linux host through QEMU's gdbstub, caught it in one hit:
+
+    gate 1  status        = 0x40230001
+    gate 2  m_bCancelled  = 0x0
+    gate 3  port id       = 0x0
+
+`0x40230001` is `STATUS_NDIS_INDICATION_REQUIRED` -- severity
+informational, facility `0x23` `FACILITY_NDIS`, code 1. It is the value
+the OID handler returned, arriving as the scan job's completion status.
+`FinishJob` writes `WfcPortPropertyGoodScanStartTime` only when that
+status is zero, so the property was never written; without it
+`CConnectJob::CheckAndUpdateCandidates` zeroes the candidate list,
+`CheckAndStartConnectProcess` skips `StartConnectRoamTask`, and
+`OID_WDI_TASK_CONNECT` is never sent. Scanning worked, the network list
+filled, and connecting was refused -- with no connect task ever
+reaching the driver to explain it.
+
+The tell was available the whole time and cost nothing to check:
+
+    grep -i INDICATION_REQUIRED dot11wdi.h WABIModel.xml wditypes.hpp
+
+returns nothing. WDI expresses "an indication follows" *structurally* --
+by defining a task's `FromIhv` message as a bare header and its
+completion as a separate indication -- and never as a status code. A
+constant whose name describes your protocol, but which your protocol's
+own headers never mention, belongs to some other contract.
+
+Correct shape for a WDI task: complete the OID with
+`NDIS_STATUS_SUCCESS`, write the `WDI_MESSAGE_HEADER` into its output
+buffer as the M2, and send the outcome later as the M3 indication.
+
+Two notes on getting the breakpoint. Local kernel debugging (`kd -kl`)
+reads and disassembles but cannot stop the machine, which is why this
+took so long to find by reading alone; QEMU's `-gdb tcp::1234` can, and
+`scripts/gdb-wdi-finishjob.sh` drives it. Use `hbreak`, not `break` --
+a software breakpoint writes `0xCC` into wdiwifi's code, which is
+exactly the kernel modification PatchGuard bugchecks for.
+
 ### When the driver log is silent, the problem is above the driver
 
 The 0xE9 trace records everything the driver is asked to do. That makes

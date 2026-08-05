@@ -864,9 +864,16 @@ VwifiHandleTaskScan(_Inout_ PVWIFI_ADAPTER Adapter,
                (unsigned long long)scanReq->channel_mask_5,
                scanReq->dwell_ms, scanReq->num_ssids);
 
-    /* WDI_SCAN_RESULTS (the M0) needs no TLV data — the header alone is
-     * the "task started" acknowledgement. INDICATION_REQUIRED tells
-     * NDIS the real completion arrives later as an indication. */
+    /* WDI_SCAN_RESULTS is the M2: no TLV data, the header alone is the
+     * "task accepted" acknowledgement, and the OID completes with
+     * SUCCESS. The scan's real outcome arrives later as
+     * WDI_INDICATION_SCAN_COMPLETE.
+     *
+     * Not INDICATION_REQUIRED. That status reached CScanJob::FinishJob
+     * as the scan job's completion status, where any non-zero value
+     * suppresses WfcPortPropertyGoodScanStartTime -- and without that
+     * property the connect job throws away its candidates. See
+     * VwifiWdiTaskAccepted. */
     return VwifiWdiTaskAccepted(Req);
 }
 
