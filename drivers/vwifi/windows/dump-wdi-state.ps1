@@ -652,48 +652,60 @@ if ($wdiState) {
     # StartConnectRoamTask, so OID_WDI_TASK_CONNECT never goes out and
     # *pAssocStatus is left at WDI_ASSOC_STATUS_CANDIDATE_LIST_EXHAUSTED.
     #
-    # GetStatusFromTaskOutput, in full:
+    # Two things settled, one opened.
     #
-    #   call Task::get_OutputBuffer(&len, &buf)
-    #   test eax,eax / jne  -> return eax        ; no output at all
-    #   cmp  dword ptr [len],30h                 ; 48 bytes minimum
-    #   jb   -> ebx = 0xC0010014                 ; NDIS_STATUS_INVALID_LENGTH
-    #   mov  rcx,[buf]
-    #   mov  ebx,dword ptr [rcx+24h]             ; status at buf+0x24
-    #   return ebx
+    # Settled 1: our 16-byte SCAN_COMPLETE is correct, and the
+    # 48-byte minimum is not about our payload. _WFC_MESSAGE_METADATA is
     #
-    # Our SCAN_COMPLETE indication carries 16 bytes: a bare
-    # WDI_MESSAGE_HEADER, which is what WABIModel asks for. Two readings
-    # fit, and they call for opposite fixes, so neither gets acted on
-    # until Task::get_OutputBuffer says which:
+    #   +0x00 MessageId  +0x04 MessageLength  +0x08 flags
+    #   +0x0c MessageType
+    #   +0x10 _Command / _Response / _Indication  (union, 0x10)
+    #   +0x20 Message : _WDI_MESSAGE_HEADER
     #
-    #   (a) The task output is our payload as received. 16 < 48, so
-    #       every header-only task completion fails this check, and the
-    #       driver has to send something longer.
+    # so metadata plus header is exactly 0x30 and Message.Status lands
+    # at exactly 0x24 -- the two constants in GetStatusFromTaskOutput.
+    # wdiwifi wraps what we send. Lengthening our indication would have
+    # been the wrong fix, which is why it was not made last round.
     #
-    #   (b) wdiwifi prepends its own metadata. A 0x20-byte prefix plus
-    #       our 0x10 header is exactly 0x30, and puts WDI_MESSAGE_HEADER
-    #       .Status at exactly 0x24 -- PortId 0x20, Reserved 0x22,
-    #       Status 0x24, TransactionId 0x28, IhvSpecificId 0x2c. The
-    #       arithmetic fits far too well to be coincidence, and under
-    #       this reading our 16 bytes are correct and the failure is
-    #       that get_OutputBuffer returns nothing at all.
+    # Settled 2: a task only accepts an indication that matches it.
+    # Task::OnDeviceIndicationArrived compares
+    # DeviceCommand::get_CommandToken against the indication transaction
+    # id and DeviceCommand::get_PortId against its port id, and returns
+    # silently on either mismatch -- leaving the task with no output, so
+    # get_OutputBuffer answers 0xC0000184, the same code an unpopulated
+    # property gives.
     #
-    # get_OutputBuffer and OnTaskCompletedHandler settle it: the first
-    # shows where the length and buffer come from, the second shows what
-    # a completing task stores. OnDeviceIndicationArrived is the entry
-    # point from our indication, and _WFC_MESSAGE_METADATA is the type
-    # reading (b) depends on -- CMessageHelper::FitMessageToBufferSize
-    # takes one, so it exists.
+    # Opened: CScanJob has a second step, and it is not the scan.
+    #
+    #   +0x140  edi = CompleteScanTask(status)
+    #           if (edi != 0) -> FinishJob(edi)
+    #   +0x150  cmp byte ptr [rbx+788h],0
+    #           je  -> FinishJob(0)
+    #   +0x15d  CBSSListUpdateJob::Initialize(...)
+    #   +0x1c6  CJobBase::StartChildJob(job, &m_BssListUpdateJob)
+    #
+    # When the child completes, OnJobStepCompleted re-enters with step 2
+    # and calls FinishJob with the CHILD's status. So the status gating
+    # WfcPortPropertyGoodScanStartTime may never have been the scan
+    # task's at all.
+    #
+    # And the byte search's third hit deserved more attention than it
+    # got: CEnumBSSListJob::CompleteBSSListEnum+0x1a1 also loads 0x47
+    # into edx. Two of the four sites that touch this property are on
+    # the BSS-list side, not the scan side -- and with
+    # BSSListCachemanagement TRUE, the BSS list is fetched from us by
+    # OID_WDI_GET_BSS_ENTRY_LIST, which we answer with an unsolicited
+    # indication carrying transaction id 0.
     Write-Host '[4/5] Reading the decision'
     $log4 = Join-Path $OutDir 'wdi-state-decide.txt'
     $out4 = Invoke-Kd -Kd $kd -Sym $sym -LogFile $log4 -Commands (@(
         '.reload /f wdiwifi.sys',
-        'uf wdiwifi!Task::get_OutputBuffer',
-        'uf wdiwifi!Task::OnTaskCompletedHandler',
-        'uf wdiwifi!Task::OnDeviceIndicationArrived',
-        'dt wdiwifi!_WFC_MESSAGE_METADATA',
-        'dt wdiwifi!_WDI_INDICATION_TYPE'
+        'x wdiwifi!CBSSListUpdateJob::*',
+        'x wdiwifi!CEnumBSSListJob::*',
+        'uf wdiwifi!CEnumBSSListJob::CompleteBSSListEnum',
+        'uf wdiwifi!CBSSListUpdateJob::Initialize',
+        'uf wdiwifi!DeviceCommand::get_CommandToken',
+        'uf wdiwifi!DeviceCommand::get_PortId'
     ) -join ';')
     Write-Host "      $log4 ($($out4.Count) lines)"
 } else {
@@ -708,5 +720,6 @@ Write-Host '[5/5] Done'
 Write-Host "      $log1 ($($out1.Count) lines)"
 Write-Host "      $log2 ($($out2.Count) lines)"
 Write-Host ''
-Write-Host '      Send wdi-state-decide.txt. Task::get_OutputBuffer decides'
-Write-Host '      whether our 16-byte SCAN_COMPLETE is too short or never arrived.'
+Write-Host '      Send wdi-state-decide.txt. The scan job has a second step -- a'
+Write-Host '      BSS list update -- and it is that child job whose status gates the'
+Write-Host '      good-scan time.'
