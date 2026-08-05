@@ -652,34 +652,51 @@ if ($wdiState) {
     # StartConnectRoamTask, so OID_WDI_TASK_CONNECT never goes out and
     # *pAssocStatus is left at WDI_ASSOC_STATUS_CANDIDATE_LIST_EXHAUSTED.
     #
-    # The byte search found exactly four sites that load 0x47 into edx:
+    # The write is guarded by exactly two conditions.
     #
-    #   CAdapterPropertyCache::GetTCPOffloadCapabilities+0xca
-    #       -- a different cache, so a different enum. Not ours.
-    #   CScanJob::FinishJob+0xd2                    <- the writer
-    #   CEnumBSSListJob::CompleteBSSListEnum+0x1a1
-    #   CConnectJob::CheckAndUpdateCandidates+0x2b7 <- the reader
+    #   CScanJob::StartScanTask+0x17c
+    #     rax = *KUSER_SHARED_DATA.InterruptTime
+    #     mov [rbx+790h],rax           ; stamp the start time on the job
+    #     call CJobBase::StartTask
     #
-    # So WfcPortPropertyGoodScanStartTime is written by CScanJob when a
-    # scan job finishes, and the connect job refuses to trust its
-    # candidates until that has happened at least once. Our scans do
-    # complete -- SCAN_COMPLETE goes back with status 0 for every
-    # transaction id -- and the property is still unset, so FinishJob is
-    # reaching its write under a condition our scans do not satisfy.
+    #   CScanJob::FinishJob(status in ebp)
+    #     +0x98  test ebp,ebp
+    #            jne  +0x12b                    ; status != 0 -> no write
+    #     +0xa6  cmp  byte ptr [rbx+78Ah],bpl
+    #            jne  +0x12b                    ; flag != 0   -> no write
+    #     +0xaf  resolve the port property cache by port id
+    #     +0xd2  mov  edx,47h                   ; GoodScanStartTime
+    #            lea  r9,[rbx+790h]             ; the stamped start time
+    #            lea  r8d,[rdx-3Fh]             ; length 8
+    #            call CPropertyCache::SetPropertyBuffer
     #
-    # Disassemble the whole small class rather than just FinishJob.
-    # "StartTime" is recorded somewhere and committed somewhere else, so
-    # StartScanTask and CompleteScanTask are as likely to hold the guard
-    # as FinishJob is, and IsScanAllowed can skip the job outright.
+    # Our scans finish with status 0 -- SCAN_COMPLETE carries
+    # 0x00000000 in the message header for every transaction id -- so
+    # the first gate is satisfied and the byte at CScanJob+0x78A is the
+    # one refusing the write.
+    #
+    # Nothing in FinishJob, CompleteScanTask, StartScanTask,
+    # IsScanAllowed or OnJobStepCompleted writes that byte; the only
+    # reference in all five is the comparison above. Its neighbours are
+    # read though -- +0x789 gates IsScanAllowed and +0x788 is tested in
+    # the step handler -- so these are three adjacent flags set at
+    # initialization, and _WFC_SCAN_JOB_PARAMETERS is only four fields
+    # long, so they are not simply copied in from the caller.
+    #
+    # Search for the displacement itself. Any instruction touching
+    # +0x78A encodes 8A 07 00 00, so the search finds the write site
+    # whatever the opcode, and ln names it. The three routines that
+    # build a scan job are disassembled alongside, since that is where
+    # a flag like this is most likely decided.
     Write-Host '[4/5] Reading the decision'
     $log4 = Join-Path $OutDir 'wdi-state-decide.txt'
     $out4 = Invoke-Kd -Kd $kd -Sym $sym -LogFile $log4 -Commands (@(
         '.reload /f wdiwifi.sys',
-        'uf wdiwifi!CScanJob::FinishJob',
-        'uf wdiwifi!CScanJob::CompleteScanTask',
-        'uf wdiwifi!CScanJob::StartScanTask',
-        'uf wdiwifi!CScanJob::IsScanAllowed',
-        'uf wdiwifi!CScanJob::OnJobStepCompleted'
+        's -[1]b wdiwifi L?0xf2000 8a 07 00 00',
+        '.foreach (a {s -[1]b wdiwifi L?0xf2000 8a 07 00 00}) { ln a }',
+        'uf wdiwifi!CScanJob::InitializeFromScanParams',
+        'uf wdiwifi!CConnectJob::StartScanJob',
+        'uf wdiwifi!CScanOidJob::StartScanJob'
     ) -join ';')
     Write-Host "      $log4 ($($out4.Count) lines)"
 } else {
@@ -694,6 +711,5 @@ Write-Host '[5/5] Done'
 Write-Host "      $log1 ($($out1.Count) lines)"
 Write-Host "      $log2 ($($out2.Count) lines)"
 Write-Host ''
-Write-Host '      Send wdi-state-decide.txt. CScanJob::FinishJob is what writes'
-Write-Host '      WfcPortPropertyGoodScanStartTime, and our scans finish without it'
-Write-Host '      being written; this is the condition it is guarded by.'
+Write-Host '      Send wdi-state-decide.txt. The good-scan time is only written'
+Write-Host '      when CScanJob+0x78A is zero; this finds what sets that byte.'
