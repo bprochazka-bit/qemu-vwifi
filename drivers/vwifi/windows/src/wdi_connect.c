@@ -89,6 +89,16 @@ typedef struct _VWIFI_CONNECT_TASK
     USHORT  TargetSsidLen;
     BOOLEAN Associated;
 
+    /* Band and algorithms, kept from the connect request so the
+     * association result can state them.
+     *
+     * The device's vwifi_assoc_result reports the BSSID, the status
+     * code and the response IEs and nothing else -- it has no reason
+     * to echo back what it was just told. WDI's association result
+     * wants the band and the negotiated algorithms named explicitly,
+     * so they are remembered here rather than reconstructed. */
+    VWIFI_ASSOC_PARAMS AssocParams;
+
     /* The disconnect's own port and transaction id. Separate fields,
      * not the connect's: a disconnect can arrive with no connect ever
      * having run, and its completion has to echo the transaction id it
@@ -174,6 +184,7 @@ VwifiParseConnectParameters(
 static VOID
 VwifiIndicateAssociationResult(_Inout_ PVWIFI_ADAPTER Adapter,
                                _In_ const struct vwifi_assoc_result *Result,
+                               _In_ const VWIFI_ASSOC_PARAMS *Params,
                                _In_reads_bytes_(Result->ie_len) const UCHAR *Ies)
 {
     PVWIFI_CONNECT_TASK task = Adapter->ConnectTask;
@@ -181,9 +192,19 @@ VwifiIndicateAssociationResult(_Inout_ PVWIFI_ADAPTER Adapter,
     ULONG tlvLen = 0;
 
     if (VwifiTlvGenerateAssociationResult(Adapter->WdiPeerVersion,
-                                          Result, Ies, &tlv, &tlvLen)
+                                          Result, Params, Ies, &tlv, &tlvLen)
             != NDIS_STATUS_SUCCESS) {
-        VWIFI_ERR("ASSOCIATION_RESULT TLV generate failed");
+        /* The mandatory-container trap, twice over now: this failed for
+         * the whole life of the project because ActivePhyTypeList was
+         * left empty, and the message it produced was a bare
+         * "generate failed" with no idea which field. If it fires
+         * again, the fields are printed so the next reader starts
+         * somewhere. */
+        VWIFI_ERR("ASSOCIATION_RESULT TLV generate failed "
+                  "(status %u freq %u auth %u akm %u cipher %u/%u ies %u)",
+                  Result->status_code, Params->FreqMhz, Params->AuthAlgo,
+                  Params->AkmSuite, Params->CipherPairwise,
+                  Params->CipherGroup, Result->ie_len);
         return;
     }
 
@@ -419,7 +440,7 @@ VwifiConnectOnAssocResult(_Inout_ PVWIFI_ADAPTER Adapter,
     }
     ies = (const UCHAR *)Payload + sizeof(*res);
 
-    VwifiIndicateAssociationResult(Adapter, res, ies);
+    VwifiIndicateAssociationResult(Adapter, res, &task->AssocParams, ies);
 
     if (res->status_code == 0) {
         task->Associated = TRUE;
@@ -506,6 +527,13 @@ VwifiHandleTaskConnect(_Inout_ PVWIFI_ADAPTER Adapter,
     RtlCopyMemory(task->TargetBssid, creq->bssid, 6);
     task->TargetSsidLen = creq->ssid_len;
     RtlCopyMemory(task->TargetSsid, creq->ssid, sizeof(task->TargetSsid));
+
+    /* And what the association is being made on, for the result. */
+    task->AssocParams.FreqMhz        = creq->channel_freq;
+    task->AssocParams.AuthAlgo       = creq->auth_algo;
+    task->AssocParams.AkmSuite       = creq->akm_suite;
+    task->AssocParams.CipherPairwise = creq->cipher_pairwise;
+    task->AssocParams.CipherGroup    = creq->cipher_group;
 
     /* Marked pending, and the watchdog armed, before the device is
      * asked to do anything: the ASSOC_RESULT can land on another

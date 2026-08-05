@@ -967,7 +967,24 @@ VwifiHandleTaskScan(_Inout_ PVWIFI_ADAPTER Adapter,
          * status and indicating a completion for the same task is a
          * double completion. Release the claim so the next scan is not
          * refused as an overlap. */
-        VWIFI_ERR("device rejected SCAN: 0x%x", status);
+        /* Expected during a connect: the device refuses to sweep while
+         * its association state machine is running, and wdiwifi issues
+         * a scan or two as part of the connect flow. Harmless so far --
+         * a connect has run all the way to its association result with
+         * two of these in the middle of it -- but not obviously safe:
+         * this returns a failure status synchronously, and a task OID's
+         * return value is what CScanJob::FinishJob reads as the job's
+         * outcome, which is exactly the mechanism that used to suppress
+         * WfcPortPropertyGoodScanStartTime. Left alone for now so the
+         * association-result fix can be judged on its own; if connects
+         * start failing every other attempt, this is the first suspect.
+         */
+        VWIFI_ERR("device rejected SCAN: 0x%x%s", status,
+                  (VwifiConnectTaskState(Adapter) &
+                   VWIFI_TASK_CONNECT_PENDING)
+                      ? " (a connect is in flight; the device will not "
+                        "sweep while associating)"
+                      : "");
         if (InterlockedCompareExchange(&task->Active, 0, 1) == 1 &&
             task->Watchdog) {
             (VOID)NdisCancelTimerObject(task->Watchdog);

@@ -165,9 +165,27 @@ NDIS_STATUS VwifiTlvParseConnectRequest(
     _In_ ULONG ReqCap,
     _Out_ PULONG ReqLen);
 
+/* What the association actually settled on, in device-ABI terms.
+ *
+ * The device's vwifi_assoc_result carries the BSSID, the status code
+ * and the response IEs, and nothing about the band or the algorithms --
+ * it does not need to, since both were named in the connect request it
+ * was given. WDI's association result wants them stated explicitly, so
+ * the connect task keeps this alongside the request it sent and hands
+ * it back when the result arrives. */
+typedef struct _VWIFI_ASSOC_PARAMS
+{
+    USHORT FreqMhz;         /* vwifi_connect_req.channel_freq   */
+    USHORT AuthAlgo;        /* VWIFI_AUTH_*                     */
+    USHORT AkmSuite;        /* VWIFI_AKM_*                      */
+    USHORT CipherPairwise;  /* VWIFI_CIPHER_*                   */
+    USHORT CipherGroup;     /* VWIFI_CIPHER_*                   */
+} VWIFI_ASSOC_PARAMS;
+
 NDIS_STATUS VwifiTlvGenerateAssociationResult(
     _In_ ULONG PeerVersion,
     _In_ const struct vwifi_assoc_result *Result,
+    _In_ const VWIFI_ASSOC_PARAMS *Params,
     _In_reads_bytes_opt_(Result->ie_len) const UCHAR *Ies,
     _Outptr_result_bytebuffer_(*BufferLen) VOID **Buffer,
     _Out_ PULONG BufferLen);

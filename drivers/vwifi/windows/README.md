@@ -780,6 +780,52 @@ An absent property would have been *safer* than a half-filled one: the
 default is "no limit". Half-filling a container is worse than omitting
 it.
 
+With the inner bit set, `OID_WDI_TASK_CONNECT` arrives for the first
+time in this project's life:
+
+    OID: method 0xe4400006 WDI_TASK_CONNECT
+    OID M1: txn 20 wdiport 0x0000 ndisport 0 ... in 336 out 2046 bytes
+    connect parsed: bssid 02:11:22:33:44:01 ssid='vwifi-open'
+                    auth=0 akm=0 cipher=0 assoc_ies=0
+
+### The same trap, one message later: ActivePhyTypeList
+
+The connect ran, the device associated, and then:
+
+    ASSOCIATION_RESULT TLV generate failed
+    indicating CONNECT_COMPLETE (0xc0000001)
+
+`WDI_ASSOCIATION_RESULT_CONTAINER` has five optional members with
+presence bits and two mandatory ones -- and a third that is mandatory
+only sometimes. `WABIModel.xml` lists it twice:
+
+```xml
+<containerRef id="WDI_TLV_PHY_TYPE_LIST" name="ActivePhyTypeList"
+              type="PhyTypeListContainer" versionAdded="WDI_VERSION_1_1_4" />
+<containerRef id="WDI_TLV_PHY_TYPE_LIST" name="ActivePhyTypeList"
+              type="PhyTypeListContainer" optional="true"
+              versionRemoved="WDI_VERSION_1_1_4" />
+```
+
+Optional up to 1.1.4, **required from 1.1.4 on**. This peer reports
+`0x0001010a` -- 1.1.10 -- so it is required, and the driver left it as
+a zeroed `ArrayOfElements`. Same failure as the empty `FirmwareVersion`
+that once stopped adapter bring-up: the generator rejects the whole
+message with `NDIS_STATUS_INVALID_DATA`.
+
+**A `versionAdded` attribute can make a field mandatory that the
+same file also describes as optional.** Read both rows, and check the
+peer version before deciding which applies.
+
+Three neighbouring fields were also wrong in a way worth stating,
+because the values look plausible and are not: `AuthAlgorithm`,
+`BandID` and `DSInfo` were all left at zero, and zero is not a valid
+enumerator for any of them --- `WDI_AUTH_ALGO_80211_OPEN` is 1,
+`WDI_BAND_ID_2400` is 1, and `WDI_DS_INFO` runs `CHANGED` 1,
+`UNCHANGED` 2, `UNKNOWN` 3 with no zero at all. Only
+`WDI_CIPHER_ALGO_NONE` is genuinely 0. A zeroed struct is a valid
+starting point only for the fields whose zero means something.
+
 ### When the driver log is silent, the problem is above the driver
 
 The 0xE9 trace records everything the driver is asked to do. That makes

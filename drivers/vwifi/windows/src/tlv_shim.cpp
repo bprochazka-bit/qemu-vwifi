@@ -554,11 +554,51 @@ VwifiTlvParseConnectRequest(
  * WDI_INDICATION_ASSOCIATION_START_PARAMETERS is a container carried
  * inside the association result, not a standalone message. */
 
+/* Our device-ABI cipher back to WDI's. The inverse of
+ * WdiCipherToVwifi, for the association result, which has to state the
+ * cipher that was negotiated rather than the one that was asked for. */
+static WDI_CIPHER_ALGORITHM VwifiCipherToWdi(USHORT cipher)
+{
+    switch (cipher) {
+    case VWIFI_CIPHER_CCMP128:  return WDI_CIPHER_ALGO_CCMP;
+    case VWIFI_CIPHER_GCMP256:  return WDI_CIPHER_ALGO_GCMP_256;
+    case VWIFI_CIPHER_TKIP:     return WDI_CIPHER_ALGO_TKIP;
+    case VWIFI_CIPHER_WEP40:    return WDI_CIPHER_ALGO_WEP40;
+    case VWIFI_CIPHER_WEP104:   return WDI_CIPHER_ALGO_WEP104;
+    case VWIFI_CIPHER_NONE:     return WDI_CIPHER_ALGO_NONE;
+    default:                    return WDI_CIPHER_ALGO_NONE;
+    }
+}
+
+/* Our (auth, AKM) pair back to WDI's single auth algorithm.
+ *
+ * The AKM is what carries the information here, for the reason set out
+ * above WdiAuthToVwifi: WPA2-PSK authenticates over the air as Open
+ * System and does its real work in the EAPOL handshake afterwards, so
+ * auth alone cannot tell WPA2-PSK from an open network. The forward
+ * mapping folds both onto VWIFI_AUTH_OPEN; the AKM is what unfolds
+ * them. */
+static WDI_AUTH_ALGORITHM VwifiAuthToWdi(USHORT auth, USHORT akm)
+{
+    switch (akm) {
+    case VWIFI_AKM_PSK:   return WDI_AUTH_ALGO_RSNA_PSK;
+    case VWIFI_AKM_8021X: return WDI_AUTH_ALGO_RSNA;
+    case VWIFI_AKM_SAE:   return WDI_AUTH_ALGO_WPA3_SAE;
+    default:              break;
+    }
+    switch (auth) {
+    case VWIFI_AUTH_SHARED: return WDI_AUTH_ALGO_80211_SHARED_KEY;
+    case VWIFI_AUTH_SAE:    return WDI_AUTH_ALGO_WPA3_SAE;
+    default:                return WDI_AUTH_ALGO_80211_OPEN;
+    }
+}
+
 extern "C"
 NDIS_STATUS
 VwifiTlvGenerateAssociationResult(
     ULONG PeerVersion,
     const struct vwifi_assoc_result *Result,
+    const VWIFI_ASSOC_PARAMS *Params,
     const UCHAR *Ies,
     VOID **Buffer,
     PULONG BufferLen)
@@ -566,6 +606,9 @@ VwifiTlvGenerateAssociationResult(
     TLV_CONTEXT ctx = MakeCtx(PeerVersion);
     WDI_INDICATION_ASSOCIATION_RESULT_LIST params = {};
     WDI_ASSOCIATION_RESULT_CONTAINER entry = {};
+    WDI_PHY_TYPE activePhys[2] = {};
+    UINT32 nActivePhys = 0;
+    WDI_BAND_ID band = VwifiFreqToBandId(Params->FreqMhz);
     UINT8 *pOut = nullptr;
     ULONG outLen = 0;
 
@@ -579,6 +622,74 @@ VwifiTlvGenerateAssociationResult(
     entry.AssociationResultParameters.StatusCode    = Result->status_code;
     entry.AssociationResultParameters.ReAssociation = FALSE;
     entry.AssociationResultParameters.PortAuthorized = FALSE;
+
+    /* The negotiated algorithms and the band. All four were left at
+     * zero, and zero is not a valid value for three of them:
+     * WDI_AUTH_ALGO_80211_OPEN is 1, WDI_BAND_ID_2400 is 1, and
+     * WDI_DS_INFO has no zero enumerator at all (CHANGED 1, UNCHANGED
+     * 2, UNKNOWN 3). Only WDI_CIPHER_ALGO_NONE is genuinely 0.
+     *
+     * DSInfo is UNKNOWN rather than UNCHANGED on purpose: "unchanged"
+     * is a claim that this port is rejoining the same distribution
+     * system it was on before, which is a roam's claim to make and not
+     * a first connect's. */
+    entry.AssociationResultParameters.AuthAlgorithm =
+        VwifiAuthToWdi(Params->AuthAlgo, Params->AkmSuite);
+    entry.AssociationResultParameters.UnicastCipherAlgorithm =
+        VwifiCipherToWdi(Params->CipherPairwise);
+    entry.AssociationResultParameters.MulticastDataCipherAlgorithm =
+        VwifiCipherToWdi(Params->CipherGroup);
+    /* No management-frame protection, consistently with MFPCapable 0
+     * and with MulticastManagementAlgorithms being left out of the
+     * advertised capabilities. */
+    entry.AssociationResultParameters.MulticastMgmtCipherAlgorithm =
+        WDI_CIPHER_ALGO_NONE;
+    entry.AssociationResultParameters.BandID = band;
+    entry.AssociationResultParameters.DSInfo = WDI_DS_UNKNOWN;
+
+    /* ActivePhyTypeList is MANDATORY here, and leaving it empty is what
+     * made every association fail.
+     *
+     * WABIModel.xml lists it twice, which is the whole point:
+     *
+     *   <containerRef id="WDI_TLV_PHY_TYPE_LIST" name="ActivePhyTypeList"
+     *                 type="PhyTypeListContainer"
+     *                 versionAdded="WDI_VERSION_1_1_4" />
+     *   <containerRef id="WDI_TLV_PHY_TYPE_LIST" name="ActivePhyTypeList"
+     *                 type="PhyTypeListContainer" optional="true"
+     *                 versionRemoved="WDI_VERSION_1_1_4" />
+     *
+     * Optional up to 1.1.4, required from 1.1.4 on. This peer reports
+     * 0x0001010a -- 1.1.10 -- so it is required, and a zeroed
+     * ArrayOfElements is the same empty-mandatory-container that the
+     * FirmwareVersion note above describes: the generator rejects the
+     * whole message with NDIS_STATUS_INVALID_DATA, the driver logs
+     * "ASSOCIATION_RESULT TLV generate failed", and the connect
+     * completes 0xc0000001 having associated perfectly well.
+     *
+     * The contents are a judgement, the presence is not. dot11
+     * ActivePhyList means the PHYs currently operating on the
+     * interface, so this mirrors the ValidPhyTypes advertised for the
+     * band in VwifiTlvGenerateAdapterCapabilities -- an 11b/g radio on
+     * a 2.4 GHz ERP BSS is running both. Reporting something the
+     * capabilities never claimed would be worse than reporting too
+     * much.
+     *
+     * A FreqMhz of 0 lands on 2400, since VwifiFreqToBandId treats
+     * anything under 5000 as 2.4 GHz. The connect request only carries
+     * a frequency when it names a preferred BSS entry -- see
+     * VwifiTlvParseConnectRequest -- and a connect with no preferred
+     * BSS on a 5 GHz-only AP would be described wrongly here. Nothing
+     * exercises that today: the device is 2.4 GHz and every connect so
+     * far has arrived with its BSS named. */
+    if (band == WDI_BAND_ID_2400) {
+        activePhys[nActivePhys++] = WDI_PHY_TYPE_HRDSSS;   /* 11b */
+        activePhys[nActivePhys++] = WDI_PHY_TYPE_ERP;      /* 11g */
+    } else {
+        activePhys[nActivePhys++] = WDI_PHY_TYPE_OFDM;     /* 11a */
+    }
+    entry.ActivePhyTypeList.ElementCount = nActivePhys;
+    entry.ActivePhyTypeList.pElements    = activePhys;
 
     /* The AP's association-response frame, verbatim. The OS reads the
      * negotiated cipher suite out of its IEs, so it has to be real. */
