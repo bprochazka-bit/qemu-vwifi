@@ -947,11 +947,35 @@ Two shapes worth knowing, because they are not symmetrical:
   for a (peer, TID); the component decides when to take them and calls
   back through `RxGetMpdusHandler`. They have to be parked in between.
 
-`MaxOutstandingTransfers` was 1, on the reasoning that an unimplemented
-TX path has no depth to offer. That turned out to be a throttle rather
-than modesty — the trace showed `TxTargetDescInit`, then
-`TxPeerBacklog(backlogged=1)`, then nothing at all, which is a component
-that prepared a frame and found the miniport full.
+### Changing five things at once costs a round, every time
+
+The build that landed the data path also raised `MaxOutstandingTransfers`
+from 1 to 64, on the reading that 1 was throttling TX — the previous
+trace had shown `TxTargetDescInit`, then `TxPeerBacklog(backlogged=1)`,
+then nothing, which looks like a component that prepared a frame and
+found the miniport full.
+
+That build regressed: `TalTxRxPeerConfigHandler`, which had been
+arriving in the same millisecond as the connect completion, stopped
+arriving at all — and with it the receive-filter widening, the multicast
+updates and `TxTargetDescInit`. An associated link that Windows would no
+longer build on.
+
+The log isolated it without another round, but only by luck. Five things
+changed and **four of them provably did not execute**: no TX
+notification arrived, so the pump never ran; no data frame was received,
+so the RX routing never ran and the queue was never non-empty; the fifth
+was a log line. `MaxOutstandingTransfers` is set in `TalTxRxStart`, at
+adapter init, long before a peer exists — the only change on the path
+that mattered.
+
+So it is back to 1. Not because 1 is known right, but because 64 is the
+only candidate the evidence leaves. And 1 may not be a throttle at all
+now: a transfer here is a memcpy into a ring slot and completes before
+the handler returns, so the component can never find more than one
+outstanding, and `TxPeerBacklog` drives the pump directly.
+
+**Land one variable at a time, or be able to prove which one ran.**
 
 ### The contract that is not in the header, and how to act on one anyway
 

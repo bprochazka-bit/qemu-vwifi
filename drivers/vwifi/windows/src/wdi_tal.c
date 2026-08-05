@@ -130,11 +130,10 @@ VwifiTalStart(
      * the kit actually has. */
     RtlZeroMemory(pTalTxRxParameters, sizeof(*pTalTxRxParameters));
 
-    /* Was 1, with the reasoning that an unimplemented TX path has no
-     * depth to offer. It is implemented now, and 1 turned out to be a
-     * throttle rather than modesty: the trace showed TxTargetDescInit
-     * and then TxPeerBacklog(backlogged=1) and then nothing, which is a
-     * component that prepared a frame and found the miniport full. */
+    /* See VWIFI_TAL_MAX_OUTSTANDING_TRANSFERS. Briefly 64, on the
+     * reading that 1 was throttling TX; that build stopped the
+     * component ever configuring a peer, and this is the only change in
+     * it that ran before peer configuration was due. */
     pTalTxRxParameters->MaxOutstandingTransfers =
         VWIFI_TAL_MAX_OUTSTANDING_TRANSFERS;
     return NDIS_STATUS_SUCCESS;

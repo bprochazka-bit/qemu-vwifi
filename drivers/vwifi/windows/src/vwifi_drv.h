@@ -676,18 +676,31 @@ ULONG       VwifiConnectTaskState(_In_ PVWIFI_ADAPTER Adapter);
 
 /* How many transfers we tell the component it may have outstanding.
  *
- * This was 1, with the comment "the TAL TX path is not implemented, so
- * there is no depth to offer". It is implemented now, and 1 is a
- * throttle rather than a promise: the trace showed TxTargetDescInit
- * followed immediately by TxPeerBacklog(backlogged=1) and then nothing
- * at all, which is the shape of a component that prepared a frame and
- * found the miniport with no room for it.
+ * ONE. Raising it to 64 broke peer creation, and the log isolates that
+ * cleanly enough to be worth writing down.
  *
- * Well under the 256-slot TX ring, because a transfer here is a memcpy
- * into a ring slot and is complete by the time the handler returns --
- * the depth that matters is the component's willingness to hand frames
- * over, not our ability to hold them. */
-#define VWIFI_TAL_MAX_OUTSTANDING_TRANSFERS 64
+ * The build that raised it changed five things: this number, the TX
+ * pump wired to the send notifications, the RX drain routed through the
+ * TAL, the RxGetMpdus/RxReturnFrames handoff, and a log line. In the
+ * failing trace the component sent no TX notification and the device
+ * received no data frame, so the pump never ran, the RX routing never
+ * ran and the RX queue was never non-empty. Four of the five changes
+ * did not execute. This one did -- TalTxRxStart runs at adapter init,
+ * long before a peer exists -- and TalTxRxPeerConfigHandler, which had
+ * arrived within the same millisecond as the connect completion on the
+ * previous build, stopped arriving at all.
+ *
+ * That is the whole argument for 1 over 64: not that 1 is right, but
+ * that 64 is the only candidate the evidence leaves. Raise it again
+ * only with a trace that shows TX actually starved.
+ *
+ * One is also not obviously a throttle any more. A transfer here is a
+ * memcpy into a ring slot and is complete before the handler returns,
+ * so the component can never find more than one outstanding -- and
+ * TxPeerBacklog, which the previous build did receive, now drives the
+ * pump directly. The depth that matters is the component's willingness
+ * to hand frames over, not our ability to hold them. */
+#define VWIFI_TAL_MAX_OUTSTANDING_TRANSFERS 1
 
 /* monitor.c — NDIS's return path for RX NBLs, and the only code that
  * frees an RX NBL and re-arms the ring slot behind it. Declared here
