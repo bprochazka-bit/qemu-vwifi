@@ -173,6 +173,37 @@ VwifiParseConnectParameters(
  * WDI indications
  * ============================================================ */
 
+/* An 802.11 status code by name, for the association result.
+ *
+ * The device reports these verbatim from the AP and they are the one
+ * place in this driver's log where a bare number is genuinely someone
+ * else's verdict rather than ours. "status=16" cost a round of looking
+ * in the wrong place; "status=16 (AUTH_TIMEOUT)" would not have -- it
+ * says immediately that the AP never answered the authentication
+ * handshake, which is a question for the device and the host-side AP,
+ * not for anything above this line.
+ *
+ * Only the codes this stack can actually produce. IEEE 802.11-2016
+ * Table 9-46 has a hundred more and listing them would bury the six
+ * that matter. */
+static PCSTR
+VwifiDot11StatusName(_In_ USHORT Status)
+{
+    switch (Status) {
+    case 0:  return "SUCCESS";
+    case 1:  return "UNSPECIFIED_FAILURE";
+    case 10: return "CAPABILITIES_MISMATCH";
+    case 12: return "DENIED_OTHER_REASON";
+    case 13: return "UNSUPPORTED_AUTH_ALGORITHM";
+    case 14: return "AUTH_SEQUENCE_ERROR";
+    case 15: return "AUTH_CHALLENGE_FAILURE";
+    case 16: return "AUTH_TIMEOUT -- the AP never answered";
+    case 17: return "DENIED_NO_MORE_STAS";
+    case 18: return "BASIC_RATES_MISMATCH";
+    default: return "?";
+    }
+}
+
 /* WDI has no ASSOCIATION_START indication -- dot11wdi.h defines
  * ASSOCIATION_RESULT (76) and CONNECT_COMPLETE (64) for this flow, and
  * ASSOCIATION_PARAMETERS_REQUEST (98) for the unrelated case where the
@@ -208,8 +239,10 @@ VwifiIndicateAssociationResult(_Inout_ PVWIFI_ADAPTER Adapter,
         return;
     }
 
-    VWIFI_INFO("indicating ASSOCIATION_RESULT status=%u aid=%u ies=%u",
-               Result->status_code, Result->aid, Result->ie_len);
+    VWIFI_INFO("indicating ASSOCIATION_RESULT status=%u (%s) aid=%u ies=%u",
+               Result->status_code,
+               VwifiDot11StatusName(Result->status_code),
+               Result->aid, Result->ie_len);
     VwifiSendWdiIndication(Adapter, task->WdiPortId, task->PortId,
                            NDIS_STATUS_WDI_INDICATION_ASSOCIATION_RESULT,
                            NDIS_STATUS_SUCCESS,
