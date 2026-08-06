@@ -415,6 +415,17 @@ typedef struct _VWIFI_ADAPTER
     ULONG               RxQueueCount;
     KSPIN_LOCK          RxQueueLock;
 
+    /* Non-zero once RxInorderDataIndication has answered
+     * NDIS_STATUS_PAUSED.
+     *
+     * That status is the component saying "stop indicating"; the
+     * matching RxResumeHandler is how it says the other thing. This
+     * driver logged the pause and carried on indicating into it, which
+     * is a contract violation whatever else is true. Frames are still
+     * queued while paused -- nothing is dropped -- they are simply not
+     * announced until the resume arrives. */
+    volatile LONG       RxPaused;
+
     /* The periodic heartbeat: a timer this driver owns, and the count
      * of beats it has printed. See VwifiHeartbeatStart in driver.c for
      * why the beat is not driven by MiniportCheckForHangEx. */
@@ -775,6 +786,8 @@ VOID        VwifiTalTxPump(_Inout_ PVWIFI_ADAPTER Adapter,
 VOID        VwifiTalTxRestartPeer(_Inout_ PVWIFI_ADAPTER Adapter,
                                   _In_ WDI_PORT_ID PortId,
                                   _In_ WDI_PEER_ID PeerId);
+/* Clear the RX pause latch and announce anything held behind it. */
+VOID        VwifiTalRxOnResume(_Inout_ PVWIFI_ADAPTER Adapter);
 VOID        VwifiTalRxIndicate(_Inout_ PVWIFI_ADAPTER Adapter,
                                _In_ PNET_BUFFER_LIST Nbl,
                                _In_ WDI_PEER_ID PeerId,

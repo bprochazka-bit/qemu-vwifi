@@ -631,9 +631,8 @@ VwifiTalRxReturnFrames(
 static VOID
 VwifiTalRxResume(_In_ TAL_TXRX_HANDLE MiniportTalTxRxContext)
 {
-    UNREFERENCED_PARAMETER(MiniportTalTxRxContext);
-
     VWIFI_INFO("TAL RxResume");
+    VwifiTalRxOnResume((PVWIFI_ADAPTER)MiniportTalTxRxContext);
 }
 
 static VOID

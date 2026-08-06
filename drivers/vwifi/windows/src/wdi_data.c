@@ -469,15 +469,96 @@ VwifiTalRxIndicate(_Inout_ PVWIFI_ADAPTER Adapter,
     Adapter->RxQueueCount++;
     KeReleaseSpinLock(&Adapter->RxQueueLock, irql);
 
+    /* Paused means paused.
+     *
+     * RxInorderDataIndication answered NDIS_STATUS_PAUSED once in an
+     * earlier trace and this driver logged it and kept indicating. That
+     * is the component saying "stop"; RxResumeHandler is how it says
+     * the other thing, and it has only ever been seen firing at
+     * teardown -- consistent with an RX path that was paused the whole
+     * time and never waited for.
+     *
+     * The frame is already on the queue, so nothing is lost by not
+     * announcing it: whenever the next indication does go out, or the
+     * resume arrives, RxGetMpdus takes the whole queue at once. */
+    if (Adapter->RxPaused) {
+        VWIFI_TAL_FIRST(4, "TAL rx: queued for peer %u tid %u without "
+                           "indicating -- the component paused RX and has "
+                           "not resumed it (%u frame(s) held)",
+                        PeerId, ExTid, Adapter->RxQueueCount);
+        return;
+    }
+
+    /* Bracketed on purpose. The guest has hard-hung twice inside this
+     * region, and "entering" without a matching "returned" is the
+     * difference between the component wedging on a frame we handed it
+     * and this driver wedging on its own. Neither was distinguishable
+     * from the other in any trace so far. */
+    VWIFI_TAL_FIRST(4, "TAL rx: entering indication for peer %u tid %u "
+                       "(%u frame(s) queued)",
+                    PeerId, ExTid, Adapter->RxQueueCount);
+
     /* Queued before the indication, because the component is entitled
      * to call RxGetMpdus from inside it. */
     api->RxInorderDataIndication(Adapter->DataPathHandle,
                                  WDI_RX_INDICATION_DISPATCH_GENERAL,
                                  PeerId, ExTid, NULL, &status);
-    if (status != NDIS_STATUS_SUCCESS) {
+
+    VWIFI_TAL_FIRST(4, "TAL rx: indication returned 0x%08x %s",
+                    status, VwifiNdisStatusName(status));
+
+    if (status == NDIS_STATUS_PAUSED) {
+        /* Latched, not just logged. Every further frame is queued in
+         * silence until VwifiTalRxOnResume clears this. */
+        if (InterlockedExchange(&Adapter->RxPaused, 1) == 0) {
+            VWIFI_WARN("TAL rx: component paused RX -- holding frames "
+                       "until it resumes");
+        }
+    } else if (status != NDIS_STATUS_SUCCESS) {
         VWIFI_TAL_FIRST(8, "TAL rx: indication for peer %u tid %u returned "
                            "0x%08x %s",
                         PeerId, ExTid, status, VwifiNdisStatusName(status));
+    }
+}
+
+/* The component saying it will take frames again.
+ *
+ * Called from the TAL's RxResumeHandler. Clears the latch and, if
+ * anything accumulated while paused, announces it once -- one
+ * indication is enough, because RxGetMpdus drains the entire queue
+ * however many frames are on it. */
+VOID
+VwifiTalRxOnResume(_Inout_ PVWIFI_ADAPTER Adapter)
+{
+    PNDIS_WDI_DATA_API api = Adapter->DataPathApi;
+    PVWIFI_PEER peer;
+    NDIS_STATUS status = NDIS_STATUS_SUCCESS;
+
+    if (InterlockedExchange(&Adapter->RxPaused, 0) == 0) return;
+
+    /* The indication is made here rather than through
+     * VwifiTalRxIndicate, which takes an NBL and attaches metadata to
+     * it. There is no new frame at this point -- the frames are already
+     * queued -- so there is nothing to pass it, and handing it NULL
+     * would fault on the first line of that function. */
+    peer = VwifiPeerFirstActive(Adapter);
+    if (api == NULL || api->RxInorderDataIndication == NULL ||
+        peer == NULL || Adapter->RxQueueCount == 0) {
+        VWIFI_INFO("TAL rx: resumed with nothing held");
+        return;
+    }
+
+    VWIFI_INFO("TAL rx: resumed -- announcing %u held frame(s)",
+               Adapter->RxQueueCount);
+    api->RxInorderDataIndication(Adapter->DataPathHandle,
+                                 WDI_RX_INDICATION_DISPATCH_GENERAL,
+                                 peer->PeerId, 0, NULL, &status);
+    if (status != NDIS_STATUS_SUCCESS) {
+        VWIFI_WARN("TAL rx: resume indication returned 0x%08x %s",
+                   status, VwifiNdisStatusName(status));
+        if (status == NDIS_STATUS_PAUSED) {
+            InterlockedExchange(&Adapter->RxPaused, 1);
+        }
     }
 }
 
