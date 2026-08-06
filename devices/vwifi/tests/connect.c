@@ -663,6 +663,75 @@ int main(void)
         printf("  connect w/o channel uses the BSS table's: PASS\n");
     }
 
+    /* ---- 9. A WPA2 connect builds its own RSN element ----
+     *
+     * WDI never hands one down: it describes the security it wants as an
+     * auth algorithm and a pair of cipher lists and leaves the element
+     * to be constructed below. Nothing was constructing it, so an
+     * association request for a protected network went out with an SSID
+     * and a rate set and no RSN at all, and hostapd answered status 40
+     * -- WLAN_STATUS_INVALID_IE -- which reaches the user as nothing
+     * more than "Can't connect to this network". */
+    {
+        uint8_t cbuf[sizeof(struct vwifi_connect_req)];
+        struct vwifi_connect_req *c3 = (struct vwifi_connect_req *)cbuf;
+
+        memset(cbuf, 0, sizeof(cbuf));
+        memcpy(c3->bssid, AP_MAC, 6);
+        c3->ssid_len = (uint16_t)strlen("Lab-Real");
+        memcpy(c3->ssid, "Lab-Real", c3->ssid_len);
+        c3->channel_freq    = 2437;
+        c3->auth_algo       = VWIFI_AUTH_OPEN;   /* RSN uses open auth */
+        c3->akm_suite       = VWIFI_AKM_PSK;
+        c3->cipher_pairwise = VWIFI_CIPHER_CCMP128;
+        c3->cipher_group    = VWIFI_CIPHER_CCMP128;
+        c3->assoc_ie_len    = 0;                 /* exactly what WDI gives */
+
+        arm_all_rsp_slots();
+        mock_backend_clear_events(g_mock);
+        assert(ctrl_send(VWIFI_OP_CONNECT, cbuf, sizeof(cbuf)) == 0);
+
+        aplen = build_auth_resp(apbuf, 0);
+        mock_backend_clear_events(g_mock);
+        medium_rx(apbuf, aplen, 2437, AP_MAC);
+
+        {
+            uint16_t len;
+            const uint8_t *f = last_tx_frame(&len);
+            const uint8_t *ie;
+            const uint8_t *rsnie = NULL;
+
+            assert(f != NULL);
+            assert(((f[0] >> 4) & 0xF) == 0);         /* Assoc Request */
+
+            /* Privacy, because the request must not claim the link is
+             * open while carrying an RSN element. */
+            assert(le16(f + 24) & 0x0010);
+
+            /* Walk the elements rather than assuming an order. */
+            ie = f + 28;
+            while (ie + 2 <= f + len && ie + 2 + ie[1] <= f + len) {
+                if (ie[0] == 48) { rsnie = ie; break; }
+                ie += 2 + ie[1];
+            }
+            assert(rsnie != NULL);
+            assert(rsnie[1] == 20);                   /* body length */
+            assert(le16(rsnie + 2) == 1);             /* version */
+
+            /* group suite 00-0F-AC-04, one pairwise 00-0F-AC-04,
+             * one AKM 00-0F-AC-02 (PSK), capabilities 0. */
+            assert(rsnie[4] == 0x00 && rsnie[5] == 0x0F && rsnie[6] == 0xAC);
+            assert(rsnie[7] == 4);
+            assert(le16(rsnie + 8) == 1);
+            assert(rsnie[13] == 4);
+            assert(le16(rsnie + 14) == 1);
+            assert(rsnie[19] == 2);
+            assert(le16(rsnie + 20) == 0);
+        }
+        assert(ctrl_send(VWIFI_OP_DISCONNECT, NULL, 0) == 0);
+        printf("  WPA2 connect emits RSN (CCMP/PSK) + Privacy: PASS\n");
+    }
+
     printf("connect: PASS\n");
     free(g_dev);
     mock_backend_free(g_mock);

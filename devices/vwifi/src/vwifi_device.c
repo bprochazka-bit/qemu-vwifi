@@ -1236,6 +1236,36 @@ static void bss_observe(struct vwifi_dev *d,
         memset(b, 0, sizeof(*b));
         memcpy(b->bssid, bssid, 6);
         b->valid = true;
+    } else if (b->ssid_len != ssid_len ||
+               memcmp(b->ssid, ssid, ssid_len) != 0) {
+        /* Same BSSID, different network.
+         *
+         * This table keeps a beacon and a probe response per BSS and
+         * bss_emit sends both, so an entry is only coherent while the
+         * two describe the same thing. Reconfigure an access point --
+         * new SSID, security switched on -- and they stop: the beacon
+         * slot still holds the old network and the probe slot holds the
+         * new one, and the pair goes up as a single BSS entry that
+         * contradicts itself. A station sees two SSIDs where there is
+         * one radio, one of them advertising Privacy=0 for a network
+         * that now requires WPA2, and a connect to it cannot work.
+         *
+         * Nothing else clears them. The SSID field is overwritten by
+         * whichever frame arrived last, and last_seen_us is refreshed
+         * by either, so the stale frame is neither replaced nor aged
+         * out and survives for as long as the BSS keeps transmitting.
+         *
+         * So when the network behind a BSSID changes, everything
+         * remembered about the old one is discarded. The frame being
+         * processed refills its own slot immediately below. */
+        VWIFI_TRACE(d, "bss %02x:%02x:%02x:%02x:%02x:%02x changed ssid "
+                       "'%.*s' -> '%.*s': dropping the cached beacon and "
+                       "probe response, they describe the old network",
+                    bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5],
+                    (int)b->ssid_len, b->ssid, (int)ssid_len, ssid);
+        b->beacon_len = 0;
+        b->probe_len  = 0;
+        b->reported_this_scan = 0;
     }
 
     b->last_seen_us     = now;
@@ -1726,16 +1756,104 @@ static void conn_send_auth_req(struct vwifi_dev *d)
                       d->ops->now_us(d->be), false);
 }
 
+/* The RSN element for an association request.
+ *
+ * WDI never hands one down. It describes the security the OS wants as
+ * an auth algorithm and a pair of cipher lists and leaves the element
+ * itself to be constructed further down -- the driver's connect parser
+ * says as much, and nothing below it was doing the constructing. So an
+ * association request for a WPA2 network went out carrying an SSID and
+ * a rate set and nothing else, and hostapd answered it with status 40,
+ * WLAN_STATUS_INVALID_IE: an RSN network cannot associate a station
+ * that did not say which ciphers it intends to use.
+ *
+ * Layout is 802.11-2020 9.4.2.24: version, group cipher suite, a
+ * counted list of pairwise suites, a counted list of AKM suites, then
+ * the capability field. One of each is all this device offers, which
+ * makes the body twenty bytes -- the same size the AP advertises in the
+ * beacon it answers with.
+ */
+#define IEEE80211_EID_RSN  48
+
+static const uint8_t rsn_oui[3] = { 0x00, 0x0F, 0xAC };
+
+/* Our cipher enum to the 802.11 suite selector's last byte. Zero means
+ * "nothing sensible to send", which the caller treats as "do not build
+ * an element at all" rather than sending a malformed one. */
+static uint8_t rsn_cipher_selector(uint16_t cipher)
+{
+    switch (cipher) {
+    case VWIFI_CIPHER_WEP40:   return 1;
+    case VWIFI_CIPHER_TKIP:    return 2;
+    case VWIFI_CIPHER_CCMP128: return 4;
+    case VWIFI_CIPHER_WEP104:  return 5;
+    case VWIFI_CIPHER_GCMP256: return 9;
+    default:                   return 0;
+    }
+}
+
+static uint8_t rsn_akm_selector(uint16_t akm)
+{
+    switch (akm) {
+    case VWIFI_AKM_8021X: return 1;
+    case VWIFI_AKM_PSK:   return 2;
+    case VWIFI_AKM_SAE:   return 8;
+    default:              return 0;
+    }
+}
+
+static uint16_t ie_put_rsn(uint8_t *buf, uint16_t len,
+                           uint16_t akm, uint16_t pairwise, uint16_t group)
+{
+    uint8_t akm_sel      = rsn_akm_selector(akm);
+    uint8_t pairwise_sel = rsn_cipher_selector(pairwise);
+    uint8_t group_sel    = rsn_cipher_selector(group);
+
+    if (akm_sel == 0 || pairwise_sel == 0) return len;
+    /* An AP that advertises RSN always names a group cipher; if the
+     * request did not, the pairwise one is the only honest guess. */
+    if (group_sel == 0) group_sel = pairwise_sel;
+
+    buf[len++] = IEEE80211_EID_RSN;
+    buf[len++] = 20;
+
+    put_le16(buf + len, 1);                 /* version */
+    len += 2;
+
+    memcpy(buf + len, rsn_oui, 3); len += 3;
+    buf[len++] = group_sel;
+
+    put_le16(buf + len, 1); len += 2;       /* one pairwise suite */
+    memcpy(buf + len, rsn_oui, 3); len += 3;
+    buf[len++] = pairwise_sel;
+
+    put_le16(buf + len, 1); len += 2;       /* one AKM suite */
+    memcpy(buf + len, rsn_oui, 3); len += 3;
+    buf[len++] = akm_sel;
+
+    put_le16(buf + len, 0);                 /* RSN capabilities */
+    len += 2;
+
+    return len;
+}
+
 static void conn_send_assoc_req(struct vwifi_dev *d)
 {
     /* mgmt header + fixed body + SSID + rates + whatever the driver adds */
     uint8_t frame[IEEE80211_MGMT_HDR_LEN + 4 + (2 + 33) +
-                  (2 + 8) + (2 + 4) + VWIFI_ASSOC_IE_MAX];
+                  (2 + 8) + (2 + 4) + (2 + 20) + VWIFI_ASSOC_IE_MAX];
     uint16_t len = mgmt_hdr(d, frame, IEEE80211_SUBTYPE_ASSOC_REQ,
                             d->conn.bssid, d->conn.bssid);
+    uint16_t rsn_bytes = 0;
 
-    /* Assoc body: capability info (2), listen interval (2). */
-    put_le16(frame + len, 0x0431);   /* ESS + short preamble/slot */
+    /* Assoc body: capability info (2), listen interval (2).
+     *
+     * Privacy tracks the network, rather than being hardcoded: an RSN
+     * association whose request claims the link is unprotected is
+     * contradicting the RSN element it carries. */
+    put_le16(frame + len,
+             (uint16_t)(0x0431 |
+                        ((d->conn.akm_suite != VWIFI_AKM_NONE) ? 0x0010 : 0)));
     len += 2;
     put_le16(frame + len, 10);       /* listen interval */
     len += 2;
@@ -1751,14 +1869,27 @@ static void conn_send_assoc_req(struct vwifi_dev *d)
      * status 1, and the SSID element alone is not enough to associate. */
     len = ie_put_supp_rates(frame, len, d->conn.channel_freq);
 
-    /* Driver-supplied IEs (RSN element for WPA2, etc). */
+    /* RSN, when the connect asked for a protected network. Built here
+     * because nothing above builds it -- see ie_put_rsn. */
+    {
+        uint16_t before = len;
+
+        len = ie_put_rsn(frame, len, d->conn.akm_suite,
+                         d->conn.cipher_pairwise, d->conn.cipher_group);
+        rsn_bytes = (uint16_t)(len - before);
+    }
+
+    /* Driver-supplied IEs (vendor elements; WDI passes only those). */
     if (d->conn.req_ie_len) {
         memcpy(frame + len, d->conn.req_ies, d->conn.req_ie_len);
         len += d->conn.req_ie_len;
     }
 
-    VWIFI_TRACE(d, "conn: -> Assoc Request (ssid='%s', %u extra IE bytes)",
-                d->conn.ssid, d->conn.req_ie_len);
+    VWIFI_TRACE(d, "conn: -> Assoc Request (ssid='%s', %u RSN bytes "
+                   "[akm %u cipher %u/%u], %u extra IE bytes)",
+                d->conn.ssid, rsn_bytes, d->conn.akm_suite,
+                d->conn.cipher_pairwise, d->conn.cipher_group,
+                d->conn.req_ie_len);
     medium_send_frame(d, frame, len, 0, d->conn.channel_freq,
                       d->ops->now_us(d->be), false);
 }
