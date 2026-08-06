@@ -548,26 +548,6 @@ VwifiTalRxIndicate(_Inout_ PVWIFI_ADAPTER Adapter,
     Adapter->RxQueueCount++;
     KeReleaseSpinLock(&Adapter->RxQueueLock, irql);
 
-    /* Paused means paused.
-     *
-     * RxInorderDataIndication answered NDIS_STATUS_PAUSED once in an
-     * earlier trace and this driver logged it and kept indicating. That
-     * is the component saying "stop"; RxResumeHandler is how it says
-     * the other thing, and it has only ever been seen firing at
-     * teardown -- consistent with an RX path that was paused the whole
-     * time and never waited for.
-     *
-     * The frame is already on the queue, so nothing is lost by not
-     * announcing it: whenever the next indication does go out, or the
-     * resume arrives, RxGetMpdus takes the whole queue at once. */
-    if (Adapter->RxPaused) {
-        VWIFI_TAL_FIRST(4, "TAL rx: queued for peer %u tid %u without "
-                           "indicating -- the component paused RX and has "
-                           "not resumed it (%u frame(s) held)",
-                        PeerId, ExTid, Adapter->RxQueueCount);
-        return;
-    }
-
     /* Bracketed on purpose. The guest has hard-hung twice inside this
      * region, and "entering" without a matching "returned" is the
      * difference between the component wedging on a frame we handed it
@@ -586,17 +566,37 @@ VwifiTalRxIndicate(_Inout_ PVWIFI_ADAPTER Adapter,
     VWIFI_TAL_FIRST(4, "TAL rx: indication returned 0x%08x %s",
                     status, VwifiNdisStatusName(status));
 
-    if (status == NDIS_STATUS_PAUSED) {
-        /* Latched, not just logged. Every further frame is queued in
-         * silence until VwifiTalRxOnResume clears this. */
-        if (InterlockedExchange(&Adapter->RxPaused, 1) == 0) {
-            VWIFI_WARN("TAL rx: component paused RX -- holding frames "
-                       "until it resumes");
+    /* Counted, and that is all.
+     *
+     * A previous version latched on NDIS_STATUS_PAUSED and stopped
+     * indicating until RxResumeHandler fired. RxResume never fired, so
+     * the latch was permanent: four DHCP offers arrived after it and
+     * every one of them was queued in silence. The link was up, the
+     * frames were in the ring, and the driver had decided on its own
+     * not to mention them.
+     *
+     * The trace also says the status does not mean what the latch
+     * assumed. The component called RxGetMpdus from inside this very
+     * indication and took the frame before answering PAUSED -- so
+     * PAUSED is not "I did not receive this", and treating it as "do
+     * not send me another" was reading a status as an instruction.
+     *
+     * So: report it, keep indicating. Every indication drains the whole
+     * queue through RxGetMpdus whatever it returns afterwards, which is
+     * the behaviour that actually moves frames. RxResumeHandler stays
+     * wired for the case where the component does use it. */
+    if (status == NDIS_STATUS_SUCCESS) {
+        InterlockedIncrement(&Adapter->RxIndOk);
+    } else {
+        LONG n = InterlockedIncrement(&Adapter->RxIndNotOk);
+
+        /* Powers of two: enough to see it start and to see whether it is
+         * every frame or an occasional one, without a line per frame. */
+        if ((n & (n - 1)) == 0) {
+            VWIFI_WARN("TAL rx: indication %u for peer %u tid %u returned "
+                       "0x%08x %s -- still indicating",
+                       n, PeerId, ExTid, status, VwifiNdisStatusName(status));
         }
-    } else if (status != NDIS_STATUS_SUCCESS) {
-        VWIFI_TAL_FIRST(8, "TAL rx: indication for peer %u tid %u returned "
-                           "0x%08x %s",
-                        PeerId, ExTid, status, VwifiNdisStatusName(status));
     }
 }
 

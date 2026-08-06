@@ -621,6 +621,15 @@ VwifiHeartbeat(_In_ PVOID SystemSpecific1,
                adapter->PortCreated ? 1u : 0u,
                adapter->OpMode,
                adapter->PendingOpMode);
+
+    /* The RX path on its own line, because the state above says nothing
+     * about it: every trace so far has shown assoc 1 on a link that
+     * carried no received traffic at all, and the difference between
+     * "no frames arrive" and "frames arrive and the component will not
+     * take them" was not visible without rebuilding. */
+    VWIFI_INFO("alive: rx ind ok %d, not-ok %d, held %u, slots out %d",
+               adapter->RxIndOk, adapter->RxIndNotOk,
+               adapter->RxQueueCount, adapter->RxOutstanding);
 }
 
 NDIS_STATUS

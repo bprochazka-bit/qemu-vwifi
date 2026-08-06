@@ -453,6 +453,14 @@ typedef struct _VWIFI_ADAPTER
      * announced until the resume arrives. */
     volatile LONG       RxPaused;
 
+    /* How the component answered RxInorderDataIndication, split two
+     * ways. The pair is in the heartbeat because "RX is not working"
+     * and "RX is working and something above us is dropping it" look
+     * identical from outside the guest, and telling them apart has cost
+     * a rebuild-and-reboot round trip every time. */
+    volatile LONG       RxIndOk;
+    volatile LONG       RxIndNotOk;
+
     /* Re-entrancy guard for the TX pump, and a note that it was needed
      * while it was running.
      *
