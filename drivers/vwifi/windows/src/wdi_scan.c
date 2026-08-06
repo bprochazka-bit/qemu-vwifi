@@ -1301,6 +1301,69 @@ VwifiScanTaskDestroy(_Inout_ PVWIFI_ADAPTER Adapter)
  * a superset is exactly what a scan would have produced anyway, and
  * filtering here would only risk hiding an entry the caller wanted.
  * ============================================================ */
+/* Drop entries nothing has seen for a while.
+ *
+ * The cache had no expiry at all: an entry was replaced when the same
+ * BSSID was seen again, evicted when the table filled, or cleared by an
+ * explicit flush, and otherwise it lived forever. So an access point
+ * that was reconfigured or switched off stayed in the list
+ * indefinitely -- "netsh wlan show networks" kept listing an SSID that
+ * had not been on the air for hours, the OS kept offering it, and every
+ * connect to it failed because the network really was gone. Rebooting
+ * the client did not help, because the first scan after boot re-cached
+ * nothing and the stale entry was re-reported from a cache that had
+ * never dropped it.
+ *
+ * The BSSID merge cannot cover this. It updates an entry when the same
+ * BSS is seen again, which is the case where nothing is stale; the case
+ * that needs handling is the BSS that is never seen again, and by
+ * definition nothing arrives to trigger it. Only time can.
+ *
+ * VWIFI_SCAN_CACHE_TTL is a compromise between two real failures. Too
+ * short and the cache is empty when the host asks for it -- it requests
+ * the cached list a few milliseconds after a dot11 reset, with no time
+ * to scan, and an empty answer is a connect that cannot succeed. Too
+ * long is the bug above. Scans during any active use of the adapter
+ * arrive far more often than this.
+ */
+static VOID
+VwifiScanCacheExpire(_Inout_ PVWIFI_SCAN_TASK Task)
+{
+    LARGE_INTEGER now;
+    ULONG kept = 0;
+
+    if (Task->CacheCount == 0) return;
+
+    NdisGetCurrentSystemTime(&now);
+
+    for (ULONG i = 0; i < Task->CacheCount; i++) {
+        ULONGLONG age;
+
+        /* Unsigned, so a clock that stepped backwards would otherwise
+         * make every entry look impossibly old and empty the cache. */
+        if ((ULONGLONG)now.QuadPart < Task->Cache[i].SeenSystemTime) {
+            age = 0;
+        } else {
+            age = (ULONGLONG)now.QuadPart - Task->Cache[i].SeenSystemTime;
+        }
+
+        if (age > VWIFI_SCAN_CACHE_TTL) {
+            VWIFI_INFO("BSS cache: dropping %02x:%02x:%02x:%02x:%02x:%02x "
+                       "-- not seen for %llu seconds",
+                       Task->Cache[i].Entry.bssid[0], Task->Cache[i].Entry.bssid[1],
+                       Task->Cache[i].Entry.bssid[2], Task->Cache[i].Entry.bssid[3],
+                       Task->Cache[i].Entry.bssid[4], Task->Cache[i].Entry.bssid[5],
+                       age / 10000000ULL);
+            continue;
+        }
+
+        if (kept != i) Task->Cache[kept] = Task->Cache[i];
+        kept++;
+    }
+
+    Task->CacheCount = kept;
+}
+
 VOID
 VwifiScanIndicateCachedBss(_Inout_ PVWIFI_ADAPTER Adapter,
                            _In_ WDI_PORT_ID WdiPortId,
@@ -1312,6 +1375,8 @@ VwifiScanIndicateCachedBss(_Inout_ PVWIFI_ADAPTER Adapter,
     ULONG  generatedLen = 0;
     NDIS_STATUS status;
     ULONG n;
+
+    if (task) VwifiScanCacheExpire(task);
 
     if (!task || task->CacheCount == 0) {
         /* Loud, because this is no longer a harmless nothing-to-say.

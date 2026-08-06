@@ -62,6 +62,15 @@
  * OID_WDI_GET_BSS_ENTRY_LIST. */
 #define VWIFI_SCAN_CACHE_MAX      32
 
+/* ...and for how long. System-time units, so 100 ns.
+ *
+ * Without this the cache had no expiry and a BSS that stopped
+ * transmitting was reported forever -- see VwifiScanCacheExpire for why
+ * the BSSID merge cannot substitute for it. Ninety seconds is well
+ * above the gap between scans whenever the adapter is in use, and well
+ * below "an access point I reconfigured an hour ago is still listed". */
+#define VWIFI_SCAN_CACHE_TTL      (90ULL * 10ULL * 1000ULL * 1000ULL)
+
 /* Stamped in by the build; see the PreprocessorDefinitions in
  * vwifi.vcxproj. Two levels of macro so the argument is expanded before
  * it is stringized. */

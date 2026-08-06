@@ -1169,7 +1169,43 @@ static NDIS_STATUS
 VwifiHandleTaskSetRadioState(_Inout_ PVWIFI_ADAPTER Adapter,
                              _In_ PNDIS_OID_REQUEST Req)
 {
-    VWIFI_INFO("OID: set radio state (device radio is always on)");
+    /* What was actually asked for, rather than a line that only says we
+     * answered.
+     *
+     * The radio cannot be turned off here -- the capabilities report it
+     * hardwired on and the device has no control for it -- so this
+     * handler completes the task without acting. That is fine for "turn
+     * it on" and is exactly the wrong answer for "turn it off", and the
+     * trace could not tell the two apart: turning Wi-Fi off in the
+     * system tray leaves the adapter unable to come back, and the only
+     * evidence in the log was this same line either way.
+     *
+     * The payload is dumped rather than parsed. The TLV shim has no
+     * decoder for this task and writing one on the strength of a guess
+     * at the layout is how the last few of these went wrong; the bytes
+     * say what the host asked, and a decoder can follow once they do. */
+    {
+        ULONG inLen = Req->DATA.METHOD_INFORMATION.InputBufferLength;
+        const UCHAR *in = (const UCHAR *)Req->DATA.METHOD_INFORMATION.InformationBuffer;
+
+        if (in != NULL && inLen >= 24) {
+            VWIFI_INFO("OID: set radio state, %u bytes: "
+                       "%02x %02x %02x %02x %02x %02x %02x %02x "
+                       "%02x %02x %02x %02x %02x %02x %02x %02x "
+                       "%02x %02x %02x %02x %02x %02x %02x %02x",
+                       inLen,
+                       in[0],  in[1],  in[2],  in[3],  in[4],  in[5],
+                       in[6],  in[7],  in[8],  in[9],  in[10], in[11],
+                       in[12], in[13], in[14], in[15], in[16], in[17],
+                       in[18], in[19], in[20], in[21], in[22], in[23]);
+        } else {
+            VWIFI_INFO("OID: set radio state, %u bytes of input", inLen);
+        }
+    }
+
+    VWIFI_INFO("OID: set radio state (device radio is always on -- if the "
+               "host asked for OFF, nothing here honours it and nothing "
+               "reports the radio back ON afterwards)");
 
     VwifiSendWdiIndication(Adapter, VwifiGetWdiPortId(Req), Req->PortNumber,
                            NDIS_STATUS_WDI_INDICATION_SET_RADIO_STATE_COMPLETE,
