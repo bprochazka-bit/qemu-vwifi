@@ -751,9 +751,16 @@ VwifiTalRxAnnounceHeld(_Inout_ PVWIFI_ADAPTER Adapter, _In_z_ PCSTR Why)
         return;
     }
 
+    /* FROM_RX_RESUME_FRAMES, not DISPATCH_GENERAL.
+     *
+     * dot11wdi.h has a level for exactly this -- frames announced
+     * because a pause ended rather than because they just arrived --
+     * and this function is the only thing that makes that kind of
+     * announcement. Saying GENERAL described the wrong situation to the
+     * component. */
     VWIFI_INFO("TAL rx: %s -- announcing %u held frame(s)", Why, held);
     api->RxInorderDataIndication(Adapter->DataPathHandle,
-                                 WDI_RX_INDICATION_DISPATCH_GENERAL,
+                                 WDI_RX_INDICATION_FROM_RX_RESUME_FRAMES,
                                  peer->PeerId, 0, NULL, &status);
     if (status != NDIS_STATUS_SUCCESS) {
         VWIFI_WARN("TAL rx: announcing held frames returned 0x%08x %s",
