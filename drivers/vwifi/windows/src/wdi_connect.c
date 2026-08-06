@@ -670,6 +670,15 @@ VwifiHandleTaskDisconnect(_Inout_ PVWIFI_ADAPTER Adapter,
     task->DiscWdiPortId     = VwifiGetWdiPortId(Req);
     task->DiscTransactionId = VwifiGetWdiTransactionId(Req);
 
+    /* Why the host is tearing this down.
+     *
+     * A WPA2 association that succeeded -- status 0, aid 1 -- was
+     * disconnected sixteen milliseconds later, before the component had
+     * configured the peer for data and so before any EAPOL could be
+     * sent. Nothing in the trace says what the OS objected to, and this
+     * request is the only thing it sends that could carry the reason. */
+    VwifiTraceOidInput("task disconnect", Req);
+
     dreq.reason_code = 3;   /* STA is leaving */
 
     InterlockedExchange(&task->DisconnectPending, 1);

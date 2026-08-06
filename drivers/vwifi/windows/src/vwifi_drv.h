@@ -570,6 +570,10 @@ NDIS_STATUS VwifiAdapterCreate(
     _Inout_ PNDIS_MINIPORT_ADAPTER_REGISTRATION_ATTRIBUTES RegistrationAttributes);
 VOID VwifiAdapterDestroy(_In_ NDIS_HANDLE MiniportAdapterContext);
 
+/* Hex-dump a task OID's input. For the tasks whose TLVs this driver
+ * does not decode -- see the definition in oids.c. */
+VOID VwifiTraceOidInput(_In_z_ PCSTR What, _In_ PNDIS_OID_REQUEST Req);
+
 /* Crash-path reporting. Debug-only, like the 0xE9 log it writes to:
  * see driver.c for why a bugcheck callback is the thing that tells a
  * bugcheck apart from a hard lock in this environment. */

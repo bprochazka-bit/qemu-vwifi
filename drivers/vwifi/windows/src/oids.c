@@ -1158,6 +1158,48 @@ VwifiHandleAbortTask(_Inout_ PVWIFI_ADAPTER Adapter,
     return VwifiWdiAckHeaderOnly(Req, NDIS_STATUS_SUCCESS);
 }
 
+/* The raw input of a task whose TLVs this driver does not decode.
+ *
+ * There is a standing temptation to write a parser from a guess at the
+ * layout, and it has gone wrong here before. The bytes cost nothing and
+ * settle it: two captures of the same task -- radio off and radio on,
+ * say -- differ in exactly the field that carries the answer, and the
+ * decoder that follows is then a fact rather than a hypothesis.
+ *
+ * Whatever length actually arrives. An earlier version of this required
+ * at least 24 bytes before printing anything, and every radio-state
+ * request is 21, so it printed nothing at all -- the one case it was
+ * added for.
+ */
+VOID
+VwifiTraceOidInput(_In_z_ PCSTR What, _In_ PNDIS_OID_REQUEST Req)
+{
+    ULONG len = Req->DATA.METHOD_INFORMATION.InputBufferLength;
+    const UCHAR *in =
+        (const UCHAR *)Req->DATA.METHOD_INFORMATION.InformationBuffer;
+    CHAR hex[3 * 32 + 1];
+    ULONG n, i;
+
+    if (in == NULL || len == 0) {
+        VWIFI_INFO("OID: %s, no input", What);
+        return;
+    }
+
+    n = (len > 32) ? 32 : len;
+    for (i = 0; i < n; i++) {
+        static const CHAR d[] = "0123456789abcdef";
+        hex[i * 3 + 0] = d[in[i] >> 4];
+        hex[i * 3 + 1] = d[in[i] & 0xf];
+        hex[i * 3 + 2] = ' ';
+    }
+    hex[n * 3] = '\0';
+
+    /* The WDI message header is the first 16 bytes; the TLVs start
+     * after it, so the interesting part of a short task is the tail. */
+    VWIFI_INFO("OID: %s, %u bytes: %s%s", What, len, hex,
+               (len > 32) ? "..." : "");
+}
+
 /* ============================================================
  * OID_WDI_TASK_SET_RADIO_STATE
  *
@@ -1169,39 +1211,7 @@ static NDIS_STATUS
 VwifiHandleTaskSetRadioState(_Inout_ PVWIFI_ADAPTER Adapter,
                              _In_ PNDIS_OID_REQUEST Req)
 {
-    /* What was actually asked for, rather than a line that only says we
-     * answered.
-     *
-     * The radio cannot be turned off here -- the capabilities report it
-     * hardwired on and the device has no control for it -- so this
-     * handler completes the task without acting. That is fine for "turn
-     * it on" and is exactly the wrong answer for "turn it off", and the
-     * trace could not tell the two apart: turning Wi-Fi off in the
-     * system tray leaves the adapter unable to come back, and the only
-     * evidence in the log was this same line either way.
-     *
-     * The payload is dumped rather than parsed. The TLV shim has no
-     * decoder for this task and writing one on the strength of a guess
-     * at the layout is how the last few of these went wrong; the bytes
-     * say what the host asked, and a decoder can follow once they do. */
-    {
-        ULONG inLen = Req->DATA.METHOD_INFORMATION.InputBufferLength;
-        const UCHAR *in = (const UCHAR *)Req->DATA.METHOD_INFORMATION.InformationBuffer;
-
-        if (in != NULL && inLen >= 24) {
-            VWIFI_INFO("OID: set radio state, %u bytes: "
-                       "%02x %02x %02x %02x %02x %02x %02x %02x "
-                       "%02x %02x %02x %02x %02x %02x %02x %02x "
-                       "%02x %02x %02x %02x %02x %02x %02x %02x",
-                       inLen,
-                       in[0],  in[1],  in[2],  in[3],  in[4],  in[5],
-                       in[6],  in[7],  in[8],  in[9],  in[10], in[11],
-                       in[12], in[13], in[14], in[15], in[16], in[17],
-                       in[18], in[19], in[20], in[21], in[22], in[23]);
-        } else {
-            VWIFI_INFO("OID: set radio state, %u bytes of input", inLen);
-        }
-    }
+    VwifiTraceOidInput("set radio state", Req);
 
     VWIFI_INFO("OID: set radio state (device radio is always on -- if the "
                "host asked for OFF, nothing here honours it and nothing "
