@@ -1311,6 +1311,18 @@ VwifiOidRequest(
         return VwifiHandleTaskSetRadioState(adapter, OidRequest);
     }
     if (oid == OID_WDI_SET_PRIVACY_EXEMPTION_LIST) {
+        /* Which EtherTypes the OS wants to cross an unauthorized port.
+         *
+         * This is the 802.11 controlled/uncontrolled port rule made
+         * explicit, and on a WPA2 association it is the mechanism that
+         * lets EAPOL through before any key exists. This driver accepts
+         * the list and does nothing with it, which is defensible only
+         * while nothing is encrypted -- and the trace has a WPA2
+         * association where EAPOL-Key message 1 was indicated and
+         * answered SUCCESS and the supplicant still never replied.
+         * Whatever the OS is asking for here is worth reading before
+         * guessing at what else it wants. */
+        VwifiTraceOidInput("privacy exemption list", OidRequest);
         return VwifiHandleAcceptedSet(adapter, OidRequest,
                                       "privacy exemption list");
     }
