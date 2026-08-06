@@ -679,6 +679,36 @@ static void medium_deliver_rx(struct vwifi_dev *d,
         if (!sta_is_our_data_frame(d, frame, frame_len)) {
             return;
         }
+        /* Who actually put this on the medium.
+         *
+         * The Windows driver's RX trace shows frames arriving whose
+         * 802.3 source is the station's own MAC -- its own DHCP
+         * DISCOVER and its own IPv6 multicast, coming back. Two things
+         * produce that and they need completely different fixes: the
+         * AP flooding a broadcast back out the port it arrived on
+         * (tx_mac is the AP's, and this is someone else's frame to
+         * fix), or this device looping its own transmit into its own
+         * receive (tx_mac is ours, and the echo suppression above is
+         * not working).
+         *
+         * The medium header knows. addr2 of the 802.11 frame is logged
+         * next to it because a reflected frame carries the AP as the
+         * transmitter but the original station as the sender inside. */
+        VWIFI_TRACE(d, "rx: data %u bytes from tx_mac "
+                       "%02x:%02x:%02x:%02x:%02x:%02x "
+                       "addr2 %02x:%02x:%02x:%02x:%02x:%02x "
+                       "addr3 %02x:%02x:%02x:%02x:%02x:%02x%s",
+                    frame_len,
+                    hdr->tx_mac[0], hdr->tx_mac[1], hdr->tx_mac[2],
+                    hdr->tx_mac[3], hdr->tx_mac[4], hdr->tx_mac[5],
+                    frame[10], frame[11], frame[12],
+                    frame[13], frame[14], frame[15],
+                    frame[16], frame[17], frame[18],
+                    frame[19], frame[20], frame[21],
+                    (memcmp(hdr->tx_mac, d->sta_mac, 6) == 0)
+                        ? "  <-- OUR OWN tx_mac: the echo suppression "
+                          "above did not fire"
+                        : "");
     }
 
     /* In monitor mode, honor the raw filter: only forward frame types
