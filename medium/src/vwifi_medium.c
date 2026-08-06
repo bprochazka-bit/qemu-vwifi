@@ -78,6 +78,7 @@
 #include <stdarg.h>
 #include <stddef.h>
 #include <time.h>
+#include <sys/time.h>   /* gettimeofday -- pcap record timestamps */
 #include <stdbool.h>
 
 #include "vwifi.h"
@@ -1337,6 +1338,137 @@ static void survey_reset(void)
  * ------------------------------------------------------------------- */
 static uint8_t *fwd_scratch = NULL;     /* 4 + MAX_MSG_SIZE bytes */
 
+/* -------------------------------------------------------------------
+ *  PCAP capture
+ *
+ *  Every frame that crosses the hub, written once, as transmitted.
+ *
+ *  The hub is the only place with ground truth. Each endpoint sees a
+ *  filtered view -- its own channel, its own echo suppression, its own
+ *  idea of what is addressed to it -- so when an endpoint reports
+ *  receiving something surprising there is no way, from that endpoint,
+ *  to tell a frame that was genuinely transmitted twice from one that
+ *  its own driver looped back. Here there is: a frame appears in this
+ *  file once per transmission, with the transmitter that sent it.
+ *
+ *  DLT_IEEE802_11_RADIOTAP, so channel and signal survive into
+ *  Wireshark. The radiotap header is the minimum that is useful and is
+ *  laid out by hand -- every field in radiotap is aligned to its own
+ *  width, which is why the pad byte below is not optional.
+ * ------------------------------------------------------------------- */
+
+#define PCAP_DLT_IEEE802_11_RADIOTAP  127
+
+/* Radiotap fields present: FLAGS(1), CHANNEL(3), DBM_ANTSIGNAL(5). */
+#define RT_PRESENT  ((1u << 1) | (1u << 3) | (1u << 5))
+#define RT_LEN      15
+
+static FILE *pcap_fp = NULL;
+static const char *pcap_path = NULL;
+static uint64_t pcap_frames = 0;
+
+static void pcap_open(const char *path)
+{
+    struct {
+        uint32_t magic;
+        uint16_t major, minor;
+        int32_t  thiszone;
+        uint32_t sigfigs, snaplen, network;
+    } gh;
+
+    pcap_fp = fopen(path, "wb");
+    if (!pcap_fp) {
+        fprintf(stderr, "vwifi-medium: cannot open capture file %s: %s\n",
+                path, strerror(errno));
+        return;
+    }
+
+    gh.magic    = 0xa1b2c3d4u;   /* microsecond resolution, host order */
+    gh.major    = 2;
+    gh.minor    = 4;
+    gh.thiszone = 0;
+    gh.sigfigs  = 0;
+    gh.snaplen  = 65535;
+    gh.network  = PCAP_DLT_IEEE802_11_RADIOTAP;
+
+    if (fwrite(&gh, sizeof(gh), 1, pcap_fp) != 1) {
+        fprintf(stderr, "vwifi-medium: capture header write failed\n");
+        fclose(pcap_fp);
+        pcap_fp = NULL;
+        return;
+    }
+    fflush(pcap_fp);
+    fprintf(stderr, "vwifi-medium: capturing to %s\n", path);
+}
+
+/* One transmission. `hdr` is the medium header, `frame` the 802.11
+ * frame that followed it. */
+static void pcap_write(const uint8_t *hdr, uint32_t hdr_len,
+                       const uint8_t *frame, uint32_t frame_len)
+{
+    uint8_t  rt[RT_LEN];
+    uint16_t chan_freq = 0, chan_flags = 0;
+    uint16_t rt_freq;
+    int8_t   rssi = 0;
+    struct timeval tv;
+    uint32_t rec[4];
+
+    if (!pcap_fp || frame_len == 0) return;
+
+    if (hdr_len > HDR_OFF_RSSI)      rssi = (int8_t)hdr[HDR_OFF_RSSI];
+    if (hdr_len >= VWIFI_HDR_SIZE) {
+        memcpy(&chan_freq,  hdr + HDR_OFF_CHAN_FREQ,  2);
+        memcpy(&chan_flags, hdr + HDR_OFF_CHAN_FLAGS, 2);
+    }
+
+    memset(rt, 0, sizeof(rt));
+    rt[0] = 0;                                   /* it_version */
+    rt[1] = 0;                                   /* it_pad     */
+    rt[2] = (uint8_t)(RT_LEN & 0xFF);            /* it_len     */
+    rt[3] = (uint8_t)(RT_LEN >> 8);
+    rt[4] = (uint8_t)(RT_PRESENT & 0xFF);        /* it_present */
+    rt[5] = (uint8_t)((RT_PRESENT >> 8) & 0xFF);
+    rt[6] = (uint8_t)((RT_PRESENT >> 16) & 0xFF);
+    rt[7] = (uint8_t)((RT_PRESENT >> 24) & 0xFF);
+
+    rt[8] = 0x00;    /* FLAGS: no FCS present in these frames */
+    rt[9] = 0x00;    /* pad -- CHANNEL is two u16 and must be 2-aligned */
+
+    /* Radiotap channel flags are its own vocabulary, not ours; only the
+     * band bit is worth translating, and getting it wrong would show up
+     * as a nonsense band in Wireshark rather than as missing data. */
+    rt_freq = chan_freq;
+    rt[10] = (uint8_t)(rt_freq & 0xFF);
+    rt[11] = (uint8_t)(rt_freq >> 8);
+    {
+        uint16_t f = (chan_flags & VWIFI_CHAN_FLAG_5GHZ) ? 0x0140  /* OFDM|5GHz */
+                                                         : 0x00a0; /* CCK|2GHz  */
+        rt[12] = (uint8_t)(f & 0xFF);
+        rt[13] = (uint8_t)(f >> 8);
+    }
+    rt[14] = (uint8_t)rssi;   /* dBm antenna signal */
+
+    gettimeofday(&tv, NULL);
+    rec[0] = (uint32_t)tv.tv_sec;
+    rec[1] = (uint32_t)tv.tv_usec;
+    rec[2] = RT_LEN + frame_len;   /* incl_len */
+    rec[3] = RT_LEN + frame_len;   /* orig_len */
+
+    if (fwrite(rec, sizeof(rec), 1, pcap_fp) != 1 ||
+        fwrite(rt, RT_LEN, 1, pcap_fp) != 1 ||
+        fwrite(frame, frame_len, 1, pcap_fp) != 1) {
+        fprintf(stderr, "vwifi-medium: capture write failed, stopping\n");
+        fclose(pcap_fp);
+        pcap_fp = NULL;
+        return;
+    }
+    /* Flushed per frame on purpose. A capture that only survives a
+     * clean shutdown is no use for diagnosing a guest that hard-hangs
+     * and has to be reset. */
+    fflush(pcap_fp);
+    pcap_frames++;
+}
+
 static void forward_message(int sender_idx, const uint8_t *msg,
                             uint32_t total_len)
 {
@@ -1378,6 +1510,20 @@ static void forward_message(int sender_idx, const uint8_t *msg,
 
     int sender_ni = peer_node[sender_idx];
     if (sender_ni >= 0) nodes[sender_ni].tx_frames++;
+
+    /* Captured here: once per transmission, before any per-peer
+     * filtering. What lands in the file is what was put on the air,
+     * not what any one endpoint decided to keep. */
+    if (pcap_fp) {
+        uint16_t cap_len = 0;
+
+        memcpy(&cap_len, tmp + 4 + HDR_OFF_FRAME_LEN, 2);
+        if (cap_len > 0 && (uint32_t)cap_len + MIN_HDR_SIZE <= payload_len) {
+            uint32_t hdr_len = payload_len - cap_len;
+
+            pcap_write(tmp + 4, hdr_len, tmp + 4 + hdr_len, cap_len);
+        }
+    }
 
     /* Extract rate code from the medium header */
     uint8_t rate_code = tmp[4 + HDR_OFF_RATE_CODE];
@@ -2650,6 +2796,7 @@ static void usage(const char *prog)
         "  -u <host:port>   Connect to upstream hub (repeatable, max %d)\n"
         "  -c <path>        Control socket path (for runtime commands)\n"
         "  -C <path>        Initial config file (commands run at startup)\n"
+        "  -w <path>        Write every transmitted frame to a pcap file\n"
         "  -h               Show this help\n"
         "\n"
         "Examples:\n"
@@ -2695,8 +2842,11 @@ int main(int argc, char **argv)
 
     /* Parse options (appear after the positional socket path) */
     optind = 2;
-    while ((opt = getopt(argc, argv, "t:u:c:C:h")) != -1) {
+    while ((opt = getopt(argc, argv, "t:u:c:C:w:h")) != -1) {
         switch (opt) {
+        case 'w':
+            pcap_path = optarg;
+            break;
         case 't':
             tcp_port = optarg;
             break;
@@ -2738,6 +2888,8 @@ int main(int argc, char **argv)
             return 1;
         }
     }
+
+    if (pcap_path) pcap_open(pcap_path);
 
     /* Seed the PRNG */
     rng_state = (uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32);
