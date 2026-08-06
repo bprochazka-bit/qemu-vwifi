@@ -647,8 +647,41 @@ VwifiTlvGenerateAssociationResult(
      * The AKM is the discriminator, not the cipher: WPA2-PSK
      * authenticates over the air as Open System (see WdiAuthToVwifi), so
      * auth alone cannot tell the two apart. */
-    entry.AssociationResultParameters.PortAuthorized =
-        (Params->AkmSuite == VWIFI_AKM_NONE) ? TRUE : FALSE;
+    /* ...and it is now TRUE unconditionally, as a probe. Read on.
+     *
+     * pktmon localised where the four-way handshake dies. EAPOL-Key
+     * message 1 arrives, is indicated, and the component answers
+     * SUCCESS -- and the capture shows it reaching component 11 on its
+     * lower edge and never emerging on the upper one. Component 11 is
+     * the 802.11-to-802.3 converter: the transmit capture has the same
+     * component with a 342-byte Ethernet frame on edge 1 and the
+     * 360-byte 802.11 frame on edge 2. So the frame is discarded
+     * exactly at the layer that enforces the controlled port, on a port
+     * this driver has declared unauthorized.
+     *
+     * That leaves two possibilities. Either the component exempts EAPOL
+     * itself and something about this frame stops it recognising it --
+     * which would be a field of WDI_FRAME_METADATA's receive half that
+     * this driver leaves zeroed -- or PortAuthorized does not mean what
+     * the paragraph above assumes and an unauthorized port passes
+     * nothing at all, which no driver could ever recover from, since
+     * the handshake that would authorize it runs over the port.
+     *
+     * The second is one line to test and the first needs a structure
+     * layout that is not in this repository. So: test the cheap one.
+     *
+     *   Message 2 goes out  -> the flag was the gate. The honest fix is
+     *                          then to authorize on handshake
+     *                          completion rather than at association,
+     *                          which needs the key path anyway.
+     *   Message 2 still not -> the flag is not the gate, the exemption
+     *                          is in the frame metadata, and this line
+     *                          goes back to what it was.
+     *
+     * Until that is known this is a probe and not a fix, and it is
+     * wrong for anything but a lab: it tells the OS the link is
+     * authorized before any key exists. */
+    entry.AssociationResultParameters.PortAuthorized = TRUE;
 
     /* The negotiated algorithms and the band. All four were left at
      * zero, and zero is not a valid value for three of them:

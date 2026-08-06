@@ -263,10 +263,13 @@ VwifiIndicateAssociationResult(_Inout_ PVWIFI_ADAPTER Adapter,
         return;
     }
 
-    VWIFI_INFO("indicating ASSOCIATION_RESULT status=%u (%s) aid=%u ies=%u",
+    VWIFI_INFO("indicating ASSOCIATION_RESULT status=%u (%s) aid=%u ies=%u "
+               "akm=%u -- PROBE BUILD: reporting the port AUTHORIZED even "
+               "with an AKM, to find out whether that flag is what stops "
+               "EAPOL crossing it",
                Result->status_code,
                VwifiDot11StatusName(Result->status_code),
-               Result->aid, Result->ie_len);
+               Result->aid, Result->ie_len, Params->AkmSuite);
     VwifiSendWdiIndication(Adapter, task->WdiPortId, task->PortId,
                            NDIS_STATUS_WDI_INDICATION_ASSOCIATION_RESULT,
                            NDIS_STATUS_SUCCESS,
