@@ -252,6 +252,13 @@ VwifiPeerOnConfig(_Inout_ PVWIFI_ADAPTER Adapter,
     VWIFI_INFO("peer config: id %u port %u -- peer is now configured for data",
                PeerId, PortId);
 
+    /* Anything that arrived before this moment is still queued, and this
+     * is the event that makes it deliverable. In the WPA2 trace the AP's
+     * EAPOL-Key message 1 landed in the gap between CONNECT_COMPLETE and
+     * this callback; unannounced, it sits in the queue while the OS
+     * times the four-way handshake out and disconnects. */
+    VwifiTalRxAnnounceHeld(Adapter, "the peer is configured for data");
+
     /* And now it may actually be sent to. Creating a peer pauses its TX
      * -- WDI_TX_PAUSE_REASON_PEER_CREATE -- and only the miniport can
      * lift that. This is the first moment it is true to do so: the

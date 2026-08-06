@@ -618,6 +618,33 @@ VwifiTalRxIndicate(_Inout_ PVWIFI_ADAPTER Adapter,
     Adapter->RxQueueCount++;
     KeReleaseSpinLock(&Adapter->RxQueueLock, irql);
 
+    /* Not before the component is ready for this peer.
+     *
+     * TalTxRxPeerConfigHandler is what says the peer's data path is
+     * built, and it arrives AFTER CONNECT_COMPLETE -- in the WPA2 trace
+     * the gap was wide enough for the AP's EAPOL-Key message 1 to land
+     * inside it. Indicating in that window is not harmless: the
+     * component called RxGetMpdus, took the frame, answered PAUSED and
+     * handed it straight back. The frame was consumed and discarded,
+     * the four-way handshake never got its first message, and the OS
+     * disconnected a second and a half later with a link that had
+     * associated perfectly.
+     *
+     * Held instead, and announced by VwifiTalRxAnnounceHeld the moment
+     * the peer is configured. Nothing is lost and nothing is indicated
+     * to a peer that cannot yet receive it. */
+    {
+        PVWIFI_PEER peer = VwifiPeerFind(Adapter, PeerId);
+
+        if (peer != NULL && !peer->Configured) {
+            VWIFI_TAL_FIRST(4, "TAL rx: holding %u frame(s) for peer %u tid "
+                               "%u -- the component has not configured this "
+                               "peer for data yet",
+                            Adapter->RxQueueCount, PeerId, ExTid);
+            return;
+        }
+    }
+
     /* Bracketed on purpose. The guest has hard-hung twice inside this
      * region, and "entering" without a matching "returned" is the
      * difference between the component wedging on a frame we handed it
@@ -670,45 +697,52 @@ VwifiTalRxIndicate(_Inout_ PVWIFI_ADAPTER Adapter,
     }
 }
 
-/* The component saying it will take frames again.
+/* Announce whatever is being held, if anything is.
  *
- * Called from the TAL's RxResumeHandler. Clears the latch and, if
- * anything accumulated while paused, announces it once -- one
- * indication is enough, because RxGetMpdus drains the entire queue
- * however many frames are on it. */
+ * One indication is enough however many frames are queued: RxGetMpdus
+ * drains the entire queue in one call. Called from the two places that
+ * mean "the component can take frames now" -- the peer being configured
+ * for data, and RxResumeHandler.
+ *
+ * The indication is made here rather than through VwifiTalRxIndicate,
+ * which takes an NBL and attaches metadata to it. There is no new frame
+ * at this point -- the frames are already queued and already carry
+ * their metadata -- so there is nothing to pass it, and handing it NULL
+ * would fault on the first line of that function. */
 VOID
-VwifiTalRxOnResume(_Inout_ PVWIFI_ADAPTER Adapter)
+VwifiTalRxAnnounceHeld(_Inout_ PVWIFI_ADAPTER Adapter, _In_z_ PCSTR Why)
 {
     PNDIS_WDI_DATA_API api = Adapter->DataPathApi;
     PVWIFI_PEER peer;
     NDIS_STATUS status = NDIS_STATUS_SUCCESS;
+    ULONG held = Adapter->RxQueueCount;
 
-    if (InterlockedExchange(&Adapter->RxPaused, 0) == 0) return;
+    if (held == 0) return;
 
-    /* The indication is made here rather than through
-     * VwifiTalRxIndicate, which takes an NBL and attaches metadata to
-     * it. There is no new frame at this point -- the frames are already
-     * queued -- so there is nothing to pass it, and handing it NULL
-     * would fault on the first line of that function. */
     peer = VwifiPeerFirstActive(Adapter);
-    if (api == NULL || api->RxInorderDataIndication == NULL ||
-        peer == NULL || Adapter->RxQueueCount == 0) {
-        VWIFI_INFO("TAL rx: resumed with nothing held");
+    if (api == NULL || api->RxInorderDataIndication == NULL || peer == NULL) {
         return;
     }
 
-    VWIFI_INFO("TAL rx: resumed -- announcing %u held frame(s)",
-               Adapter->RxQueueCount);
+    VWIFI_INFO("TAL rx: %s -- announcing %u held frame(s)", Why, held);
     api->RxInorderDataIndication(Adapter->DataPathHandle,
                                  WDI_RX_INDICATION_DISPATCH_GENERAL,
                                  peer->PeerId, 0, NULL, &status);
     if (status != NDIS_STATUS_SUCCESS) {
-        VWIFI_WARN("TAL rx: resume indication returned 0x%08x %s",
+        VWIFI_WARN("TAL rx: announcing held frames returned 0x%08x %s",
                    status, VwifiNdisStatusName(status));
-        if (status == NDIS_STATUS_PAUSED) {
-            InterlockedExchange(&Adapter->RxPaused, 1);
-        }
     }
+}
+
+/* The component saying it will take frames again. Unconditional: an
+ * earlier version returned early unless a pause latch was set, so a
+ * resume that arrived without one -- which is what actually happens --
+ * left the held frames unmentioned. */
+VOID
+VwifiTalRxOnResume(_Inout_ PVWIFI_ADAPTER Adapter)
+{
+    InterlockedExchange(&Adapter->RxPaused, 0);
+    VwifiTalRxAnnounceHeld(Adapter, "the component resumed RX");
 }
 
 /* Hand the whole queue over. Called from RxGetMpdusHandler.

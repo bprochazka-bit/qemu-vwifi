@@ -874,6 +874,8 @@ VOID        VwifiTalTxRestartPeer(_Inout_ PVWIFI_ADAPTER Adapter,
                                   _In_ WDI_PORT_ID PortId,
                                   _In_ WDI_PEER_ID PeerId);
 /* Clear the RX pause latch and announce anything held behind it. */
+VOID        VwifiTalRxAnnounceHeld(_Inout_ PVWIFI_ADAPTER Adapter,
+                                   _In_z_ PCSTR Why);
 VOID        VwifiTalRxOnResume(_Inout_ PVWIFI_ADAPTER Adapter);
 VOID        VwifiTalRxIndicate(_Inout_ PVWIFI_ADAPTER Adapter,
                                _In_ PNET_BUFFER_LIST Nbl,
