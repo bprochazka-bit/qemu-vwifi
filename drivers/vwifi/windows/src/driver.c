@@ -158,6 +158,7 @@ static BOOLEAN                   g_BugCheckRegistered = FALSE;
 static PVWIFI_ADAPTER volatile   g_BugCheckAdapter = NULL;
 
 static KBUGCHECK_CALLBACK_ROUTINE VwifiBugCheckCallback;
+static VOID VwifiBugCheckDumpStack(VOID);
 
 static VOID
 VwifiBugCheckCallback(_In_ PVOID Buffer, _In_ ULONG Length)
@@ -183,6 +184,76 @@ VwifiBugCheckCallback(_In_ PVOID Buffer, _In_ ULONG Length)
                   a->RxPaused, a->RxOutstanding);
     VwifiE9Printf("BUGCHECK: rings tx@%u rx@%u\n",
                   a->TxRing.NextIndex, a->RxRing.NextIndex);
+
+    VwifiBugCheckDumpStack();
+}
+
+/* Raw stack scan, not an unwind.
+ *
+ * The minidump from the first captured bugcheck did not contain the
+ * stack the machine died on: the fault was in DPC context, and a triage
+ * dump records the interrupted thread's stack instead -- which was a
+ * completely unrelated NTFS write. So the crash path has to record its
+ * own.
+ *
+ * A scan rather than RtlCaptureStackBackTrace because this runs at
+ * HIGH_LEVEL with every other processor frozen. The unwinder consults
+ * the loaded-module list and the exception directories and is not
+ * something to invoke in that state; reading words off the stack needs
+ * nothing but the stack. It costs false positives -- data that happens
+ * to look like a code address -- which is a fair trade for a routine
+ * that cannot itself become the reason the crash log is empty.
+ *
+ * IoGetStackLimits bounds it, and it is the reason this is safe: it
+ * reports the limits of the stack actually in use, DPC stack included,
+ * so the walk cannot step off the end into unmapped memory.
+ *
+ * The anchor line is what makes the rest readable: every address is
+ * raw, and one known address inside this driver is enough to tell which
+ * of them are ours.
+ */
+static VOID
+VwifiBugCheckDumpStack(VOID)
+{
+    ULONG_PTR  lo = 0, hi = 0;
+    ULONG_PTR  probe;
+    ULONG_PTR *p;
+    ULONG      shown = 0;
+
+    IoGetStackLimits(&lo, &hi);
+
+    VwifiE9Printf("BUGCHECK: stack %p..%p, this callback is at %p\n",
+                  (PVOID)lo, (PVOID)hi, (PVOID)(ULONG_PTR)VwifiBugCheckCallback);
+
+    if (lo == 0 || hi <= lo) {
+        VwifiE9Printf("BUGCHECK: no usable stack limits -- not scanning\n");
+        return;
+    }
+
+    /* From here up. &probe is inside the current frame, so everything
+     * above it is the callers we want and everything below is ours. */
+    probe = (ULONG_PTR)&probe;
+    if (probe < lo || probe >= hi) probe = lo;
+
+    for (p = (ULONG_PTR *)(probe & ~(ULONG_PTR)7);
+         (ULONG_PTR)p + sizeof(*p) <= hi;
+         p++) {
+        ULONG_PTR v = *p;
+
+        /* Kernel image range. Everything loaded in the captured dump --
+         * ntoskrnl, ndis, wdiwifi, this driver -- was in 0xfffff8xx. */
+        if (v < 0xfffff80000000000ULL || v > 0xfffff8ffffffffffULL) continue;
+
+        VwifiE9Printf("BUGCHECK: stack+0x%04x %p\n",
+                      (ULONG)((ULONG_PTR)p - lo), (PVOID)v);
+
+        /* Enough to see who called whom, few enough that emitting it
+         * one byte at a time through an I/O port still finishes. */
+        if (++shown >= 64) {
+            VwifiE9Printf("BUGCHECK: (stopping after %u addresses)\n", shown);
+            break;
+        }
+    }
 }
 
 VOID

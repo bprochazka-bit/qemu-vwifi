@@ -188,9 +188,7 @@ VwifiRxDrainMonitor(_Inout_ PVWIFI_ADAPTER Adapter)
 
             /* Remember which slot backs this NBL so we can re-arm it
              * on return. */
-            PVWIFI_RX_NBL_CONTEXT ctx =
-                (PVWIFI_RX_NBL_CONTEXT)NET_BUFFER_LIST_CONTEXT_DATA_START(nbl);
-            ctx->SlotIndex = idx;
+            VwifiRxNblSetSlot(nbl, idx);
 
             /* Build and attach the DOT11_EXTSTA_RECV_CONTEXT. This is
              * the OOB info Npcap turns into radiotap. */
@@ -280,9 +278,7 @@ VwifiMiniportReturnNetBufferLists(
     for (nbl = NetBufferLists; nbl; nbl = next) {
         next = NET_BUFFER_LIST_NEXT_NBL(nbl);
 
-        PVWIFI_RX_NBL_CONTEXT ctx =
-            (PVWIFI_RX_NBL_CONTEXT)NET_BUFFER_LIST_CONTEXT_DATA_START(nbl);
-        ULONG slot = ctx->SlotIndex;
+        ULONG slot = VwifiRxNblGetSlot(nbl);
 
         /* Free the MDL we allocated, then the NBL. */
         PNET_BUFFER nb = NET_BUFFER_LIST_FIRST_NB(nbl);
@@ -292,10 +288,33 @@ VwifiMiniportReturnNetBufferLists(
         }
         NdisFreeNetBufferList(nbl);
 
+        InterlockedDecrement(&adapter->RxOutstanding);
+
+        /* Checked before it is used as an index, because the three
+         * writes below go through whatever this produces.
+         *
+         * There is no defensible way for a returned NBL to name a slot
+         * outside the ring, and that is exactly why it has to be
+         * tested: the failure is silent and unbounded. An unchecked
+         * index here does not corrupt a frame, it writes six bytes to
+         * an arbitrary kernel address, and the machine dies later
+         * somewhere with no connection to this driver at all.
+         *
+         * Leaking the slot is the right answer when it happens. The
+         * ring loses one descriptor; the drain already copes with slots
+         * that never come back, and it beats the alternative by a
+         * distance that does not need arguing. */
+        if (slot >= adapter->RxRing.NumDescs) {
+            VWIFI_ERR("rx return: NBL %p names ring slot %u, but the ring "
+                      "has %u -- refusing to re-arm it. The slot is lost; "
+                      "writing through this index would not have been.",
+                      nbl, slot, adapter->RxRing.NumDescs);
+            continue;
+        }
+
         /* Re-arm the RX slot so the device can reuse it, and account
          * for it: this is the moment the slot stops being outstanding,
          * and the drain's lap guard reads that count. */
-        InterlockedDecrement(&adapter->RxOutstanding);
         struct vwifi_rx_desc *d = (struct vwifi_rx_desc *)
             ((PUCHAR)adapter->RxRing.VirtualAddress
              + slot * adapter->RxRing.DescSize);

@@ -187,6 +187,33 @@ typedef struct _VWIFI_RX_NBL_CONTEXT
                MEMORY_ALLOCATION_ALIGNMENT - 1) /                     \
               MEMORY_ALLOCATION_ALIGNMENT) * MEMORY_ALLOCATION_ALIGNMENT))
 
+/* Which RX ring slot an indicated NBL is holding.
+ *
+ * MiniportReserved, NOT the NBL context, and the difference is not
+ * stylistic. NET_BUFFER_LIST_CONTEXT_DATA_START is not a fixed
+ * location: it is ContextData + Context->Offset, and Offset MOVES --
+ * NdisAllocateNetBufferListContext prepends to the context area and
+ * walks it backwards. Anything above us that adds a context to one of
+ * these NBLs -- and in WDI they are handed to the component and come
+ * back -- shifts DATA_START off our four bytes, so the slot index read
+ * on return is whatever now sits there instead.
+ *
+ * That value was then used, unchecked, as an index into the RX
+ * descriptor ring, and three fields written through the result. A
+ * wrong slot is not a wrong frame: it is a write to an arbitrary
+ * kernel address, and a stray kernel write is diagnosed nowhere near
+ * where it happened. VwifiMiniportReturnNetBufferLists range-checks it
+ * now as well. The two changes are independent, and the range check is
+ * the one that must never be removed.
+ *
+ * MiniportReserved is reserved to the miniport for the whole lifetime
+ * of the NBL and nothing may relocate it. [0] already carries the
+ * WDI_FRAME_METADATA on this path, so the slot lives in [1]. */
+#define VwifiRxNblSetSlot(nbl, idx)                                   \
+    (NET_BUFFER_LIST_MINIPORT_RESERVED(nbl)[1] = (PVOID)(ULONG_PTR)(idx))
+#define VwifiRxNblGetSlot(nbl)                                        \
+    ((ULONG)(ULONG_PTR)NET_BUFFER_LIST_MINIPORT_RESERVED(nbl)[1])
+
 /* ============================================================
  * Pending control-request tracking
  *

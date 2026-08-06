@@ -201,9 +201,7 @@ VwifiRxDrainSta(_Inout_ PVWIFI_ADAPTER Adapter)
                 goto rearm;
             }
 
-            PVWIFI_RX_NBL_CONTEXT ctx =
-                (PVWIFI_RX_NBL_CONTEXT)NET_BUFFER_LIST_CONTEXT_DATA_START(nbl);
-            ctx->SlotIndex = idx;
+            VwifiRxNblSetSlot(nbl, idx);
 
             NET_BUFFER_LIST_STATUS(nbl) = NDIS_STATUS_SUCCESS;
             NET_BUFFER_LIST_NEXT_NBL(nbl) = NULL;
