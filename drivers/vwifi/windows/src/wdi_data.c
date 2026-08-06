@@ -192,9 +192,9 @@ VwifiTalTxOneNbl(_Inout_ PVWIFI_ADAPTER Adapter, _In_ PNET_BUFFER_LIST Nbl)
                         ? "802.3: EtherType IPv6 at 12 -- the device's "
                           "assumption holds"
                         : (((flat[0] >> 2) & 0x3) == 2)
-                            ? "NOT 802.3: byte 0 says this is an 802.11 DATA "
-                              "MPDU, and the device is building a second "
-                              "802.11 header on top of it"
+                            ? "802.11 DATA MPDU, as expected -- sent with "
+                              "VWIFI_TX_F_80211 so the device passes it "
+                              "through rather than encapsulating it again"
                             : "NOT 802.3 and not an 802.11 data frame either "
                               "-- shape unknown");
         }
