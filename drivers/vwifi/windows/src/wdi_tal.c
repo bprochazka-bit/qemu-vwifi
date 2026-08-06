@@ -621,7 +621,7 @@ VwifiTalRxReturnFrames(
     while (pNBL != NULL) {
         PNET_BUFFER_LIST next = NET_BUFFER_LIST_NEXT_NBL(pNBL);
 
-        VwifiTalRxReturn(adapter, pNBL);
+        VwifiTalRxReturnOrRequeue(adapter, pNBL);
         pNBL = next;
         n++;
     }

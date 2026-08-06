@@ -645,6 +645,25 @@ VwifiTalRxIndicate(_Inout_ PVWIFI_ADAPTER Adapter,
         }
     }
 
+    /* Nor while the component has said it is paused.
+     *
+     * Waiting for the peer to be configured was not enough: the
+     * indication that followed it returned PAUSED anyway, and RxResume
+     * came twenty-four milliseconds later. So the component is not
+     * ready at peer-config time, it is ready when it says so, and
+     * RxResume is the only thing that says so.
+     *
+     * This latch was tried once before and stalled forever because
+     * RxResume never fired. It does now -- every trace since the peer
+     * path started working has one. VwifiHeartbeatRxWatchdog is the
+     * insurance against the old failure returning. */
+    if (Adapter->RxPaused) {
+        VWIFI_TAL_FIRST(4, "TAL rx: holding %u frame(s) for peer %u tid %u "
+                           "-- the component paused RX and has not resumed",
+                        Adapter->RxQueueCount, PeerId, ExTid);
+        return;
+    }
+
     /* Bracketed on purpose. The guest has hard-hung twice inside this
      * region, and "entering" without a matching "returned" is the
      * difference between the component wedging on a frame we handed it
@@ -682,6 +701,14 @@ VwifiTalRxIndicate(_Inout_ PVWIFI_ADAPTER Adapter,
      * queue through RxGetMpdus whatever it returns afterwards, which is
      * the behaviour that actually moves frames. RxResumeHandler stays
      * wired for the case where the component does use it. */
+    if (status == NDIS_STATUS_PAUSED) {
+        /* Latched so the next frame is held rather than offered into
+         * the same refusal -- and, more to the point, so
+         * VwifiTalRxReturn knows the frames coming back were never
+         * delivered. */
+        InterlockedExchange(&Adapter->RxPaused, 1);
+    }
+
     if (status == NDIS_STATUS_SUCCESS) {
         InterlockedIncrement(&Adapter->RxIndOk);
     } else {
@@ -791,6 +818,63 @@ VwifiTalRxReturn(_Inout_ PVWIFI_ADAPTER Adapter, _In_ PNET_BUFFER_LIST Nbl)
      * followed after its first element has been freed. */
     NET_BUFFER_LIST_NEXT_NBL(Nbl) = NULL;
     VwifiMiniportReturnNetBufferLists((NDIS_HANDLE)Adapter, Nbl, 0);
+}
+
+/* How many times one frame may be put back before it is given up on.
+ * A frame the component keeps taking and refusing must not circulate
+ * forever; two attempts is enough to cross a pause and cheap to lose. */
+#define VWIFI_RX_REQUEUE_MAX 2
+
+/* Give one RX NBL back, unless it was never delivered.
+ *
+ * The component collects through RxGetMpdus BEFORE it decides it is
+ * paused: the trace shows it taking the AP's EAPOL-Key message 1,
+ * answering PAUSED, and handing the frame straight back. Freeing it
+ * there is how the four-way handshake lost its first message twice
+ * over -- the frame was on the wire, in the ring, and correctly
+ * indicated, and this function threw it away.
+ *
+ * So while the pause is latched, a returned frame goes back on the
+ * queue instead, keeping its metadata, and is announced again when
+ * RxResume arrives. Bounded, because a frame that is refused every time
+ * would otherwise never leave. */
+VOID
+VwifiTalRxReturnOrRequeue(_Inout_ PVWIFI_ADAPTER Adapter,
+                          _In_ PNET_BUFFER_LIST Nbl)
+{
+    ULONG_PTR tries;
+
+    if (!Adapter->RxPaused) {
+        VwifiTalRxReturn(Adapter, Nbl);
+        return;
+    }
+
+    tries = (ULONG_PTR)NET_BUFFER_LIST_MINIPORT_RESERVED(Nbl)[2];
+    if (tries >= VWIFI_RX_REQUEUE_MAX) {
+        VWIFI_WARN("TAL rx: frame refused %u times while paused -- dropping",
+                   (ULONG)tries);
+        VwifiTalRxReturn(Adapter, Nbl);
+        return;
+    }
+    NET_BUFFER_LIST_MINIPORT_RESERVED(Nbl)[2] = (PVOID)(tries + 1);
+
+    {
+        KIRQL irql;
+
+        NET_BUFFER_LIST_NEXT_NBL(Nbl) = NULL;
+        KeAcquireSpinLock(&Adapter->RxQueueLock, &irql);
+        if (Adapter->RxQueueTail != NULL) {
+            NET_BUFFER_LIST_NEXT_NBL(Adapter->RxQueueTail) = Nbl;
+        } else {
+            Adapter->RxQueueHead = Nbl;
+        }
+        Adapter->RxQueueTail = Nbl;
+        Adapter->RxQueueCount++;
+        KeReleaseSpinLock(&Adapter->RxQueueLock, irql);
+    }
+
+    VWIFI_TAL_FIRST(4, "TAL rx: the component returned a frame it took while "
+                       "paused -- requeued, not freed");
 }
 
 /* Drop anything indicated and never collected.

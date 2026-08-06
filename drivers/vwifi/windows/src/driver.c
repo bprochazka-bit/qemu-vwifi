@@ -627,9 +627,36 @@ VwifiHeartbeat(_In_ PVOID SystemSpecific1,
      * carried no received traffic at all, and the difference between
      * "no frames arrive" and "frames arrive and the component will not
      * take them" was not visible without rebuilding. */
-    VWIFI_INFO("alive: rx ind ok %d, not-ok %d, held %u, slots out %d",
+    VWIFI_INFO("alive: rx ind ok %d, not-ok %d, held %u, slots out %d, "
+               "paused %d",
                adapter->RxIndOk, adapter->RxIndNotOk,
-               adapter->RxQueueCount, adapter->RxOutstanding);
+               adapter->RxQueueCount, adapter->RxOutstanding,
+               adapter->RxPaused);
+
+    /* The insurance on the RX pause latch.
+     *
+     * Holding frames until RxResumeHandler arrives is right when it
+     * arrives, and it does -- but a version of that latch has already
+     * stalled this driver's receive path permanently once, when it did
+     * not. Nothing about the component guarantees it, so do not build
+     * on the assumption: if frames sit held across two heartbeats, give
+     * up on the resume, clear the latch and announce them anyway.
+     *
+     * Loud, because reaching this means the pause contract is not what
+     * this driver believes and the next reader needs to know that
+     * before anything else here is trusted. */
+    if (adapter->RxPaused && adapter->RxQueueCount > 0) {
+        if (++adapter->RxPausedBeats >= 2) {
+            VWIFI_WARN("alive: %u frame(s) held across %u heartbeats waiting "
+                       "for an RX resume that has not come -- clearing the "
+                       "pause and indicating anyway",
+                       adapter->RxQueueCount, adapter->RxPausedBeats);
+            adapter->RxPausedBeats = 0;
+            VwifiTalRxOnResume(adapter);
+        }
+    } else {
+        adapter->RxPausedBeats = 0;
+    }
 }
 
 NDIS_STATUS

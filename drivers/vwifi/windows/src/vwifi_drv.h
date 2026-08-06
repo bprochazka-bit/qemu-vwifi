@@ -462,6 +462,12 @@ typedef struct _VWIFI_ADAPTER
      * announced until the resume arrives. */
     volatile LONG       RxPaused;
 
+    /* Heartbeats seen with RxPaused set and frames waiting. The latch
+     * above depends on RxResumeHandler arriving, and an earlier version
+     * of it stalled the receive path permanently when that never
+     * happened. This is what stops that from being possible twice. */
+    ULONG               RxPausedBeats;
+
     /* How the component answered RxInorderDataIndication, split two
      * ways. The pair is in the heartbeat because "RX is not working"
      * and "RX is working and something above us is dropping it" look
@@ -874,6 +880,8 @@ VOID        VwifiTalTxRestartPeer(_Inout_ PVWIFI_ADAPTER Adapter,
                                   _In_ WDI_PORT_ID PortId,
                                   _In_ WDI_PEER_ID PeerId);
 /* Clear the RX pause latch and announce anything held behind it. */
+VOID        VwifiTalRxReturnOrRequeue(_Inout_ PVWIFI_ADAPTER Adapter,
+                                      _In_ PNET_BUFFER_LIST Nbl);
 VOID        VwifiTalRxAnnounceHeld(_Inout_ PVWIFI_ADAPTER Adapter,
                                    _In_z_ PCSTR Why);
 VOID        VwifiTalRxOnResume(_Inout_ PVWIFI_ADAPTER Adapter);
