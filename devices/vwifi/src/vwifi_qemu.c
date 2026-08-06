@@ -64,6 +64,29 @@ struct VWifiState {
      * so the warning does not repeat for every interrupt we drop. */
     bool          intx_warned;
 
+    /* Bytes owed to the hub that the socket would not take yet.
+     *
+     * medium_send runs on the vCPU thread with the BQL held, straight
+     * out of an MMIO write handler -- the guest's doorbell store. A
+     * blocking write there does not merely slow the device down, it
+     * stops the guest dead: the store never retires, the vCPU never
+     * leaves the exit, and the other vCPU spins at HIGH_LEVEL waiting
+     * for the BQL. That is what a "hung" guest looked like from gdb --
+     * both processors inside ntoskrnl at IRQL 15, RIP a few bytes into
+     * the WRITE_REGISTER_* leaf that was writing the doorbell.
+     *
+     * So nothing here may block. The remainder goes in this buffer and
+     * is flushed from a writability watch on the main loop. The hub's
+     * stream is length-prefixed, so this is a byte queue rather than a
+     * message queue: a partial write has to be finished exactly where
+     * it stopped or the peer's framing is destroyed from there on. */
+    uint8_t      *txbuf;
+    size_t        txbuf_len;      /* bytes held */
+    size_t        txbuf_off;      /* bytes of those already written */
+    size_t        txbuf_cap;      /* allocation size */
+    guint         tx_watch;       /* 0 when no watch is armed */
+    bool          tx_overflow_warned;
+
     /* Portable device. Allocated dynamically since its size is
      * exposed only via vwifi_dev_sizeof() to keep vwifi_device.c
      * changes from forcing header rebuilds. */
@@ -122,26 +145,119 @@ static void qemu_be_raise_irq(void *be, unsigned vec)
     }
 }
 
+/* How much we are willing to owe the hub before dropping frames.
+ *
+ * A radio that cannot get a frame onto the air drops it; that is the
+ * honest failure here too, and it is bounded. Sized for a burst rather
+ * than a stall: a megabyte is hundreds of frames, far more than any
+ * momentary scheduling hiccup, and still nothing next to the guest's
+ * RAM. */
+#define VWIFI_TXBUF_MAX  (1u << 20)
+
+static gboolean qemu_be_tx_ready(void *do_not_use, GIOCondition cond,
+                                 void *opaque);
+
+/* Push whatever is owed. Returns with txbuf empty, or with a watch
+ * armed and the remainder still buffered. */
+static void qemu_be_tx_flush(VWifiState *s)
+{
+    while (s->txbuf_off < s->txbuf_len) {
+        int n = qemu_chr_fe_write(&s->chr, s->txbuf + s->txbuf_off,
+                                  (int)(s->txbuf_len - s->txbuf_off));
+        if (n <= 0) {
+            /* Would block, or the peer is gone. Either way, come back
+             * when it is writable rather than spinning on it here. */
+            if (s->tx_watch == 0) {
+                s->tx_watch = qemu_chr_fe_add_watch(&s->chr, G_IO_OUT | G_IO_HUP,
+                                                    qemu_be_tx_ready, s);
+            }
+            return;
+        }
+        s->txbuf_off += (size_t)n;
+    }
+
+    s->txbuf_len = 0;
+    s->txbuf_off = 0;
+    if (s->tx_watch) {
+        g_source_remove(s->tx_watch);
+        s->tx_watch = 0;
+    }
+}
+
+static gboolean qemu_be_tx_ready(void *do_not_use, GIOCondition cond,
+                                 void *opaque)
+{
+    VWifiState *s = opaque;
+
+    (void)do_not_use;
+    (void)cond;
+
+    /* Cleared first: qemu_be_tx_flush re-arms if it still cannot
+     * finish, and this source is about to be dropped by returning
+     * FALSE either way. */
+    s->tx_watch = 0;
+    qemu_be_tx_flush(s);
+    return FALSE;
+}
+
 static int qemu_be_medium_send(void *be, const void *buf, size_t len)
 {
     VWifiState *s = be;
+    const uint8_t *p = buf;
+    size_t queued = 0;
 
     /*
-     * write_all, not a qemu_chr_fe_write() loop. The hub's stream is
-     * length-prefixed, so a message goes out whole or the peer's framing
-     * is corrupted from there on -- there is no partial-send that leaves
-     * it intact. The hand-rolled loop this replaced retried EAGAIN with
-     * no delay at all, which is the same stall plus a spin.
+     * Never blocks. See the txbuf comment in VWifiState for why that
+     * matters: this runs on the vCPU thread with the BQL held, out of
+     * the guest's doorbell write, and blocking here freezes the guest.
      *
-     * The stall itself is not fixed and cannot be here: this runs on the
-     * vCPU thread with the BQL held, and a hub that stops draining this
-     * peer blocks it. Fixing that means buffering the remainder and
-     * flushing from a qemu_chr_fe_add_watch() callback.
+     * Ordering is kept by never writing directly while anything is
+     * still owed -- otherwise a frame would overtake the tail of a
+     * partially-written one and corrupt the hub's framing.
      */
-    if (qemu_chr_fe_write_all(&s->chr, (const uint8_t *)buf,
-                              (int)len) != (int)len) {
-        return -1;
+    if (s->txbuf_len == s->txbuf_off) {
+        int n = qemu_chr_fe_write(&s->chr, p, (int)len);
+
+        if (n == (int)len) {
+            return 0;                    /* the common case, no copy */
+        }
+        queued = (n > 0) ? (size_t)n : 0;
     }
+
+    /* Buffer whatever is left, behind anything already owed. */
+    {
+        size_t need = (s->txbuf_len - s->txbuf_off) + (len - queued);
+
+        if (need > VWIFI_TXBUF_MAX) {
+            if (!s->tx_overflow_warned) {
+                s->tx_overflow_warned = true;
+                warn_report("vwifi-virt[%s]: hub is not draining; dropping "
+                            "frames rather than stalling the guest",
+                            s->node_id ? s->node_id : "?");
+            }
+            return -1;                   /* a radio drops what it cannot send */
+        }
+
+        /* Compact before growing: the already-written head is dead
+         * weight and this is the moment it is free to discard. */
+        if (s->txbuf_off) {
+            memmove(s->txbuf, s->txbuf + s->txbuf_off,
+                    s->txbuf_len - s->txbuf_off);
+            s->txbuf_len -= s->txbuf_off;
+            s->txbuf_off = 0;
+        }
+        if (need > s->txbuf_cap) {
+            size_t cap = s->txbuf_cap ? s->txbuf_cap : 8192;
+
+            while (cap < need) cap *= 2;
+            s->txbuf = g_realloc(s->txbuf, cap);
+            s->txbuf_cap = cap;
+        }
+        memcpy(s->txbuf + s->txbuf_len, p + queued, len - queued);
+        s->txbuf_len += len - queued;
+    }
+
+    qemu_be_tx_flush(s);
     return 0;
 }
 
@@ -345,6 +461,16 @@ static void vwifi_realize(PCIDevice *pdev, Error **errp)
 static void vwifi_unrealize(PCIDevice *pdev)
 {
     VWifiState *s = VWIFI_VIRT(pdev);
+
+    /* Before the chardev goes: a writability watch that outlives its
+     * frontend fires into freed state. */
+    if (s->tx_watch) {
+        g_source_remove(s->tx_watch);
+        s->tx_watch = 0;
+    }
+    g_free(s->txbuf);
+    s->txbuf = NULL;
+    s->txbuf_len = s->txbuf_off = s->txbuf_cap = 0;
 
     if (qemu_chr_fe_backend_connected(&s->chr)) {
         qemu_chr_fe_deinit(&s->chr, true);
