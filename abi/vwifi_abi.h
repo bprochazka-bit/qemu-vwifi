@@ -160,6 +160,21 @@ typedef signed   __int64 int64_t;
 /* VWIFI_REG_CTRL bits */
 #define VWIFI_CTRL_ENABLE       (1u << 0)  /* start ring processing */
 #define VWIFI_CTRL_IRQ_ENABLE   (1u << 1)  /* master IRQ enable */
+/* Deliver STA data frames as 802.11 MPDUs instead of converting them to
+ * 802.3. The frame arrives with its 802.11 header and LLC/SNAP intact
+ * and VWIFI_RX_F_RAW set, decrypted if it was protected.
+ *
+ * Opt-in, and off by default, because it is the mirror of
+ * VWIFI_TX_F_80211 and exists for the same reason: Windows' WDI stack
+ * works in MPDUs in both directions. wdiwifi hands the miniport a
+ * complete 802.11 frame to transmit, and on receive it expects one back
+ * and does the 802.3 conversion itself. Handing it Ethernet makes it
+ * read the destination MAC as frame control, find a frame that is not
+ * data, and discard it without a word.
+ *
+ * The Linux driver wants 802.3 and never sets this bit, so its RX path
+ * is unchanged. */
+#define VWIFI_CTRL_RX_80211     (1u << 2)  /* RX stays 802.11, no re-encap */
 #define VWIFI_CTRL_RESET        (1u << 31) /* same effect as REG_RESET */
 
 /* VWIFI_REG_STATUS bits */

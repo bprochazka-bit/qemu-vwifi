@@ -407,8 +407,13 @@ VwifiHwStart(_Inout_ PVWIFI_ADAPTER Adapter)
 
     /* Enable device: IRQs + ring processing. */
     VwifiWrite32(Adapter, VWIFI_REG_IRQ_MASK, 0);
+    /* VWIFI_CTRL_RX_80211: see the flag's definition in the ABI header.
+     * This driver is a WDI miniport and the component works in 802.11
+     * MPDUs in both directions, so the device must not convert received
+     * frames to 802.3 on our behalf. */
     VwifiWrite32(Adapter, VWIFI_REG_CTRL,
-                 VWIFI_CTRL_ENABLE | VWIFI_CTRL_IRQ_ENABLE);
+                 VWIFI_CTRL_ENABLE | VWIFI_CTRL_IRQ_ENABLE |
+                 VWIFI_CTRL_RX_80211);
 
     /* GET_CAPS synchronously. Gives us the default MAC and feature
      * bits. This is the first round trip over the rings, so it is also
@@ -532,7 +537,12 @@ VwifiHwReset(_Inout_ PVWIFI_ADAPTER Adapter)
     VwifiRingsProgramMmio(Adapter);
     VwifiRingsArmCtrlRsp(Adapter);
     VwifiRingsPostRxBuffers(Adapter);
+    /* VWIFI_CTRL_RX_80211: see the flag's definition in the ABI header.
+     * This driver is a WDI miniport and the component works in 802.11
+     * MPDUs in both directions, so the device must not convert received
+     * frames to 802.3 on our behalf. */
     VwifiWrite32(Adapter, VWIFI_REG_CTRL,
-                 VWIFI_CTRL_ENABLE | VWIFI_CTRL_IRQ_ENABLE);
+                 VWIFI_CTRL_ENABLE | VWIFI_CTRL_IRQ_ENABLE |
+                 VWIFI_CTRL_RX_80211);
     return NDIS_STATUS_SUCCESS;
 }

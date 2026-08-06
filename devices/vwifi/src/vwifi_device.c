@@ -625,6 +625,7 @@ static void medium_deliver_rx(struct vwifi_dev *d,
     uint64_t desc_gpa;
     uint32_t idx;
     bool desc_decrypted = false;
+    bool desc_sta_raw   = false;
 
     if (!d->rx.enabled) {
         d->drops++;
@@ -833,13 +834,24 @@ static void medium_deliver_rx(struct vwifi_dev *d,
                 was_decrypted = true;
             }
 
-            out_len = sta_rx_80211_to_8023(d, plain, plain_len,
-                                           eth, sizeof(eth));
-            if (out_len == 0) {
-                /* Not convertible (non-SNAP, malformed, wrong BSS). */
-                return;
+            if (d->ctrl & VWIFI_CTRL_RX_80211) {
+                /* Straight through, header and all. The driver asked
+                 * for MPDUs; converting and having it convert back
+                 * would lose the QoS control field and the sequence
+                 * number on the way. Decryption has already happened
+                 * above, so what goes up is a plaintext MPDU. */
+                out_frame = plain;
+                out_len   = plain_len;
+                desc_sta_raw = true;
+            } else {
+                out_len = sta_rx_80211_to_8023(d, plain, plain_len,
+                                               eth, sizeof(eth));
+                if (out_len == 0) {
+                    /* Not convertible (non-SNAP, malformed, wrong BSS). */
+                    return;
+                }
+                out_frame = eth;
             }
-            out_frame = eth;
         }
 
         if (out_len > desc.buffer_len) {
@@ -860,7 +872,7 @@ static void medium_deliver_rx(struct vwifi_dev *d,
     desc.channel_freq = hdr->channel_freq;
     desc.tsf          = ((uint64_t)hdr->tsf_hi << 32) | hdr->tsf_lo;
     desc.flags        = 0;   /* clear OWN — transfer to driver */
-    if (d->op_mode == VWIFI_MODE_MONITOR) {
+    if (d->op_mode == VWIFI_MODE_MONITOR || desc_sta_raw) {
         desc.flags |= VWIFI_RX_F_RAW;
     }
     if (desc_decrypted) {

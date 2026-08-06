@@ -115,10 +115,22 @@ VwifiRxDrainSta(_Inout_ PVWIFI_ADAPTER Adapter)
                            "freq=%u rssi=%d",
                         idx, d->frame_len, d->flags, d->channel_freq, d->rssi);
 
-        /* In STA mode the device delivers 802.3 with RAW clear. If we
-         * somehow got a raw frame here, skip it. */
-        if ((d->flags & VWIFI_RX_F_RAW) || d->frame_len == 0) {
+        /* RAW is what we asked for.
+         *
+         * This used to drop raw frames as something that could not
+         * happen in STA mode, back when the device converted to 802.3
+         * for us. VWIFI_CTRL_RX_80211 turns that conversion off,
+         * because wdiwifi wants MPDUs on receive exactly as it hands
+         * them down on transmit, so RAW is now the normal case and its
+         * absence is the surprising one. */
+        if (d->frame_len == 0) {
             goto rearm;
+        }
+        if (!(d->flags & VWIFI_RX_F_RAW)) {
+            VWIFI_TAL_ONCE("rx(sta): device delivered an 802.3 frame despite "
+                           "VWIFI_CTRL_RX_80211 -- passing it up anyway, but "
+                           "the component expects an 802.11 MPDU and will "
+                           "discard it in silence");
         }
 
         /* Stop one slot short of owning the whole ring. The frame is
@@ -139,78 +151,71 @@ VwifiRxDrainSta(_Inout_ PVWIFI_ADAPTER Adapter)
 
             /* What is actually arriving, and in what shape.
              *
-             * TX turned out to be the opposite of what this driver
-             * assumed -- the component hands down 802.11 MPDUs, not
-             * 802.3 -- and RX is the same contract read the other way,
-             * so "the device converts to 802.3 and we pass it up" is an
-             * assumption of exactly the kind that was wrong last time.
-             * The dump settles it instead of arguing it.
+             * An 802.11 MPDU now, not 802.3: addr1 at 4, addr2 at 10,
+             * addr3 at 16, then LLC/SNAP and the EtherType. pktmon
+             * settled the contract -- it showed wdiwifi converting
+             * 802.3 to 802.11 on the way down and showed not one
+             * received packet reaching NDIS while this driver was
+             * handing up Ethernet.
              *
-             * It also says what the frame IS. An associated link that
-             * cannot complete DHCP has two very different explanations
-             * -- the offer never arrives, or it arrives and the
-             * component discards it -- and "UDP 67->68" in this line
-             * tells them apart in one look. */
-            if (d->frame_len >= 42) {
+             * The offsets below are computed rather than written out
+             * because a QoS data frame carries two more header bytes
+             * and getting that wrong silently shifts every field. */
+            if (d->frame_len >= 34) {
+                ULONG hdr = 24;
+                ULONG snap, etype;
+
+                if ((frame_va[0] >> 4) & 0x08) hdr += 2;   /* QoS control */
+                snap  = hdr + 8;                            /* LLC/SNAP */
+                etype = hdr + 6;
+
                 VWIFI_TAL_FIRST(4,
-                    "rx(sta): frame %u bytes: dst %02x:%02x:%02x:%02x:%02x:%02x "
-                    "src %02x:%02x:%02x:%02x:%02x:%02x type %02x%02x -- %s",
+                    "rx(sta): frame %u bytes: a1 %02x:%02x:%02x:%02x:%02x:%02x "
+                    "a2 %02x:%02x:%02x:%02x:%02x:%02x "
+                    "a3 %02x:%02x:%02x:%02x:%02x:%02x fc %02x%02x type %02x%02x",
                     d->frame_len,
-                    frame_va[0], frame_va[1], frame_va[2],
-                    frame_va[3], frame_va[4], frame_va[5],
-                    frame_va[6], frame_va[7], frame_va[8],
-                    frame_va[9], frame_va[10], frame_va[11],
-                    frame_va[12], frame_va[13],
-                    (frame_va[12] == 0x08 && frame_va[13] == 0x06)
-                        ? "802.3 ARP"
-                        : (frame_va[12] == 0x08 && frame_va[13] == 0x00)
-                            ? ((frame_va[23] == 17) ? "802.3 IPv4/UDP"
-                                                    : "802.3 IPv4")
-                            : (frame_va[12] == 0x86 && frame_va[13] == 0xdd)
-                                ? "802.3 IPv6"
-                                : (((frame_va[0] >> 2) & 0x3) == 2)
-                                    ? "NOT 802.3 -- this is an 802.11 DATA "
-                                      "MPDU and is being passed up as an MSDU"
-                                    : "802.3 with an unrecognised EtherType");
-                /* Ports second, and only when they exist, rather than
-                 * widening the line above for every frame. 67 -> 68 is
+                    frame_va[4], frame_va[5], frame_va[6],
+                    frame_va[7], frame_va[8], frame_va[9],
+                    frame_va[10], frame_va[11], frame_va[12],
+                    frame_va[13], frame_va[14], frame_va[15],
+                    frame_va[16], frame_va[17], frame_va[18],
+                    frame_va[19], frame_va[20], frame_va[21],
+                    frame_va[0], frame_va[1],
+                    frame_va[etype], frame_va[etype + 1]);
+
+                /* Ports second, and only when they exist. 67 -> 68 is
                  * the DHCP offer this link keeps not getting. */
-                if (frame_va[12] == 0x08 && frame_va[13] == 0x00 &&
-                    frame_va[23] == 17 && d->frame_len >= 38) {
-                    ULONG sport = (ULONG)((frame_va[34] << 8) | frame_va[35]);
-                    ULONG dport = (ULONG)((frame_va[36] << 8) | frame_va[37]);
+                if (frame_va[etype] == 0x08 && frame_va[etype + 1] == 0x00 &&
+                    d->frame_len >= snap + 28 &&
+                    frame_va[snap + 9] == 17) {
+                    ULONG udp   = snap + 20;
+                    ULONG sport = (ULONG)((frame_va[udp] << 8) | frame_va[udp + 1]);
+                    ULONG dport = (ULONG)((frame_va[udp + 2] << 8) | frame_va[udp + 3]);
 
                     VWIFI_TAL_FIRST(4, "rx(sta):   UDP %u -> %u", sport, dport);
 
-                    /* The offer, in full, on its own counter.
-                     *
-                     * Everything above this line now works: the frame is
-                     * in the ring, the component takes it, returns it,
-                     * and answers SUCCESS. Windows still does not
-                     * complete DHCP, so the remaining questions are
-                     * about the contents of this frame and nothing else
-                     * -- is the offer addressed to this station, does
-                     * its transaction id match what this station asked,
-                     * and is the hardware address in the payload ours.
-                     *
-                     * Any one of those being wrong is a frame Windows is
-                     * correct to ignore, and none of them are visible in
-                     * "UDP 67 -> 68". BOOTP sits at 42: op at +0, xid at
-                     * +4, flags at +10, yiaddr at +16, chaddr at +28. */
-                    if (sport == 67 && dport == 68 && d->frame_len >= 86) {
+                    /* The offer, in full, on its own counter: is it
+                     * addressed to this station, does its transaction id
+                     * match what this station asked, and is the hardware
+                     * address in the payload ours. Any one of those being
+                     * wrong is a frame Windows is right to ignore, and
+                     * none of them show up in "UDP 67 -> 68". */
+                    if (sport == 67 && dport == 68 &&
+                        d->frame_len >= udp + 8 + 44) {
+                        ULONG b = udp + 8;   /* BOOTP */
+
                         VWIFI_TAL_FIRST(3,
                             "rx(sta):   DHCP op %u xid %02x%02x%02x%02x "
                             "flags %02x%02x yiaddr %u.%u.%u.%u "
-                            "chaddr %02x:%02x:%02x:%02x:%02x:%02x "
-                            "-> eth dst %02x:%02x:%02x:%02x:%02x:%02x",
-                            frame_va[42],
-                            frame_va[46], frame_va[47], frame_va[48], frame_va[49],
-                            frame_va[52], frame_va[53],
-                            frame_va[58], frame_va[59], frame_va[60], frame_va[61],
-                            frame_va[70], frame_va[71], frame_va[72],
-                            frame_va[73], frame_va[74], frame_va[75],
-                            frame_va[0], frame_va[1], frame_va[2],
-                            frame_va[3], frame_va[4], frame_va[5]);
+                            "chaddr %02x:%02x:%02x:%02x:%02x:%02x",
+                            frame_va[b],
+                            frame_va[b + 4], frame_va[b + 5],
+                            frame_va[b + 6], frame_va[b + 7],
+                            frame_va[b + 10], frame_va[b + 11],
+                            frame_va[b + 16], frame_va[b + 17],
+                            frame_va[b + 18], frame_va[b + 19],
+                            frame_va[b + 28], frame_va[b + 29], frame_va[b + 30],
+                            frame_va[b + 31], frame_va[b + 32], frame_va[b + 33]);
                     }
                 }
             }

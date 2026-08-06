@@ -530,6 +530,44 @@ int main(void)
     }
     printf("  RX 802.11 -> 802.3 (addrs, ethertype, payload): PASS\n");
 
+    /* ---- 5b. RX with VWIFI_CTRL_RX_80211: no conversion at all ----
+     *
+     * The mirror of the TX passthrough above, and it exists for the
+     * same reason: a WDI miniport's component works in MPDUs both
+     * ways. With the bit set the driver must get back exactly what
+     * arrived on the medium, with RAW set to say so. */
+    {
+        uint32_t ctrl = (uint32_t)vwifi_reg_read(g_dev, VWIFI_REG_CTRL, 4);
+
+        vwifi_reg_write(g_dev, VWIFI_REG_CTRL, ctrl | VWIFI_CTRL_RX_80211, 4);
+
+        dl_len = build_data_downlink(dl, AP_MAC, payload, 20, 0x0800);
+        rx_tail_before = (uint32_t)vwifi_reg_read(g_dev,
+                                                  VWIFI_REG_RX_RING_TAIL, 4);
+        medium_rx(dl, dl_len, 2437, AP_MAC);
+        rx_tail_after = (uint32_t)vwifi_reg_read(g_dev,
+                                                 VWIFI_REG_RX_RING_TAIL, 4);
+        assert(rx_tail_after != rx_tail_before);
+
+        {
+            struct vwifi_rx_desc *rd =
+                (struct vwifi_rx_desc *)(g_ram_va + RX_OFFSET
+                                         + rx_tail_before * sizeof(*rd));
+            const uint8_t *out = g_ram_va + RX_BUFFER_OFFSET
+                               + (uint64_t)rx_tail_before * RX_BUFSZ;
+
+            assert(!(rd->flags & VWIFI_DESC_F_OWN));
+            assert(rd->flags & VWIFI_RX_F_RAW);   /* said so */
+            assert(rd->frame_len == dl_len);      /* not re-encapsulated */
+            assert(memcmp(out, dl, dl_len) == 0); /* byte for byte */
+        }
+
+        /* Back to the default so the tests after this one still see
+         * the 802.3 behaviour the Linux driver relies on. */
+        vwifi_reg_write(g_dev, VWIFI_REG_CTRL, ctrl, 4);
+    }
+    printf("  RX 802.11 passthrough (VWIFI_CTRL_RX_80211, no re-encap): PASS\n");
+
     /* ---- 6. Frame from a different BSSID is filtered out ---- */
     uint8_t other_bssid[6] = { 0xDE, 0xAD, 0x00, 0x00, 0x00, 0x99 };
     dl_len = build_data_downlink(dl, other_bssid, payload, 20, 0x0800);
