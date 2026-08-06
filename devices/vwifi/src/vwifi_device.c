@@ -679,6 +679,35 @@ static void medium_deliver_rx(struct vwifi_dev *d,
         if (!sta_is_our_data_frame(d, frame, frame_len)) {
             return;
         }
+        /* Not our own frame handed back to us.
+         *
+         * On a FromDS frame addr3 is the original sender, so addr3 ==
+         * our MAC means this is something we transmitted, bridged back
+         * out the port it arrived on. A medium capture shows the AP
+         * doing exactly that: every ToDS broadcast the station sends
+         * reappears half a millisecond later as a FromDS copy with the
+         * BSSID as transmitter and the station as addr3 -- ARP, MLD,
+         * DHCP DISCOVER, all of it.
+         *
+         * The echo suppression above cannot catch these and should not
+         * try: the AP really did transmit them, and its MAC really is
+         * the one in the medium header. This is the other half of the
+         * same rule, and it belongs in the device rather than in any
+         * driver -- no station is ever handed a frame it sent, real
+         * stacks drop them silently, and passing them up doubles the
+         * receive load with traffic that can only be discarded.
+         *
+         * Checked here rather than inside sta_is_our_data_frame because
+         * that takes a const device and so cannot say what it dropped,
+         * and a silent drop is the thing that makes these logs hard to
+         * read in the first place. */
+        if (memcmp(frame + 16, d->sta_mac, 6) == 0) {
+            VWIFI_TRACE(d, "rx dropped: our own %u-byte frame reflected "
+                           "back by the AP (addr3 is us)", frame_len);
+            d->drops++;
+            d->regs[VWIFI_REG_DIAG_DROPS / 4] = d->drops;
+            return;
+        }
         /* Who actually put this on the medium.
          *
          * The Windows driver's RX trace shows frames arriving whose
