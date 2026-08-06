@@ -526,6 +526,17 @@ NDIS_STATUS VwifiAdapterCreate(
     _Inout_ PNDIS_MINIPORT_ADAPTER_REGISTRATION_ATTRIBUTES RegistrationAttributes);
 VOID VwifiAdapterDestroy(_In_ NDIS_HANDLE MiniportAdapterContext);
 
+/* Crash-path reporting. Debug-only, like the 0xE9 log it writes to:
+ * see driver.c for why a bugcheck callback is the thing that tells a
+ * bugcheck apart from a hard lock in this environment. */
+#if DBG
+VOID VwifiBugCheckRegister(_In_ PVWIFI_ADAPTER Adapter);
+VOID VwifiBugCheckDeregister(VOID);
+#else
+#define VwifiBugCheckRegister(a)  ((VOID)(a))
+#define VwifiBugCheckDeregister() ((VOID)0)
+#endif
+
 /* wdi_ops.c — WDI handler table.
  *
  * Note the role-type names: the handler for StartOperationHandler is

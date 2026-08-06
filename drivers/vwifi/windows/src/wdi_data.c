@@ -63,6 +63,11 @@
 #define VWIFI_TAL_DEQUEUE_MAXFRAMES 32
 #define VWIFI_TAL_DEQUEUE_CREDIT    0xFFFFu
 
+/* Total dequeue rounds one pump may run, counting every time it is
+ * re-entered and goes round again. A ceiling on time spent at
+ * DISPATCH_LEVEL, which is the whole point of having one. */
+#define VWIFI_TAL_PUMP_MAX_ROUNDS   16
+
 /* ============================================================
  * The metadata attached to a frame
  * ============================================================ */
@@ -287,9 +292,11 @@ VwifiTalTxPump(_Inout_ PVWIFI_ADAPTER Adapter,
      * between one pump's first and last log line, at the same
      * timestamp, so it came from inside this function. Each such
      * re-entry was another pump frame on a 24 KB kernel stack with
-     * nothing bounding the depth, and a captured hang has CR2 pointing
-     * into the stack region (a guard-page fault) with both processors
-     * in ntoskrnl at IRQL 15 (KeBugCheckEx, other CPU halted by IPI).
+     * nothing bounding the depth. Every captured hang has both
+     * processors in ntoskrnl at IRQL 15, which is what a bugcheck's
+     * freeze looks like; the cause of that bugcheck is not readable
+     * from the registers, so treat unbounded depth here as a defect
+     * worth fixing on its own terms rather than as a diagnosis.
      *
      * Nothing is lost by deferring: the loop below asks the component
      * what it has rather than being told what to send, so the running
@@ -302,6 +309,7 @@ VwifiTalTxPump(_Inout_ PVWIFI_ADAPTER Adapter,
         return;
     }
 
+claimed:
     for (;;) {
         PNET_BUFFER_LIST chain = NULL;
         WDI_FRAME_ID     frameIds[VWIFI_TAL_DEQUEUE_MAXFRAMES];
@@ -409,24 +417,59 @@ VwifiTalTxPump(_Inout_ PVWIFI_ADAPTER Adapter,
 
         /* A component that keeps handing back frames forever would spin
          * this loop at DISPATCH_LEVEL. Bounded, and the next
-         * TxDataSend/TxPeerBacklog brings us straight back. */
-        if (++rounds >= 16) {
-            VWIFI_WARN("TAL tx: 16 dequeue rounds in one pump -- yielding");
+         * TxDataSend/TxPeerBacklog brings us straight back.
+         *
+         * `rounds` is deliberately NOT reset when the pump goes round
+         * again below -- see the tail. */
+        if (++rounds >= VWIFI_TAL_PUMP_MAX_ROUNDS) {
+            VWIFI_WARN("TAL tx: %u dequeue rounds in one pump -- yielding",
+                       rounds);
             break;
         }
     }
 
     /* Anything that arrived while this pump was running is answered by
-     * going round once more, on this stack frame rather than a deeper
-     * one. Cleared before the re-check so a notification racing the
-     * release is not lost: worst case the loop runs once with nothing
-     * to send, which is a logged no-op. */
+     * going round once more. Cleared before the re-check so a
+     * notification racing the release is not lost: worst case the loop
+     * runs once with nothing to send, which is a logged no-op.
+     *
+     * A `goto`, not a call. This used to recurse into VwifiTalTxPump
+     * here, and that made the bound above bound nothing: every re-entry
+     * started a fresh 16-round budget, so a component that re-entered
+     * the pump from inside TxTransferCompleteIndication -- which the
+     * trace shows it does -- could keep the pair ping-ponging with no
+     * ceiling at all. In a checked build MSVC does not fold that call
+     * into a jump, so each lap also cost a stack frame carrying a
+     * 32-entry frameIds array on a 24 KB kernel stack. Unbounded time at
+     * DISPATCH_LEVEL and unbounded stack, from the one line that was
+     * supposed to be the safety net.
+     *
+     * Now the budget spans the whole pump, however many times it is
+     * re-entered, and running out of it ends the pump rather than
+     * renewing it: the work is not dropped, because whatever set
+     * TxPumpAgain will set it again through the next TxDataSend or
+     * TxPeerBacklog. */
     InterlockedExchange(&Adapter->TxPumpActive, 0);
     if (InterlockedExchange(&Adapter->TxPumpAgain, 0) != 0) {
+        if (rounds >= VWIFI_TAL_PUMP_MAX_ROUNDS) {
+            VWIFI_WARN("TAL tx: pump re-entered again after %u rounds -- "
+                       "stopping here and leaving the rest to the next "
+                       "notification (port %u peer %u)",
+                       rounds, PortId, PeerId);
+            return;
+        }
+        /* Re-claim before going round. Losing the race means another
+         * CPU owns the pump now and will do this work; hand the flag
+         * back so its own tail check sees it. */
+        if (InterlockedCompareExchange(&Adapter->TxPumpActive, 1, 0) != 0) {
+            InterlockedExchange(&Adapter->TxPumpAgain, 1);
+            return;
+        }
         VWIFI_TAL_FIRST(4, "TAL tx: pump was re-entered while running -- "
-                           "going round again for port %u peer %u",
-                        PortId, PeerId);
-        VwifiTalTxPump(Adapter, PortId, PeerId, ExTidBitmask);
+                           "going round again for port %u peer %u "
+                           "(%u round(s) used)",
+                        PortId, PeerId, rounds);
+        goto claimed;
     }
 }
 

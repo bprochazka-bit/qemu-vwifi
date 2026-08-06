@@ -61,6 +61,7 @@ VwifiE9Printf(PCSTR Format, ...)
     KIRQL     oldIrql;
     size_t    used = 0;
     ULONGLONG ms;
+    BOOLEAN   held = FALSE;
 
     /* Timestamped, because a trace without one cannot be lined up
      * against anything that happened outside the guest. Reading this
@@ -88,16 +89,125 @@ VwifiE9Printf(PCSTR Format, ...)
     va_end(ap);
 
     KeRaiseIrql(HIGH_LEVEL, &oldIrql);
-    while (InterlockedCompareExchange(&g_E9Lock, 1, 0) != 0) {
-        YieldProcessor();
+
+    /* Bounded, not infinite.
+     *
+     * This is also called from the bugcheck callback below, and there
+     * every other processor is already frozen exactly where it stood.
+     * One of them frozen holding this lock would hang the crash path
+     * forever -- and the crash path is the one place whose output
+     * cannot be collected any other way. A garbled last line beats no
+     * last line, so give up on the lock and write anyway. */
+    {
+        ULONG spins;
+        for (spins = 0; spins < 1000000; spins++) {
+            if (InterlockedCompareExchange(&g_E9Lock, 1, 0) == 0) {
+                held = TRUE;
+                break;
+            }
+            YieldProcessor();
+        }
     }
 
     for (p = buf; *p != '\0'; p++) {
         WRITE_PORT_UCHAR(VWIFI_E9_PORT, (UCHAR)*p);
     }
 
-    InterlockedExchange(&g_E9Lock, 0);
+    /* Only if we actually took it. Releasing a lock whose holder is
+     * frozen would just let the next line collide with it too. */
+    if (held) {
+        InterlockedExchange(&g_E9Lock, 0);
+    }
     KeLowerIrql(oldIrql);
+}
+
+/* ====================================================================
+ * Bugcheck callback
+ *
+ * Every hang in this bring-up has looked identical from outside: the
+ * desktop stops repainting, the 0xE9 trace stops mid-flow, and a gdb
+ * attach finds both processors in ntoskrnl at IRQL 15. That is what a
+ * bugcheck's processor freeze looks like -- and it is also what a
+ * genuine hard lock looks like from the same distance, which is why
+ * three separate "fixes" have been aimed at mechanisms that turned out
+ * not to be the hang.
+ *
+ * This tells the two apart, and does it in the one log that survives
+ * the machine dying. If these lines appear, Windows bugchecked: the
+ * callback runs from KeBugCheck2 with every other processor already
+ * frozen. If they never appear, it was not a bugcheck and the driver
+ * state below is not where to look.
+ *
+ * The callback cannot see the bugcheck code -- KBUGCHECK_CALLBACK_ROUTINE
+ * is handed only its own buffer -- so it reports what the OS will not:
+ * where this driver's data path was standing when the machine stopped.
+ * The code itself comes from the minidump, which is why writing one
+ * should stay enabled.
+ *
+ * Runs at HIGH_LEVEL. Nothing here may allocate, take a lock that a
+ * frozen processor could hold, or touch pageable memory: it reads
+ * already-resident adapter fields and writes bytes to an I/O port.
+ * ==================================================================== */
+
+static KBUGCHECK_CALLBACK_RECORD g_BugCheckRecord;
+static BOOLEAN                   g_BugCheckRegistered = FALSE;
+
+/* The adapter, for the crash path only. Single-instance by design: this
+ * device is not enumerated more than once, and a wrong guess here costs
+ * nothing but a misleading log line on a machine that is already dead. */
+static PVWIFI_ADAPTER volatile   g_BugCheckAdapter = NULL;
+
+static KBUGCHECK_CALLBACK_ROUTINE VwifiBugCheckCallback;
+
+static VOID
+VwifiBugCheckCallback(_In_ PVOID Buffer, _In_ ULONG Length)
+{
+    PVWIFI_ADAPTER a = g_BugCheckAdapter;
+
+    UNREFERENCED_PARAMETER(Buffer);
+    UNREFERENCED_PARAMETER(Length);
+
+    VwifiE9Printf("BUGCHECK: the machine stopped in a bugcheck, not a "
+                  "hard lock -- read the code from the minidump\n");
+
+    if (a == NULL) {
+        VwifiE9Printf("BUGCHECK: no adapter registered\n");
+        return;
+    }
+
+    VwifiE9Printf("BUGCHECK: adapter %p opmode %u assoc %u datapath %d\n",
+                  a, a->OpMode, (ULONG)a->Associated, a->DataPathRunning);
+    VwifiE9Printf("BUGCHECK: tx pump active %d again %d\n",
+                  a->TxPumpActive, a->TxPumpAgain);
+    VwifiE9Printf("BUGCHECK: rx paused %d outstanding %d\n",
+                  a->RxPaused, a->RxOutstanding);
+    VwifiE9Printf("BUGCHECK: rings tx@%u rx@%u\n",
+                  a->TxRing.NextIndex, a->RxRing.NextIndex);
+}
+
+VOID
+VwifiBugCheckRegister(_In_ PVWIFI_ADAPTER Adapter)
+{
+    g_BugCheckAdapter = Adapter;
+
+    if (g_BugCheckRegistered) {
+        return;
+    }
+    KeInitializeCallbackRecord(&g_BugCheckRecord);
+    g_BugCheckRegistered = KeRegisterBugCheckCallback(
+        &g_BugCheckRecord, VwifiBugCheckCallback, NULL, 0, (PUCHAR)"vwifi");
+    VWIFI_INFO("bugcheck callback %s",
+               g_BugCheckRegistered ? "registered" : "NOT registered");
+}
+
+VOID
+VwifiBugCheckDeregister(VOID)
+{
+    g_BugCheckAdapter = NULL;
+    if (g_BugCheckRegistered) {
+        (VOID)KeDeregisterBugCheckCallback(&g_BugCheckRecord);
+        g_BugCheckRegistered = FALSE;
+    }
 }
 #endif /* DBG */
 
@@ -194,6 +304,9 @@ VwifiAdapterCreate(
         goto fail;
     }
 
+    /* Last, so the crash path only ever sees a fully built adapter. */
+    VwifiBugCheckRegister(adapter);
+
     VWIFI_INFO("adapter %p initialized successfully", adapter);
     return NDIS_STATUS_SUCCESS;
 
@@ -219,6 +332,9 @@ VwifiAdapterDestroy(NDIS_HANDLE MiniportAdapterContext)
     }
 
     VWIFI_INFO("VwifiAdapterDestroy");
+    /* Before the memory goes back, or the crash path would read a freed
+     * adapter -- which is a bugcheck of its own. */
+    VwifiBugCheckDeregister();
     VwifiHwShutdown(adapter);
     NdisFreeMemoryWithTagPriority(adapter->MiniportAdapterHandle, adapter,
                                   VWIFI_POOL_TAG);
