@@ -600,6 +600,8 @@ VwifiTlvGenerateAssociationResult(
     const struct vwifi_assoc_result *Result,
     const VWIFI_ASSOC_PARAMS *Params,
     const UCHAR *Ies,
+    const UCHAR *ReqIes,
+    ULONG ReqIeLen,
     VOID **Buffer,
     PULONG BufferLen)
 {
@@ -647,41 +649,13 @@ VwifiTlvGenerateAssociationResult(
      * The AKM is the discriminator, not the cipher: WPA2-PSK
      * authenticates over the air as Open System (see WdiAuthToVwifi), so
      * auth alone cannot tell the two apart. */
-    /* ...and it is now TRUE unconditionally, as a probe. Read on.
-     *
-     * pktmon localised where the four-way handshake dies. EAPOL-Key
-     * message 1 arrives, is indicated, and the component answers
-     * SUCCESS -- and the capture shows it reaching component 11 on its
-     * lower edge and never emerging on the upper one. Component 11 is
-     * the 802.11-to-802.3 converter: the transmit capture has the same
-     * component with a 342-byte Ethernet frame on edge 1 and the
-     * 360-byte 802.11 frame on edge 2. So the frame is discarded
-     * exactly at the layer that enforces the controlled port, on a port
-     * this driver has declared unauthorized.
-     *
-     * That leaves two possibilities. Either the component exempts EAPOL
-     * itself and something about this frame stops it recognising it --
-     * which would be a field of WDI_FRAME_METADATA's receive half that
-     * this driver leaves zeroed -- or PortAuthorized does not mean what
-     * the paragraph above assumes and an unauthorized port passes
-     * nothing at all, which no driver could ever recover from, since
-     * the handshake that would authorize it runs over the port.
-     *
-     * The second is one line to test and the first needs a structure
-     * layout that is not in this repository. So: test the cheap one.
-     *
-     *   Message 2 goes out  -> the flag was the gate. The honest fix is
-     *                          then to authorize on handshake
-     *                          completion rather than at association,
-     *                          which needs the key path anyway.
-     *   Message 2 still not -> the flag is not the gate, the exemption
-     *                          is in the frame metadata, and this line
-     *                          goes back to what it was.
-     *
-     * Until that is known this is a probe and not a fix, and it is
-     * wrong for anything but a lab: it tells the OS the link is
-     * authorized before any key exists. */
-    entry.AssociationResultParameters.PortAuthorized = TRUE;
+    /* Probed and settled: TRUE unconditionally is wrong. Reporting an
+     * AKM association as already authorized made the OS disconnect
+     * twenty-eight milliseconds later, before the peer was even
+     * configured -- it rejects a link that claims authorization it
+     * cannot have. FALSE until the handshake completes is right. */
+    entry.AssociationResultParameters.PortAuthorized =
+        (Params->AkmSuite == VWIFI_AKM_NONE) ? TRUE : FALSE;
 
     /* The negotiated algorithms and the band. All four were left at
      * zero, and zero is not a valid value for three of them:
@@ -757,6 +731,26 @@ VwifiTlvGenerateAssociationResult(
         entry.AssociationResponseFrame.ElementCount = Result->ie_len;
         entry.AssociationResponseFrame.pElements = const_cast<UINT8 *>(Ies);
         entry.Optional.AssociationResponseFrame_IsPresent = TRUE;
+    }
+
+    /* ...and our own association request, which matters just as much on
+     * a protected network and was not being reported at all.
+     *
+     * The four-way handshake is authenticated over the two RSN elements
+     * that were exchanged: the supplicant needs the one the station
+     * sent in its association request to build message 2 and to verify
+     * message 3. WDI never handed that element down -- it describes
+     * security as cipher lists and leaves the element to be built
+     * below, which the device now does -- so the OS has never seen the
+     * RSN element this station actually associated with, and could not
+     * begin a handshake it has no key data for.
+     *
+     * Which is exactly what the trace shows: EAPOL-Key message 1
+     * arrives, reaches the component, and message 2 is never sent. */
+    if (ReqIes != nullptr && ReqIeLen > 0) {
+        entry.AssociationRequestFrame.ElementCount = ReqIeLen;
+        entry.AssociationRequestFrame.pElements = const_cast<UINT8 *>(ReqIes);
+        entry.Optional.AssociationRequestFrame_IsPresent = TRUE;
     }
 
     params.AssociationResults.ElementCount = 1;

@@ -240,14 +240,18 @@ static VOID
 VwifiIndicateAssociationResult(_Inout_ PVWIFI_ADAPTER Adapter,
                                _In_ const struct vwifi_assoc_result *Result,
                                _In_ const VWIFI_ASSOC_PARAMS *Params,
-                               _In_reads_bytes_(Result->ie_len) const UCHAR *Ies)
+                               _In_reads_bytes_(Result->ie_len) const UCHAR *Ies,
+                               _In_reads_bytes_opt_(Result->req_ie_len)
+                                   const UCHAR *ReqIes)
 {
     PVWIFI_CONNECT_TASK task = Adapter->ConnectTask;
     PVOID tlv = NULL;
     ULONG tlvLen = 0;
 
     if (VwifiTlvGenerateAssociationResult(Adapter->WdiPeerVersion,
-                                          Result, Params, Ies, &tlv, &tlvLen)
+                                          Result, Params, Ies,
+                                          ReqIes, Result->req_ie_len,
+                                          &tlv, &tlvLen)
             != NDIS_STATUS_SUCCESS) {
         /* The mandatory-container trap, twice over now: this failed for
          * the whole life of the project because ActivePhyTypeList was
@@ -263,13 +267,12 @@ VwifiIndicateAssociationResult(_Inout_ PVWIFI_ADAPTER Adapter,
         return;
     }
 
-    VWIFI_INFO("indicating ASSOCIATION_RESULT status=%u (%s) aid=%u ies=%u "
-               "akm=%u -- PROBE BUILD: reporting the port AUTHORIZED even "
-               "with an AKM, to find out whether that flag is what stops "
-               "EAPOL crossing it",
+    VWIFI_INFO("indicating ASSOCIATION_RESULT status=%u (%s) aid=%u "
+               "resp ies=%u req ies=%u akm=%u",
                Result->status_code,
                VwifiDot11StatusName(Result->status_code),
-               Result->aid, Result->ie_len, Params->AkmSuite);
+               Result->aid, Result->ie_len, Result->req_ie_len,
+               Params->AkmSuite);
     VwifiSendWdiIndication(Adapter, task->WdiPortId, task->PortId,
                            NDIS_STATUS_WDI_INDICATION_ASSOCIATION_RESULT,
                            NDIS_STATUS_SUCCESS,
@@ -507,9 +510,17 @@ VwifiConnectOnAssocResult(_Inout_ PVWIFI_ADAPTER Adapter,
                    res->ie_len, PayloadLen);
         return;
     }
+    if (PayloadLen < sizeof(*res) + res->ie_len + res->req_ie_len) {
+        VWIFI_WARN("ASSOC_RESULT request-IE length %u does not fit the "
+                   "payload (%u bytes, %u response IEs) -- ignoring them",
+                   res->req_ie_len, PayloadLen, res->ie_len);
+        ((struct vwifi_assoc_result *)res)->req_ie_len = 0;
+    }
     ies = (const UCHAR *)Payload + sizeof(*res);
 
-    VwifiIndicateAssociationResult(Adapter, res, &task->AssocParams, ies);
+    VwifiIndicateAssociationResult(Adapter, res, &task->AssocParams, ies,
+                                   (res->req_ie_len > 0)
+                                       ? (ies + res->ie_len) : NULL);
 
     if (res->status_code == 0) {
         WDI_PEER_ID peerId = WDI_PEER_ANY;

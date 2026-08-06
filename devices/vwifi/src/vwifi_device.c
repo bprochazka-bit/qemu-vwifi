@@ -330,6 +330,13 @@ struct vwifi_conn {
     /* IEs the driver asked us to include in the Assoc Request. */
     uint16_t req_ie_len;
     uint8_t  req_ies[VWIFI_ASSOC_IE_MAX];
+    /* The IE block of the association request this device actually
+     * sent -- SSID, rates, the RSN element it builds itself, and any
+     * driver-supplied vendor elements. Reported back with the
+     * association result because a supplicant cannot run a four-way
+     * handshake without knowing which RSN element was exchanged. */
+    uint8_t  sent_ies[VWIFI_ASSOC_IE_MAX];
+    uint16_t sent_ie_len;
 };
 
 struct vwifi_dev {
@@ -1885,6 +1892,19 @@ static void conn_send_assoc_req(struct vwifi_dev *d)
         len += d->conn.req_ie_len;
     }
 
+    /* Keep what went out. The IEs start after the mgmt header and the
+     * four fixed bytes (capability info, listen interval). */
+    {
+        uint16_t ie_off = IEEE80211_MGMT_HDR_LEN + 4;
+        uint16_t ie_len = (len > ie_off) ? (uint16_t)(len - ie_off) : 0;
+
+        if (ie_len > sizeof(d->conn.sent_ies)) {
+            ie_len = (uint16_t)sizeof(d->conn.sent_ies);
+        }
+        memcpy(d->conn.sent_ies, frame + ie_off, ie_len);
+        d->conn.sent_ie_len = ie_len;
+    }
+
     VWIFI_TRACE(d, "conn: -> Assoc Request (ssid='%s', %u RSN bytes "
                    "[akm %u cipher %u/%u], %u extra IE bytes)",
                 d->conn.ssid, rsn_bytes, d->conn.akm_suite,
@@ -1911,24 +1931,34 @@ static void conn_send_deauth(struct vwifi_dev *d, uint16_t reason)
 static void conn_emit_assoc_result(struct vwifi_dev *d, uint16_t status_code,
                                    const uint8_t *resp_ies, uint16_t ie_len)
 {
-    uint8_t payload[sizeof(struct vwifi_assoc_result) + VWIFI_ASSOC_IE_MAX];
+    uint8_t payload[sizeof(struct vwifi_assoc_result) +
+                    2 * VWIFI_ASSOC_IE_MAX];
     struct vwifi_assoc_result *r = (struct vwifi_assoc_result *)payload;
+    uint16_t req_len = d->conn.sent_ie_len;
 
     if (ie_len > VWIFI_ASSOC_IE_MAX) ie_len = VWIFI_ASSOC_IE_MAX;
+    if (req_len > VWIFI_ASSOC_IE_MAX) req_len = VWIFI_ASSOC_IE_MAX;
 
     memset(r, 0, sizeof(*r));
     memcpy(r->bssid, d->conn.bssid, 6);
     r->status_code = status_code;
     r->aid         = d->conn.aid;
     r->ie_len      = ie_len;
+    r->req_ie_len  = req_len;
     if (ie_len && resp_ies) {
         memcpy(payload + sizeof(*r), resp_ies, ie_len);
     }
+    /* Our own request IEs after the AP's, so a reader that knows only
+     * about ie_len reads exactly what it always did. */
+    if (req_len) {
+        memcpy(payload + sizeof(*r) + ie_len, d->conn.sent_ies, req_len);
+    }
 
-    VWIFI_TRACE(d, "conn: ASSOC_RESULT status=%u aid=%u ies=%u",
-                status_code, d->conn.aid, ie_len);
+    VWIFI_TRACE(d, "conn: ASSOC_RESULT status=%u aid=%u resp ies=%u "
+                   "req ies=%u",
+                status_code, d->conn.aid, ie_len, req_len);
     vwifi_post_event(d, VWIFI_EV_ASSOC_RESULT, payload,
-                     sizeof(*r) + ie_len);
+                     sizeof(*r) + ie_len + req_len);
 }
 
 static void conn_fail(struct vwifi_dev *d, uint16_t status_code)

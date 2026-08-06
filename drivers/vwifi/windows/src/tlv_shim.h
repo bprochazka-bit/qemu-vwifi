@@ -187,6 +187,8 @@ NDIS_STATUS VwifiTlvGenerateAssociationResult(
     _In_ const struct vwifi_assoc_result *Result,
     _In_ const VWIFI_ASSOC_PARAMS *Params,
     _In_reads_bytes_opt_(Result->ie_len) const UCHAR *Ies,
+    _In_reads_bytes_opt_(ReqIeLen) const UCHAR *ReqIes,
+    _In_ ULONG ReqIeLen,
     _Outptr_result_bytebuffer_(*BufferLen) VOID **Buffer,
     _Out_ PULONG BufferLen);
 

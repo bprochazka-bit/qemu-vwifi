@@ -511,8 +511,21 @@ struct vwifi_assoc_result {
     uint16_t status_code;           /* 0 = success, 802.11 status code otherwise */
     uint16_t aid;
     uint16_t ie_len;                /* assoc response IEs */
-    uint16_t _reserved1;
-    /* followed by ie_len bytes of AP's assoc response IEs */
+    /* IEs of the association REQUEST this station sent.
+     *
+     * The four-way handshake is authenticated over the two RSN elements
+     * that were exchanged, so a supplicant needs the one the station
+     * sent as well as the one the AP answered with. The device builds
+     * the station's RSN element itself -- WDI never supplies one -- so
+     * without this the OS has no way to know what it associated with.
+     *
+     * This was _reserved1, and takes its place rather than extending
+     * the structure: the size is unchanged, every existing field stays
+     * where it was, and a reader that does not know about this simply
+     * reads ie_len bytes and stops, as it always did. */
+    uint16_t req_ie_len;
+    /* followed by ie_len bytes of the AP's assoc response IEs,
+     * then req_ie_len bytes of our own assoc request IEs */
 } VWIFI_PACKED;
 
 struct vwifi_disconnect_ev {

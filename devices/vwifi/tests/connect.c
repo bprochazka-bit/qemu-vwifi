@@ -728,8 +728,40 @@ int main(void)
             assert(rsnie[19] == 2);
             assert(le16(rsnie + 20) == 0);
         }
+        /* And the request IEs come back with the association result,
+         * RSN included. Without them the OS has never seen the element
+         * this station associated with and cannot run the handshake. */
+        arm_all_rsp_slots();
+        aplen = build_assoc_resp(apbuf, 0, 9);
+        medium_rx(apbuf, aplen, 2437, AP_MAC);
+        {
+            struct vwifi_ctrl_rsp_desc *e = find_event(VWIFI_EV_ASSOC_RESULT);
+            struct vwifi_assoc_result *ar;
+            const uint8_t *req;
+            const uint8_t *rsnie = NULL;
+            uint16_t off = 0;
+
+            assert(e != NULL);
+            ar = (struct vwifi_assoc_result *)event_payload(e);
+            assert(ar->status_code == 0);
+            assert(ar->req_ie_len > 0);
+
+            req = (const uint8_t *)ar + sizeof(*ar) + ar->ie_len;
+            while (off + 2 <= ar->req_ie_len &&
+                   off + 2 + req[off + 1] <= ar->req_ie_len) {
+                if (req[off] == 48) { rsnie = req + off; break; }
+                off += 2 + req[off + 1];
+            }
+            assert(rsnie != NULL);
+            assert(rsnie[1] == 20);
+            assert(rsnie[7] == 4);      /* group CCMP */
+            assert(rsnie[13] == 4);     /* pairwise CCMP */
+            assert(rsnie[19] == 2);     /* AKM PSK */
+        }
+
         assert(ctrl_send(VWIFI_OP_DISCONNECT, NULL, 0) == 0);
         printf("  WPA2 connect emits RSN (CCMP/PSK) + Privacy: PASS\n");
+        printf("  ASSOC_RESULT carries the request IEs incl. RSN: PASS\n");
     }
 
     printf("connect: PASS\n");
