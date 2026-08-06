@@ -335,8 +335,8 @@ struct vwifi_conn {
      * driver-supplied vendor elements. Reported back with the
      * association result because a supplicant cannot run a four-way
      * handshake without knowing which RSN element was exchanged. */
-    uint8_t  sent_ies[VWIFI_ASSOC_IE_MAX];
-    uint16_t sent_ie_len;
+    uint8_t  sent_frame[VWIFI_ASSOC_IE_MAX];
+    uint16_t sent_frame_len;
 };
 
 struct vwifi_dev {
@@ -1892,17 +1892,22 @@ static void conn_send_assoc_req(struct vwifi_dev *d)
         len += d->conn.req_ie_len;
     }
 
-    /* Keep what went out. The IEs start after the mgmt header and the
-     * four fixed bytes (capability info, listen interval). */
+    /* Keep what went out -- the whole frame, header and fixed fields
+     * included, not just the IE block.
+     *
+     * WDI has both WDI_TLV_ASSOCIATION_REQUEST_FRAME and
+     * WDI_TLV_ASSOCIATION_REQUEST_IES, so the distinction is deliberate
+     * and the driver reports this one as the frame. Sending an IE block
+     * in the frame's place made Windows reject the association in
+     * thirty-three milliseconds rather than wait for a handshake. */
     {
-        uint16_t ie_off = IEEE80211_MGMT_HDR_LEN + 4;
-        uint16_t ie_len = (len > ie_off) ? (uint16_t)(len - ie_off) : 0;
+        uint16_t keep = len;
 
-        if (ie_len > sizeof(d->conn.sent_ies)) {
-            ie_len = (uint16_t)sizeof(d->conn.sent_ies);
+        if (keep > sizeof(d->conn.sent_frame)) {
+            keep = (uint16_t)sizeof(d->conn.sent_frame);
         }
-        memcpy(d->conn.sent_ies, frame + ie_off, ie_len);
-        d->conn.sent_ie_len = ie_len;
+        memcpy(d->conn.sent_frame, frame, keep);
+        d->conn.sent_frame_len = keep;
     }
 
     VWIFI_TRACE(d, "conn: -> Assoc Request (ssid='%s', %u RSN bytes "
@@ -1934,7 +1939,7 @@ static void conn_emit_assoc_result(struct vwifi_dev *d, uint16_t status_code,
     uint8_t payload[sizeof(struct vwifi_assoc_result) +
                     2 * VWIFI_ASSOC_IE_MAX];
     struct vwifi_assoc_result *r = (struct vwifi_assoc_result *)payload;
-    uint16_t req_len = d->conn.sent_ie_len;
+    uint16_t req_len = d->conn.sent_frame_len;
 
     if (ie_len > VWIFI_ASSOC_IE_MAX) ie_len = VWIFI_ASSOC_IE_MAX;
     if (req_len > VWIFI_ASSOC_IE_MAX) req_len = VWIFI_ASSOC_IE_MAX;
@@ -1951,7 +1956,7 @@ static void conn_emit_assoc_result(struct vwifi_dev *d, uint16_t status_code,
     /* Our own request IEs after the AP's, so a reader that knows only
      * about ie_len reads exactly what it always did. */
     if (req_len) {
-        memcpy(payload + sizeof(*r) + ie_len, d->conn.sent_ies, req_len);
+        memcpy(payload + sizeof(*r) + ie_len, d->conn.sent_frame, req_len);
     }
 
     VWIFI_TRACE(d, "conn: ASSOC_RESULT status=%u aid=%u resp ies=%u "
@@ -2004,8 +2009,7 @@ static void conn_rx_assoc_resp(struct vwifi_dev *d,
                                const uint8_t *frame, uint16_t frame_len)
 {
     const uint8_t *body = frame + IEEE80211_MGMT_HDR_LEN;
-    uint16_t status, aid, ie_len;
-    const uint8_t *ies;
+    uint16_t status, aid;
 
     if (d->conn.state != VWIFI_CONN_ASSOC_SENT) return;
     if (frame_len < IEEE80211_MGMT_HDR_LEN + 6) return;
@@ -2014,8 +2018,7 @@ static void conn_rx_assoc_resp(struct vwifi_dev *d,
     /* Assoc Response body: capability (2), status (2), AID (2), IEs. */
     status = get_le16(body + 2);
     aid    = get_le16(body + 4) & 0x3FFF;   /* top two bits are reserved */
-    ies    = body + 6;
-    ie_len = (uint16_t)(frame_len - IEEE80211_MGMT_HDR_LEN - 6);
+
 
     timer_clear(d, &d->timers.conn_us);
 
@@ -2030,7 +2033,12 @@ static void conn_rx_assoc_resp(struct vwifi_dev *d,
     d->conn.state = VWIFI_CONN_ASSOCIATED;
 
     VWIFI_TRACE(d, "conn: ASSOCIATED aid=%u", aid);
-    conn_emit_assoc_result(d, IEEE80211_STATUS_SUCCESS, ies, ie_len);
+    /* The whole response frame, for the same reason as the request:
+     * the driver reports it as ASSOCIATION_RESPONSE_FRAME, and WDI has
+     * a separate TLV for bare IEs. This has always sent the IE block,
+     * which no path exercised until WPA2 needed the OS to read the
+     * exchange back. */
+    conn_emit_assoc_result(d, IEEE80211_STATUS_SUCCESS, frame, frame_len);
 }
 
 /* Handle a Deauth/Disassoc from the AP. */

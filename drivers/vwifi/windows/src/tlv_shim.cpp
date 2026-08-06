@@ -725,8 +725,13 @@ VwifiTlvGenerateAssociationResult(
     entry.ActivePhyTypeList.ElementCount = nActivePhys;
     entry.ActivePhyTypeList.pElements    = activePhys;
 
-    /* The AP's association-response frame, verbatim. The OS reads the
-     * negotiated cipher suite out of its IEs, so it has to be real. */
+    /* The AP's association-response frame, verbatim -- and verbatim now
+     * means the frame, which it did not before. This carried the bare
+     * IE block for most of the project's life. Nothing exercised the
+     * difference until WPA2 needed the OS to read the exchange back:
+     * WDI has WDI_TLV_ASSOCIATION_RESPONSE_FRAME and
+     * WDI_TLV_ASSOCIATION_RESPONSE_IES as separate elements, so the
+     * frame slot wants a frame. */
     if (Ies != nullptr && Result->ie_len > 0) {
         entry.AssociationResponseFrame.ElementCount = Result->ie_len;
         entry.AssociationResponseFrame.pElements = const_cast<UINT8 *>(Ies);
@@ -745,8 +750,13 @@ VwifiTlvGenerateAssociationResult(
      * RSN element this station actually associated with, and could not
      * begin a handshake it has no key data for.
      *
-     * Which is exactly what the trace shows: EAPOL-Key message 1
-     * arrives, reaches the component, and message 2 is never sent. */
+     * Which is exactly what the trace showed: EAPOL-Key message 1
+     * arrives, reaches the component, and message 2 is never sent.
+     *
+     * A frame, like its counterpart above. Reporting the IE block here
+     * instead made Windows reject the association outright, in
+     * thirty-three milliseconds rather than the second and a half it
+     * had previously spent waiting for a handshake. */
     if (ReqIes != nullptr && ReqIeLen > 0) {
         entry.AssociationRequestFrame.ElementCount = ReqIeLen;
         entry.AssociationRequestFrame.pElements = const_cast<UINT8 *>(ReqIes);

@@ -510,8 +510,15 @@ struct vwifi_assoc_result {
     uint8_t  _reserved0[2];
     uint16_t status_code;           /* 0 = success, 802.11 status code otherwise */
     uint16_t aid;
-    uint16_t ie_len;                /* assoc response IEs */
-    /* IEs of the association REQUEST this station sent.
+    uint16_t ie_len;                /* assoc response FRAME, whole */
+    /* The association REQUEST frame this station sent, whole.
+     *
+     * Frames, not IE blocks, on both of these. WDI defines
+     * WDI_TLV_ASSOCIATION_REQUEST_FRAME and
+     * WDI_TLV_ASSOCIATION_REQUEST_IES separately, and the driver
+     * reports these as the frames; handing an IE block to the frame TLV
+     * made Windows reject an otherwise perfect association in
+     * thirty-three milliseconds.
      *
      * The four-way handshake is authenticated over the two RSN elements
      * that were exchanged, so a supplicant needs the one the station
@@ -524,8 +531,8 @@ struct vwifi_assoc_result {
      * where it was, and a reader that does not know about this simply
      * reads ie_len bytes and stops, as it always did. */
     uint16_t req_ie_len;
-    /* followed by ie_len bytes of the AP's assoc response IEs,
-     * then req_ie_len bytes of our own assoc request IEs */
+    /* followed by ie_len bytes of the AP's assoc response frame,
+     * then req_ie_len bytes of our own assoc request frame */
 } VWIFI_PACKED;
 
 struct vwifi_disconnect_ev {

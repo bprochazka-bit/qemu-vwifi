@@ -405,11 +405,19 @@ int main(void)
         assert(memcmp(ar->bssid, AP_MAC, 6) == 0);
         assert(ar->status_code == 0);
         assert(ar->aid == 7);              /* top two bits masked off */
-        assert(ar->ie_len == 6);           /* the rates IE */
-        const uint8_t *ies = (const uint8_t *)ar + sizeof(*ar);
-        assert(ies[0] == 1 && ies[1] == 4);
+        /* The whole response frame, not the IE block: WDI reports it as
+         * ASSOCIATION_RESPONSE_FRAME and keeps a separate TLV for bare
+         * IEs. Header (24) + capability/status/AID (6) + the rates IE. */
+        assert(ar->ie_len == aplen);
+        const uint8_t *rsp = (const uint8_t *)ar + sizeof(*ar);
+        assert(((rsp[0] >> 4) & 0xF) == 1);          /* Assoc Response */
+        assert(memcmp(rsp + 10, AP_MAC, 6) == 0);    /* addr2 = the AP */
+        {
+            const uint8_t *ies = rsp + 24 + 6;
+            assert(ies[0] == 1 && ies[1] == 4);      /* rates, where it was */
+        }
     }
-    printf("  Assoc Response -> ASSOC_RESULT aid=7 + response IEs: PASS\n");
+    printf("  Assoc Response -> ASSOC_RESULT aid=7 + response frame: PASS\n");
 
     /* ---- 4. TX: 802.3 in, 802.11 out ---- */
     uint8_t eth[64];
@@ -746,7 +754,11 @@ int main(void)
             assert(ar->status_code == 0);
             assert(ar->req_ie_len > 0);
 
+            /* A whole Association Request frame: header (24) plus
+             * capability and listen interval (4) before the IEs. */
             req = (const uint8_t *)ar + sizeof(*ar) + ar->ie_len;
+            assert(((req[0] >> 4) & 0xF) == 0);      /* Assoc Request */
+            off = 24 + 4;
             while (off + 2 <= ar->req_ie_len &&
                    off + 2 + req[off + 1] <= ar->req_ie_len) {
                 if (req[off] == 48) { rsnie = req + off; break; }
