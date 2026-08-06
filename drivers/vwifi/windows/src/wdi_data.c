@@ -279,6 +279,29 @@ VwifiTalTxPump(_Inout_ PVWIFI_ADAPTER Adapter,
         return;
     }
 
+    /* One pump at a time, per adapter.
+     *
+     * Everything below re-enters the component, and the component is
+     * entitled to call TxDataSend, TxTalSend or TxPeerBacklog back from
+     * inside those calls -- the trace shows a TxPeerBacklog arriving
+     * between one pump's first and last log line, at the same
+     * timestamp, so it came from inside this function. Each such
+     * re-entry was another pump frame on a 24 KB kernel stack with
+     * nothing bounding the depth, and a captured hang has CR2 pointing
+     * into the stack region (a guard-page fault) with both processors
+     * in ntoskrnl at IRQL 15 (KeBugCheckEx, other CPU halted by IPI).
+     *
+     * Nothing is lost by deferring: the loop below asks the component
+     * what it has rather than being told what to send, so the running
+     * pump picks up whatever the re-entrant call wanted. */
+    if (InterlockedCompareExchange(&Adapter->TxPumpActive, 1, 0) != 0) {
+        InterlockedExchange(&Adapter->TxPumpAgain, 1);
+        VWIFI_TAL_FIRST(4, "TAL tx: pump re-entered for port %u peer %u -- "
+                           "deferring to the one already running",
+                        PortId, PeerId);
+        return;
+    }
+
     for (;;) {
         PNET_BUFFER_LIST chain = NULL;
         WDI_FRAME_ID     frameIds[VWIFI_TAL_DEQUEUE_MAXFRAMES];
@@ -391,6 +414,19 @@ VwifiTalTxPump(_Inout_ PVWIFI_ADAPTER Adapter,
             VWIFI_WARN("TAL tx: 16 dequeue rounds in one pump -- yielding");
             break;
         }
+    }
+
+    /* Anything that arrived while this pump was running is answered by
+     * going round once more, on this stack frame rather than a deeper
+     * one. Cleared before the re-check so a notification racing the
+     * release is not lost: worst case the loop runs once with nothing
+     * to send, which is a logged no-op. */
+    InterlockedExchange(&Adapter->TxPumpActive, 0);
+    if (InterlockedExchange(&Adapter->TxPumpAgain, 0) != 0) {
+        VWIFI_TAL_FIRST(4, "TAL tx: pump was re-entered while running -- "
+                           "going round again for port %u peer %u",
+                        PortId, PeerId);
+        VwifiTalTxPump(Adapter, PortId, PeerId, ExTidBitmask);
     }
 }
 

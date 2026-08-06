@@ -426,6 +426,34 @@ typedef struct _VWIFI_ADAPTER
      * announced until the resume arrives. */
     volatile LONG       RxPaused;
 
+    /* Re-entrancy guard for the TX pump, and a note that it was needed
+     * while it was running.
+     *
+     * Three TAL handlers -- TxDataSend, TxTalSend, TxPeerBacklog -- all
+     * call VwifiTalTxPump, and the pump re-enters the component through
+     * TxDequeueIndication, TxReleaseFrameIndication,
+     * TxTransferCompleteIndication and TxSendCompleteIndication. The
+     * component is entitled to call those handlers back from inside any
+     * of them, and the trace shows it doing exactly that: a
+     * TxPeerBacklog arrives between a pump's first log line and its
+     * last, at the same timestamp, so the notification came from inside
+     * the pump.
+     *
+     * Nothing bounded that. Each re-entry is another pump frame on the
+     * kernel stack, and a kernel stack is 24 KB. A guest hang was
+     * caught with gdb showing CR2 pointing into the stack region -- a
+     * guard-page fault, which is stack overflow -- and both processors
+     * inside ntoskrnl at IRQL 15, which is KeBugCheckEx running with
+     * the other CPU halted by IPI. That is the hang: not a livelock, a
+     * bugcheck that never reached the screen.
+     *
+     * Deferring rather than recursing loses nothing. The running pump
+     * loops again and takes whatever the re-entrant call was going to
+     * ask for, because the component is asked what it has rather than
+     * told what to send. */
+    volatile LONG       TxPumpActive;
+    volatile LONG       TxPumpAgain;
+
     /* The periodic heartbeat: a timer this driver owns, and the count
      * of beats it has printed. See VwifiHeartbeatStart in driver.c for
      * why the beat is not driven by MiniportCheckForHangEx. */
