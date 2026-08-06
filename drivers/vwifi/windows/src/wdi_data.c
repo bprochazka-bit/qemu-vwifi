@@ -199,6 +199,44 @@ VwifiTalTxOneNbl(_Inout_ PVWIFI_ADAPTER Adapter, _In_ PNET_BUFFER_LIST Nbl)
                               "-- shape unknown");
         }
 
+        /* The request side of the same exchange.
+         *
+         * Printed so the two transaction ids can be put next to each
+         * other without a packet capture: an offer whose xid does not
+         * match the discover that asked for it is a frame the stack is
+         * right to drop, and that is indistinguishable from every other
+         * failure at the level of "DHCP does not complete".
+         *
+         * This one is an MPDU, so the offsets are the 802.11 header
+         * (24, plus 2 if QoS), then LLC/SNAP (8), then IP (20) and UDP
+         * (8) before BOOTP starts. */
+        if (flat != NULL) {
+            ULONG hdr = 24;
+
+            if ((flat[0] >> 4) & 0x08) hdr += 2;   /* QoS control */
+            {
+                ULONG ip = hdr + 8;
+                ULONG udp = ip + 20;
+                ULONG bootp = udp + 8;
+
+                if (len >= bootp + 44 &&
+                    flat[hdr + 6] == 0x08 && flat[hdr + 7] == 0x00 &&
+                    flat[ip + 9] == 17 &&
+                    ((flat[udp] << 8) | flat[udp + 1]) == 68 &&
+                    ((flat[udp + 2] << 8) | flat[udp + 3]) == 67) {
+                    VWIFI_TAL_FIRST(3,
+                        "TAL tx:   DHCP op %u xid %02x%02x%02x%02x "
+                        "flags %02x%02x chaddr %02x:%02x:%02x:%02x:%02x:%02x",
+                        flat[bootp],
+                        flat[bootp + 4], flat[bootp + 5],
+                        flat[bootp + 6], flat[bootp + 7],
+                        flat[bootp + 10], flat[bootp + 11],
+                        flat[bootp + 28], flat[bootp + 29], flat[bootp + 30],
+                        flat[bootp + 31], flat[bootp + 32], flat[bootp + 33]);
+                }
+            }
+        }
+
         /* VWIFI_TX_F_80211: what the component hands down is a
          * complete MPDU, header and all -- confirmed off the wire by
          * the dump above. The device must not encapsulate it again. */
@@ -523,6 +561,38 @@ VwifiTalRxIndicate(_Inout_ PVWIFI_ADAPTER Adapter,
         VWIFI_WARN("TAL rx: frame metadata allocation failed -- dropping");
         VwifiTalRxReturn(Adapter, Nbl);
         return;
+    }
+
+    /* What the component handed back, before we write a single field.
+     *
+     * This driver fills in exactly two members of the structure below
+     * and leaves the rest at whatever the allocator left there. That is
+     * fine if the allocator zeroes it and not fine at all if it does
+     * not: the RX metadata carries the frame's encryption and exemption
+     * state, and residue that claims a frame arrived protected is a
+     * frame the 802.11 layer discards above us -- on an open network,
+     * silently, after answering SUCCESS to the indication. Which is
+     * precisely the shape of the problem still outstanding.
+     *
+     * Raw bytes rather than named fields, because naming them would be
+     * asserting a layout this driver has never verified. Once. */
+    {
+        const UCHAR *raw = (const UCHAR *)md;
+
+        VWIFI_TAL_ONCE("TAL rx: fresh frame metadata at %p reads "
+                       "%02x %02x %02x %02x %02x %02x %02x %02x "
+                       "%02x %02x %02x %02x %02x %02x %02x %02x "
+                       "%02x %02x %02x %02x %02x %02x %02x %02x "
+                       "%02x %02x %02x %02x %02x %02x %02x %02x",
+                       md,
+                       raw[0],  raw[1],  raw[2],  raw[3],
+                       raw[4],  raw[5],  raw[6],  raw[7],
+                       raw[8],  raw[9],  raw[10], raw[11],
+                       raw[12], raw[13], raw[14], raw[15],
+                       raw[16], raw[17], raw[18], raw[19],
+                       raw[20], raw[21], raw[22], raw[23],
+                       raw[24], raw[25], raw[26], raw[27],
+                       raw[28], raw[29], raw[30], raw[31]);
     }
 
     md->pNBL = Nbl;

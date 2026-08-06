@@ -177,9 +177,41 @@ VwifiRxDrainSta(_Inout_ PVWIFI_ADAPTER Adapter)
                  * the DHCP offer this link keeps not getting. */
                 if (frame_va[12] == 0x08 && frame_va[13] == 0x00 &&
                     frame_va[23] == 17 && d->frame_len >= 38) {
-                    VWIFI_TAL_FIRST(4, "rx(sta):   UDP %u -> %u",
-                                    (ULONG)((frame_va[34] << 8) | frame_va[35]),
-                                    (ULONG)((frame_va[36] << 8) | frame_va[37]));
+                    ULONG sport = (ULONG)((frame_va[34] << 8) | frame_va[35]);
+                    ULONG dport = (ULONG)((frame_va[36] << 8) | frame_va[37]);
+
+                    VWIFI_TAL_FIRST(4, "rx(sta):   UDP %u -> %u", sport, dport);
+
+                    /* The offer, in full, on its own counter.
+                     *
+                     * Everything above this line now works: the frame is
+                     * in the ring, the component takes it, returns it,
+                     * and answers SUCCESS. Windows still does not
+                     * complete DHCP, so the remaining questions are
+                     * about the contents of this frame and nothing else
+                     * -- is the offer addressed to this station, does
+                     * its transaction id match what this station asked,
+                     * and is the hardware address in the payload ours.
+                     *
+                     * Any one of those being wrong is a frame Windows is
+                     * correct to ignore, and none of them are visible in
+                     * "UDP 67 -> 68". BOOTP sits at 42: op at +0, xid at
+                     * +4, flags at +10, yiaddr at +16, chaddr at +28. */
+                    if (sport == 67 && dport == 68 && d->frame_len >= 86) {
+                        VWIFI_TAL_FIRST(3,
+                            "rx(sta):   DHCP op %u xid %02x%02x%02x%02x "
+                            "flags %02x%02x yiaddr %u.%u.%u.%u "
+                            "chaddr %02x:%02x:%02x:%02x:%02x:%02x "
+                            "-> eth dst %02x:%02x:%02x:%02x:%02x:%02x",
+                            frame_va[42],
+                            frame_va[46], frame_va[47], frame_va[48], frame_va[49],
+                            frame_va[52], frame_va[53],
+                            frame_va[58], frame_va[59], frame_va[60], frame_va[61],
+                            frame_va[70], frame_va[71], frame_va[72],
+                            frame_va[73], frame_va[74], frame_va[75],
+                            frame_va[0], frame_va[1], frame_va[2],
+                            frame_va[3], frame_va[4], frame_va[5]);
+                    }
                 }
             }
 
