@@ -314,34 +314,95 @@ class PcapWriter:
             self.f.close()
 
 
+def usage(stream=sys.stdout):
+    """The tool's own description of itself.
+
+    A function, and reachable from -h, because it was neither: the text
+    only appeared when the script was run with no arguments at all, so
+    `vwifi_dump.py -h` took "-h" for the socket path and died in
+    connect() with a traceback. A tool that answers the standard
+    question with a stack trace is one people stop asking.
+    """
+    prog = sys.argv[0]
+    print(f"Usage: {prog} <socket_path> [options]", file=stream)
+    print(file=stream)
+    print("Attach to the vwifi medium hub as a silent peer and capture",
+          file=stream)
+    print("every frame on every channel. Prints a decoded one-line summary",
+          file=stream)
+    print("per frame, and optionally writes a Wireshark-readable pcap.",
+          file=stream)
+    print(file=stream)
+    print("Options:", file=stream)
+    print("  -v              Verbose (hex dump of each frame)", file=stream)
+    print("  -w <file.pcap>  Write captured frames to pcap file", file=stream)
+    print("                  (with radiotap headers for Wireshark)",
+          file=stream)
+    print("  -w -            Write the pcap to stdout, for piping:",
+          file=stream)
+    print("                    ... -w - | wireshark -k -i -", file=stream)
+    print("  -h, --help      Show this help and exit", file=stream)
+    print(file=stream)
+    print("Examples:", file=stream)
+    print(f"  {prog} /tmp/vwifi.sock", file=stream)
+    print(f"  {prog} /tmp/vwifi.sock -v", file=stream)
+    print(f"  {prog} /tmp/vwifi.sock -w capture.pcap", file=stream)
+    print(f"  {prog} /tmp/vwifi.sock -w capture.pcap -v", file=stream)
+    print(f"  {prog} /tmp/vwifi.sock -w - | wireshark -k -i -", file=stream)
+
+
+def die(msg):
+    """Refuse with a reason and the usage, rather than a traceback."""
+    print(f"{sys.argv[0]}: {msg}\n", file=sys.stderr)
+    usage(sys.stderr)
+    sys.exit(1)
+
+
 def main():
-    if len(sys.argv) < 2:
-        print(f"Usage: {sys.argv[0]} <socket_path> [options]")
-        print()
-        print("Options:")
-        print("  -v              Verbose (hex dump of each frame)")
-        print("  -w <file.pcap>  Write captured frames to pcap file")
-        print("                  (with radiotap headers for Wireshark)")
-        print("  -w -            Write the pcap to stdout, for piping:")
-        print("                    ... -w - | wireshark -k -i -")
-        print()
-        print("Examples:")
-        print(f"  {sys.argv[0]} /tmp/vwifi.sock")
-        print(f"  {sys.argv[0]} /tmp/vwifi.sock -v")
-        print(f"  {sys.argv[0]} /tmp/vwifi.sock -w capture.pcap")
-        print(f"  {sys.argv[0]} /tmp/vwifi.sock -w capture.pcap -v")
+    args = sys.argv[1:]
+
+    # Checked before anything else, so -h works with or without a socket
+    # path and never has to reach the connect.
+    if "-h" in args or "--help" in args:
+        usage()
+        sys.exit(0)
+
+    if not args:
+        usage(sys.stderr)
         sys.exit(1)
 
-    sock_path = sys.argv[1]
-    verbose = "-v" in sys.argv
+    sock_path = None
+    verbose = False
     pcap_file = None
     pcap_writer = None
 
-    # Parse -w argument
-    for i, arg in enumerate(sys.argv):
-        if arg == "-w" and i + 1 < len(sys.argv):
-            pcap_file = sys.argv[i + 1]
-            break
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "-v":
+            verbose = True
+        elif arg == "-w":
+            if i + 1 >= len(args):
+                die("-w needs a file path ('-' for stdout)")
+            pcap_file = args[i + 1]
+            # "-" is the documented stdout form; anything else starting
+            # with a dash is much more likely a forgotten argument than
+            # a file someone meant to create, and silently capturing
+            # into a file called "-v" is the kind of thing that is only
+            # noticed after the run that mattered.
+            if pcap_file != "-" and pcap_file.startswith("-"):
+                die(f"-w wants a file path, got the option '{pcap_file}'")
+            i += 1
+        elif arg.startswith("-") and arg != "-":
+            die(f"unknown option '{arg}'")
+        elif sock_path is None:
+            sock_path = arg
+        else:
+            die(f"unexpected extra argument '{arg}'")
+        i += 1
+
+    if sock_path is None:
+        die("no socket path given")
 
     # With the pcap on stdout, every human-readable line has to go to
     # stderr instead or it lands in the middle of the capture file.
@@ -353,7 +414,14 @@ def main():
         sys.stdout = sys.stderr
 
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    sock.connect(sock_path)
+    try:
+        sock.connect(sock_path)
+    except OSError as e:
+        # The most common way to run this wrong is with the hub not
+        # started, or with the wrong socket path, and a traceback says
+        # neither of those things.
+        die(f"cannot connect to {sock_path}: {e.strerror}\n"
+            f"       (is the hub running? check the path it was given)")
     print(f"Connected to {sock_path}")
     if pcap_file:
         pcap_writer = PcapWriter(pcap_file, pcap_stream)
