@@ -994,8 +994,21 @@ VwifiHandleTaskScan(_Inout_ PVWIFI_ADAPTER Adapter,
     status = VwifiCtrlSendSync(Adapter, VWIFI_OP_SCAN,
                                scanReq, reqLen, NULL, &outLen);
     if (status != NDIS_STATUS_SUCCESS) {
-        BOOLEAN connecting = (VwifiConnectTaskState(Adapter) &
-                              VWIFI_TASK_CONNECT_PENDING) ? TRUE : FALSE;
+        /* Two reasons the device refuses a sweep, and both of them are
+         * "not now", not "no".
+         *
+         * CONNECT_PENDING is the auth/assoc exchange. HandshakePending
+         * is the 4-way handshake that follows it -- and that one is NOT
+         * covered by the first, because CONNECT_COMPLETE is indicated
+         * at association, before a single EAPOL frame moves. Keying the
+         * deferral on the connect task alone was measured doing exactly
+         * the damage the deferral exists to prevent: the device refused
+         * the scan 0 ms after CONNECT_COMPLETE, this branch read the
+         * connect as finished, failed the OID with 0xc0000001, and
+         * wlansvc tore the association down 15 ms later. */
+        BOOLEAN connecting = ((VwifiConnectTaskState(Adapter) &
+                               VWIFI_TASK_CONNECT_PENDING) != 0 ||
+                              Adapter->HandshakePending) ? TRUE : FALSE;
 
         if (!connecting) {
             /* Rejected before the scan ever started, so no SCAN_COMPLETE

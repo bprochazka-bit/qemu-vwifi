@@ -799,6 +799,26 @@ VwifiTalRxAnnounceHeld(_Inout_ PVWIFI_ADAPTER Adapter, _In_z_ PCSTR Why)
         VWIFI_WARN("TAL rx: announcing held frames returned 0x%08x %s",
                    status, VwifiNdisStatusName(status));
     }
+
+    /* The same latch VwifiTalRxIndicate sets, for the same reason, and
+     * its absence here was costing the frame outright.
+     *
+     * Measured: the peer-config announcement handed over EAPOL M1, the
+     * component took it through RxGetMpdus and answered PAUSED, and
+     * because only the other indication path latched, RxPaused was
+     * still 0 when the component handed the frame back 15 ms later.
+     * VwifiTalRxReturnOrRequeue read that as "not paused", freed the
+     * NBL and re-armed the ring slot -- so the RxResume that arrived in
+     * the same millisecond found an empty queue and announced nothing.
+     * The heartbeat's "rx ind ok 0" is that frame: received, indicated,
+     * accepted, returned, discarded.
+     *
+     * The latch is what makes the return path requeue instead. Set
+     * after the call, so the announcement that discovered the pause is
+     * not itself suppressed. */
+    if (status == NDIS_STATUS_PAUSED) {
+        InterlockedExchange(&Adapter->RxPaused, 1);
+    }
 }
 
 /* The component saying it will take frames again. Unconditional: an
