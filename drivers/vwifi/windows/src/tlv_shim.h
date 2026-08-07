@@ -18,7 +18,16 @@
  * on one side, the device contract on the other, nothing leaking
  * across.
  *
- * ============================================================
+ * PeerVersion: every entry point takes it. The caller supplies
+ * Adapter->WdiPeerVersion, captured at init. The library uses it to
+ * emit/consume a byte stream matching whatever WDI version the running
+ * OS has — that's what lets one binary serve Windows 10 (WDI 1.1.9)
+ * and Windows 11.
+ */
+
+#pragma once
+
+/* ============================================================
  * DIAGNOSTIC PROBES
  *
  * At most one of these may be 1, and none of them may ship set.
@@ -51,15 +60,6 @@
 #elif VWIFI_PROBE_PORT_AUTHORIZED
 #  define VWIFI_PROBE_NAME "reporting PortAuthorized=TRUE"
 #endif
-
- * PeerVersion: every entry point takes it. The caller supplies
- * Adapter->WdiPeerVersion, captured at init. The library uses it to
- * emit/consume a byte stream matching whatever WDI version the running
- * OS has — that's what lets one binary serve Windows 10 (WDI 1.1.9)
- * and Windows 11.
- */
-
-#pragma once
 
 #include <ndis.h>
 #include "vwifi_abi.h"
