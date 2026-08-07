@@ -1765,6 +1765,30 @@ the supplicant is running and is never given a frame.
 On the miniport side all four are indicated and all four come back
 `NDIS_STATUS_SUCCESS` from the component (`rx ind ok 4, not-ok 0`).
 
+**The instrument itself has been checked.** Everything above rests on
+one reading — "appears at nwifi's lower edge, never at its upper edge,
+therefore nwifi consumed it" — and that reading was an assumption until
+a frame known to succeed was captured the same way. An ARP request on
+an open BSS, same boot, same component IDs:
+
+```
+Appearance 4: Component 102, Edge 2, Type WiFi     , 60 bytes
+Appearance 5: Component 102, Edge 1, Type Ethernet , 42 bytes
+Appearance 8: Component 109, Edge 1, Type Ethernet , 42 bytes   (tcpip)
+```
+
+Same `PktGroupId` throughout. pktmon does log nwifi's upper edge, as
+the same packet, carrying the converted 802.3 frame. So the missing
+`edge 1` in every WPA2 capture is real and means what it appears to
+mean.
+
+Two things fall out of the same capture: `ndisuio` (103) is correctly
+absent from the ARP path, since it registers only for 802.1X and
+802.11i — which is why it is the expected next hop for EAPOL and never
+reached. And pktmon's third printed address field is confirmed a
+display artifact in both directions: it prints `addr1` as "SA" on
+receive and as "DA" on transmit.
+
 **What has been checked against the authoritative sources rather than
 assumed:**
 
