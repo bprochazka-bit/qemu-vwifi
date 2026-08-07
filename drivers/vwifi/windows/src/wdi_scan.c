@@ -1147,6 +1147,25 @@ VwifiScanReleaseDeferred(_Inout_ PVWIFI_ADAPTER Adapter)
 
     if (!task || !task->Active || !task->DeferredForConnect) return;
 
+    /* Not yet, if a 4-way handshake is still running.
+     *
+     * CONNECT_COMPLETE fires at association, which on a secure BSS is
+     * the START of the handshake, not the end of the connect in any
+     * sense the radio cares about. Releasing here would let the sweep
+     * begin exactly when the EAPOL exchange needs the station to stay
+     * on channel -- which is what was measured: M1 transmitted 60 ms
+     * into a 13-channel sweep and never seen by the station at all.
+     *
+     * VwifiKeysOnInstalled releases it instead, and a disconnect
+     * releases it too, so there is no path where the hold outlives the
+     * thing it is waiting for. */
+    if (Adapter->HandshakePending) {
+        VWIFI_INFO("holding the %u scan task(s) past CONNECT_COMPLETE -- "
+                   "the 4-way handshake still needs the channel",
+                   task->TransactionCount);
+        return;
+    }
+
     VWIFI_INFO("connect finished -- releasing the %u scan task(s) held "
                "behind it", task->TransactionCount);
 

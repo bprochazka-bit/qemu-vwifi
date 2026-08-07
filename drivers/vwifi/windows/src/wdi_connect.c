@@ -529,6 +529,18 @@ VwifiConnectOnAssocResult(_Inout_ PVWIFI_ADAPTER Adapter,
         Adapter->Associated = TRUE;
         RtlCopyMemory(Adapter->Bssid, res->bssid, 6);
 
+        /* On a secure BSS the link is associated but not yet usable:
+         * the 4-way handshake has to run before a key exists. Marked
+         * here so a scan arriving in that window is held rather than
+         * swept -- see VWIFI_ADAPTER::HandshakePending. */
+        Adapter->HandshakePending =
+            (task->AssocParams.AkmSuite != VWIFI_AKM_NONE) ? TRUE : FALSE;
+        if (Adapter->HandshakePending) {
+            VWIFI_INFO("associated on a secure BSS (akm %u) -- holding the "
+                       "radio on channel until the pairwise key arrives",
+                       task->AssocParams.AkmSuite);
+        }
+
         /* The AP is now a peer, and this is the moment to say so.
          *
          * Before CONNECT_COMPLETE, deliberately. The WDI data path is
@@ -548,6 +560,7 @@ VwifiConnectOnAssocResult(_Inout_ PVWIFI_ADAPTER Adapter,
     } else {
         task->Associated = FALSE;
         Adapter->Associated = FALSE;
+        Adapter->HandshakePending = FALSE;
         VwifiIndicateConnectComplete(Adapter, NDIS_STATUS_FAILURE);
     }
 }
@@ -565,6 +578,12 @@ VwifiConnectOnDisconnected(_Inout_ PVWIFI_ADAPTER Adapter,
 
     Adapter->Associated = FALSE;
     RtlZeroMemory(Adapter->Bssid, 6);
+
+    /* No association, no handshake to protect the channel for. Cleared
+     * before the release below so a scan held behind a handshake that
+     * never finished is let go here rather than waiting on a watchdog. */
+    Adapter->HandshakePending = FALSE;
+    VwifiScanReleaseDeferred(Adapter);
 
     /* The peer goes with the association. Indicated before the
      * disassociation and the link-state change for the same reason the

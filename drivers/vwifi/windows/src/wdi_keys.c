@@ -171,9 +171,20 @@ VwifiKeysOnInstalled(_Inout_ PVWIFI_ADAPTER Adapter,
 {
     const struct vwifi_key_id *id = Payload;
 
-    UNREFERENCED_PARAMETER(Adapter);
-
     if (PayloadLen < sizeof(*id)) return;
     VWIFI_INFO("device confirmed %s key idx=%u installed",
                id->pairwise ? "pairwise" : "group", id->key_idx);
+
+    /* The pairwise key is the end of the 4-way handshake, and so the
+     * end of the window in which this station must not leave its
+     * channel. Any scan held for that reason is released here.
+     *
+     * The group key is not the end of anything -- a rekey installs one
+     * mid-association -- so only the pairwise one clears the flag. */
+    if (id->pairwise && Adapter->HandshakePending) {
+        Adapter->HandshakePending = FALSE;
+        VWIFI_INFO("4-way handshake complete -- the radio is free to "
+                   "sweep again");
+        VwifiScanReleaseDeferred(Adapter);
+    }
 }

@@ -425,6 +425,19 @@ typedef struct _VWIFI_ADAPTER
     BOOLEAN             Associated;
     UCHAR               Bssid[6];
 
+    /* Associated on a secure BSS with no pairwise key installed yet --
+     * i.e. the 4-way handshake is in flight.
+     *
+     * Set when an association to a network with an AKM succeeds,
+     * cleared when the device confirms the pairwise key or the link
+     * goes down. Its one job is to keep a scan from sweeping the radio
+     * off channel while the handshake is running: EAPOL that arrives
+     * while the station is three channels away is simply lost, and
+     * losing it looks exactly like a handshake that was never
+     * answered. See the refusal in the device's op_scan and the
+     * release in VwifiScanReleaseDeferred. */
+    BOOLEAN             HandshakePending;
+
     /* WDI peers. See wdi_peer.c.
      *
      * The WDI data path is addressed by (port, peer, TID), never by

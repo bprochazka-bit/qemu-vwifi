@@ -1627,6 +1627,37 @@ static int32_t op_scan(struct vwifi_dev *d, const void *in_buf, uint32_t in_len)
     if (d->conn.state == VWIFI_CONN_AUTH_SENT ||
         d->conn.state == VWIFI_CONN_ASSOC_SENT) return -16;
 
+    /* Nor out from under a 4-way handshake, which is the same kind of
+     * exchange and was not covered by the test above.
+     *
+     * Measured, not assumed. In a WPA2 connect from the Windows guest,
+     * wlansvc issued a scan 0 ms after the connect task; the device
+     * accepted it because the association had already finished, and
+     * swept 13 channels at 100 ms each. On the medium capture the AP's
+     * EAPOL M1 went out 60 ms into that sweep, with the station three
+     * channels away, and the hub's channel filter dropped it. The
+     * retry a second later happened to land in the one moment the
+     * sweep was back on the AP's channel, which is the only reason any
+     * M1 was seen at all. The station deauthenticated 1.6 s later,
+     * having never completed a handshake it was never on channel for.
+     *
+     * "Associated on a secure BSS with no pairwise key" is exactly the
+     * handshake window: the key arrives at the end of it. On an open
+     * network there is no window and this does not apply.
+     *
+     * -EBUSY rather than a silent refusal because the Windows driver
+     * already knows what to do with it -- it holds the scan and
+     * answers it when the connect settles, rather than failing the job
+     * (see the deferral in wdi_scan.c). */
+    if (d->conn.state == VWIFI_CONN_ASSOCIATED &&
+        d->conn.akm_suite != VWIFI_AKM_NONE &&
+        !d->keys.pairwise.valid) {
+        VWIFI_TRACE(d, "scan refused: 4-way handshake in flight "
+                       "(associated, akm 0x%04x, no pairwise key yet)",
+                    d->conn.akm_suite);
+        return -16;
+    }
+
     memset(&d->scan, 0, sizeof(d->scan));
 
     /* Build the channel list from the 2.4 GHz mask. A zero mask means

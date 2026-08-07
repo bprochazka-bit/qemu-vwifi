@@ -1810,6 +1810,36 @@ the device where both drivers benefit:
 - The WPA2 4-way handshake. Association succeeds and EAPOL M1 is
   indicated and accepted, but nothing emerges above the 802.11-to-802.3
   converter and the supplicant never reports a result.
+
+  One cause of this is now identified and fixed, and it was not in the
+  receive path at all. Anchoring a medium capture to the driver log —
+  three points, association, probe response and deauthentication, all
+  agreeing to within 15 ms — shows what actually happened:
+
+  | driver | medium | |
+  |---|---|---|
+  | 327.99 | 13.54 | scan starts sweeping 13 channels at 100 ms each |
+  | 328.05 | 13.60 | AP transmits EAPOL M1 (replay counter 1) — **station is off channel, frame lost** |
+  | 329.05 | 14.60 | AP retries M1 (replay counter 2) — lands in the one moment the sweep is back on channel 11 |
+  | 329.60 | 15.15 | station deauthenticates |
+
+  wlansvc issued `OID_WDI_TASK_SCAN` 0 ms after `OID_WDI_TASK_CONNECT`.
+  The device accepted it, because its only rule was "don't sweep during
+  an auth/assoc exchange" and the association was already over. The
+  4-way handshake is the same kind of exchange and was not covered.
+  The single M1 that ever reached the driver was the retry, and it
+  reached it *during* the sweep — so the converter that dropped it was
+  being handed a frame while the OS believed the radio was elsewhere.
+
+  Fixed by making the device refuse a scan while associated on a secure
+  BSS with no pairwise key yet, and by holding the driver's deferred
+  scan past `CONNECT_COMPLETE` until the key arrives. Whether that is
+  also why the converter dropped the retry is not established.
+
+  Worth recording as a method note: this was invisible in the driver log
+  alone, which showed one EAPOL arriving and being indicated
+  successfully. It took correlating two clocks to see that the
+  interesting frame was the one that never appeared.
 - Airplane mode. `OID_WDI_TASK_SET_RADIO_STATE` is accepted and not
   acted on, so the radio comes back on about 30 seconds after it is
   turned off.
