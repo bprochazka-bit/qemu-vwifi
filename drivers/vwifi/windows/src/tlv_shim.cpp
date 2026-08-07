@@ -681,6 +681,62 @@ VwifiTlvGenerateAssociationResult(
     entry.AssociationResultParameters.BandID = band;
     entry.AssociationResultParameters.DSInfo = WDI_DS_UNKNOWN;
 
+    /* ============================================================
+     * PROBE. This is not a fix and must not ship set to 1.
+     *
+     * What is being tested
+     * --------------------
+     * On an open BSS this driver carries traffic end to end -- DHCP
+     * lease, verified on this build. On a WPA2 BSS the AP's EAPOL-Key
+     * message 1 and all three of its retries are delivered, indicated,
+     * and answered NDIS_STATUS_SUCCESS by the component, then die
+     * inside nwifi.sys: pktmon shows all four at component 62 edge 2
+     * and never at edge 1, so they never reach ndisuio.sys and the
+     * supplicant never sees one.
+     *
+     * Everything the miniport controls has been checked against the
+     * headers and WABIModel.xml and is correct. Four things differ
+     * between the association that works and the one that does not:
+     * AuthAlgorithm, UnicastCipherAlgorithm,
+     * MulticastDataCipherAlgorithm, and PortAuthorized. PortAuthorized
+     * cannot be varied -- TRUE is refused by the OS at association,
+     * measured, disconnect in 28 ms.
+     *
+     * So this varies the ciphers, and only the ciphers. The AKM stays
+     * RSNA_PSK and PortAuthorized stays FALSE, which means the OS is
+     * still told this is a WPA2-PSK association with an unauthorized
+     * port -- the truth -- and only the negotiated data ciphers are
+     * misreported as NONE.
+     *
+     * What each outcome means
+     * -----------------------
+     * EAPOL reaches ndisuio and the supplicant answers with M2:
+     *   nwifi is discarding the frame because it is unprotected on an
+     *   association whose negotiated cipher is CCMP. The real fix is
+     *   then about how an unprotected exempt frame is presented, not
+     *   about the port.
+     *
+     * EAPOL still dies at nwifi:
+     *   the ciphers are irrelevant and the gate is PortAuthorized --
+     *   which the OS will not let this driver open at association.
+     *   That is a much stronger and more useful conclusion than
+     *   another guess, and it is worth one build to reach.
+     *
+     * The association is refused outright:
+     *   the OS cross-checks the reported cipher against the profile.
+     *   Also an answer, also worth knowing, and it costs one run.
+     * ============================================================ */
+#define VWIFI_PROBE_REPORT_CIPHER_NONE 1
+
+#if VWIFI_PROBE_REPORT_CIPHER_NONE
+    if (Params->AkmSuite != VWIFI_AKM_NONE) {
+        entry.AssociationResultParameters.UnicastCipherAlgorithm =
+            WDI_CIPHER_ALGO_NONE;
+        entry.AssociationResultParameters.MulticastDataCipherAlgorithm =
+            WDI_CIPHER_ALGO_NONE;
+    }
+#endif
+
     /* ActivePhyTypeList is MANDATORY here, and leaving it empty is what
      * made every association fail.
      *

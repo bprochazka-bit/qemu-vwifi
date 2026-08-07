@@ -273,6 +273,16 @@ VwifiIndicateAssociationResult(_Inout_ PVWIFI_ADAPTER Adapter,
                VwifiDot11StatusName(Result->status_code),
                Result->aid, Result->ie_len, Result->req_ie_len,
                Params->AkmSuite);
+
+    /* So a trace from a probe build can never be mistaken for a trace
+     * from a real one. See VWIFI_PROBE_REPORT_CIPHER_NONE in
+     * tlv_shim.cpp; this line disappears when the probe is turned off. */
+    if (Params->AkmSuite != VWIFI_AKM_NONE) {
+        VWIFI_WARN("*** PROBE BUILD: reporting the negotiated data ciphers "
+                   "as NONE on a secure BSS. AKM and PortAuthorized are "
+                   "unchanged. This build is a diagnostic, not a fix. ***");
+    }
+
     VwifiSendWdiIndication(Adapter, task->WdiPortId, task->PortId,
                            NDIS_STATUS_WDI_INDICATION_ASSOCIATION_RESULT,
                            NDIS_STATUS_SUCCESS,
