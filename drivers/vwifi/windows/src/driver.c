@@ -507,11 +507,28 @@ VwifiMiniportSendNetBufferLists(
             }
             NET_BUFFER_LIST_STATUS(nbl) = st;
         } else if (adapter->OpMode == VWIFI_MODE_STA && adapter->Associated) {
-            /* STA data path. The device converts 802.3 -> 802.11 using
-             * its association state, so we just hand it the 802.3
-             * frame the WLAN component gave us. */
+            /* STA data path -- which in WDI mode is not supposed to
+             * run at all. wdiwifi.sys owns the send path for station
+             * data: NDIS hands data NBLs to IT, and the miniport takes
+             * them back through NdisWdiTxDequeueIndication (see
+             * wdi_data.c). This handler stays registered and stays
+             * unused.
+             *
+             * It used to pass flags of 0, i.e. "this is 802.3", under a
+             * comment saying the device would encapsulate it. That was
+             * wrong on both counts and only harmless because nothing
+             * reached it: anything arriving here came down through the
+             * WDI stack and is therefore already an MPDU, per the
+             * frame-format contract in vwifi_drv.h.
+             *
+             * Logged once because it firing at all would mean something
+             * about the send path is not what this driver believes. */
             PNET_BUFFER nb = NET_BUFFER_LIST_FIRST_NB(nbl);
             NDIS_STATUS st = NDIS_STATUS_SUCCESS;
+
+            VWIFI_ONCE("send: MiniportSendNetBufferLists took the STA "
+                       "data path -- unexpected in WDI mode; treating "
+                       "the frame as an 802.11 MPDU");
 
             for (; nb; nb = NET_BUFFER_NEXT_NB(nb)) {
                 ULONG len = NET_BUFFER_DATA_LENGTH(nb);
@@ -527,7 +544,8 @@ VwifiMiniportSendNetBufferLists(
                     flat = NdisGetDataBuffer(nb, len, alloc, 1, 0);
                 }
                 if (flat) {
-                    st = VwifiTxDataFrame(adapter, flat, len, 0);
+                    st = VwifiTxDataFrame(adapter, flat, len,
+                                          VWIFI_TX_F_80211);
                 }
                 if (alloc) {
                     NdisFreeMemoryWithTagPriority(

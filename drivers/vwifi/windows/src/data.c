@@ -4,14 +4,20 @@
  *
  * Phase 3: STA-mode data path.
  *
- * The device does the 802.3 <-> 802.11 conversion (it owns the
- * association state, BSSID, and sequence counter), so this file is
- * deliberately thin:
+ * What shape the frames are is stated once, in the frame-format
+ * contract next to the VwifiTxDataFrame declaration in vwifi_drv.h.
+ * It is not restated here. In short: in WDI mode both directions
+ * carry 802.11 MPDUs, because wdiwifi.sys does the 802.3 conversion
+ * above the miniport.
  *
- *   TX: stage the 802.3 frame into a TX slot, publish the descriptor,
- *       ring the doorbell.
- *   RX: the device hands us 802.3 frames with VWIFI_RX_F_RAW clear;
- *       wrap each in an NBL and indicate it up.
+ * This file is deliberately thin:
+ *
+ *   TX: stage the frame into a TX slot, publish the descriptor, ring
+ *       the doorbell. ExtraFlags decides whether the device treats it
+ *       as an MPDU to pass through or as 802.3 to encapsulate.
+ *   RX: the device hands us MPDUs with VWIFI_RX_F_RAW set (it was
+ *       asked for them with VWIFI_CTRL_RX_80211); wrap each in an NBL
+ *       and indicate it up.
  *
  * Monitor-mode RX (raw 802.11, flagged as a capture) lives in
  * monitor.c; the RX DPC routes to one or the other by op mode.
@@ -20,7 +26,7 @@
 #include "vwifi_drv.h"
 
 /* ============================================================
- * TX — stage an 802.3 frame for the device
+ * TX — stage a frame for the device
  * ============================================================ */
 
 NDIS_STATUS
@@ -31,10 +37,18 @@ VwifiTxDataFrame(_Inout_ PVWIFI_ADAPTER Adapter,
 {
     PVWIFI_RING ring = &Adapter->TxRing;
     ULONG slot;
+    ULONG minLen;
     struct vwifi_tx_desc *desc;
     PUCHAR tx_buf;
 
-    if (FrameLen < 14 || FrameLen > VWIFI_RX_BUFFER_SIZE) {
+    /* The minimum length is a property of the shape, not of the ring:
+     * 24 is the shortest 802.11 MPDU header, 14 the shortest 802.3
+     * one. This used to be a flat 14, which on the MPDU path let a
+     * 14-to-23-byte runt reach a device that would then read an
+     * addr3 that was never sent. */
+    minLen = (ExtraFlags & VWIFI_TX_F_80211) ? 24u : 14u;
+
+    if (FrameLen < minLen || FrameLen > VWIFI_RX_BUFFER_SIZE) {
         return NDIS_STATUS_INVALID_LENGTH;
     }
     if (!Adapter->Associated) {
@@ -66,14 +80,16 @@ VwifiTxDataFrame(_Inout_ PVWIFI_ADAPTER Adapter,
 }
 
 /* ============================================================
- * RX — indicate 802.3 frames from the device
+ * RX — indicate received frames from the device
  *
  * Mirrors VwifiRxDrainMonitor's NBL lifetime: the ring slot stays
  * owned by the NBL until VwifiMiniportReturnNetBufferLists reclaims
- * it. The only differences are that there's no
- * frame is not flagged as a raw capture -- both paths attach a
- * DOT11_EXTSTA_RECV_CONTEXT, and since VWIFI_CTRL_RX_80211 both carry
- * 802.11 MPDUs.
+ * it. Since VWIFI_CTRL_RX_80211 the two paths differ less than the
+ * split suggests -- both carry 802.11 MPDUs and both attach a
+ * DOT11_EXTSTA_RECV_CONTEXT; what monitor mode adds is the raw-capture
+ * flag on the indication. (This comment previously said the STA path
+ * indicated 802.3 frames. It did not, and had not for some time -- see
+ * the frame-format contract in vwifi_drv.h.)
  * ============================================================ */
 
 VOID
@@ -163,11 +179,15 @@ VwifiRxDrainSta(_Inout_ PVWIFI_ADAPTER Adapter)
              * The offsets below are computed rather than written out
              * because a QoS data frame carries two more header bytes
              * and getting that wrong silently shifts every field. */
-            if (d->frame_len >= 34) {
+            if (d->frame_len >= 34 && ((frame_va[0] >> 2) & 0x3) == 2) {
                 ULONG hdr = 24;
                 ULONG snap, etype;
 
-                if ((frame_va[0] >> 4) & 0x08) hdr += 2;   /* QoS control */
+                /* Subtype bit 3 (0x80 of frame control byte 0) marks a
+                 * QoS data frame, which carries two extra header bytes.
+                 * Only meaningful once the type is known to be data,
+                 * hence the test above. */
+                if (frame_va[0] & 0x80) hdr += 2;           /* QoS control */
                 snap  = hdr + 8;                            /* LLC/SNAP */
                 etype = hdr + 6;
 
@@ -242,17 +262,18 @@ VwifiRxDrainSta(_Inout_ PVWIFI_ADAPTER Adapter)
 
             VwifiRxNblSetSlot(nbl, idx);
 
-            /* The 802.11 receive context, which this path has never
+            /* The 802.11 receive context, which this path had never
              * attached.
              *
-             * The comment at the top of this file says there is none to
-             * attach "and the payload is 802.3". The second half stopped
-             * being true when VWIFI_CTRL_RX_80211 landed and the first
-             * half was only ever true because of it: this is the OOB
-             * data that describes an 802.11 reception -- PHY, channel,
-             * RSSI, rate, timestamp -- and what crosses this boundary
-             * now is an 802.11 MPDU. Monitor mode has always attached
-             * one; the station path is the odd one out.
+             * The reason it had not was that the file header used to say
+             * there was nothing to attach one to, "and the payload is
+             * 802.3". The second half stopped being true when
+             * VWIFI_CTRL_RX_80211 landed and the first half was only
+             * ever true because of it: this is the OOB data that
+             * describes an 802.11 reception -- PHY, channel, RSSI, rate,
+             * timestamp -- and what crosses this boundary is an 802.11
+             * MPDU. Monitor mode has always attached one; the station
+             * path was the odd one out.
              *
              * Whether it is what the receive path is missing is not
              * established. What is established is that it is

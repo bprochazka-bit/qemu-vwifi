@@ -304,7 +304,13 @@ struct vwifi_rx_desc {
 /* RX descriptor flags */
 #define VWIFI_RX_F_FCS_OK       (1u << 1)
 #define VWIFI_RX_F_DECRYPTED    (1u << 2)  /* device decrypted this frame */
-#define VWIFI_RX_F_RAW          (1u << 3)  /* monitor-mode capture */
+/* The frame above the descriptor is an 802.11 MPDU, not 802.3. Set for
+ * every monitor-mode capture, and — since VWIFI_CTRL_RX_80211 — for STA
+ * data frames too when the driver asked for them unconverted. It says
+ * what SHAPE the bytes are, not which mode produced them; a receiver
+ * that reads it as "this is monitor mode" is reading more into it than
+ * it carries. */
+#define VWIFI_RX_F_RAW          (1u << 3)  /* payload is 802.11, not 802.3 */
 
 /* ================================================================
  * Control opcodes

@@ -268,8 +268,13 @@ struct vwifi_ap {
  *   any failure / timeout          -> IDLE, emit ASSOC_RESULT w/ status
  *
  * Once ASSOCIATED the RX path accepts data frames to/from the BSSID
- * and converts them to 802.3 for the driver; the TX path converts
- * 802.3 from the driver into 802.11 data frames.
+ * and the TX path accepts frames for it. Whether either direction is
+ * converted to or from 802.3 is the driver's choice, not a property
+ * of this state machine: VWIFI_CTRL_RX_80211 asks for MPDUs on
+ * receive, VWIFI_TX_F_80211 declares them on transmit, and the
+ * Windows WDI driver sets both because its stack converts above the
+ * miniport. Without them the device converts, which is what the Linux
+ * driver and the tests use.
  * ============================================================ */
 
 enum vwifi_conn_state {
@@ -779,9 +784,11 @@ static void medium_deliver_rx(struct vwifi_dev *d,
         return;
     }
 
-    /* In STA mode, hand the driver an 802.3 frame; the 802.11 header
-     * and LLC/SNAP are the device's business, not the driver's. In
-     * monitor mode the raw 802.11 frame goes up untouched. */
+    /* In STA mode, hand the driver whichever shape it asked for:
+     * VWIFI_CTRL_RX_80211 means the plaintext MPDU goes up as it
+     * stands, otherwise the 802.11 header and LLC/SNAP are stripped
+     * and it gets 802.3. In monitor mode the raw 802.11 frame goes up
+     * untouched either way. */
     {
         uint8_t eth[VWIFI_MAX_FRAME_SIZE];
         uint8_t work[VWIFI_MAX_FRAME_SIZE];
@@ -3015,8 +3022,9 @@ static void process_tx_ring(struct vwifi_dev *d)
                     bool inject = (desc.flags & VWIFI_TX_F_INJECT) != 0;
 
                     if (!inject && d->op_mode == VWIFI_MODE_STA) {
-                        /* STA mode: the driver hands us 802.3; build
-                         * the 802.11 data frame here. */
+                        /* STA mode. VWIFI_TX_F_80211 says the driver
+                         * already built the MPDU; without it the frame
+                         * is 802.3 and the header is built here. */
                         uint8_t frame80211[VWIFI_MAX_FRAME_SIZE];
                         uint16_t len;
 

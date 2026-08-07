@@ -9,9 +9,22 @@
  * ----------------------------
  * Nowhere new. TX ends up in VwifiTxDataFrame and RX comes from the
  * same ring drain data.c already had; this file is the WDI-shaped
- * plumbing between the component and those. The device does the
+ * plumbing between the component and those.
+ *
+ * What shape those frames are is stated once, in the frame-format
+ * contract next to the VwifiTxDataFrame declaration in vwifi_drv.h,
+ * and is not restated here. In short: 802.11 MPDUs in both
+ * directions, because wdiwifi.sys does the 802.3 conversion above
+ * the miniport rather than leaving it to the device.
+ *
+ * This header used to claim the opposite -- "the device does the
  * 802.3 <-> 802.11 conversion, so what crosses this boundary is
- * ordinary Ethernet frames in both directions.
+ * ordinary Ethernet frames in both directions" -- and went on
+ * claiming it after the code had been changed to do the other thing.
+ * It is worth naming, because the cost was not one bug: RX was
+ * debugged against it, then TX, then EAPOL, each time by reasoning
+ * from a comment instead of from the wire. Hence one copy of the
+ * contract, in a header both directions include.
  *
  * Why not MiniportSendNetBufferLists
  * ----------------------------------
@@ -161,42 +174,62 @@ VwifiTalTxOneNbl(_Inout_ PVWIFI_ADAPTER Adapter, _In_ PNET_BUFFER_LIST Nbl)
 
         /* What shape is a WDI TX frame?
          *
-         * The device treats a non-injected STA frame as 802.3 and
-         * builds the 802.11 header itself, so this only works if the
-         * component hands down Ethernet. Nothing in the headers says
-         * which it is, and the failure mode either way is silent: an
-         * 802.11 MPDU fed to sta_tx_8023_to_80211 either fails its
-         * length check or produces a frame with a nonsense EtherType,
-         * and both look from here like a frame that was sent fine.
+         * An MPDU, per the frame-format contract in vwifi_drv.h --
+         * this dump is what established that, and it stays because a
+         * silent change of shape underneath us is the one thing the
+         * flag we pass below cannot survive.
          *
-         * So read it off the wire. Bytes 12-13 of an Ethernet II frame
-         * are the EtherType -- 0x0800 for the DHCP that is failing,
-         * 0x0806 for ARP, 0x86dd for v6. An 802.11 data MPDU has
-         * frame-control in bytes 0-1 (0x08 0x0x for data) and its
-         * addresses where Ethernet has none. */
+         * It is decoded AS an MPDU, which is a correction. The
+         * original version tested bytes 12-13 for an EtherType first
+         * and only fell through to the 802.11 test if that failed --
+         * but in an MPDU bytes 12-13 are the middle of addr1, so the
+         * "802.3, the device's assumption holds" branch was reachable
+         * by coincidence on a frame that was nothing of the kind.
+         * Reading it as 802.11 first and 802.3 only as the fallback
+         * puts the burden of proof on the right side.
+         *
+         * Frame control is bytes 0-1: bits 2-3 of byte 0 are the type
+         * (2 = data), bits 4-7 the subtype (bit 3 set = QoS, which
+         * adds 2 bytes to the header). Then LLC/SNAP, whose last two
+         * bytes are the EtherType the payload actually has. */
         if (flat != NULL && len >= 24) {
+            ULONG type = (flat[0] >> 2) & 0x3;
+            ULONG hlen = 24 + (((flat[0] & 0x80) && type == 2) ? 2u : 0u);
+            ULONG et   = (len >= hlen + 8)
+                             ? (((ULONG)flat[hlen + 6] << 8) | flat[hlen + 7])
+                             : 0;
+
             VWIFI_TAL_ONCE(
-                "TAL tx: first frame %u bytes: "
-                "%02x %02x %02x %02x %02x %02x | %02x %02x %02x %02x %02x %02x "
-                "| %02x %02x | %02x %02x %02x %02x %02x %02x %02x %02x -- %s",
+                "TAL tx: first frame %u bytes: fc %02x %02x dur %02x %02x "
+                "| a1 %02x:%02x:%02x:%02x:%02x:%02x "
+                "| a2 %02x:%02x:%02x:%02x:%02x:%02x "
+                "| a3 %02x:%02x:%02x:%02x:%02x:%02x | seq %02x %02x -- %s",
                 len,
-                flat[0], flat[1], flat[2], flat[3], flat[4], flat[5],
-                flat[6], flat[7], flat[8], flat[9], flat[10], flat[11],
-                flat[12], flat[13],
-                flat[14], flat[15], flat[16], flat[17],
-                flat[18], flat[19], flat[20], flat[21],
-                (flat[12] == 0x08 && (flat[13] == 0x00 || flat[13] == 0x06))
-                    ? "802.3: EtherType IPv4/ARP at 12 -- the device's "
-                      "assumption holds"
-                    : (flat[12] == 0x86 && flat[13] == 0xdd)
-                        ? "802.3: EtherType IPv6 at 12 -- the device's "
-                          "assumption holds"
-                        : (((flat[0] >> 2) & 0x3) == 2)
-                            ? "802.11 DATA MPDU, as expected -- sent with "
-                              "VWIFI_TX_F_80211 so the device passes it "
-                              "through rather than encapsulating it again"
-                            : "NOT 802.3 and not an 802.11 data frame either "
-                              "-- shape unknown");
+                flat[0], flat[1], flat[2], flat[3],
+                flat[4], flat[5], flat[6], flat[7], flat[8], flat[9],
+                flat[10], flat[11], flat[12], flat[13], flat[14], flat[15],
+                flat[16], flat[17], flat[18], flat[19], flat[20], flat[21],
+                flat[22], flat[23],
+                (type == 2)
+                    ? "802.11 DATA MPDU, as expected -- sent with "
+                      "VWIFI_TX_F_80211 so the device passes it through "
+                      "rather than encapsulating it again"
+                    : (type == 0)
+                        ? "802.11 MANAGEMENT frame on the data path -- "
+                          "unexpected"
+                        : "NOT an 802.11 data frame -- shape unknown, the "
+                          "addresses above are not addresses");
+
+            if (type == 2 && et != 0) {
+                VWIFI_TAL_ONCE(
+                    "TAL tx:   hdr %u bytes%s, SNAP EtherType 0x%04x (%s)",
+                    hlen, (hlen == 26) ? " (QoS)" : "", et,
+                    (et == 0x0800) ? "IPv4"
+                                   : (et == 0x0806) ? "ARP"
+                                   : (et == 0x86dd) ? "IPv6"
+                                   : (et == 0x888e) ? "EAPOL"
+                                                    : "other");
+            }
         }
 
         /* The request side of the same exchange.
@@ -210,10 +243,10 @@ VwifiTalTxOneNbl(_Inout_ PVWIFI_ADAPTER Adapter, _In_ PNET_BUFFER_LIST Nbl)
          * This one is an MPDU, so the offsets are the 802.11 header
          * (24, plus 2 if QoS), then LLC/SNAP (8), then IP (20) and UDP
          * (8) before BOOTP starts. */
-        if (flat != NULL) {
+        if (flat != NULL && len >= 24 && ((flat[0] >> 2) & 0x3) == 2) {
             ULONG hdr = 24;
 
-            if ((flat[0] >> 4) & 0x08) hdr += 2;   /* QoS control */
+            if (flat[0] & 0x80) hdr += 2;   /* QoS control */
             {
                 ULONG ip = hdr + 8;
                 ULONG udp = ip + 20;

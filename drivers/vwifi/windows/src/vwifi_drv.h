@@ -823,6 +823,12 @@ ULONG       VwifiConnectTaskState(_In_ PVWIFI_ADAPTER Adapter);
         }                                                           \
     } while (0)
 
+/* Neither of the two above is TAL-specific despite the name; they are
+ * "log this once" and "log the first n". Same thing, subsystem-neutral
+ * name, for use outside the TAL. */
+#define VWIFI_ONCE(fmt, ...)      VWIFI_TAL_ONCE(fmt, ##__VA_ARGS__)
+#define VWIFI_FIRST(n, fmt, ...)  VWIFI_TAL_FIRST(n, fmt, ##__VA_ARGS__)
+
 /* How many transfers we tell the component it may have outstanding.
  *
  * ONE. Raising it to 64 broke peer creation, and the log isolates that
@@ -936,11 +942,57 @@ VOID        VwifiKeysOnInstalled(_Inout_ PVWIFI_ADAPTER Adapter,
                                  _In_reads_bytes_(PayloadLen) const VOID *Payload,
                                  _In_ ULONG PayloadLen);
 
-/* data.c — Phase 3 STA data path. */
+/* ============================================================
+ * data.c — Phase 3 STA data path.
+ *
+ * THE FRAME-FORMAT CONTRACT
+ * -------------------------
+ * This is the driver's one authoritative statement of what shape
+ * a data frame has at each boundary. Every other site that needs
+ * it points here instead of restating it, deliberately: this
+ * driver spent weeks carrying two contradictory versions of this
+ * contract in comments in different files, and each time a bug in
+ * the data path was investigated, the wrong copy was the one that
+ * got read.
+ *
+ * Upward (miniport -> OS), in WDI mode:
+ *   802.11 MPDUs. wdiwifi.sys performs the 802.11 -> 802.3
+ *   conversion itself, above the miniport. Proven by pktmon: one
+ *   frame appears as 360 bytes of 802.11 at component 11 edge 2
+ *   and 342 bytes of Ethernet at edge 1. So the device is asked
+ *   for raw RX (VWIFI_CTRL_RX_80211) and the miniport indicates
+ *   what it is given, unchanged.
+ *
+ * Downward (OS -> miniport), in WDI mode:
+ *   802.11 MPDUs, the same contract read the other way --
+ *   wdiwifi.sys hands down a frame it has already encapsulated.
+ *   Confirmed off the wire by the TX shape dump in wdi_data.c.
+ *   These reach the device with VWIFI_TX_F_80211 set so it passes
+ *   them through rather than encapsulating them a second time.
+ *
+ * The 802.3 path still exists on both sides -- the device
+ * supports it and VwifiTxDataFrame still accepts it -- but
+ * nothing in WDI mode travels it. It is kept for the device's own
+ * tests and for any non-WDI consumer.
+ *
+ * Things that follow from this, all of which have been got wrong
+ * here at least once:
+ *   - A minimum frame length of 14 is an 802.3 constant. The
+ *     shortest possible 802.11 MPDU header is 24.
+ *   - Bytes 12-13 are an EtherType only in 802.3. In an MPDU they
+ *     are the middle of addr1, and will occasionally read as a
+ *     plausible EtherType by coincidence.
+ *   - Payload offsets are computed, never constant: 24 for the
+ *     header, +2 if QoS (subtype bit 3 of frame control), then 8
+ *     for LLC/SNAP before the EtherType.
+ * ============================================================ */
+
 /* ExtraFlags is OR'd into the TX descriptor alongside VWIFI_DESC_F_OWN.
- * Pass 0 for an 802.3 frame the device should encapsulate, or
- * VWIFI_TX_F_80211 for a frame that already carries its own 802.11
- * header -- which is what the WDI data path hands down. */
+ * Pass VWIFI_TX_F_80211 for a frame that already carries its own
+ * 802.11 header -- which, per the contract above, is everything the
+ * WDI data path hands down. Pass 0 only for a genuine 802.3 frame the
+ * device should encapsulate. The two are not interchangeable, and the
+ * failure mode of confusing them is silent on both sides. */
 NDIS_STATUS VwifiTxDataFrame(_Inout_ PVWIFI_ADAPTER Adapter,
                              _In_reads_bytes_(FrameLen) PUCHAR Frame,
                              _In_ ULONG FrameLen,

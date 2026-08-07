@@ -1732,15 +1732,53 @@ medium sees it as coming from whoever the injector claims to be.
   incomplete; one showing 6 Mb/s for every 802.11n frame looks right
   and gets believed.
 
+## The 802.3 audit
+
+Three separate bugs in this driver had the same shape: a piece of code
+that was correct while the device did the 802.3 ↔ 802.11 conversion,
+and stayed in place after `VWIFI_CTRL_RX_80211` and `VWIFI_TX_F_80211`
+moved that conversion above the miniport. Each was found the same way
+— a frame going missing with nothing reporting an error — and fixed
+one at a time. This is the sweep for the rest of them.
+
+**What was found and fixed**
+
+| Site | The assumption | Consequence |
+|---|---|---|
+| `data.c`, `VwifiTxDataFrame` | `FrameLen < 14` — the 802.3 minimum — on a path that now carries MPDUs | A 14-to-23-byte frame passed the check and reached a device that would read an `addr3` that was never sent. Now `24` when `VWIFI_TX_F_80211` is set. |
+| `driver.c`, `MiniportSendNetBufferLists` STA branch | Passed flags of `0`, i.e. "this is 802.3", under a comment saying the device would encapsulate it | Dormant — wdiwifi owns the send path for station data and this handler is never called for it. Live and wrong all the same. Now passes `VWIFI_TX_F_80211` and logs once if it ever fires, because it firing at all would mean something about the send path is not what this driver believes. |
+| `wdi_data.c`, TX shape dump | Tested bytes 12-13 for an EtherType *first*, and only fell through to the 802.11 test if that failed | Bytes 12-13 of an MPDU are the middle of `addr1`. The dump could print "802.3: the device's assumption holds" about a frame that was nothing of the kind. Now decoded as 802.11 first, with the EtherType read from LLC/SNAP at a computed offset. |
+| `abi/vwifi_abi.h`, `VWIFI_RX_F_RAW` | Documented as "monitor-mode capture" | It means "the payload is 802.11, not 802.3", and since `VWIFI_CTRL_RX_80211` it is set on ordinary station traffic too. The Linux driver still routes on it as though it meant monitor mode, which is safe only because that driver never asks for MPDUs — noted in place. |
+
+**The actual root**
+
+None of the above is the root. The root is that the frame-format
+contract was *written down in five places* — the file headers of
+`data.c` and `wdi_data.c`, the RX section header, the ABI flag
+comments, and this README — and when the contract changed, three of
+those copies did not. Every one of the bugs above was written or left
+standing by someone reading a stale copy, and at least two debugging
+sessions were spent reasoning from a comment instead of from the wire.
+
+So there is now exactly one authoritative statement of it, next to the
+`VwifiTxDataFrame` declaration in `vwifi_drv.h`, and the other sites
+point at it rather than restating it. A contract that exists once
+cannot disagree with itself.
+
 ## Status
 
 The phase-by-phase plan in `docs/vwifi-virt-development-plan.md`
 describes the intended order of work. In this tree the source covers
 Phase 1 (bring-up), 1.5 (monitor), 2 (scan), 3 (connect) and 4 (keys) —
 `wdi_scan.c`, `wdi_connect.c`, `wdi_keys.c` and `monitor.c` are all
-implemented. What has **not** happened is a build against the WDK or a
-run in a Windows guest, so treat "implemented" as "written and
-reviewed", not "working".
+implemented. It builds against the WDK and runs in a Windows 10 (19041)
+guest: it scans, associates on an open network, and gets a DHCP lease.
+WPA2 associates but the 4-way handshake does not complete.
+
+(This paragraph used to say no build and no guest run had happened,
+long after both had. It is corrected here for the same reason the
+802.3 audit above exists — a stale statement of fact in a document
+people reason from is not a harmless stale statement.)
 
 ## Parity with the Linux driver and the device
 
@@ -1769,8 +1807,12 @@ the device where both drivers benefit:
 
 ## Not done
 
-- No build against the WDK, and no run in a guest. Everything above is
-  unverified on Windows.
+- The WPA2 4-way handshake. Association succeeds and EAPOL M1 is
+  indicated and accepted, but nothing emerges above the 802.11-to-802.3
+  converter and the supplicant never reports a result.
+- Airplane mode. `OID_WDI_TASK_SET_RADIO_STATE` is accepted and not
+  acted on, so the radio comes back on about 30 seconds after it is
+  turned off.
 - TX power reporting (`OID_WDI_TASK_SET_RADIO_STATE` and friends) has
   no counterpart to the Linux driver's `get_tx_power`/`set_tx_power`.
   Nothing has asked for it yet.
