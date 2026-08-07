@@ -287,50 +287,37 @@ VwifiRxDrainSta(_Inout_ PVWIFI_ADAPTER Adapter)
                                 qos ? "QoS" : "non-QoS", tid);
             }
 
-            /* The 802.11 receive context, which this path had never
-             * attached.
+            /* No DOT11_EXTSTA_RECV_CONTEXT here, deliberately.
              *
-             * The reason it had not was that the file header used to say
-             * there was nothing to attach one to, "and the payload is
-             * 802.3". The second half stopped being true when
-             * VWIFI_CTRL_RX_80211 landed and the first half was only
-             * ever true because of it: this is the OOB data that
-             * describes an 802.11 reception -- PHY, channel, RSSI, rate,
-             * timestamp -- and what crosses this boundary is an 802.11
-             * MPDU. Monitor mode has always attached one; the station
-             * path was the odd one out.
+             * This path briefly attached one, by analogy with monitor.c
+             * and on the argument that both directions now carry 802.11
+             * MPDUs so both should describe the reception the same way.
+             * The argument was wrong about which interface it was
+             * talking to, and the code said so itself: "whether it is
+             * what the receive path is missing is not established".
              *
-             * Whether it is what the receive path is missing is not
-             * established. What is established is that it is
-             * inconsistent, that every previous bug here has been an
-             * assumption left standing after the thing that justified
-             * it changed, and that this is the same shape.
+             * DOT11_EXTSTA_RECV_CONTEXT belongs to the NATIVE 802.11
+             * receive path, where a miniport calls
+             * NdisMIndicateReceiveNetBufferLists and the layer above
+             * reads MediaSpecificInformation off the NBL. That is what
+             * monitor.c does, and it is right to attach one there.
              *
-             * No RAW flag: monitor mode sets DOT11_RECV_FLAG_RAW_PACKET
-             * because Npcap wants the frame verbatim with radiotap. A
-             * station reception is not a raw capture even though the
-             * bytes are the same, and claiming otherwise would ask the
-             * layer above to stop treating it as ordinary traffic. */
-            {
-                PDOT11_EXTSTA_RECV_CONTEXT rc = &Adapter->RxRecvContext[idx];
-
-                RtlZeroMemory(rc, sizeof(*rc));
-                rc->Header.Type     = NDIS_OBJECT_TYPE_DEFAULT;
-                rc->Header.Revision = DOT11_EXTSTA_RECV_CONTEXT_REVISION_1;
-                rc->Header.Size     = sizeof(DOT11_EXTSTA_RECV_CONTEXT);
-
-                rc->uReceiveFlags           = 0;
-                rc->uPhyId                  = dot11_phy_type_erp;
-                rc->uChCenterFrequency      = d->channel_freq;
-                rc->usNumberOfMPDUsReceived = 1;
-                rc->lRSSI                   = d->rssi;
-                rc->ucDataRate              = VwifiRateCodeTo500Kbps(d->rate_code);
-                rc->uSizeMediaSpecificInfo  = 0;
-                rc->pvMediaSpecificInfo     = NULL;
-                rc->ullTimestamp            = d->tsf;
-
-                NET_BUFFER_LIST_INFO(nbl, MediaSpecificInformation) = rc;
-            }
+             * A WDI station reception is not that path. The NBL is
+             * handed to wdiwifi through the TAL -- RxInorderDataIndication
+             * then RxGetMpdus -- and every scrap of per-frame metadata
+             * WDI defines for receive lives in WDI_RX_METADATA, which
+             * dot11wdi.h gives exactly one member: PayloadType. There is
+             * no second channel. Writing a native-802.11 structure into
+             * an OOB slot on an NBL that is about to travel a different
+             * interface is not extra information, it is a pointer the
+             * component did not put there.
+             *
+             * And it is not needed: this link obtained a DHCP lease on
+             * an open network before this code existed. Whatever is
+             * eating EAPOL, the absence of a receive context is not it.
+             *
+             * The per-slot RxRecvContext array stays -- monitor.c uses
+             * it -- and so does VwifiRateCodeTo500Kbps. */
 
             NET_BUFFER_LIST_STATUS(nbl) = NDIS_STATUS_SUCCESS;
             NET_BUFFER_LIST_NEXT_NBL(nbl) = NULL;
