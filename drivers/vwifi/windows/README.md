@@ -1790,6 +1790,26 @@ EAPOL MPDU on an association it knows is WPA2-PSK with no key yet, and
 discards it. That is the ordinary bootstrap case for WPA2, and no
 interface the miniport has exposes a reason for it.
 
+**Two probes have since varied the fields that could not be verified by
+reading, and both came back negative:**
+
+| Probe | Result |
+|---|---|
+| Report both data ciphers as `NONE`, AKM and `PortAuthorized` unchanged | Association **accepted** — so the OS does not cross-check the reported cipher against the profile — and all four EAPOL frames still discarded. The ciphers are not the gate. |
+| Report `PortAuthorized = TRUE` on a secure BSS | Association **held the full four seconds** and ended with the AP's own handshake timeout, exactly as with `FALSE`. So the 28 ms disconnect once blamed on this field was a misattribution to two defects fixed since (`18a7a0e`, `7fb9481`). But `TRUE` does not open the path either. `PortAuthorized` is not the gate. |
+
+The one optional container of the association result this driver never
+sends, `WDI_TLV_ETHERTYPE_ENCAP_TABLE`, is a list of
+`{UINT16 EtherType; UINT16 EncapsulationType;}` where the type is
+`WDI_ENCAPSULATION_RFC_1042 = 1` or `WDI_ENCAPSULATION_802_1H = 2`.
+Its absence means the default, and the frames in question are RFC 1042
+(`AA AA 03 00 00 00`) — the same encapsulation carrying DHCP
+successfully on an open BSS. Not the gate either.
+
+So every field of `WDI_ASSOCIATION_RESULT_PARAMETERS` has now been
+varied by probe or verified against the model, and none of them is it.
+The next idea should not be another field of that message.
+
 ## WDI_EXT_TID_NON_QOS bugchecks NDIS
 
 `dot11wdi.h` documents the extended-TID encoding in a comment above the
