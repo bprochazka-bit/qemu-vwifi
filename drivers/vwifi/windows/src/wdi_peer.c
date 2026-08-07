@@ -238,7 +238,29 @@ VwifiPeerOnConfig(_Inout_ PVWIFI_ADAPTER Adapter,
 {
     PVWIFI_PEER p = VwifiPeerFind(Adapter, PeerId);
 
-    UNREFERENCED_PARAMETER(Cfg);
+    /* What the component says about this peer, which this driver used
+     * to throw away with an UNREFERENCED_PARAMETER.
+     *
+     * WDI_TXRX_PEER_CFG::PeerQoSConfig is WDI_TXRX_PeerCfgQosNone (0),
+     * QosCapable (1) or UapsdTids (2). It is the component's answer to
+     * "may I address this peer by QoS TID", and the receive path has
+     * been answering that question for itself -- announcing every frame
+     * on TID 0 regardless. Logged rather than acted on: the TID now
+     * comes off the frame, and this is here to show whether the two
+     * agree. A peer the component calls QosNone that is nevertheless
+     * being handed QoS TIDs is a bug the log should name out loud. */
+    if (Cfg != NULL) {
+        VWIFI_INFO("peer config: peer %u QoS config %u (%s)",
+                   PeerId, (ULONG)Cfg->PeerQoSConfig,
+                   (Cfg->PeerQoSConfig == WDI_TXRX_PeerCfgQosNone)
+                       ? "none -- non-QoS TIDs only"
+                       : (Cfg->PeerQoSConfig == WDI_TXRX_PeerCfgQosCapable)
+                           ? "QoS capable"
+                           : "U-APSD TIDs");
+    } else {
+        VWIFI_WARN("peer config: peer %u arrived with no WDI_TXRX_PEER_CFG",
+                   PeerId);
+    }
 
     if (p == NULL) {
         /* Worth an error rather than a shrug: it means the component

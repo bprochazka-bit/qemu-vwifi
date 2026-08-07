@@ -223,6 +223,33 @@ typedef struct _VWIFI_RX_NBL_CONTEXT
 #define VwifiRxNblGetSlot(nbl)                                        \
     ((ULONG)(ULONG_PTR)NET_BUFFER_LIST_MINIPORT_RESERVED(nbl)[1])
 
+/* [2] is the requeue counter (see VwifiTalRxReturnOrRequeue); [3] is
+ * the WDI extended TID the frame was indicated on, kept because a frame
+ * held for a paused component has to be announced again later on the
+ * same TID it belongs to. */
+#define VwifiRxNblSetTid(nbl, tid)                                    \
+    (NET_BUFFER_LIST_MINIPORT_RESERVED(nbl)[3] = (PVOID)(ULONG_PTR)(tid))
+#define VwifiRxNblGetTid(nbl)                                         \
+    ((WDI_EXTENDED_TID)(ULONG_PTR)NET_BUFFER_LIST_MINIPORT_RESERVED(nbl)[3])
+
+/* The extended TID for a non-QoS MSDU.
+ *
+ * dot11wdi.h describes the encoding in a comment above the typedef and
+ * #defines only one of the values:
+ *
+ *     0-15: 802.11 TIDs
+ *     16:   non-QoS (WDI_EXT_TID_NON_QOS)
+ *     17-24: IHV reserved
+ *     31:   unknown/unspecified (WDI_EXT_TID_UNKNOWN)
+ *
+ * So 16 has to be spelled out here. It matters: this driver indicated
+ * every received frame on TID 0, under a comment claiming TID 0 meant
+ * "best-effort". It does not -- it means 802.11 QoS TID 0, which is a
+ * different statement about a frame that carries no QoS control field
+ * at all. Every EAPOL-Key message this station has ever received was a
+ * non-QoS MPDU announced as QoS TID 0. */
+#define VWIFI_WDI_EXT_TID_NON_QOS  ((WDI_EXTENDED_TID)16)
+
 /* ============================================================
  * Pending control-request tracking
  *

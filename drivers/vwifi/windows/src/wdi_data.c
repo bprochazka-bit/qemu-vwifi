@@ -776,6 +776,8 @@ VwifiTalRxAnnounceHeld(_Inout_ PVWIFI_ADAPTER Adapter, _In_z_ PCSTR Why)
     PVWIFI_PEER peer;
     NDIS_STATUS status = NDIS_STATUS_SUCCESS;
     ULONG held = Adapter->RxQueueCount;
+    WDI_EXTENDED_TID tid = VWIFI_WDI_EXT_TID_NON_QOS;
+    KIRQL irql;
 
     if (held == 0) return;
 
@@ -784,6 +786,20 @@ VwifiTalRxAnnounceHeld(_Inout_ PVWIFI_ADAPTER Adapter, _In_z_ PCSTR Why)
         return;
     }
 
+    /* Announce on the TID the held frames actually belong to.
+     *
+     * This passed a literal 0 before, which named 802.11 QoS TID 0 for
+     * frames that are not QoS frames. The queue head's TID is the right
+     * one to name because RxGetMpdus drains the whole queue in one call
+     * whatever TID is announced -- and because this station's frames
+     * are all non-QoS, so there is only ever one TID in it. If that
+     * stops being true, this needs to announce once per distinct TID. */
+    KeAcquireSpinLock(&Adapter->RxQueueLock, &irql);
+    if (Adapter->RxQueueHead != NULL) {
+        tid = VwifiRxNblGetTid(Adapter->RxQueueHead);
+    }
+    KeReleaseSpinLock(&Adapter->RxQueueLock, irql);
+
     /* FROM_RX_RESUME_FRAMES, not DISPATCH_GENERAL.
      *
      * dot11wdi.h has a level for exactly this -- frames announced
@@ -791,10 +807,11 @@ VwifiTalRxAnnounceHeld(_Inout_ PVWIFI_ADAPTER Adapter, _In_z_ PCSTR Why)
      * and this function is the only thing that makes that kind of
      * announcement. Saying GENERAL described the wrong situation to the
      * component. */
-    VWIFI_INFO("TAL rx: %s -- announcing %u held frame(s)", Why, held);
+    VWIFI_INFO("TAL rx: %s -- announcing %u held frame(s) on tid %u",
+               Why, held, tid);
     api->RxInorderDataIndication(Adapter->DataPathHandle,
                                  WDI_RX_INDICATION_FROM_RX_RESUME_FRAMES,
-                                 peer->PeerId, 0, NULL, &status);
+                                 peer->PeerId, tid, NULL, &status);
     if (status != NDIS_STATUS_SUCCESS) {
         VWIFI_WARN("TAL rx: announcing held frames returned 0x%08x %s",
                    status, VwifiNdisStatusName(status));

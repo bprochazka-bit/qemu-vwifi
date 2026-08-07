@@ -262,6 +262,32 @@ VwifiRxDrainSta(_Inout_ PVWIFI_ADAPTER Adapter)
 
             VwifiRxNblSetSlot(nbl, idx);
 
+            /* The TID this MSDU actually arrived on, read off the frame
+             * rather than assumed.
+             *
+             * A QoS data frame (subtype bit 3, i.e. 0x80 of frame
+             * control byte 0) carries a QoS control field at offset 24
+             * whose low four bits are the TID. Anything else is a
+             * non-QoS MSDU, and WDI has a distinct extended TID for
+             * that -- 16, not 0. See VWIFI_WDI_EXT_TID_NON_QOS.
+             *
+             * Kept on the NBL because a frame held while the component
+             * is paused has to be announced again later, and the
+             * announcement names a TID. */
+            {
+                WDI_EXTENDED_TID tid = VWIFI_WDI_EXT_TID_NON_QOS;
+
+                if ((frame_va[0] & 0x80) && d->frame_len >= 26) {
+                    tid = (WDI_EXTENDED_TID)(frame_va[24] & 0x0F);
+                }
+                VwifiRxNblSetTid(nbl, tid);
+                VWIFI_TAL_FIRST(4, "rx(sta): frame is %s -- indicating on "
+                                   "extended TID %u",
+                                (tid == VWIFI_WDI_EXT_TID_NON_QOS)
+                                    ? "non-QoS" : "QoS",
+                                tid);
+            }
+
             /* The 802.11 receive context, which this path had never
              * attached.
              *
@@ -358,10 +384,12 @@ VwifiRxDrainSta(_Inout_ PVWIFI_ADAPTER Adapter)
 
                 indicate_head = NET_BUFFER_LIST_NEXT_NBL(nbl);
                 NET_BUFFER_LIST_NEXT_NBL(nbl) = NULL;
-                /* Best-effort TID. This device does no QoS and the
-                 * component told us nothing per-frame, so every MSDU is
-                 * best-effort -- which is what TID 0 means. */
-                VwifiTalRxIndicate(Adapter, nbl, peer->PeerId, 0);
+                /* The TID read off the frame above, not a constant.
+                 * This used to pass 0 under a comment saying TID 0 meant
+                 * "best-effort"; in WDI it means 802.11 QoS TID 0, and
+                 * these frames carry no QoS control field at all. */
+                VwifiTalRxIndicate(Adapter, nbl, peer->PeerId,
+                                   VwifiRxNblGetTid(nbl));
             }
             return;
         }
