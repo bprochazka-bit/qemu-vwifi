@@ -1786,15 +1786,42 @@ RFC 1042 SNAP, so nwifi's header-length parse is correct.
 frame `[[peer+0x60]+0x58]` is non-zero, and that is the instruction
 that ends the WPA2 handshake.
 
-What that QWORD is has not been established. The natural reading is a
-key-mapping key, which would match the privacy exemption the OS
-installs — `0x888E`, `WDI_EXEMPT_ON_KEY_MAPPING_KEY_UNAVAILABLE`,
-unicast — where "exempt when no key-mapping key is available" is
-exactly "accept when this field is zero". But no key is installed at
-message-1 time, so under that reading it should be zero and the frame
-should pass. Either the field is something else, or something is
-setting it. That is the next thing to find out, and it is now a
-question about one struct offset rather than about the whole stack.
+**What that QWORD is, established from the other end of the same
+struct.** Exactly two places in nwifi.sys load `[X+0x60]` and then
+touch `+0x58` on the result: the gate above, and the transmit
+encryption path at `nwifi+0x27918`. That one requires the field to be
+**non-zero** — zero returns `0xC0000225`, `STATUS_NOT_FOUND` — and
+then does this:
+
+```
+or   WORD PTR [rdi],0x4000        ; set the Protected bit
+mov  al,BYTE PTR [r14+0x8]        ; -> CCMP header byte 0   (PN0)
+mov  al,BYTE PTR [r14+0x9]        ; -> CCMP header byte 1   (PN1)
+mov  BYTE PTR [...+0x2],0         ;    CCMP header byte 2   (reserved)
+mov  al,BYTE PTR [r14]            ; key id
+shl  al,0x6
+or   al,0x20                      ; | ExtIV
+mov  BYTE PTR [...+0x3],al        ; -> CCMP header byte 3
+```
+
+That is CCMP header construction, byte for byte. So `[peer+0x60]` is a
+**cipher key context** — key id at `+0x00`, packet number at `+0x08`,
+and the key itself at `+0x58`. Transmit needs a key to encrypt;
+receive lets an unprotected EAPOL frame through only when there is no
+key. Which is precisely the privacy exemption the OS installed on this
+adapter: `0x888E`, `EXEMPT_ON_KEY_MAPPING_KEY_UNAVAILABLE`, unicast —
+"exempt while no key-mapping key is available".
+
+**So nwifi discards the AP's EAPOL-Key message because it believes a
+pairwise key is already installed for that peer.** The exemption is
+doing exactly what it says; the premise is wrong.
+
+Why it believes that is not established, and it is the open question.
+No trace of any connect attempt contains `OID_WDI_SET_ADD_CIPHER_KEYS`
+— the handshake never gets far enough for the OS to install a key —
+and this driver never sends `WDI_INDICATION_CIPHER_KEY_UPDATED`. The
+next step is to find what writes `[cipherctx+0x58]` in nwifi and what
+drives it.
 
 ## Where the EAPOL frame dies, verified
 
