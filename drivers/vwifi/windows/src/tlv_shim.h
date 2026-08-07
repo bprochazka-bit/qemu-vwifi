@@ -18,6 +18,40 @@
  * on one side, the device contract on the other, nothing leaking
  * across.
  *
+ * ============================================================
+ * DIAGNOSTIC PROBES
+ *
+ * At most one of these may be 1, and none of them may ship set.
+ * They deliberately misreport a field of the association result to
+ * find out which one gates the WPA2 handshake, and a build with one
+ * enabled announces itself in the trace so its log can never be
+ * mistaken for a real one.
+ *
+ * They live here rather than in the .cpp because wdi_connect.c prints
+ * the banner and tlv_shim.cpp does the misreporting, and a probe that
+ * is on in one file and off in the other is worse than no probe.
+ *
+ * History, so nobody repeats a run:
+ *
+ *   CIPHER_NONE -- ran. The association was ACCEPTED with the data
+ *     ciphers reported as NONE on a WPA2-PSK profile, so the OS does
+ *     not cross-check the reported cipher against the profile. All
+ *     four EAPOL frames were still discarded by nwifi.sys. The
+ *     ciphers are not the gate.
+ * ============================================================ */
+#define VWIFI_PROBE_REPORT_CIPHER_NONE   0
+#define VWIFI_PROBE_PORT_AUTHORIZED      1
+
+#if (VWIFI_PROBE_REPORT_CIPHER_NONE + VWIFI_PROBE_PORT_AUTHORIZED) > 1
+#error "enable at most one diagnostic probe at a time"
+#endif
+
+#if VWIFI_PROBE_REPORT_CIPHER_NONE
+#  define VWIFI_PROBE_NAME "reporting the negotiated data ciphers as NONE"
+#elif VWIFI_PROBE_PORT_AUTHORIZED
+#  define VWIFI_PROBE_NAME "reporting PortAuthorized=TRUE"
+#endif
+
  * PeerVersion: every entry point takes it. The caller supplies
  * Adapter->WdiPeerVersion, captured at init. The library uses it to
  * emit/consume a byte stream matching whatever WDI version the running

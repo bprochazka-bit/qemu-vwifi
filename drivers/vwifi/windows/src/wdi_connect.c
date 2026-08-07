@@ -275,13 +275,14 @@ VwifiIndicateAssociationResult(_Inout_ PVWIFI_ADAPTER Adapter,
                Params->AkmSuite);
 
     /* So a trace from a probe build can never be mistaken for a trace
-     * from a real one. See VWIFI_PROBE_REPORT_CIPHER_NONE in
-     * tlv_shim.cpp; this line disappears when the probe is turned off. */
+     * from a real one. The switches are in tlv_shim.h; this line
+     * disappears when they are all off. */
+#ifdef VWIFI_PROBE_NAME
     if (Params->AkmSuite != VWIFI_AKM_NONE) {
-        VWIFI_WARN("*** PROBE BUILD: reporting the negotiated data ciphers "
-                   "as NONE on a secure BSS. AKM and PortAuthorized are "
-                   "unchanged. This build is a diagnostic, not a fix. ***");
+        VWIFI_WARN("*** PROBE BUILD: %s on a secure BSS. This build is a "
+                   "diagnostic, not a fix. ***", VWIFI_PROBE_NAME);
     }
+#endif
 
     VwifiSendWdiIndication(Adapter, task->WdiPortId, task->PortId,
                            NDIS_STATUS_WDI_INDICATION_ASSOCIATION_RESULT,

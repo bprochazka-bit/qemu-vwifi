@@ -649,13 +649,42 @@ VwifiTlvGenerateAssociationResult(
      * The AKM is the discriminator, not the cipher: WPA2-PSK
      * authenticates over the air as Open System (see WdiAuthToVwifi), so
      * auth alone cannot tell the two apart. */
-    /* Probed and settled: TRUE unconditionally is wrong. Reporting an
-     * AKM association as already authorized made the OS disconnect
-     * twenty-eight milliseconds later, before the peer was even
-     * configured -- it rejects a link that claims authorization it
-     * cannot have. FALSE until the handshake completes is right. */
+    /* This used to say "probed and settled: TRUE unconditionally is
+     * wrong", on the strength of one run where reporting an AKM
+     * association as authorized was followed by a disconnect twenty-
+     * eight milliseconds later.
+     *
+     * That attribution does not hold up. The run was commit bf1a1d7,
+     * and at that revision the radio swept thirteen channels for 1.6
+     * seconds starting the instant the association completed (fixed in
+     * 18a7a0e) and any frame the component returned while it was
+     * paused was freed rather than requeued (fixed in 7fb9481). Both
+     * defects end an association early on their own. Nothing isolated
+     * PortAuthorized as the cause; it was simply the field that had
+     * been changed.
+     *
+     * FALSE is still what the model says is true at this moment -- the
+     * handshake has not run -- so it stays the default. The probe
+     * below is how the claim gets tested properly rather than asserted
+     * a second time. */
     entry.AssociationResultParameters.PortAuthorized =
         (Params->AkmSuite == VWIFI_AKM_NONE) ? TRUE : FALSE;
+
+#if VWIFI_PROBE_PORT_AUTHORIZED
+    /* PROBE. The last field left. Ciphers have been eliminated by
+     * measurement, the receive contract and the rest of the
+     * association description have been checked against the headers
+     * and WABIModel.xml, and the frame still dies inside nwifi.sys.
+     *
+     * Association holds and EAPOL reaches ndisuio: the controlled port
+     *   is the gate, the earlier result was a misattribution, and the
+     *   question becomes how a real driver opens it.
+     * Association is torn down in tens of milliseconds again, on a
+     *   build without the two defects that were present last time: the
+     *   original conclusion was right after all, and this driver has
+     *   no remaining lever in the association result. */
+    entry.AssociationResultParameters.PortAuthorized = TRUE;
+#endif
 
     /* The negotiated algorithms and the band. All four were left at
      * zero, and zero is not a valid value for three of them:
@@ -681,54 +710,13 @@ VwifiTlvGenerateAssociationResult(
     entry.AssociationResultParameters.BandID = band;
     entry.AssociationResultParameters.DSInfo = WDI_DS_UNKNOWN;
 
-    /* ============================================================
-     * PROBE. This is not a fix and must not ship set to 1.
-     *
-     * What is being tested
-     * --------------------
-     * On an open BSS this driver carries traffic end to end -- DHCP
-     * lease, verified on this build. On a WPA2 BSS the AP's EAPOL-Key
-     * message 1 and all three of its retries are delivered, indicated,
-     * and answered NDIS_STATUS_SUCCESS by the component, then die
-     * inside nwifi.sys: pktmon shows all four at component 62 edge 2
-     * and never at edge 1, so they never reach ndisuio.sys and the
-     * supplicant never sees one.
-     *
-     * Everything the miniport controls has been checked against the
-     * headers and WABIModel.xml and is correct. Four things differ
-     * between the association that works and the one that does not:
-     * AuthAlgorithm, UnicastCipherAlgorithm,
-     * MulticastDataCipherAlgorithm, and PortAuthorized. PortAuthorized
-     * cannot be varied -- TRUE is refused by the OS at association,
-     * measured, disconnect in 28 ms.
-     *
-     * So this varies the ciphers, and only the ciphers. The AKM stays
-     * RSNA_PSK and PortAuthorized stays FALSE, which means the OS is
-     * still told this is a WPA2-PSK association with an unauthorized
-     * port -- the truth -- and only the negotiated data ciphers are
-     * misreported as NONE.
-     *
-     * What each outcome means
-     * -----------------------
-     * EAPOL reaches ndisuio and the supplicant answers with M2:
-     *   nwifi is discarding the frame because it is unprotected on an
-     *   association whose negotiated cipher is CCMP. The real fix is
-     *   then about how an unprotected exempt frame is presented, not
-     *   about the port.
-     *
-     * EAPOL still dies at nwifi:
-     *   the ciphers are irrelevant and the gate is PortAuthorized --
-     *   which the OS will not let this driver open at association.
-     *   That is a much stronger and more useful conclusion than
-     *   another guess, and it is worth one build to reach.
-     *
-     * The association is refused outright:
-     *   the OS cross-checks the reported cipher against the profile.
-     *   Also an answer, also worth knowing, and it costs one run.
-     * ============================================================ */
-#define VWIFI_PROBE_REPORT_CIPHER_NONE 1
-
 #if VWIFI_PROBE_REPORT_CIPHER_NONE
+    /* PROBE, already run and answered: the association was ACCEPTED
+     * with both data ciphers reported as NONE on a WPA2-PSK profile --
+     * so the OS does not cross-check the reported cipher against the
+     * profile -- and all four EAPOL frames were still discarded inside
+     * nwifi.sys. The ciphers are not the gate. Kept switched off
+     * rather than deleted so the result is not re-derived. */
     if (Params->AkmSuite != VWIFI_AKM_NONE) {
         entry.AssociationResultParameters.UnicastCipherAlgorithm =
             WDI_CIPHER_ALGO_NONE;
