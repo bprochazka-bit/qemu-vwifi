@@ -677,6 +677,10 @@ VOID        VwifiRxDrainMonitor(_Inout_ PVWIFI_ADAPTER Adapter);
 NDIS_STATUS VwifiInjectFrame(_Inout_ PVWIFI_ADAPTER Adapter,
                              _In_reads_bytes_(FrameLen) PUCHAR Frame,
                              _In_ ULONG FrameLen);
+/* ath9k rate code -> ucDataRate in 500 kbps units, for the
+ * DOT11_EXTSTA_RECV_CONTEXT. Both RX drains attach one, so both need
+ * this; it lives in monitor.c because that path had it first. */
+UCHAR       VwifiRateCodeTo500Kbps(UCHAR RateCode);
 
 /* Control helpers to push mode/channel/filter to the device. */
 NDIS_STATUS VwifiSetOpMode(_Inout_ PVWIFI_ADAPTER Adapter, ULONG Mode);

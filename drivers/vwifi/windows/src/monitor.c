@@ -66,9 +66,13 @@ VwifiRxNblPoolDestroy(_Inout_ PVWIFI_ADAPTER Adapter)
  * Data-rate conversion: the medium uses ath9k rate codes; the
  * DOT11_EXTSTA_RECV_CONTEXT wants ucDataRate in 500 kbps units.
  * We keep a tiny lookup for the OFDM/DSSS rates we care about.
+ *
+ * Not static: the STA drain in data.c attaches the same receive
+ * context now that VWIFI_CTRL_RX_80211 makes both paths carry MPDUs,
+ * and it needs the same conversion. Declared in vwifi_drv.h.
  * ============================================================ */
 
-static UCHAR
+UCHAR
 VwifiRateCodeTo500Kbps(UCHAR rate_code)
 {
     /* ath9k OFDM rate codes (see ath9k hw). Values in 500 kbps units:
