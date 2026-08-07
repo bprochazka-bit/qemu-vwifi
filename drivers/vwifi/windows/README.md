@@ -1732,6 +1732,64 @@ medium sees it as coming from whoever the injector claims to be.
   incomplete; one showing 6 Mb/s for every 802.11n frame looks right
   and gets believed.
 
+## Where the EAPOL frame dies, verified
+
+pktmon component IDs are reassigned every boot — they have been
+1/12/12/11, then 9/18/18/17, then 60/61/61/62 across this
+investigation — and for most of it the identity of the last component
+was something inferred once and carried forward. `pktmon list --all`
+names them:
+
+```
+NIC: vwifi virtual Wi-Fi adapter
+    Id: 60          Driver: vwifi.sys
+    Filter Drivers:
+        62 nwifi.sys   Native WiFi Filter Driver
+        61 wfplwfs.sys WFP Native Filter
+    Protocols:
+        63 ndisuio.sys NDISUIO  VLAN, 802.1X, 802.11i
+        68 tcpip.sys   TCPIP    IPv4, ARP
+```
+
+So the receive path is: our miniport (60) → the WFP filter (61) →
+**nwifi.sys (62)**, which does the 802.11 → 802.3 conversion, and above
+it `ndisuio.sys` (63), which is registered for 802.1X and is what hands
+EAPOL to the supplicant.
+
+Every EAPOL-Key message 1 and all three of the AP's retries appear at
+60 edge 1, 61 edge 2, 61 edge 1, 62 edge 2 — `Type WiFi` at all four —
+and never emerge from nwifi. They never reach ndisuio. That is why the
+WLAN AutoConfig log shows 11010 "security started" and then nothing:
+the supplicant is running and is never given a frame.
+
+On the miniport side all four are indicated and all four come back
+`NDIS_STATUS_SUCCESS` from the component (`rx ind ok 4, not-ok 0`).
+
+**What has been checked against the authoritative sources rather than
+assumed:**
+
+- `dot11wdi.h`: `WDI_RX_METADATA` has exactly one member,
+  `PayloadType`; `MINIPORT_WDI_RX_GET_MPDUS` has no output beyond the
+  NBL chain; `MINIPORT_WDI_RX_PPDU_RSSI`'s `_Out_` is written. The
+  miniport meets the TAL receive contract as written.
+- `WABIModel.xml`, `WDI_ASSOCIATION_RESULT_PARAMETERS`: the driver
+  reports `AuthAlgorithm = WDI_AUTH_ALGO_RSNA_PSK`,
+  `UnicastCipherAlgorithm = CCMP`, `MulticastDataCipherAlgorithm =
+  CCMP`, `MulticastMgmtCipherAlgorithm = NONE`, `PortAuthorized =
+  FALSE`. That is an accurate description of a WPA2-PSK association
+  mid-handshake, and it matches what the OS itself believes
+  (AutoConfig logs `AuthVal 7`, `CipherVal 4`).
+- There is no WDI indication for port authorization or for 802.1X. The
+  only channels the miniport has are the association result's
+  `PortAuthorized` and the later key installation. `PortAuthorized =
+  TRUE` at association is refused by the OS — measured, disconnect in
+  28 ms — so `FALSE` is the only option.
+
+So nwifi is being told the truth, is handed a well-formed unprotected
+EAPOL MPDU on an association it knows is WPA2-PSK with no key yet, and
+discards it. That is the ordinary bootstrap case for WPA2, and no
+interface the miniport has exposes a reason for it.
+
 ## WDI_EXT_TID_NON_QOS bugchecks NDIS
 
 `dot11wdi.h` documents the extended-TID encoding in a comment above the
