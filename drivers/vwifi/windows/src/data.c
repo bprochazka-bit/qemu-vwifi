@@ -268,24 +268,23 @@ VwifiRxDrainSta(_Inout_ PVWIFI_ADAPTER Adapter)
              * A QoS data frame (subtype bit 3, i.e. 0x80 of frame
              * control byte 0) carries a QoS control field at offset 24
              * whose low four bits are the TID. Anything else is a
-             * non-QoS MSDU, and WDI has a distinct extended TID for
-             * that -- 16, not 0. See VWIFI_WDI_EXT_TID_NON_QOS.
+             * non-QoS MSDU, and gets VWIFI_WDI_RX_TID_NON_QOS -- read
+             * the comment on that constant before changing it, because
+             * the value the header documents bugchecks NDIS.
              *
              * Kept on the NBL because a frame held while the component
              * is paused has to be announced again later, and the
              * announcement names a TID. */
             {
-                WDI_EXTENDED_TID tid = VWIFI_WDI_EXT_TID_NON_QOS;
+                BOOLEAN qos = (frame_va[0] & 0x80) && d->frame_len >= 26;
+                WDI_EXTENDED_TID tid =
+                    qos ? (WDI_EXTENDED_TID)(frame_va[24] & 0x0F)
+                        : VWIFI_WDI_RX_TID_NON_QOS;
 
-                if ((frame_va[0] & 0x80) && d->frame_len >= 26) {
-                    tid = (WDI_EXTENDED_TID)(frame_va[24] & 0x0F);
-                }
                 VwifiRxNblSetTid(nbl, tid);
                 VWIFI_TAL_FIRST(4, "rx(sta): frame is %s -- indicating on "
                                    "extended TID %u",
-                                (tid == VWIFI_WDI_EXT_TID_NON_QOS)
-                                    ? "non-QoS" : "QoS",
-                                tid);
+                                qos ? "QoS" : "non-QoS", tid);
             }
 
             /* The 802.11 receive context, which this path had never

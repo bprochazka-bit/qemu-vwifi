@@ -776,7 +776,7 @@ VwifiTalRxAnnounceHeld(_Inout_ PVWIFI_ADAPTER Adapter, _In_z_ PCSTR Why)
     PVWIFI_PEER peer;
     NDIS_STATUS status = NDIS_STATUS_SUCCESS;
     ULONG held = Adapter->RxQueueCount;
-    WDI_EXTENDED_TID tid = VWIFI_WDI_EXT_TID_NON_QOS;
+    WDI_EXTENDED_TID tid = VWIFI_WDI_RX_TID_NON_QOS;
     KIRQL irql;
 
     if (held == 0) return;

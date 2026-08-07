@@ -1732,6 +1732,52 @@ medium sees it as coming from whoever the injector claims to be.
   incomplete; one showing 6 Mb/s for every 802.11n frame looks right
   and gets believed.
 
+## WDI_EXT_TID_NON_QOS bugchecks NDIS
+
+`dot11wdi.h` documents the extended-TID encoding in a comment above the
+`WDI_EXTENDED_TID` typedef:
+
+```
+/* 5 bit TID:
+0-15: 802.11 TIDs
+16: non-QoS (WDI_EXT_TID_NON_QOS)
+17-24: IHV reserved
+31: unknown/unspecified (WDI_EXT_TID_UNKNOWN)
+*/
+```
+
+Only `WDI_EXT_TID_UNKNOWN` is actually `#define`d. The EAPOL-Key frames
+this station receives are non-QoS MPDUs — `fc 0802`, subtype 0, no QoS
+control field — and the component's own peer config agrees, reporting
+`WDI_TXRX_PeerCfgQosNone` for the AP. So 16 looks like the right value
+to announce them on.
+
+It bugchecks the machine:
+
+```
+0x1000007E  SYSTEM_THREAD_EXCEPTION_NOT_HANDLED
+  P1 0xC0000005          access violation
+  P2 0xFFFFF8064AAD334C  ndis.sys+0x334C
+  rcx = 0x10
+```
+
+with the TID in the first argument register at the faulting
+instruction. The sequence in the trace is: announce on TID 16 →
+`RxGetMpdus: peer 0 tid 16 -- handing frames over` → the indication
+returns `PAUSED` → and the component faults on the way back out,
+where every previous build had returned the frame. That is an array
+of sixteen entries indexed with sixteen.
+
+So on `NdisWdiRxInorderDataIndication` the runtime takes 0-15 and the
+comment describing 16 is not a description of what it will survive.
+This driver announces real QoS frames on their real TID and non-QoS
+frames on 0 — see `VWIFI_WDI_RX_TID_NON_QOS`, which exists so that
+re-testing 16 is a one-line change rather than a rediscovery.
+
+Whether announcing a non-QoS frame as QoS TID 0 is *why* wdiwifi
+swallows EAPOL is still open. What is settled is that 16 is not the
+alternative.
+
 ## The 802.3 audit
 
 Three separate bugs in this driver had the same shape: a piece of code

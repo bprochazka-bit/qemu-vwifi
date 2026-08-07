@@ -232,23 +232,40 @@ typedef struct _VWIFI_RX_NBL_CONTEXT
 #define VwifiRxNblGetTid(nbl)                                         \
     ((WDI_EXTENDED_TID)(ULONG_PTR)NET_BUFFER_LIST_MINIPORT_RESERVED(nbl)[3])
 
-/* The extended TID for a non-QoS MSDU.
+/* The extended TID this driver announces a non-QoS MSDU on.
  *
- * dot11wdi.h describes the encoding in a comment above the typedef and
- * #defines only one of the values:
+ * ZERO, and not what the header says. dot11wdi.h documents the
+ * encoding in a comment above the WDI_EXTENDED_TID typedef:
  *
  *     0-15: 802.11 TIDs
  *     16:   non-QoS (WDI_EXT_TID_NON_QOS)
  *     17-24: IHV reserved
  *     31:   unknown/unspecified (WDI_EXT_TID_UNKNOWN)
  *
- * So 16 has to be spelled out here. It matters: this driver indicated
- * every received frame on TID 0, under a comment claiming TID 0 meant
- * "best-effort". It does not -- it means 802.11 QoS TID 0, which is a
- * different statement about a frame that carries no QoS control field
- * at all. Every EAPOL-Key message this station has ever received was a
- * non-QoS MPDU announced as QoS TID 0. */
-#define VWIFI_WDI_EXT_TID_NON_QOS  ((WDI_EXTENDED_TID)16)
+ * 16 was tried, because these frames genuinely are non-QoS MPDUs and
+ * because the component's own peer config says so -- it reports
+ * WDI_TXRX_PeerCfgQosNone for the AP. It bugchecks the machine:
+ *
+ *     0x1000007E SYSTEM_THREAD_EXCEPTION_NOT_HANDLED
+ *     P1 0xC0000005  access violation
+ *     P2 0xFFFFF8064AAD334C  ndis.sys+0x334C
+ *     rcx = 0x10
+ *
+ * with the TID sitting in the first argument register at the faulting
+ * instruction. The frame was announced on TID 16, the component took
+ * it through RxGetMpdus, and it died on the way back out -- an array
+ * indexed by TID that has sixteen entries, indexed with sixteen.
+ *
+ * So the runtime accepts 0-15 on this path and the comment describing
+ * 16 is not a description of what NdisWdiRxInorderDataIndication will
+ * survive. A real QoS frame still gets its real TID; a non-QoS frame
+ * gets 0, which is what this driver did for its whole life before the
+ * experiment and never crashed.
+ *
+ * Left as a named constant so re-testing it is a one-line change, and
+ * written down so nobody re-derives 16 from the header and rediscovers
+ * the bugcheck. */
+#define VWIFI_WDI_RX_TID_NON_QOS   ((WDI_EXTENDED_TID)0)
 
 /* ============================================================
  * Pending control-request tracking
