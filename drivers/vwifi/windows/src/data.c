@@ -13,7 +13,7 @@
  *   RX: the device hands us 802.3 frames with VWIFI_RX_F_RAW clear;
  *       wrap each in an NBL and indicate it up.
  *
- * Monitor-mode RX (raw 802.11 + DOT11_EXTSTA_RECV_CONTEXT) lives in
+ * Monitor-mode RX (raw 802.11, flagged as a capture) lives in
  * monitor.c; the RX DPC routes to one or the other by op mode.
  */
 
@@ -71,7 +71,9 @@ VwifiTxDataFrame(_Inout_ PVWIFI_ADAPTER Adapter,
  * Mirrors VwifiRxDrainMonitor's NBL lifetime: the ring slot stays
  * owned by the NBL until VwifiMiniportReturnNetBufferLists reclaims
  * it. The only differences are that there's no
- * DOT11_EXTSTA_RECV_CONTEXT to attach and the payload is 802.3.
+ * frame is not flagged as a raw capture -- both paths attach a
+ * DOT11_EXTSTA_RECV_CONTEXT, and since VWIFI_CTRL_RX_80211 both carry
+ * 802.11 MPDUs.
  * ============================================================ */
 
 VOID
@@ -239,6 +241,50 @@ VwifiRxDrainSta(_Inout_ PVWIFI_ADAPTER Adapter)
             }
 
             VwifiRxNblSetSlot(nbl, idx);
+
+            /* The 802.11 receive context, which this path has never
+             * attached.
+             *
+             * The comment at the top of this file says there is none to
+             * attach "and the payload is 802.3". The second half stopped
+             * being true when VWIFI_CTRL_RX_80211 landed and the first
+             * half was only ever true because of it: this is the OOB
+             * data that describes an 802.11 reception -- PHY, channel,
+             * RSSI, rate, timestamp -- and what crosses this boundary
+             * now is an 802.11 MPDU. Monitor mode has always attached
+             * one; the station path is the odd one out.
+             *
+             * Whether it is what the receive path is missing is not
+             * established. What is established is that it is
+             * inconsistent, that every previous bug here has been an
+             * assumption left standing after the thing that justified
+             * it changed, and that this is the same shape.
+             *
+             * No RAW flag: monitor mode sets DOT11_RECV_FLAG_RAW_PACKET
+             * because Npcap wants the frame verbatim with radiotap. A
+             * station reception is not a raw capture even though the
+             * bytes are the same, and claiming otherwise would ask the
+             * layer above to stop treating it as ordinary traffic. */
+            {
+                PDOT11_EXTSTA_RECV_CONTEXT rc = &Adapter->RxRecvContext[idx];
+
+                RtlZeroMemory(rc, sizeof(*rc));
+                rc->Header.Type     = NDIS_OBJECT_TYPE_DEFAULT;
+                rc->Header.Revision = DOT11_EXTSTA_RECV_CONTEXT_REVISION_1;
+                rc->Header.Size     = sizeof(DOT11_EXTSTA_RECV_CONTEXT);
+
+                rc->uReceiveFlags           = 0;
+                rc->uPhyId                  = dot11_phy_type_erp;
+                rc->uChCenterFrequency      = d->channel_freq;
+                rc->usNumberOfMPDUsReceived = 1;
+                rc->lRSSI                   = d->rssi;
+                rc->ucDataRate              = VwifiRateCodeTo500Kbps(d->rate_code);
+                rc->uSizeMediaSpecificInfo  = 0;
+                rc->pvMediaSpecificInfo     = NULL;
+                rc->ullTimestamp            = d->tsf;
+
+                NET_BUFFER_LIST_INFO(nbl, MediaSpecificInformation) = rc;
+            }
 
             NET_BUFFER_LIST_STATUS(nbl) = NDIS_STATUS_SUCCESS;
             NET_BUFFER_LIST_NEXT_NBL(nbl) = NULL;
