@@ -262,30 +262,29 @@ VwifiRxDrainSta(_Inout_ PVWIFI_ADAPTER Adapter)
 
             VwifiRxNblSetSlot(nbl, idx);
 
-            /* The TID this MSDU actually arrived on, read off the frame
-             * rather than assumed.
+            /* Say what shape this MSDU is, but do not keep it on the
+             * NBL.
              *
              * A QoS data frame (subtype bit 3, i.e. 0x80 of frame
              * control byte 0) carries a QoS control field at offset 24
-             * whose low four bits are the TID. Anything else is a
-             * non-QoS MSDU, and gets VWIFI_WDI_RX_TID_NON_QOS -- read
-             * the comment on that constant before changing it, because
-             * the value the header documents bugchecks NDIS.
+             * whose low four bits would be its TID. Every frame this
+             * station has ever received is non-QoS, so the indication
+             * below and the held-frame announcement in wdi_data.c both
+             * name VWIFI_WDI_RX_TID_NON_QOS -- read the comment on that
+             * constant before changing it, because the value the header
+             * documents bugchecks NDIS.
              *
-             * Kept on the NBL because a frame held while the component
-             * is paused has to be announced again later, and the
-             * announcement names a TID. */
-            {
-                BOOLEAN qos = (frame_va[0] & 0x80) && d->frame_len >= 26;
-                WDI_EXTENDED_TID tid =
-                    qos ? (WDI_EXTENDED_TID)(frame_va[24] & 0x0F)
-                        : VWIFI_WDI_RX_TID_NON_QOS;
-
-                VwifiRxNblSetTid(nbl, tid);
-                VWIFI_TAL_FIRST(4, "rx(sta): frame is %s -- indicating on "
-                                   "extended TID %u",
-                                qos ? "QoS" : "non-QoS", tid);
-            }
+             * The TID was briefly stored in MiniportReserved[3] so the
+             * announcement could recover it; the component overwrites
+             * that slot while it holds the frame, and the announcement
+             * duly reported "tid 160". If the QoS branch below ever
+             * fires, that is the moment to find somewhere safe to keep
+             * a per-frame TID -- until then there is nothing to keep. */
+            VWIFI_TAL_FIRST(4, "rx(sta): frame is %s -- indicating on "
+                               "extended TID %u",
+                            ((frame_va[0] & 0x80) && d->frame_len >= 26)
+                                ? "QoS (UNEXPECTED)" : "non-QoS",
+                            VWIFI_WDI_RX_TID_NON_QOS);
 
             /* No DOT11_EXTSTA_RECV_CONTEXT here, deliberately.
              *
@@ -370,12 +369,12 @@ VwifiRxDrainSta(_Inout_ PVWIFI_ADAPTER Adapter)
 
                 indicate_head = NET_BUFFER_LIST_NEXT_NBL(nbl);
                 NET_BUFFER_LIST_NEXT_NBL(nbl) = NULL;
-                /* The TID read off the frame above, not a constant.
-                 * This used to pass 0 under a comment saying TID 0 meant
-                 * "best-effort"; in WDI it means 802.11 QoS TID 0, and
-                 * these frames carry no QoS control field at all. */
+                /* VWIFI_WDI_RX_TID_NON_QOS, which is 0 -- and 0 for a
+                 * documented reason now rather than by accident. The
+                 * held-frame announcement in wdi_data.c names the same
+                 * constant, so the two can never disagree. */
                 VwifiTalRxIndicate(Adapter, nbl, peer->PeerId,
-                                   VwifiRxNblGetTid(nbl));
+                                   VWIFI_WDI_RX_TID_NON_QOS);
             }
             return;
         }

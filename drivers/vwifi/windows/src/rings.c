@@ -189,6 +189,19 @@ VwifiRingsAllocate(_Inout_ PVWIFI_ADAPTER Adapter)
         goto fail;
     }
 
+    /* Per-slot miniport state. Same length, same lifetime, and zeroed
+     * because the requeue counter in it is read before it is written
+     * on a frame that has never been requeued. */
+    Adapter->RxSlotRequeues = NdisAllocateMemoryWithTagPriority(
+        Adapter->MiniportAdapterHandle,
+        VWIFI_RX_RING_SIZE * sizeof(UCHAR),
+        VWIFI_POOL_TAG, NormalPoolPriority);
+    if (!Adapter->RxSlotRequeues) {
+        st = NDIS_STATUS_RESOURCES;
+        goto fail;
+    }
+    RtlZeroMemory(Adapter->RxSlotRequeues, VWIFI_RX_RING_SIZE * sizeof(UCHAR));
+
     /* Ctrl-request payload scratch: one VWIFI_CTRL_PAYLOAD_SIZE slot
      * per ring entry, so concurrent requests don't collide. */
     st = VwifiDmaAlloc(Adapter,
@@ -230,6 +243,11 @@ VwifiRingsFree(_Inout_ PVWIFI_ADAPTER Adapter)
         NdisFreeMemoryWithTagPriority(Adapter->MiniportAdapterHandle,
             Adapter->RxRecvContext, VWIFI_POOL_TAG);
         Adapter->RxRecvContext = NULL;
+    }
+    if (Adapter->RxSlotRequeues) {
+        NdisFreeMemoryWithTagPriority(Adapter->MiniportAdapterHandle,
+            Adapter->RxSlotRequeues, VWIFI_POOL_TAG);
+        Adapter->RxSlotRequeues = NULL;
     }
     if (Adapter->CtrlReqPayloadVa) {
         VwifiDmaFree(Adapter,

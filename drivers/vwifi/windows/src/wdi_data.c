@@ -776,8 +776,7 @@ VwifiTalRxAnnounceHeld(_Inout_ PVWIFI_ADAPTER Adapter, _In_z_ PCSTR Why)
     PVWIFI_PEER peer;
     NDIS_STATUS status = NDIS_STATUS_SUCCESS;
     ULONG held = Adapter->RxQueueCount;
-    WDI_EXTENDED_TID tid = VWIFI_WDI_RX_TID_NON_QOS;
-    KIRQL irql;
+    const WDI_EXTENDED_TID tid = VWIFI_WDI_RX_TID_NON_QOS;
 
     if (held == 0) return;
 
@@ -786,19 +785,18 @@ VwifiTalRxAnnounceHeld(_Inout_ PVWIFI_ADAPTER Adapter, _In_z_ PCSTR Why)
         return;
     }
 
-    /* Announce on the TID the held frames actually belong to.
+    /* The TID is the constant, read from no per-frame state.
      *
-     * This passed a literal 0 before, which named 802.11 QoS TID 0 for
-     * frames that are not QoS frames. The queue head's TID is the right
-     * one to name because RxGetMpdus drains the whole queue in one call
-     * whatever TID is announced -- and because this station's frames
-     * are all non-QoS, so there is only ever one TID in it. If that
-     * stops being true, this needs to announce once per distinct TID. */
-    KeAcquireSpinLock(&Adapter->RxQueueLock, &irql);
-    if (Adapter->RxQueueHead != NULL) {
-        tid = VwifiRxNblGetTid(Adapter->RxQueueHead);
-    }
-    KeReleaseSpinLock(&Adapter->RxQueueLock, irql);
+     * This briefly took it off the queue head's NBL, and the trace
+     * showed what that produced: "announcing 1 held frame(s) on tid
+     * 160" -- 0xA0, the low byte of a pointer the component had left
+     * in MiniportReserved[3]. Every frame this station receives is
+     * non-QoS and is indicated on VWIFI_WDI_RX_TID_NON_QOS, so naming
+     * the same constant here is both correct and impossible to
+     * corrupt. The one line that would notice a QoS frame arriving is
+     * the "frame is QoS" trace in VwifiRxDrainSta; if it ever fires,
+     * this needs per-TID announcement and somewhere safe to keep the
+     * TID. */
 
     /* FROM_RX_RESUME_FRAMES, not DISPATCH_GENERAL.
      *
@@ -919,21 +917,40 @@ VOID
 VwifiTalRxReturnOrRequeue(_Inout_ PVWIFI_ADAPTER Adapter,
                           _In_ PNET_BUFFER_LIST Nbl)
 {
-    ULONG_PTR tries;
+    ULONG slot;
+    ULONG tries;
 
     if (!Adapter->RxPaused) {
         VwifiTalRxReturn(Adapter, Nbl);
         return;
     }
 
-    tries = (ULONG_PTR)NET_BUFFER_LIST_MINIPORT_RESERVED(Nbl)[2];
-    if (tries >= VWIFI_RX_REQUEUE_MAX) {
-        VWIFI_WARN("TAL rx: frame refused %u times while paused -- dropping",
-                   (ULONG)tries);
+    /* The counter lives in a slot-indexed array, not in
+     * MiniportReserved[2]. The component writes into the high
+     * MiniportReserved slots while it holds a frame -- [3] came back
+     * with the low byte of one of its pointers in it -- and a requeue
+     * counter that reads back as garbage either drops a frame that
+     * should have been kept or circulates one that should have been
+     * dropped. The slot index in [1] is the one thing on the NBL that
+     * has survived every trace, so everything else hangs off it. */
+    slot = VwifiRxNblGetSlot(Nbl);
+    if (slot >= Adapter->RxRing.NumDescs || Adapter->RxSlotRequeues == NULL) {
+        VWIFI_WARN("TAL rx: returned frame has slot %u (ring has %u) -- "
+                   "freeing rather than requeueing", slot,
+                   Adapter->RxRing.NumDescs);
         VwifiTalRxReturn(Adapter, Nbl);
         return;
     }
-    NET_BUFFER_LIST_MINIPORT_RESERVED(Nbl)[2] = (PVOID)(tries + 1);
+
+    tries = Adapter->RxSlotRequeues[slot];
+    if (tries >= VWIFI_RX_REQUEUE_MAX) {
+        VWIFI_WARN("TAL rx: frame refused %u times while paused -- dropping",
+                   tries);
+        Adapter->RxSlotRequeues[slot] = 0;
+        VwifiTalRxReturn(Adapter, Nbl);
+        return;
+    }
+    Adapter->RxSlotRequeues[slot] = (UCHAR)(tries + 1);
 
     {
         KIRQL irql;

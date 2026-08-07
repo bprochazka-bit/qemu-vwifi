@@ -223,14 +223,30 @@ typedef struct _VWIFI_RX_NBL_CONTEXT
 #define VwifiRxNblGetSlot(nbl)                                        \
     ((ULONG)(ULONG_PTR)NET_BUFFER_LIST_MINIPORT_RESERVED(nbl)[1])
 
-/* [2] is the requeue counter (see VwifiTalRxReturnOrRequeue); [3] is
- * the WDI extended TID the frame was indicated on, kept because a frame
- * held for a paused component has to be announced again later on the
- * same TID it belongs to. */
-#define VwifiRxNblSetTid(nbl, tid)                                    \
-    (NET_BUFFER_LIST_MINIPORT_RESERVED(nbl)[3] = (PVOID)(ULONG_PTR)(tid))
-#define VwifiRxNblGetTid(nbl)                                         \
-    ((WDI_EXTENDED_TID)(ULONG_PTR)NET_BUFFER_LIST_MINIPORT_RESERVED(nbl)[3])
+/* MiniportReserved[2] and [3] are NOT available to this driver.
+ *
+ * The WDI extended TID was briefly kept in [3] so a frame held for a
+ * paused component could be announced again on the TID it belonged to.
+ * The trace showed what actually comes back out of that slot:
+ *
+ *   TAL rx: the component resumed RX -- announcing 1 held frame(s) on
+ *           tid 160
+ *   TAL RxGetMpdus: peer 0 tid 31 -- handing frames over
+ *
+ * 160 is 0xA0 -- the low byte of a pointer the component stored there
+ * while it held the frame. "MiniportReserved is reserved to the
+ * miniport" is true of a plain NDIS miniport; in WDI, wdiwifi is
+ * inside that boundary and uses the slot itself. [0] carries the
+ * WDI_FRAME_METADATA by the component's own contract and [1] has
+ * survived every trace, but nothing promises [2] or [3], and one of
+ * them demonstrably does not survive.
+ *
+ * So per-frame state lives in slot-indexed arrays on the adapter,
+ * keyed by VwifiRxNblGetSlot -- the one index that has proven stable.
+ *
+ * (The 31 in the second line is the component's own choice, not
+ * corruption: WDI_EXT_TID_UNKNOWN. After a resume it asks for MPDUs
+ * without naming a TID.) */
 
 /* The extended TID this driver announces a non-QoS MSDU on.
  *
@@ -443,6 +459,14 @@ typedef struct _VWIFI_ADAPTER
     /* One DOT11_EXTSTA_RECV_CONTEXT per RX slot, referenced by the
      * NBL's MediaSpecificInformation OOB pointer while in flight. */
     struct DOT11_EXTSTA_RECV_CONTEXT *RxRecvContext;
+
+    /* Per-RX-slot miniport state, indexed by VwifiRxNblGetSlot.
+     *
+     * Here rather than in NET_BUFFER_LIST_MINIPORT_RESERVED[2..3]
+     * because the component writes to those while it holds the frame
+     * -- see the note above VwifiRxNblSetSlot. Allocated with
+     * RxRecvContext and the same length. */
+    PUCHAR              RxSlotRequeues;
 
     /* Set once VwifiHwStart has run. Adapter creation and adapter
      * start are separate in the WDI model — see hardware.c. */
