@@ -47,9 +47,22 @@
  *     not cross-check the reported cipher against the profile. All
  *     four EAPOL frames were still discarded by nwifi.sys. The
  *     ciphers are not the gate.
+ *
+ *   PORT_AUTHORIZED -- ran, and answered two things. The association
+ *     was NOT torn down: it stood for the full four seconds and ended
+ *     with the AP's own handshake timeout, exactly as it does with
+ *     FALSE. So the 28 ms disconnect once blamed on this field was a
+ *     misattribution to two defects fixed since (18a7a0e, 7fb9481).
+ *     But TRUE does not open the path either -- every EAPOL retry
+ *     still died in nwifi.sys. PortAuthorized is not the gate.
+ *
+ * Every field of WDI_ASSOCIATION_RESULT_PARAMETERS has now been either
+ * varied by probe or verified against WABIModel.xml, and none of them
+ * is the gate. The next idea should not be another field of this
+ * message.
  * ============================================================ */
 #define VWIFI_PROBE_REPORT_CIPHER_NONE   0
-#define VWIFI_PROBE_PORT_AUTHORIZED      1
+#define VWIFI_PROBE_PORT_AUTHORIZED      0
 
 #if (VWIFI_PROBE_REPORT_CIPHER_NONE + VWIFI_PROBE_PORT_AUTHORIZED) > 1
 #error "enable at most one diagnostic probe at a time"
