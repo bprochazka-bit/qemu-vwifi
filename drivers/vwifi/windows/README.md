@@ -1732,6 +1732,70 @@ medium sees it as coming from whoever the injector claims to be.
   incomplete; one showing 6 Mb/s for every 802.11n frame looks right
   and gets believed.
 
+## The instruction that drops it, read out of nwifi.sys
+
+`nwifi.sys` (19041, 758 784 bytes) disassembles cleanly with
+`objdump -d -m i386:x86-64 --target=pei-x86-64`, and `.pdata` gives
+exact function bounds. The receive path is short and the drop is a
+single compare. All addresses below are VAs at the image's preferred
+base `0x1c0000000`, so subtract that for an RVA.
+
+**1. Is privacy on?** — `nwifi+0xdea3`
+
+```
+cmp DWORD PTR [rbp+0x15f8],0x0
+je  <skip>                        ; privacy off -> the gate never runs
+call 0x1c002a1e4                  ; privacy on  -> the privacy receive path
+```
+
+This is why an open BSS is unaffected: the whole gate is bypassed.
+
+**2. Is the frame protected?** — `nwifi+0x2a2e1`
+
+```
+test WORD PTR [rsi],0x4000        ; Protected bit in frame control
+jne  0x1c0028de0                  ; protected   -> decrypt path
+call 0x1c002a098                  ; unprotected -> the gate
+```
+
+**3. The gate** — `nwifi+0x2a098`, 324 bytes, one caller.
+
+| Test | Address | Outcome |
+|---|---|---|
+| `[frame+0x16] & 0x0f` — fragment number | `+0x2a0bb` | non-zero → accept unchecked |
+| `[frame+0x04] & 1` — group bit of addr1 | `+0x2a0c6` | multicast → **drop**, counter `[ctx+0x16a0]` |
+| length ≥ header + 8 | `+0x2a0e7` | short → `0xC0000023` |
+| SNAP is RFC 1042 or bridge-tunnel | `+0x2a0fa` | neither → `0xC023000F` |
+| EtherType == `0x888E` | `+0x2a131` | not EAPOL → **drop**, counter `[ctx+0x1630]` |
+| `[[peer+0x60]+0x58] == 0` | **`+0x2a13d`** | non-zero → **drop**, same counter |
+| — | `+0x2a159` | accept |
+
+So on a secure BSS nwifi accepts an unprotected frame only if it is a
+unicast, unfragmented, RFC 1042 EAPOL frame **and** that one QWORD is
+zero.
+
+**Which condition is ours failing?** The EAPOL-Key message is unicast
+(`addr1` = `52:54:00:8b:c7:82`), unfragmented (`seq 0/0` and `1/0` on
+the medium capture), 131 bytes against a 32-byte minimum, RFC 1042
+(`AA AA 03 00 00 00`), and EtherType `0x888E` — pktmon decodes all of
+it. The SNAP branch is eliminated independently: the working
+open-network frames have the same 24-byte non-QoS header and the same
+RFC 1042 SNAP, so nwifi's header-length parse is correct.
+
+**That leaves exactly one: the compare at `nwifi+0x2a13d`.** For our
+frame `[[peer+0x60]+0x58]` is non-zero, and that is the instruction
+that ends the WPA2 handshake.
+
+What that QWORD is has not been established. The natural reading is a
+key-mapping key, which would match the privacy exemption the OS
+installs — `0x888E`, `WDI_EXEMPT_ON_KEY_MAPPING_KEY_UNAVAILABLE`,
+unicast — where "exempt when no key-mapping key is available" is
+exactly "accept when this field is zero". But no key is installed at
+message-1 time, so under that reading it should be zero and the frame
+should pass. Either the field is something else, or something is
+setting it. That is the next thing to find out, and it is now a
+question about one struct offset rather than about the whole stack.
+
 ## Where the EAPOL frame dies, verified
 
 pktmon component IDs are reassigned every boot — they have been
