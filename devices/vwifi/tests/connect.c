@@ -405,11 +405,20 @@ int main(void)
         assert(memcmp(ar->bssid, AP_MAC, 6) == 0);
         assert(ar->status_code == 0);
         assert(ar->aid == 7);              /* top two bits masked off */
-        assert(ar->ie_len == 6);           /* the rates IE */
-        const uint8_t *ies = (const uint8_t *)ar + sizeof(*ar);
-        assert(ies[0] == 1 && ies[1] == 4);
+        /* The response frame BODY, not the whole frame and not the bare
+         * IE block: capability/status/AID (6) then the IEs. nwifi.sys
+         * indexes it as params + 6 + offset, with no allowance for an
+         * 802.11 header -- see conn_rx_assoc_resp. */
+        assert(ar->ie_len == aplen - 24);
+        const uint8_t *rsp = (const uint8_t *)ar + sizeof(*ar);
+        assert(le16(rsp + 2) == 0);              /* status = success */
+        assert((le16(rsp + 4) & 0x3FFF) == 7);   /* AID */
+        {
+            const uint8_t *ies = rsp + 6;
+            assert(ies[0] == 1 && ies[1] == 4);      /* rates, where it was */
+        }
     }
-    printf("  Assoc Response -> ASSOC_RESULT aid=7 + response IEs: PASS\n");
+    printf("  Assoc Response -> ASSOC_RESULT aid=7 + response frame: PASS\n");
 
     /* ---- 4. TX: 802.3 in, 802.11 out ---- */
     uint8_t eth[64];
@@ -453,6 +462,53 @@ int main(void)
     }
     printf("  TX 802.3 -> 802.11 (ToDS, addrs, LLC/SNAP, payload): PASS\n");
 
+    /* ---- 4b. TX: 802.11 in, the same 802.11 out ----
+     *
+     * VWIFI_TX_F_80211 says the driver already built the header, which
+     * is what Windows WDI does: wdiwifi owns the 802.11 MAC state and
+     * hands the miniport complete MPDUs. Encapsulating one of those
+     * again produced a frame whose "destination MAC" was the first six
+     * bytes of the original 802.11 header -- accepted by the ring, sent
+     * to the medium, and silently dropped by the AP. Nothing on either
+     * side reported an error, which is why it took a hex dump of the
+     * first frame to find.
+     *
+     * The frame must come out byte-identical and MUST NOT grow by a
+     * second 24-byte header. */
+    {
+        uint8_t mpdu[64];
+        uint16_t mpdu_len = 24 + 8 + 20;
+
+        memset(mpdu, 0, sizeof(mpdu));
+        mpdu[0] = 0x08;                       /* data, subtype 0 */
+        mpdu[1] = 0x01;                       /* ToDS */
+        memcpy(mpdu + 4,  AP_MAC,   6);       /* addr1 = BSSID */
+        memcpy(mpdu + 10, STA_MAC,  6);       /* addr2 = us */
+        memcpy(mpdu + 16, PEER_MAC, 6);       /* addr3 = DA */
+        mpdu[24] = 0xAA; mpdu[25] = 0xAA; mpdu[26] = 0x03;
+        mpdu[30] = 0x08; mpdu[31] = 0x00;     /* ethertype IPv4 */
+        for (int i = 0; i < 20; i++) mpdu[32 + i] = (uint8_t)(0xC0 + i);
+
+        memcpy(g_ram_va + TX_FRAME_OFFSET, mpdu, mpdu_len);
+        tx = (struct vwifi_tx_desc *)(g_ram_va + TX_OFFSET
+                                      + (g_tx_slot % RING_ENTRIES) * sizeof(*tx));
+        memset(tx, 0, sizeof(*tx));
+        tx->frame_addr = g_ram + TX_FRAME_OFFSET;
+        tx->frame_len  = mpdu_len;
+        tx->flags      = VWIFI_DESC_F_OWN | VWIFI_TX_F_80211;
+        g_tx_slot++;
+
+        mock_backend_clear_events(g_mock);
+        wreg(VWIFI_REG_TX_RING_DOORBELL, g_tx_slot);
+
+        uint16_t len;
+        const uint8_t *f = last_tx_frame(&len);
+        assert(f != NULL);
+        assert(len == mpdu_len);                    /* no second header */
+        assert(memcmp(f, mpdu, mpdu_len) == 0);     /* byte-identical */
+    }
+    printf("  TX 802.11 passthrough (VWIFI_TX_F_80211, no re-encap): PASS\n");
+
     /* ---- 5. RX: 802.11 downlink in, 802.3 out ---- */
     uint8_t payload[20];
     for (int i = 0; i < 20; i++) payload[i] = (uint8_t)(0xB0 + i);
@@ -482,6 +538,44 @@ int main(void)
         assert(out[14] == 0xB0 && out[15] == 0xB1);  /* payload */
     }
     printf("  RX 802.11 -> 802.3 (addrs, ethertype, payload): PASS\n");
+
+    /* ---- 5b. RX with VWIFI_CTRL_RX_80211: no conversion at all ----
+     *
+     * The mirror of the TX passthrough above, and it exists for the
+     * same reason: a WDI miniport's component works in MPDUs both
+     * ways. With the bit set the driver must get back exactly what
+     * arrived on the medium, with RAW set to say so. */
+    {
+        uint32_t ctrl = (uint32_t)vwifi_reg_read(g_dev, VWIFI_REG_CTRL, 4);
+
+        vwifi_reg_write(g_dev, VWIFI_REG_CTRL, ctrl | VWIFI_CTRL_RX_80211, 4);
+
+        dl_len = build_data_downlink(dl, AP_MAC, payload, 20, 0x0800);
+        rx_tail_before = (uint32_t)vwifi_reg_read(g_dev,
+                                                  VWIFI_REG_RX_RING_TAIL, 4);
+        medium_rx(dl, dl_len, 2437, AP_MAC);
+        rx_tail_after = (uint32_t)vwifi_reg_read(g_dev,
+                                                 VWIFI_REG_RX_RING_TAIL, 4);
+        assert(rx_tail_after != rx_tail_before);
+
+        {
+            struct vwifi_rx_desc *rd =
+                (struct vwifi_rx_desc *)(g_ram_va + RX_OFFSET
+                                         + rx_tail_before * sizeof(*rd));
+            const uint8_t *out = g_ram_va + RX_BUFFER_OFFSET
+                               + (uint64_t)rx_tail_before * RX_BUFSZ;
+
+            assert(!(rd->flags & VWIFI_DESC_F_OWN));
+            assert(rd->flags & VWIFI_RX_F_RAW);   /* said so */
+            assert(rd->frame_len == dl_len);      /* not re-encapsulated */
+            assert(memcmp(out, dl, dl_len) == 0); /* byte for byte */
+        }
+
+        /* Back to the default so the tests after this one still see
+         * the 802.3 behaviour the Linux driver relies on. */
+        vwifi_reg_write(g_dev, VWIFI_REG_CTRL, ctrl, 4);
+    }
+    printf("  RX 802.11 passthrough (VWIFI_CTRL_RX_80211, no re-encap): PASS\n");
 
     /* ---- 6. Frame from a different BSSID is filtered out ---- */
     uint8_t other_bssid[6] = { 0xDE, 0xAD, 0x00, 0x00, 0x00, 0x99 };
@@ -576,6 +670,140 @@ int main(void)
         assert(last_tx_freq() == 5220);
         assert(ctrl_send(VWIFI_OP_DISCONNECT, NULL, 0) == 0);
         printf("  connect w/o channel uses the BSS table's: PASS\n");
+    }
+
+    /* ---- 9. A WPA2 connect builds its own RSN element ----
+     *
+     * WDI never hands one down: it describes the security it wants as an
+     * auth algorithm and a pair of cipher lists and leaves the element
+     * to be constructed below. Nothing was constructing it, so an
+     * association request for a protected network went out with an SSID
+     * and a rate set and no RSN at all, and hostapd answered status 40
+     * -- WLAN_STATUS_INVALID_IE -- which reaches the user as nothing
+     * more than "Can't connect to this network". */
+    {
+        uint8_t cbuf[sizeof(struct vwifi_connect_req)];
+        struct vwifi_connect_req *c3 = (struct vwifi_connect_req *)cbuf;
+
+        memset(cbuf, 0, sizeof(cbuf));
+        memcpy(c3->bssid, AP_MAC, 6);
+        c3->ssid_len = (uint16_t)strlen("Lab-Real");
+        memcpy(c3->ssid, "Lab-Real", c3->ssid_len);
+        c3->channel_freq    = 2437;
+        c3->auth_algo       = VWIFI_AUTH_OPEN;   /* RSN uses open auth */
+        c3->akm_suite       = VWIFI_AKM_PSK;
+        c3->cipher_pairwise = VWIFI_CIPHER_CCMP128;
+        c3->cipher_group    = VWIFI_CIPHER_CCMP128;
+        c3->assoc_ie_len    = 0;                 /* exactly what WDI gives */
+
+        arm_all_rsp_slots();
+        mock_backend_clear_events(g_mock);
+        assert(ctrl_send(VWIFI_OP_CONNECT, cbuf, sizeof(cbuf)) == 0);
+
+        aplen = build_auth_resp(apbuf, 0);
+        mock_backend_clear_events(g_mock);
+        medium_rx(apbuf, aplen, 2437, AP_MAC);
+
+        {
+            uint16_t len;
+            const uint8_t *f = last_tx_frame(&len);
+            const uint8_t *ie;
+            const uint8_t *rsnie = NULL;
+
+            assert(f != NULL);
+            assert(((f[0] >> 4) & 0xF) == 0);         /* Assoc Request */
+
+            /* Privacy, because the request must not claim the link is
+             * open while carrying an RSN element. */
+            assert(le16(f + 24) & 0x0010);
+
+            /* Walk the elements rather than assuming an order. */
+            ie = f + 28;
+            while (ie + 2 <= f + len && ie + 2 + ie[1] <= f + len) {
+                if (ie[0] == 48) { rsnie = ie; break; }
+                ie += 2 + ie[1];
+            }
+            assert(rsnie != NULL);
+            assert(rsnie[1] == 20);                   /* body length */
+            assert(le16(rsnie + 2) == 1);             /* version */
+
+            /* group suite 00-0F-AC-04, one pairwise 00-0F-AC-04,
+             * one AKM 00-0F-AC-02 (PSK), capabilities 0. */
+            assert(rsnie[4] == 0x00 && rsnie[5] == 0x0F && rsnie[6] == 0xAC);
+            assert(rsnie[7] == 4);
+            assert(le16(rsnie + 8) == 1);
+            assert(rsnie[13] == 4);
+            assert(le16(rsnie + 14) == 1);
+            assert(rsnie[19] == 2);
+            assert(le16(rsnie + 20) == 0);
+        }
+        /* And the request IEs come back with the association result,
+         * RSN included. Without them the OS has never seen the element
+         * this station associated with and cannot run the handshake. */
+        arm_all_rsp_slots();
+        aplen = build_assoc_resp(apbuf, 0, 9);
+        medium_rx(apbuf, aplen, 2437, AP_MAC);
+        {
+            struct vwifi_ctrl_rsp_desc *e = find_event(VWIFI_EV_ASSOC_RESULT);
+            struct vwifi_assoc_result *ar;
+            const uint8_t *req;
+            const uint8_t *rsnie = NULL;
+            uint16_t off = 0;
+
+            assert(e != NULL);
+            ar = (struct vwifi_assoc_result *)event_payload(e);
+            assert(ar->status_code == 0);
+            assert(ar->req_ie_len > 0);
+
+            /* An Association Request frame BODY: capability and listen
+             * interval (4) before the IEs, and no 802.11 header --
+             * nwifi.sys skips exactly the fixed fields when it hunts
+             * for the RSN element. See conn_send_assoc_req. */
+            req = (const uint8_t *)ar + sizeof(*ar) + ar->ie_len;
+            assert((le16(req) & 0x0010) != 0);   /* Privacy in caps */
+            off = 4;
+            while (off + 2 <= ar->req_ie_len &&
+                   off + 2 + req[off + 1] <= ar->req_ie_len) {
+                if (req[off] == 48) { rsnie = req + off; break; }
+                off += 2 + req[off + 1];
+            }
+            assert(rsnie != NULL);
+            assert(rsnie[1] == 20);
+            assert(rsnie[7] == 4);      /* group CCMP */
+            assert(rsnie[13] == 4);     /* pairwise CCMP */
+            assert(rsnie[19] == 2);     /* AKM PSK */
+        }
+
+        assert(ctrl_send(VWIFI_OP_DISCONNECT, NULL, 0) == 0);
+        printf("  WPA2 connect emits RSN (CCMP/PSK) + Privacy: PASS\n");
+        printf("  ASSOC_RESULT carries the request IEs incl. RSN: PASS\n");
+    }
+
+    /* ---- 10. A disconnect while already idle still confirms ----
+     *
+     * The driver completes OID_WDI_TASK_DISCONNECT on the DISCONNECTED
+     * event and nothing else, so a silent success costs it a full
+     * five-second watchdog. That is not hypothetical: the AP
+     * disassociated the station, wlansvc sent its own disconnect one
+     * second later into a device that had already gone idle, and the
+     * completion did not reach the OS for another five seconds. */
+    {
+        struct vwifi_ctrl_rsp_desc *e;
+        struct vwifi_disconnect_ev *ev;
+
+        arm_all_rsp_slots();
+        mock_backend_clear_events(g_mock);
+
+        /* Nothing is associated at this point -- the block above
+         * disconnected -- so this is the already-idle path. */
+        assert(ctrl_send(VWIFI_OP_DISCONNECT, NULL, 0) == 0);
+
+        e = find_event(VWIFI_EV_DISCONNECTED);
+        assert(e != NULL);
+        ev = event_payload(e);
+        assert(ev->local == 1);
+        printf("  disconnect while already idle still emits "
+               "DISCONNECTED: PASS\n");
     }
 
     printf("connect: PASS\n");

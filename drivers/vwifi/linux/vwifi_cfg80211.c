@@ -674,7 +674,10 @@ static void handle_scan_complete(struct vwifi_priv *p,
 			 "scan complete%s: no BSS reported by the device\n",
 			 info.aborted ? " (aborted)" : "");
 	else
-		dev_dbg(p->dev, "scan complete%s: %u BSS\n",
+		/* Frames, not distinct BSSes: the device reports a beacon
+		 * and a probe response separately for a BSS it has heard
+		 * both from, and cfg80211 merges them by BSSID. */
+		dev_dbg(p->dev, "scan complete%s: %u BSS frames\n",
 			info.aborted ? " (aborted)" : "", p->scan_bss_count);
 
 	cfg80211_scan_done(req, &info);

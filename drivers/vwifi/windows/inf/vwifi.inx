@@ -43,6 +43,35 @@ CopyFiles        = Vwifi.CopyFiles
 AddService = vwifi, 2, Vwifi.Service, Vwifi.EventLog
 
 ;-----------------------------------------------------------------
+; Device hardware key - MSI-X
+;
+; Windows does NOT give a PCI device message-signaled interrupts
+; unless its INF asks for them. Without this section the device gets
+; a line-based INTx interrupt instead, and the vwifi-virt device has
+; no working INTx path: it asserts the line and has no way to lower
+; it, because its interrupt status is cleared by a ring-head MMIO
+; write. The result is an interrupt storm that freezes the whole VM
+; on the first control response -- no bugcheck, no dump, just a hard
+; lockup and a reboot. The Linux driver demands PCI_IRQ_MSIX, which
+; is why the gap only ever showed up here.
+;
+; .HW, not the plain DDInstall section: AddReg there writes to the
+; driver key, and the PCI driver reads Interrupt Management from the
+; device's own hardware key.
+;
+; MessageNumberLimit must match VWIFI_NUM_VECTORS in vwifi_abi.h.
+;-----------------------------------------------------------------
+
+[Vwifi.ndi.NT.HW]
+AddReg = Vwifi.Msi.AddReg
+
+[Vwifi.Msi.AddReg]
+HKR, "Interrupt Management",, 0x00000010
+HKR, "Interrupt Management\MessageSignaledInterruptProperties",, 0x00000010
+HKR, "Interrupt Management\MessageSignaledInterruptProperties", MSISupported,       0x00010001, 1
+HKR, "Interrupt Management\MessageSignaledInterruptProperties", MessageNumberLimit, 0x00010001, 4
+
+;-----------------------------------------------------------------
 ; Parameters (registry)
 ;-----------------------------------------------------------------
 

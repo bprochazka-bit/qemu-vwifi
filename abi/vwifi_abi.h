@@ -33,11 +33,41 @@
  * <stdint.h> does not exist. The kernel's <linux/types.h> supplies the
  * whole fixed-width set this header uses -- signed included -- so the
  * struct definitions below need no other conditionals.
+ *
+ * The third consumer is the Windows WDI miniport, built with MSVC in
+ * kernel mode. There <stdint.h> lives in the UCRT, which is not on the
+ * kernel-mode include path, so the compiler's own sized types stand in.
+ * Define VWIFI_ABI_HAVE_STDINT to skip the shim if some future MSVC
+ * consumer does have <stdint.h> in scope.
  */
 #ifdef __KERNEL__
 #include <linux/types.h>
+#elif defined(_MSC_VER) && !defined(VWIFI_ABI_HAVE_STDINT)
+typedef unsigned __int8  uint8_t;
+typedef unsigned __int16 uint16_t;
+typedef unsigned __int32 uint32_t;
+typedef unsigned __int64 uint64_t;
+typedef signed   __int8  int8_t;
+typedef signed   __int16 int16_t;
+typedef signed   __int32 int32_t;
+typedef signed   __int64 int64_t;
 #else
 #include <stdint.h>
+#endif
+
+/*
+ * Structure packing. Every struct in this file is wire format shared
+ * verbatim with the QEMU device, so all of them are byte-packed --
+ * there is no unpacked struct here for a blanket #pragma pack to
+ * silently reinterpret. GCC/Clang keep the per-struct attribute so
+ * their layout is bit-identical to what it has always been; MSVC has
+ * no such attribute and takes the pragma instead.
+ */
+#if defined(_MSC_VER)
+#define VWIFI_PACKED
+#pragma pack(push, 1)
+#else
+#define VWIFI_PACKED __attribute__((packed))
 #endif
 
 /* ================================================================
@@ -130,6 +160,21 @@
 /* VWIFI_REG_CTRL bits */
 #define VWIFI_CTRL_ENABLE       (1u << 0)  /* start ring processing */
 #define VWIFI_CTRL_IRQ_ENABLE   (1u << 1)  /* master IRQ enable */
+/* Deliver STA data frames as 802.11 MPDUs instead of converting them to
+ * 802.3. The frame arrives with its 802.11 header and LLC/SNAP intact
+ * and VWIFI_RX_F_RAW set, decrypted if it was protected.
+ *
+ * Opt-in, and off by default, because it is the mirror of
+ * VWIFI_TX_F_80211 and exists for the same reason: Windows' WDI stack
+ * works in MPDUs in both directions. wdiwifi hands the miniport a
+ * complete 802.11 frame to transmit, and on receive it expects one back
+ * and does the 802.3 conversion itself. Handing it Ethernet makes it
+ * read the destination MAC as frame control, find a frame that is not
+ * data, and discard it without a word.
+ *
+ * The Linux driver wants 802.3 and never sets this bit, so its RX path
+ * is unchanged. */
+#define VWIFI_CTRL_RX_80211     (1u << 2)  /* RX stays 802.11, no re-encap */
 #define VWIFI_CTRL_RESET        (1u << 31) /* same effect as REG_RESET */
 
 /* VWIFI_REG_STATUS bits */
@@ -184,7 +229,7 @@ struct vwifi_ctrl_req_desc {
     uint64_t payload_addr;   /* guest physical addr of payload buffer */
     uint32_t payload_len;    /* payload length in bytes */
     uint32_t _reserved;
-} __attribute__((packed));
+} VWIFI_PACKED;
 
 /* ---- Control response descriptor ---- */
 
@@ -197,7 +242,7 @@ struct vwifi_ctrl_rsp_desc {
     uint64_t payload_addr;   /* same buffer the request used (for sync)
                               * OR device-owned for async events */
     uint64_t _reserved;
-} __attribute__((packed));
+} VWIFI_PACKED;
 
 /* ---- TX data descriptor ---- */
 
@@ -210,7 +255,7 @@ struct vwifi_tx_desc {
     uint8_t  rate_code;      /* ath9k rate code, 0 = device default */
     uint8_t  tid;            /* 802.11 TID 0-15, 0 for non-QoS */
     uint32_t _reserved1;
-} __attribute__((packed));
+} VWIFI_PACKED;
 
 /* ---- RX data descriptor ---- */
 
@@ -225,7 +270,7 @@ struct vwifi_rx_desc {
     uint32_t buffer_len;     /* size of the RX buffer (set by driver) */
     uint64_t tsf;            /* 64-bit TSF timestamp at reception */
     uint32_t _reserved;
-} __attribute__((packed));
+} VWIFI_PACKED;
 
 /* Common descriptor flag bits (all rings) */
 #define VWIFI_DESC_F_OWN        (1u << 0)  /* owner bit; producer sets, consumer clears */
@@ -237,11 +282,35 @@ struct vwifi_rx_desc {
 #define VWIFI_TX_F_INJECT       (1u << 1)  /* raw injection (monitor-mode or mgmt) */
 #define VWIFI_TX_F_NO_ACK       (1u << 2)  /* do not expect ACK from peer */
 #define VWIFI_TX_F_ENCRYPTED    (1u << 3)  /* frame pre-encrypted by driver */
+/* Payload is already a complete 802.11 frame: do NOT encapsulate it.
+ *
+ * The STA TX path's default contract is that the driver hands over
+ * 802.3 and the device builds the 802.11 header. That is not something
+ * every driver can honour. Windows WDI hands the miniport fully-formed
+ * MPDUs -- wdiwifi owns the 802.11 MAC state, so it has already set
+ * frame control, duration, the three addresses and the sequence number
+ * by the time the miniport sees the frame -- and encapsulating one of
+ * those a second time produces a frame whose "destination MAC" is the
+ * first six bytes of the original 802.11 header. It goes out, the AP
+ * drops it, and nothing anywhere reports an error.
+ *
+ * Distinct from VWIFI_TX_F_INJECT, which also skips the association
+ * check and the cipher. This flag changes the FORMAT of the payload and
+ * nothing else: the frame is still refused when not associated and
+ * still encrypted when a key is installed.
+ */
+#define VWIFI_TX_F_80211        (1u << 4)  /* payload is 802.11, not 802.3 */
 
 /* RX descriptor flags */
 #define VWIFI_RX_F_FCS_OK       (1u << 1)
 #define VWIFI_RX_F_DECRYPTED    (1u << 2)  /* device decrypted this frame */
-#define VWIFI_RX_F_RAW          (1u << 3)  /* monitor-mode capture */
+/* The frame above the descriptor is an 802.11 MPDU, not 802.3. Set for
+ * every monitor-mode capture, and — since VWIFI_CTRL_RX_80211 — for STA
+ * data frames too when the driver asked for them unconverted. It says
+ * what SHAPE the bytes are, not which mode produced them; a receiver
+ * that reads it as "this is monitor mode" is reading more into it than
+ * it carries. */
+#define VWIFI_RX_F_RAW          (1u << 3)  /* payload is 802.11, not 802.3 */
 
 /* ================================================================
  * Control opcodes
@@ -292,7 +361,7 @@ struct vwifi_caps {
     uint16_t max_scan_ssids;
     uint16_t max_bss_entries;
     uint32_t _reserved1;
-} __attribute__((packed));
+} VWIFI_PACKED;
 
 enum vwifi_mode {
     VWIFI_MODE_IDLE     = 0,
@@ -303,7 +372,7 @@ enum vwifi_mode {
 
 struct vwifi_op_mode {
     uint32_t mode;                  /* enum vwifi_mode */
-} __attribute__((packed));
+} VWIFI_PACKED;
 
 struct vwifi_channel {
     uint16_t primary_freq;          /* MHz */
@@ -312,11 +381,11 @@ struct vwifi_channel {
     uint16_t center_freq1;          /* VHT center freq of primary segment */
     uint16_t center_freq2;          /* VHT80+80 center of secondary, 0 if none */
     uint16_t _reserved;
-} __attribute__((packed));
+} VWIFI_PACKED;
 
 struct vwifi_raw_filter {
     uint32_t mask;                  /* VWIFI_RAW_F_* */
-} __attribute__((packed));
+} VWIFI_PACKED;
 
 #define VWIFI_RAW_F_DATA         (1u << 0)  /* raw data MPDUs */
 #define VWIFI_RAW_F_MGMT         (1u << 1)  /* raw mgmt MPDUs */
@@ -340,13 +409,25 @@ struct vwifi_scan_req {
      * literally reports only hidden APs and looks like it is sitting on
      * a dead medium.
      */
-} __attribute__((packed));
+} VWIFI_PACKED;
 
 /* Set in vwifi_bss_entry.capability_info bit 16 to tell the driver
  * whether the attached frame is a Beacon or a Probe Response — WDI has
  * a separate TLV for each (WDI_TLV_BEACON_FRAME vs
  * WDI_TLV_PROBE_RESPONSE_FRAME). Low 16 bits stay the 802.11 capability
- * field. */
+ * field.
+ *
+ * One event carries one frame, so a BSS the device has heard both a
+ * beacon and a probe response from produces TWO VWIFI_EV_BSS_FOUND
+ * events with the same BSSID, emitted back to back and distinguished
+ * only by this bit. Drivers merge them by BSSID: cfg80211 does it for
+ * free in cfg80211_inform_bss_frame_data(), and the WDI driver folds
+ * them into one WDI_TLV_BSS_ENTRY carrying both blobs.
+ *
+ * That is the point of the split. The two frames are separate facts
+ * about a BSS and the host consumes them separately, so a single frame
+ * slot per BSS -- which is what this ABI used to imply -- silently
+ * threw one of them away. */
 #define VWIFI_BSS_F_BEACON   (1u << 16)
 
 struct vwifi_bss_entry {
@@ -360,14 +441,33 @@ struct vwifi_bss_entry {
     uint32_t capability_info;       /* low 16 bits = 802.11 capability field;
                                      * bit 16 = VWIFI_BSS_F_BEACON */
     uint64_t tsf;
-    uint16_t ie_len;                /* length of the raw frame that follows —
-                                     * the WHOLE beacon/probe-resp, not just
-                                     * the IE tail (WDI wants the frame) */
+    uint16_t ie_len;                /* length of the raw frame that follows */
     uint16_t ssid_len;
     uint8_t  ssid[33];
     uint8_t  _reserved2[3];
-    /* followed by ie_len bytes of raw IEs copied from the beacon/probe-resp */
-} __attribute__((packed));
+    /* Followed by ie_len bytes: the WHOLE beacon / probe-response frame,
+     * starting at the 802.11 MAC header, not just the IE tail. The name
+     * is historical and misleading -- it is a frame length, not an IE
+     * length.
+     *
+     * The full frame is what Linux wants:
+     * cfg80211_inform_bss_frame_data() takes a struct ieee80211_mgmt,
+     * MAC header included.
+     *
+     * Windows wants the opposite, and each consumer is responsible for
+     * its own trimming. WDI's beacon/probe-response byte blobs are
+     * documented as NOT including the 802.11 MAC header, so the Windows
+     * driver skips VWIFI_80211_MGMT_HDR_LEN bytes before handing the
+     * frame over. Getting that wrong is not a parse error: the OS reads
+     * the first eight bytes of the MAC header as the beacon timestamp
+     * and starts looking for information elements inside addr2, finds no
+     * SSID, and reports the network as hidden. */
+} VWIFI_PACKED;
+
+/* 802.11 management frame header: frame control, duration, three
+ * addresses, sequence control. The frame body -- fixed parameters then
+ * information elements -- starts here. */
+#define VWIFI_80211_MGMT_HDR_LEN  24
 
 struct vwifi_connect_req {
     uint8_t  bssid[6];              /* specific AP to target */
@@ -382,7 +482,7 @@ struct vwifi_connect_req {
     uint16_t assoc_ie_len;
     uint16_t _reserved1;
     /* followed by assoc_ie_len bytes of IEs to include in assoc request */
-} __attribute__((packed));
+} VWIFI_PACKED;
 
 enum {
     VWIFI_AUTH_OPEN          = 0,
@@ -409,23 +509,43 @@ enum {
 struct vwifi_disconnect_req {
     uint16_t reason_code;           /* 802.11 reason code */
     uint16_t _reserved;
-} __attribute__((packed));
+} VWIFI_PACKED;
 
 struct vwifi_assoc_result {
     uint8_t  bssid[6];
     uint8_t  _reserved0[2];
     uint16_t status_code;           /* 0 = success, 802.11 status code otherwise */
     uint16_t aid;
-    uint16_t ie_len;                /* assoc response IEs */
-    uint16_t _reserved1;
-    /* followed by ie_len bytes of AP's assoc response IEs */
-} __attribute__((packed));
+    uint16_t ie_len;                /* assoc response FRAME, whole */
+    /* The association REQUEST frame this station sent, whole.
+     *
+     * Frames, not IE blocks, on both of these. WDI defines
+     * WDI_TLV_ASSOCIATION_REQUEST_FRAME and
+     * WDI_TLV_ASSOCIATION_REQUEST_IES separately, and the driver
+     * reports these as the frames; handing an IE block to the frame TLV
+     * made Windows reject an otherwise perfect association in
+     * thirty-three milliseconds.
+     *
+     * The four-way handshake is authenticated over the two RSN elements
+     * that were exchanged, so a supplicant needs the one the station
+     * sent as well as the one the AP answered with. The device builds
+     * the station's RSN element itself -- WDI never supplies one -- so
+     * without this the OS has no way to know what it associated with.
+     *
+     * This was _reserved1, and takes its place rather than extending
+     * the structure: the size is unchanged, every existing field stays
+     * where it was, and a reader that does not know about this simply
+     * reads ie_len bytes and stops, as it always did. */
+    uint16_t req_ie_len;
+    /* followed by ie_len bytes of the AP's assoc response frame,
+     * then req_ie_len bytes of our own assoc request frame */
+} VWIFI_PACKED;
 
 struct vwifi_disconnect_ev {
     uint16_t reason_code;
     uint8_t  local;                 /* 1 = locally initiated */
     uint8_t  _reserved;
-} __attribute__((packed));
+} VWIFI_PACKED;
 
 struct vwifi_mgmt_rx {
     uint16_t frame_len;
@@ -434,20 +554,20 @@ struct vwifi_mgmt_rx {
     uint16_t channel_freq;
     uint16_t _reserved1;
     /* followed by frame_len bytes of raw 802.11 management frame */
-} __attribute__((packed));
+} VWIFI_PACKED;
 
 struct vwifi_key_id {
     uint8_t  mac[6];                /* peer MAC; all-zero = group key */
     uint8_t  key_idx;               /* 0..3 */
     uint8_t  pairwise;              /* 1 = pairwise, 0 = group */
-} __attribute__((packed));
+} VWIFI_PACKED;
 
 struct vwifi_key {
     struct vwifi_key_id id;
     uint16_t cipher;                /* VWIFI_CIPHER_* */
     uint16_t key_len;               /* 16 for CCMP128, 32 for GCMP256 */
     uint8_t  key[32];
-} __attribute__((packed));
+} VWIFI_PACKED;
 
 struct vwifi_ap_config {
     uint16_t ssid_len;
@@ -459,6 +579,10 @@ struct vwifi_ap_config {
     uint16_t ie_len;                /* beacon/probe-resp IEs */
     uint16_t _reserved1;
     /* followed by ie_len bytes of IEs */
-} __attribute__((packed));
+} VWIFI_PACKED;
+
+#if defined(_MSC_VER)
+#pragma pack(pop)
+#endif
 
 #endif /* VWIFI_ABI_H */

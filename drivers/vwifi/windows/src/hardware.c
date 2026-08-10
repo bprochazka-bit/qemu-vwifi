@@ -10,6 +10,8 @@
 
 MINIPORT_MESSAGE_INTERRUPT    VwifiMessageIsr;
 MINIPORT_MESSAGE_INTERRUPT_DPC VwifiMessageDpc;
+MINIPORT_ISR                  VwifiLineIsr;
+MINIPORT_INTERRUPT_DPC        VwifiLineDpc;
 
 /* ============================================================
  * Parse the assigned PCI resources list to find BAR0 (MMIO).
@@ -91,6 +93,48 @@ VwifiMessageIsr(
     return TRUE;
 }
 
+/* ============================================================
+ * Line-based ISR/DPC — present only so registration can succeed.
+ *
+ * NdisMRegisterInterruptEx wants InterruptHandler filled in whether or
+ * not we intend to run on a line interrupt, and NDIS decides which kind
+ * we get. This claims nothing: the device is not enabled until
+ * VwifiHwStart has confirmed we were given message-based interrupts, so
+ * if these ever run the interrupt belongs to somebody else on a shared
+ * line.
+ *
+ * Claiming it would be worse than useless. vwifi-virt has no working
+ * INTx path -- it asserts the line and has no means to lower it -- so
+ * returning TRUE here would turn a dead device into a storm.
+ * ============================================================ */
+_Use_decl_annotations_
+BOOLEAN
+VwifiLineIsr(
+    NDIS_HANDLE MiniportInterruptContext,
+    PBOOLEAN     QueueDefaultInterruptDpc,
+    PULONG       TargetProcessors)
+{
+    UNREFERENCED_PARAMETER(MiniportInterruptContext);
+    UNREFERENCED_PARAMETER(TargetProcessors);
+
+    *QueueDefaultInterruptDpc = FALSE;
+    return FALSE;   /* not ours */
+}
+
+_Use_decl_annotations_
+VOID
+VwifiLineDpc(
+    NDIS_HANDLE MiniportInterruptContext,
+    PVOID       MiniportDpcContext,
+    PVOID       ReceiveThrottleParameters,
+    PVOID       NdisReserved2)
+{
+    UNREFERENCED_PARAMETER(MiniportInterruptContext);
+    UNREFERENCED_PARAMETER(MiniportDpcContext);
+    UNREFERENCED_PARAMETER(ReceiveThrottleParameters);
+    UNREFERENCED_PARAMETER(NdisReserved2);
+}
+
 _Use_decl_annotations_
 VOID
 VwifiMessageDpc(
@@ -139,22 +183,100 @@ VwifiMessageDpc(
 }
 
 /* ============================================================
- * VwifiHwInitialize — called from MiniportInitializeEx
+ * Bring-up is in two halves, and the split is not cosmetic.
+ *
+ * VwifiHwInitialize runs inside MiniportWdiAllocateAdapter. At that
+ * point the adapter is NOT yet a registered NDIS miniport: we are
+ * filling in the registration attributes that the WLAN component will
+ * apply *after* we return. So nothing here may call an NDIS routine
+ * that needs a registered adapter.
+ *
+ * VwifiHwStart runs from MiniportWdiOpenAdapter, by which time the
+ * attributes are live. Everything that touches NDIS-managed
+ * resources — DMA rings, NBL pools, interrupts — belongs there.
+ *
+ * Note that the split alone did not fix the ring allocation: a
+ * 1536-byte NdisMAllocateSharedMemory still returned
+ * NDIS_STATUS_RESOURCES from OpenAdapter on an idle machine. The rings
+ * now come from the PDO's own DMA adapter instead; see the header
+ * comment on VwifiDmaAlloc in rings.c.
  * ============================================================ */
+
+/* ============================================================
+ * The PDO's DMA adapter.
+ *
+ * IoGetDmaAdapter and PutDmaAdapter are both PASSIVE_LEVEL-only, which
+ * OpenAdapter/CloseAdapter satisfy. Every common buffer taken from this
+ * adapter must be freed before it is put back, so the release below is
+ * ordered after VwifiRingsFree in both the failure path and HwStop.
+ * ============================================================ */
+static NDIS_STATUS
+VwifiDmaAdapterAcquire(_Inout_ PVWIFI_ADAPTER Adapter)
+{
+    DEVICE_DESCRIPTION desc = { 0 };
+    PDEVICE_OBJECT     pdo  = NULL;
+    ULONG              map_registers = 0;
+
+    if (Adapter->DmaAdapter) {
+        return NDIS_STATUS_SUCCESS;
+    }
+
+    NdisMGetDeviceProperty(Adapter->MiniportAdapterHandle,
+                           &pdo, NULL, NULL, NULL, NULL);
+    if (!pdo) {
+        VWIFI_ERR("NdisMGetDeviceProperty returned no PDO");
+        return NDIS_STATUS_RESOURCES;
+    }
+
+    /* VERSION1 rather than VERSION: Dma64BitAddresses is only honoured
+     * from version 1 on, and the ring ABI carries 64-bit addresses. */
+    desc.Version           = DEVICE_DESCRIPTION_VERSION1;
+    desc.Master            = TRUE;
+    desc.ScatterGather     = TRUE;
+    desc.Dma64BitAddresses = TRUE;
+    desc.InterfaceType     = PCIBus;
+    /* Only sizes the map-register grant, which we never draw on: every
+     * allocation here is a common buffer, and AllocateCommonBuffer is
+     * not bounded by MaximumLength. Set to the largest region we ask
+     * for so the number is at least meaningful. */
+    desc.MaximumLength     = VWIFI_RX_RING_SIZE * VWIFI_RX_BUFFER_SIZE;
+
+    Adapter->DmaAdapter = IoGetDmaAdapter(pdo, &desc, &map_registers);
+    if (!Adapter->DmaAdapter) {
+        VWIFI_ERR("IoGetDmaAdapter failed");
+        return NDIS_STATUS_RESOURCES;
+    }
+    Adapter->DmaMapRegisters = map_registers;
+
+    VWIFI_INFO("DMA adapter acquired, %u map registers", map_registers);
+    return NDIS_STATUS_SUCCESS;
+}
+
+static VOID
+VwifiDmaAdapterRelease(_Inout_ PVWIFI_ADAPTER Adapter)
+{
+    if (Adapter->DmaAdapter) {
+        Adapter->DmaAdapter->DmaOperations->PutDmaAdapter(
+            Adapter->DmaAdapter);
+        Adapter->DmaAdapter      = NULL;
+        Adapter->DmaMapRegisters = 0;
+    }
+}
+
 NDIS_STATUS
 VwifiHwInitialize(
     _Inout_ PVWIFI_ADAPTER Adapter,
     _In_ PNDIS_MINIPORT_INIT_PARAMETERS InitParams)
 {
     NDIS_STATUS status;
-    NDIS_MINIPORT_INTERRUPT_CHARACTERISTICS irq_chars = { 0 };
     ULONG caps, sig, ver;
 
     status = VwifiParseResources(Adapter,
                                  InitParams->AllocatedResources);
     if (status != NDIS_STATUS_SUCCESS) return status;
 
-    /* Map BAR0 — MmNonCached because it's MMIO. */
+    /* Map BAR0 — MmNonCached because it's MMIO. MmMapIoSpace is a
+     * memory-manager call, not an NDIS one, so it is safe this early. */
     Adapter->MmioVirtualAddress = MmMapIoSpace(
         Adapter->MmioPhysicalAddress, Adapter->MmioLength, MmNonCached);
     if (!Adapter->MmioVirtualAddress) {
@@ -162,7 +284,9 @@ VwifiHwInitialize(
         return NDIS_STATUS_RESOURCES;
     }
 
-    /* Verify signature and ABI version. */
+    /* Verify signature and ABI version. Doing this here means a wrong
+     * or mismatched device is rejected before the WLAN component has
+     * committed to us. */
     sig = VwifiRead32(Adapter, VWIFI_REG_SIGNATURE);
     ver = VwifiRead32(Adapter, VWIFI_REG_ABI_VERSION);
     caps = VwifiRead32(Adapter, VWIFI_REG_CAPS);
@@ -180,13 +304,40 @@ VwifiHwInitialize(
         goto fail_mmio;
     }
 
-    /* Assert reset to start from a known state, then clear. */
+    /* Assert reset to start from a known state. */
     VwifiWrite32(Adapter, VWIFI_REG_RESET, 1);
-    /* Device reset is synchronous in our model — no need to poll. */
+
+    VWIFI_INFO("hardware probed; rings deferred to OpenAdapter");
+    return NDIS_STATUS_SUCCESS;
+
+fail_mmio:
+    MmUnmapIoSpace(Adapter->MmioVirtualAddress, Adapter->MmioLength);
+    Adapter->MmioVirtualAddress = NULL;
+    return status;
+}
+
+/* ============================================================
+ * VwifiHwStart — called from MiniportWdiOpenAdapter, once the
+ * registration attributes are in effect.
+ * ============================================================ */
+NDIS_STATUS
+VwifiHwStart(_Inout_ PVWIFI_ADAPTER Adapter)
+{
+    NDIS_STATUS status;
+    NDIS_MINIPORT_INTERRUPT_CHARACTERISTICS irq_chars = { 0 };
+
+    if (Adapter->Started) {
+        return NDIS_STATUS_SUCCESS;
+    }
+
+    /* The rings are common buffers, so the DMA adapter has to exist
+     * before anything tries to allocate one. */
+    status = VwifiDmaAdapterAcquire(Adapter);
+    if (status != NDIS_STATUS_SUCCESS) return status;
 
     /* Allocate and program the four rings. */
     status = VwifiRingsAllocate(Adapter);
-    if (status != NDIS_STATUS_SUCCESS) goto fail_mmio;
+    if (status != NDIS_STATUS_SUCCESS) goto fail_dma;
     VwifiRingsProgramMmio(Adapter);
     VwifiRingsArmCtrlRsp(Adapter);
     VwifiRingsPostRxBuffers(Adapter);
@@ -204,11 +355,22 @@ VwifiHwInitialize(
     if (status != NDIS_STATUS_SUCCESS) goto fail_scan;
 
     /* Connect MSI-X interrupts. NDIS walks the resource list to find
-     * the message table and wires up the callbacks. */
+     * the message table and wires up the callbacks.
+     *
+     * MsiSupported = TRUE is not optional and not a hint about the
+     * hardware: it is the request. Leave it FALSE and NDIS connects a
+     * line-based interrupt no matter what the device offers or what the
+     * INF granted. Both halves are needed -- the INF's MSISupported key
+     * is what makes Windows assign MSI-X resources in the first place,
+     * and this is what makes NDIS connect them as messages. */
     irq_chars.Header.Type     = NDIS_OBJECT_TYPE_MINIPORT_INTERRUPT;
     irq_chars.Header.Revision = NDIS_MINIPORT_INTERRUPT_REVISION_1;
     irq_chars.Header.Size     = NDIS_SIZEOF_MINIPORT_INTERRUPT_CHARACTERISTICS_REVISION_1;
-    irq_chars.MessageInterruptHandler   = VwifiMessageIsr;
+    irq_chars.InterruptHandler           = VwifiLineIsr;
+    irq_chars.InterruptDpcHandler        = VwifiLineDpc;
+    irq_chars.MsiSupported               = TRUE;
+    irq_chars.MsiSyncWithAllMessages     = TRUE;
+    irq_chars.MessageInterruptHandler    = VwifiMessageIsr;
     irq_chars.MessageInterruptDpcHandler = VwifiMessageDpc;
 
     status = NdisMRegisterInterruptEx(
@@ -216,24 +378,54 @@ VwifiHwInitialize(
         &Adapter->InterruptHandle);
     if (status != NDIS_STATUS_SUCCESS) {
         VWIFI_ERR("NdisMRegisterInterruptEx failed 0x%x", status);
-        goto fail_rings;
+        goto fail_connect;
     }
     Adapter->MessageInfo = irq_chars.MessageInfoTable;
 
+    /* Refuse to run on a line interrupt.
+     *
+     * This is a hard stop and not a degraded mode. vwifi-virt asserts
+     * INTx and has no way to lower it -- its interrupt status is
+     * cleared by a ring-head MMIO write, which the assert path never
+     * sees -- so enabling the device on a line interrupt storms the
+     * host and freezes the whole VM on the first control response, with
+     * no bugcheck and no dump to explain it. Failing here turns that
+     * into a Code 10 with a line in the log saying why. */
+    if (irq_chars.InterruptType != NDIS_CONNECT_MESSAGE_BASED) {
+        VWIFI_ERR("got a line-based interrupt (type %u), not MSI-X. "
+                  "Refusing to enable the device: this build of "
+                  "vwifi-virt cannot deliver INTx and would hang the VM.",
+                  irq_chars.InterruptType);
+        VWIFI_ERR("  cause: the installed INF has no MSISupported key "
+                  "under Interrupt Management. Reinstall the package "
+                  "built from inf\\vwifi.inx at this revision or later.");
+        status = NDIS_STATUS_RESOURCE_CONFLICT;
+        goto fail_irq;
+    }
+    VWIFI_INFO("MSI-X connected, %u messages",
+               Adapter->MessageInfo ? Adapter->MessageInfo->MessageCount : 0);
+
     /* Enable device: IRQs + ring processing. */
     VwifiWrite32(Adapter, VWIFI_REG_IRQ_MASK, 0);
+    /* VWIFI_CTRL_RX_80211: see the flag's definition in the ABI header.
+     * This driver is a WDI miniport and the component works in 802.11
+     * MPDUs in both directions, so the device must not convert received
+     * frames to 802.3 on our behalf. */
     VwifiWrite32(Adapter, VWIFI_REG_CTRL,
-                 VWIFI_CTRL_ENABLE | VWIFI_CTRL_IRQ_ENABLE);
+                 VWIFI_CTRL_ENABLE | VWIFI_CTRL_IRQ_ENABLE |
+                 VWIFI_CTRL_RX_80211);
 
     /* GET_CAPS synchronously. Gives us the default MAC and feature
-     * bits before we report general attributes. */
+     * bits. This is the first round trip over the rings, so it is also
+     * the first proof the device is answering at all. */
     {
         ULONG out_len = sizeof(Adapter->Caps);
         status = VwifiCtrlSendSync(Adapter, VWIFI_OP_GET_CAPS,
                                    NULL, 0,
                                    &Adapter->Caps, &out_len);
         if (status != NDIS_STATUS_SUCCESS) {
-            VWIFI_ERR("GET_CAPS failed 0x%x", status);
+            VWIFI_ERR("GET_CAPS failed 0x%x — is the medium hub running?",
+                      status);
             goto fail_irq;
         }
         Adapter->CapsValid = TRUE;
@@ -253,11 +445,20 @@ VwifiHwInitialize(
                                 Adapter->CurrentMac, 6, NULL, &out_len);
     }
 
+    Adapter->Started = TRUE;
+
+    /* Last, and its failure is not this function's failure: the
+     * heartbeat is a diagnostic, and an adapter that works without a
+     * trace line every eight seconds is still an adapter that works. */
+    (VOID)VwifiHeartbeatStart(Adapter);
+
+    VWIFI_INFO("adapter started");
     return NDIS_STATUS_SUCCESS;
 
 fail_irq:
     NdisMDeregisterInterruptEx(Adapter->InterruptHandle);
     Adapter->InterruptHandle = NULL;
+fail_connect:
     VwifiConnectTaskDestroy(Adapter);
 fail_scan:
     VwifiScanTaskDestroy(Adapter);
@@ -265,20 +466,28 @@ fail_nbl:
     VwifiRxNblPoolDestroy(Adapter);
 fail_rings:
     VwifiRingsFree(Adapter);
-fail_mmio:
-    MmUnmapIoSpace(Adapter->MmioVirtualAddress, Adapter->MmioLength);
-    Adapter->MmioVirtualAddress = NULL;
+fail_dma:
+    VwifiDmaAdapterRelease(Adapter);
     return status;
 }
 
 /* ============================================================
- * VwifiHwShutdown
+ * VwifiHwStop — the mirror of VwifiHwStart, from CloseAdapter.
+ * Leaves the MMIO mapping alone; that belongs to Initialize.
  * ============================================================ */
 VOID
-VwifiHwShutdown(_Inout_ PVWIFI_ADAPTER Adapter)
+VwifiHwStop(_Inout_ PVWIFI_ADAPTER Adapter)
 {
+    if (!Adapter->Started) {
+        return;
+    }
+    Adapter->Started = FALSE;
+
+    /* First: the beat reads adapter state that everything below is
+     * about to tear down. */
+    VwifiHeartbeatStop(Adapter);
+
     if (Adapter->MmioVirtualAddress) {
-        /* Quiesce the device before tearing down. */
         VwifiWrite32(Adapter, VWIFI_REG_CTRL, 0);
         VwifiWrite32(Adapter, VWIFI_REG_RESET, 1);
     }
@@ -292,6 +501,22 @@ VwifiHwShutdown(_Inout_ PVWIFI_ADAPTER Adapter)
     VwifiScanTaskDestroy(Adapter);
     VwifiRxNblPoolDestroy(Adapter);
     VwifiRingsFree(Adapter);
+
+    /* Strictly after VwifiRingsFree -- FreeCommonBuffer needs the
+     * adapter it came from. */
+    VwifiDmaAdapterRelease(Adapter);
+}
+
+/* ============================================================
+ * VwifiHwShutdown
+ * ============================================================ */
+VOID
+VwifiHwShutdown(_Inout_ PVWIFI_ADAPTER Adapter)
+{
+    /* Safe whether or not OpenAdapter ever ran: HwStop is a no-op when
+     * the adapter was never started, which is exactly the path taken
+     * when AllocateAdapter succeeded but the start failed. */
+    VwifiHwStop(Adapter);
 
     if (Adapter->MmioVirtualAddress) {
         MmUnmapIoSpace(Adapter->MmioVirtualAddress, Adapter->MmioLength);
@@ -312,7 +537,12 @@ VwifiHwReset(_Inout_ PVWIFI_ADAPTER Adapter)
     VwifiRingsProgramMmio(Adapter);
     VwifiRingsArmCtrlRsp(Adapter);
     VwifiRingsPostRxBuffers(Adapter);
+    /* VWIFI_CTRL_RX_80211: see the flag's definition in the ABI header.
+     * This driver is a WDI miniport and the component works in 802.11
+     * MPDUs in both directions, so the device must not convert received
+     * frames to 802.3 on our behalf. */
     VwifiWrite32(Adapter, VWIFI_REG_CTRL,
-                 VWIFI_CTRL_ENABLE | VWIFI_CTRL_IRQ_ENABLE);
+                 VWIFI_CTRL_ENABLE | VWIFI_CTRL_IRQ_ENABLE |
+                 VWIFI_CTRL_RX_80211);
     return NDIS_STATUS_SUCCESS;
 }

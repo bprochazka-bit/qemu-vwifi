@@ -2,9 +2,9 @@
  * vwifi — rings.c
  * SPDX-License-Identifier: GPL-2.0-or-later
  *
- * Four descriptor rings, DMA-coherent allocation via NdisMAllocate
- * SharedMemory, the synchronous control-send primitive, and the
- * DPC-context drain functions for ctrl-rsp and rx rings.
+ * Four descriptor rings, DMA-coherent allocation via the PDO's WDM DMA
+ * adapter, the synchronous control-send primitive, and the DPC-context
+ * drain functions for ctrl-rsp and rx rings.
  *
  * Ownership model (mirrors QEMU side):
  *   - Producer rings (ctrl-req, tx): driver writes desc with OWN=1,
@@ -19,7 +19,67 @@
 
 /* ============================================================
  * DMA-coherent allocation helpers
+ *
+ * These go through the PDO's DMA adapter -- IoGetDmaAdapter, taken in
+ * VwifiHwStart -- and not through NdisMAllocateSharedMemory.
+ *
+ * NDIS refuses shared-memory allocations unless
+ * NDIS_MINIPORT_ATTRIBUTES_BUS_MASTER is in effect. We do ask for that
+ * flag, but in the WDI model the registration attributes filled in
+ * during AllocateAdapter are handed to the WLAN component to apply on
+ * our behalf, and the evidence says our AttributeFlags do not survive
+ * the trip: a 1536-byte allocation failed with NDIS_STATUS_RESOURCES on
+ * an idle machine both when it was attempted from AllocateAdapter and
+ * after the split moved it into OpenAdapter, where the attributes are
+ * unambiguously live. That is an inference about why NDIS refuses --
+ * the log only proves that it does -- but the WDM adapter belongs to
+ * the PDO and depends on none of it, so it side-steps the question.
+ *
+ * CacheEnabled is TRUE throughout: x86/x64 PCI DMA is cache-coherent,
+ * so descriptors written here are visible to the device with no
+ * explicit flush, and the RX pool is copied out of often enough that
+ * uncached memory would cost real throughput.
  * ============================================================ */
+
+NDIS_STATUS
+VwifiDmaAlloc(
+    _Inout_ PVWIFI_ADAPTER Adapter,
+    _In_ ULONG Length,
+    _Outptr_result_maybenull_ PVOID *Va,
+    _Out_ PHYSICAL_ADDRESS *Pa)
+{
+    *Va = NULL;
+    Pa->QuadPart = 0;
+
+    if (!Adapter->DmaAdapter) {
+        VWIFI_ERR("DMA alloc of %u bytes with no DMA adapter", Length);
+        return NDIS_STATUS_RESOURCES;
+    }
+
+    *Va = Adapter->DmaAdapter->DmaOperations->AllocateCommonBuffer(
+              Adapter->DmaAdapter, Length, Pa, TRUE /* CacheEnabled */);
+    if (!*Va) {
+        VWIFI_ERR("AllocateCommonBuffer failed (%u bytes)", Length);
+        return NDIS_STATUS_RESOURCES;
+    }
+
+    RtlZeroMemory(*Va, Length);
+    return NDIS_STATUS_SUCCESS;
+}
+
+VOID
+VwifiDmaFree(
+    _Inout_ PVWIFI_ADAPTER Adapter,
+    _In_ ULONG Length,
+    _In_opt_ PVOID Va,
+    _In_ PHYSICAL_ADDRESS Pa)
+{
+    if (!Va || !Adapter->DmaAdapter) {
+        return;
+    }
+    Adapter->DmaAdapter->DmaOperations->FreeCommonBuffer(
+        Adapter->DmaAdapter, Length, Pa, Va, TRUE /* CacheEnabled */);
+}
 
 static NDIS_STATUS
 VwifiRingAlloc(
@@ -32,8 +92,8 @@ VwifiRingAlloc(
     _In_ ULONG RegSize,
     _In_ ULONG RegDoorbell, _In_ ULONG RegHead)
 {
-    NDIS_STATUS status;
-    ULONG size = NumDescs * DescSize;
+    ULONG       size = NumDescs * DescSize;
+    NDIS_STATUS st;
 
     RtlZeroMemory(Ring, sizeof(*Ring));
     Ring->Name        = Name;
@@ -48,15 +108,13 @@ VwifiRingAlloc(
     Ring->RegHead     = RegHead;
     Ring->NextIndex   = 0;
 
-    NdisMAllocateSharedMemory(
-        Adapter->MiniportAdapterHandle, size, TRUE /* cached = no */,
-        &Ring->VirtualAddress, &Ring->PhysicalAddress);
-    if (!Ring->VirtualAddress) {
-        VWIFI_ERR("ring %s: shared memory alloc failed (%u bytes)",
-                  Name, size);
-        return NDIS_STATUS_RESOURCES;
+    st = VwifiDmaAlloc(Adapter, size,
+                       &Ring->VirtualAddress,
+                       &Ring->PhysicalAddress);
+    if (st != NDIS_STATUS_SUCCESS) {
+        VWIFI_ERR("ring %s: DMA alloc failed (%u bytes)", Name, size);
+        return st;
     }
-    RtlZeroMemory(Ring->VirtualAddress, size);
 
     VWIFI_INFO("ring %s: %u descs × %u B = %u B @ phys 0x%llx",
                Name, NumDescs, DescSize, size,
@@ -68,9 +126,8 @@ static VOID
 VwifiRingFreeOne(_Inout_ PVWIFI_ADAPTER Adapter, _Inout_ PVWIFI_RING Ring)
 {
     if (Ring->VirtualAddress) {
-        NdisMFreeSharedMemory(Adapter->MiniportAdapterHandle,
-                              Ring->SizeBytes, TRUE,
-                              Ring->VirtualAddress, Ring->PhysicalAddress);
+        VwifiDmaFree(Adapter, Ring->SizeBytes,
+                     Ring->VirtualAddress, Ring->PhysicalAddress);
         Ring->VirtualAddress = NULL;
     }
 }
@@ -110,24 +167,16 @@ VwifiRingsAllocate(_Inout_ PVWIFI_ADAPTER Adapter)
     /* RX buffer pool: one contiguous DMA region, divided into
      * VWIFI_RX_RING_SIZE slots of VWIFI_RX_BUFFER_SIZE bytes each. */
     Adapter->RxBufferPoolSize = VWIFI_RX_RING_SIZE * VWIFI_RX_BUFFER_SIZE;
-    NdisMAllocateSharedMemory(Adapter->MiniportAdapterHandle,
-        Adapter->RxBufferPoolSize, FALSE,
-        &Adapter->RxBufferPoolVa, &Adapter->RxBufferPoolPa);
-    if (!Adapter->RxBufferPoolVa) {
-        st = NDIS_STATUS_RESOURCES;
-        goto fail;
-    }
+    st = VwifiDmaAlloc(Adapter, Adapter->RxBufferPoolSize,
+                       &Adapter->RxBufferPoolVa, &Adapter->RxBufferPoolPa);
+    if (st != NDIS_STATUS_SUCCESS) goto fail;
 
     /* TX injection buffer pool: same geometry as RX, used to stage
      * injected 802.11 frames before DMA. */
     Adapter->TxBufferPoolSize = VWIFI_TX_RING_SIZE * VWIFI_RX_BUFFER_SIZE;
-    NdisMAllocateSharedMemory(Adapter->MiniportAdapterHandle,
-        Adapter->TxBufferPoolSize, FALSE,
-        &Adapter->TxBufferPoolVa, &Adapter->TxBufferPoolPa);
-    if (!Adapter->TxBufferPoolVa) {
-        st = NDIS_STATUS_RESOURCES;
-        goto fail;
-    }
+    st = VwifiDmaAlloc(Adapter, Adapter->TxBufferPoolSize,
+                       &Adapter->TxBufferPoolVa, &Adapter->TxBufferPoolPa);
+    if (st != NDIS_STATUS_SUCCESS) goto fail;
 
     /* Per-slot DOT11_EXTSTA_RECV_CONTEXT array — non-DMA, just kernel
      * memory referenced by RX NBLs while in flight. */
@@ -140,18 +189,30 @@ VwifiRingsAllocate(_Inout_ PVWIFI_ADAPTER Adapter)
         goto fail;
     }
 
-    /* Ctrl-request payload scratch: one VWIFI_CTRL_PAYLOAD_SIZE slot
-     * per ring entry, so concurrent requests don't collide. */
-    NdisMAllocateSharedMemory(Adapter->MiniportAdapterHandle,
-        VWIFI_CTRL_REQ_RING_SIZE * VWIFI_CTRL_PAYLOAD_SIZE, FALSE,
-        &Adapter->CtrlReqPayloadVa, &Adapter->CtrlReqPayloadPa);
-    NdisMAllocateSharedMemory(Adapter->MiniportAdapterHandle,
-        VWIFI_CTRL_RSP_RING_SIZE * VWIFI_CTRL_PAYLOAD_SIZE, FALSE,
-        &Adapter->CtrlRspPayloadVa, &Adapter->CtrlRspPayloadPa);
-    if (!Adapter->CtrlReqPayloadVa || !Adapter->CtrlRspPayloadVa) {
+    /* Per-slot miniport state. Same length, same lifetime, and zeroed
+     * because the requeue counter in it is read before it is written
+     * on a frame that has never been requeued. */
+    Adapter->RxSlotRequeues = NdisAllocateMemoryWithTagPriority(
+        Adapter->MiniportAdapterHandle,
+        VWIFI_RX_RING_SIZE * sizeof(UCHAR),
+        VWIFI_POOL_TAG, NormalPoolPriority);
+    if (!Adapter->RxSlotRequeues) {
         st = NDIS_STATUS_RESOURCES;
         goto fail;
     }
+    RtlZeroMemory(Adapter->RxSlotRequeues, VWIFI_RX_RING_SIZE * sizeof(UCHAR));
+
+    /* Ctrl-request payload scratch: one VWIFI_CTRL_PAYLOAD_SIZE slot
+     * per ring entry, so concurrent requests don't collide. */
+    st = VwifiDmaAlloc(Adapter,
+        VWIFI_CTRL_REQ_RING_SIZE * VWIFI_CTRL_PAYLOAD_SIZE,
+        &Adapter->CtrlReqPayloadVa, &Adapter->CtrlReqPayloadPa);
+    if (st != NDIS_STATUS_SUCCESS) goto fail;
+
+    st = VwifiDmaAlloc(Adapter,
+        VWIFI_CTRL_RSP_RING_SIZE * VWIFI_CTRL_PAYLOAD_SIZE,
+        &Adapter->CtrlRspPayloadVa, &Adapter->CtrlRspPayloadPa);
+    if (st != NDIS_STATUS_SUCCESS) goto fail;
 
     return NDIS_STATUS_SUCCESS;
 
@@ -169,15 +230,13 @@ VwifiRingsFree(_Inout_ PVWIFI_ADAPTER Adapter)
     VwifiRingFreeOne(Adapter, &Adapter->RxRing);
 
     if (Adapter->RxBufferPoolVa) {
-        NdisMFreeSharedMemory(Adapter->MiniportAdapterHandle,
-            Adapter->RxBufferPoolSize, FALSE,
-            Adapter->RxBufferPoolVa, Adapter->RxBufferPoolPa);
+        VwifiDmaFree(Adapter, Adapter->RxBufferPoolSize,
+                     Adapter->RxBufferPoolVa, Adapter->RxBufferPoolPa);
         Adapter->RxBufferPoolVa = NULL;
     }
     if (Adapter->TxBufferPoolVa) {
-        NdisMFreeSharedMemory(Adapter->MiniportAdapterHandle,
-            Adapter->TxBufferPoolSize, FALSE,
-            Adapter->TxBufferPoolVa, Adapter->TxBufferPoolPa);
+        VwifiDmaFree(Adapter, Adapter->TxBufferPoolSize,
+                     Adapter->TxBufferPoolVa, Adapter->TxBufferPoolPa);
         Adapter->TxBufferPoolVa = NULL;
     }
     if (Adapter->RxRecvContext) {
@@ -185,15 +244,20 @@ VwifiRingsFree(_Inout_ PVWIFI_ADAPTER Adapter)
             Adapter->RxRecvContext, VWIFI_POOL_TAG);
         Adapter->RxRecvContext = NULL;
     }
+    if (Adapter->RxSlotRequeues) {
+        NdisFreeMemoryWithTagPriority(Adapter->MiniportAdapterHandle,
+            Adapter->RxSlotRequeues, VWIFI_POOL_TAG);
+        Adapter->RxSlotRequeues = NULL;
+    }
     if (Adapter->CtrlReqPayloadVa) {
-        NdisMFreeSharedMemory(Adapter->MiniportAdapterHandle,
-            VWIFI_CTRL_REQ_RING_SIZE * VWIFI_CTRL_PAYLOAD_SIZE, FALSE,
+        VwifiDmaFree(Adapter,
+            VWIFI_CTRL_REQ_RING_SIZE * VWIFI_CTRL_PAYLOAD_SIZE,
             Adapter->CtrlReqPayloadVa, Adapter->CtrlReqPayloadPa);
         Adapter->CtrlReqPayloadVa = NULL;
     }
     if (Adapter->CtrlRspPayloadVa) {
-        NdisMFreeSharedMemory(Adapter->MiniportAdapterHandle,
-            VWIFI_CTRL_RSP_RING_SIZE * VWIFI_CTRL_PAYLOAD_SIZE, FALSE,
+        VwifiDmaFree(Adapter,
+            VWIFI_CTRL_RSP_RING_SIZE * VWIFI_CTRL_PAYLOAD_SIZE,
             Adapter->CtrlRspPayloadVa, Adapter->CtrlRspPayloadPa);
         Adapter->CtrlRspPayloadVa = NULL;
     }
@@ -461,8 +525,9 @@ VwifiCtrlRspDrain(_Inout_ PVWIFI_ADAPTER Adapter)
                 break;
             }
         } else {
-            /* Match to pending request by req_id. */
-            KIRQL old;
+            /* Match to pending request by req_id. Already at
+             * DISPATCH_LEVEL in the DPC, hence the *AtDpcLevel forms
+             * and no saved KIRQL. */
             PVWIFI_PENDING_REQ req;
             KeAcquireSpinLockAtDpcLevel(&Adapter->PendingReqLock);
             req = VwifiDequeuePendingReqLocked(Adapter, d->req_id);
@@ -503,6 +568,14 @@ VwifiCtrlRspDrain(_Inout_ PVWIFI_ADAPTER Adapter)
 
     /* Ack the vector by writing head back. */
     VwifiWrite32(Adapter, ring->RegHead, ring->NextIndex);
+
+    /* Everything the device had to say has now been consumed, so the
+     * scan's staged batch is at its most complete. Deciding whether to
+     * indicate here rather than inside VwifiScanOnBssFound is what
+     * keeps a BSS's beacon and probe response in the same entry -- the
+     * device posts them as two consecutive events, and a throttle
+     * evaluated between them would indicate the first alone. */
+    VwifiScanFlushBatch(Adapter);
 }
 
 /* ============================================================

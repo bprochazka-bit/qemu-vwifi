@@ -135,6 +135,13 @@ void vwifi_rx_frame(struct vwifi_priv *p, const struct vwifi_rx_desc *desc,
 	 * Monitor captures come up with the raw 802.11 frame and a
 	 * radiotap header built from the descriptor's metadata; they are
 	 * not Ethernet and must not go through eth_type_trans().
+	 *
+	 * This treats VWIFI_RX_F_RAW as "monitor mode", which is one step
+	 * more than the flag actually says — it says "802.11, not 802.3".
+	 * The two coincide only because this driver never sets
+	 * VWIFI_CTRL_RX_80211; the Windows one does, and gets RAW on
+	 * ordinary station traffic. If this driver ever asks for MPDUs,
+	 * this test has to become a test of the mode.
 	 */
 	if (desc->flags & VWIFI_RX_F_RAW) {
 		if (!vwifi_monitor_rx(p, desc, data))

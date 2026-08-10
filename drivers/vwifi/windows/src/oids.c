@@ -7,6 +7,8 @@
  * Microsoft WLAN component surfaces to our miniport:
  *
  *   OID_DOT11_CURRENT_OPERATION_MODE  (set) -> op mode NETWORK_MONITOR
+ *                                     (the only route to monitor mode:
+ *                                      WDI itself has no such op mode)
  *   OID_DOT11_CURRENT_CHANNEL         (set) -> channel number (2.4 GHz)
  *   OID_DOT11_CURRENT_FREQUENCY       (set) -> channel for 5 GHz
  *   OID_GEN_CURRENT_PACKET_FILTER     (set) -> raw data/mgmt bits
@@ -17,7 +19,142 @@
  */
 
 #include "vwifi_drv.h"
+#include "tlv_shim.h"
 #include <windot11.h>
+
+/* ============================================================
+ * NDIS_OID_REQUEST.DATA is a union.
+ *
+ * The same field name means a different offset in each arm, so the
+ * buffer must always be read through the arm that matches RequestType.
+ * WDI's own OIDs are method requests, but the Native 802.11 ones are
+ * plain queries and sets, and the two are mixed in this file.
+ * ============================================================ */
+
+static VOID
+VwifiOidOutBuffer(_In_ PNDIS_OID_REQUEST Req,
+                  _Outptr_result_maybenull_ PVOID *Buf,
+                  _Out_ PULONG Len)
+{
+    if (Req->RequestType == NdisRequestMethod) {
+        *Buf = Req->DATA.METHOD_INFORMATION.InformationBuffer;
+        *Len = Req->DATA.METHOD_INFORMATION.OutputBufferLength;
+    } else {
+        *Buf = Req->DATA.QUERY_INFORMATION.InformationBuffer;
+        *Len = Req->DATA.QUERY_INFORMATION.InformationBufferLength;
+    }
+}
+
+static VOID
+VwifiOidSetWritten(_Inout_ PNDIS_OID_REQUEST Req, _In_ ULONG Written)
+{
+    if (Req->RequestType == NdisRequestMethod) {
+        Req->DATA.METHOD_INFORMATION.BytesWritten = Written;
+    } else {
+        Req->DATA.QUERY_INFORMATION.BytesWritten = Written;
+    }
+}
+
+static VOID
+VwifiOidSetNeeded(_Inout_ PNDIS_OID_REQUEST Req, _In_ ULONG Needed)
+{
+    if (Req->RequestType == NdisRequestMethod) {
+        Req->DATA.METHOD_INFORMATION.BytesNeeded = Needed;
+    } else {
+        Req->DATA.QUERY_INFORMATION.BytesNeeded = Needed;
+    }
+}
+
+/* The statuses the TLV generator and parser actually return. A bare
+ * 0xc0010015 costs a trip to the headers at exactly the moment the log
+ * is meant to be answering a question.
+ *
+ * External linkage, not static. It was static here and wdi_peer.c
+ * wanted it -- the same shape as the VwifiWdiAckHeaderOnly build break,
+ * where a helper this file happened to own was reached for from another
+ * and the build was the first to say so. A status-name table is not
+ * OID-dispatch's private business. */
+PCSTR
+VwifiNdisStatusName(_In_ NDIS_STATUS Status)
+{
+    switch (Status) {
+    case NDIS_STATUS_SUCCESS:           return "SUCCESS";
+    case NDIS_STATUS_PENDING:           return "PENDING";
+    case NDIS_STATUS_FAILURE:           return "FAILURE";
+    case NDIS_STATUS_RESOURCES:         return "RESOURCES";
+    case NDIS_STATUS_NOT_SUPPORTED:     return "NOT_SUPPORTED";
+    case NDIS_STATUS_BUFFER_TOO_SHORT:  return "BUFFER_TOO_SHORT";
+    case NDIS_STATUS_INVALID_LENGTH:    return "INVALID_LENGTH";
+    case NDIS_STATUS_INVALID_DATA:      return "INVALID_DATA";
+    case NDIS_STATUS_INVALID_OID:       return "INVALID_OID";
+    case NDIS_STATUS_INVALID_PARAMETER: return "INVALID_PARAMETER";
+    case NDIS_STATUS_BAD_VERSION:       return "BAD_VERSION";
+    /* The facility-0x23 block, which is where the statuses the WDI data
+     * path returns actually live. NDIS_STATUS_PAUSED came back from
+     * RxInorderDataIndication and printed as "?", which is worse than
+     * useless: an unnamed hex code reads as an unknown failure when it
+     * is a specific and recoverable one. */
+    case NDIS_STATUS_PAUSED:               return "PAUSED";
+    case NDIS_STATUS_INVALID_PORT:         return "INVALID_PORT";
+    case NDIS_STATUS_INVALID_PORT_STATE:   return "INVALID_PORT_STATE";
+    case NDIS_STATUS_LOW_POWER_STATE:      return "LOW_POWER_STATE";
+    case NDIS_STATUS_UNSUPPORTED_REVISION: return "UNSUPPORTED_REVISION";
+    case NDIS_STATUS_REQUEST_ABORTED:      return "REQUEST_ABORTED";
+    default:                               return "?";
+    }
+}
+
+static PCSTR
+VwifiOidRequestTypeName(_In_ NDIS_REQUEST_TYPE Type)
+{
+    switch (Type) {
+    case NdisRequestQueryInformation:  return "query";
+    case NdisRequestQueryStatistics:   return "query-stats";
+    case NdisRequestSetInformation:    return "set";
+    case NdisRequestMethod:            return "method";
+    default:                           return "?";
+    }
+}
+
+/* The OIDs the WLAN component sends while bringing an adapter up. Named
+ * so the trace is readable without a copy of dot11wdi.h to hand -- when
+ * an adapter is closed seconds after it opens, the OID it gave up on is
+ * the whole story, and a bare hex value buries it. */
+static PCSTR
+VwifiOidName(_In_ NDIS_OID Oid)
+{
+    switch (Oid) {
+    case OID_WDI_GET_ADAPTER_CAPABILITIES:  return "WDI_GET_ADAPTER_CAPABILITIES";
+    case OID_WDI_SET_ADAPTER_CONFIGURATION: return "WDI_SET_ADAPTER_CONFIGURATION";
+    case OID_WDI_TASK_CREATE_PORT:          return "WDI_TASK_CREATE_PORT";
+    case OID_WDI_TASK_DELETE_PORT:          return "WDI_TASK_DELETE_PORT";
+    case OID_WDI_TASK_OPEN:                 return "WDI_TASK_OPEN";
+    case OID_WDI_TASK_CLOSE:                return "WDI_TASK_CLOSE";
+    case OID_WDI_TASK_DOT11_RESET:          return "WDI_TASK_DOT11_RESET";
+    case OID_WDI_TASK_SET_RADIO_STATE:      return "WDI_TASK_SET_RADIO_STATE";
+    case OID_WDI_TASK_SCAN:                 return "WDI_TASK_SCAN";
+    case OID_WDI_TASK_CONNECT:              return "WDI_TASK_CONNECT";
+    case OID_WDI_TASK_DISCONNECT:           return "WDI_TASK_DISCONNECT";
+    case OID_WDI_TASK_CHANGE_OPERATION_MODE: return "WDI_TASK_CHANGE_OPERATION_MODE";
+    case OID_WDI_SET_POWER_STATE:           return "WDI_SET_POWER_STATE";
+    case OID_WDI_SET_OPERATION_MODE:        return "WDI_SET_OPERATION_MODE";
+    case OID_WDI_SET_RECEIVE_PACKET_FILTER: return "WDI_SET_RECEIVE_PACKET_FILTER";
+    case OID_WDI_SET_MULTICAST_LIST:        return "WDI_SET_MULTICAST_LIST";
+    case OID_WDI_SET_ADD_CIPHER_KEYS:       return "WDI_SET_ADD_CIPHER_KEYS";
+    case OID_WDI_SET_DELETE_CIPHER_KEYS:    return "WDI_SET_DELETE_CIPHER_KEYS";
+    case OID_WDI_SET_DEFAULT_KEY_ID:        return "WDI_SET_DEFAULT_KEY_ID";
+    case OID_WDI_GET_STATISTICS:            return "WDI_GET_STATISTICS";
+    case OID_WDI_GET_BSS_ENTRY_LIST:        return "WDI_GET_BSS_ENTRY_LIST";
+    case OID_WDI_SET_ADVERTISEMENT_INFORMATION: return "WDI_SET_ADVERTISEMENT_INFORMATION";
+    case OID_WDI_SET_CONNECTION_QUALITY:    return "WDI_SET_CONNECTION_QUALITY";
+    case OID_WDI_SET_PRIVACY_EXEMPTION_LIST: return "WDI_SET_PRIVACY_EXEMPTION_LIST";
+    case OID_DOT11_CURRENT_OPERATION_MODE:  return "DOT11_CURRENT_OPERATION_MODE";
+    case OID_DOT11_CURRENT_CHANNEL:         return "DOT11_CURRENT_CHANNEL";
+    case OID_DOT11_CURRENT_FREQUENCY:       return "DOT11_CURRENT_FREQUENCY";
+    case OID_GEN_CURRENT_PACKET_FILTER:     return "GEN_CURRENT_PACKET_FILTER";
+    default:                                return "";
+    }
+}
 
 /* 2.4 GHz channel number -> center frequency (MHz). */
 static USHORT
@@ -127,6 +264,968 @@ VwifiHandleSetPacketFilter(_Inout_ PVWIFI_ADAPTER Adapter,
 }
 
 /* ============================================================
+ * OID_WDI_GET_ADAPTER_CAPABILITIES
+ *
+ * The first thing the WLAN component asks for once OpenAdapter has
+ * completed, and the answer decides whether the adapter is usable at
+ * all. Returning NDIS_STATUS_NOT_SUPPORTED -- which is what the
+ * dispatcher's default arm did, silently, because this OID had no case
+ * and VwifiTlvGenerateAdapterCapabilities had no caller anywhere in the
+ * tree -- tells it nothing about the radio, so it closes the adapter
+ * again immediately. From the outside that looks like OpenAdapter
+ * succeeding and CloseAdapter arriving a fraction of a millisecond
+ * later with nothing in between.
+ *
+ * Unlike the WDI *tasks*, this one answers in the OID's own output
+ * buffer rather than through an indication. The reply is the same
+ * [WDI_MESSAGE_HEADER][TLV blob] shape as everything else, and the
+ * generator has already reserved the header at the front of the blob,
+ * so the header is filled in place -- see VwifiSendWdiIndication for
+ * why prepending a second one is wrong.
+ * ============================================================ */
+static NDIS_STATUS
+VwifiHandleGetAdapterCapabilities(_Inout_ PVWIFI_ADAPTER Adapter,
+                                  _In_ PNDIS_OID_REQUEST Req)
+{
+    PVOID       blob    = NULL;
+    ULONG       blobLen = 0;
+    PVOID       out     = NULL;
+    ULONG       outLen  = 0;
+    NDIS_STATUS status;
+    WDI_MESSAGE_HEADER *hdr;
+    UINT32      transactionId = WDI_TRANSACTION_ID_UNSOLICIT;
+    WDI_PORT_ID portId = 0;
+
+    /* The capabilities we report are built from what the device told us
+     * during GET_CAPS in VwifiHwStart. Without that there is nothing
+     * honest to say. */
+    if (!Adapter->CapsValid) {
+        VWIFI_ERR("GET_ADAPTER_CAPABILITIES before GET_CAPS completed");
+        return NDIS_STATUS_FAILURE;
+    }
+
+    /* Echo the request's port and transaction id when there is an input
+     * buffer to read them from. A method request carries one; a plain
+     * query does not. */
+    if (Req->RequestType == NdisRequestMethod &&
+        Req->DATA.METHOD_INFORMATION.InformationBuffer != NULL &&
+        Req->DATA.METHOD_INFORMATION.InputBufferLength >=
+            sizeof(WDI_MESSAGE_HEADER)) {
+        const WDI_MESSAGE_HEADER *in = (const WDI_MESSAGE_HEADER *)
+            Req->DATA.METHOD_INFORMATION.InformationBuffer;
+        transactionId = in->TransactionId;
+        portId        = in->PortId;
+    }
+
+    status = VwifiTlvGenerateAdapterCapabilities(
+                 Adapter->WdiPeerVersion, &Adapter->Caps,
+                 Adapter->CurrentMac, &blob, &blobLen);
+    if (status != NDIS_STATUS_SUCCESS) {
+        VWIFI_ERR("capabilities generate failed 0x%08x %s", status,
+                  VwifiNdisStatusName(status));
+        if (status == NDIS_STATUS_INVALID_DATA) {
+            /* The generator says only that the message is bad, never
+             * which field. Every previous instance has been a mandatory
+             * container left as its zeroed self, so that is where to
+             * look: WABIModel.xml, any containerRef without
+             * optional="true". */
+            VWIFI_ERR("  a mandatory container is empty -- check the "
+                      "containerRefs without optional=\"true\" under "
+                      "WDI_GET_ADAPTER_CAPABILITIES in WABIModel.xml");
+        }
+        return status;
+    }
+
+    if (blobLen < sizeof(WDI_MESSAGE_HEADER)) {
+        VWIFI_ERR("capabilities blob %u bytes, shorter than the header "
+                  "space it was asked to reserve", blobLen);
+        VwifiTlvFreeGenerated(blob);
+        return NDIS_STATUS_FAILURE;
+    }
+
+    hdr = (WDI_MESSAGE_HEADER *)blob;
+    RtlZeroMemory(hdr, sizeof(*hdr));
+    hdr->PortId        = portId;
+    hdr->Status        = NDIS_STATUS_SUCCESS;
+    hdr->TransactionId = transactionId;
+    hdr->IhvSpecificId = 0;
+
+    VwifiOidOutBuffer(Req, &out, &outLen);
+    if (out == NULL || outLen < blobLen) {
+        /* NDIS convention: say how much is needed and let the OS come
+         * back with a buffer that size. Not an error worth logging as
+         * one -- a first probe with a short buffer is normal. */
+        VwifiOidSetNeeded(Req, blobLen);
+        VwifiOidSetWritten(Req, 0);
+        VwifiTlvFreeGenerated(blob);
+        return NDIS_STATUS_BUFFER_TOO_SHORT;
+    }
+
+    RtlCopyMemory(out, blob, blobLen);
+    VwifiOidSetWritten(Req, blobLen);
+    VwifiTlvFreeGenerated(blob);
+
+    VWIFI_INFO("OID: reported adapter capabilities (%u bytes)", blobLen);
+    return NDIS_STATUS_SUCCESS;
+}
+
+/* ============================================================
+ * "No TLV data needed, header is sufficient"
+ *
+ * WABIModel.xml uses that exact phrase for the FromIhv side of most of
+ * the bring-up messages — SET_ADAPTER_CONFIGURATION, TASK_CREATE_PORT,
+ * TASK_DELETE_PORT, TASK_SET_RADIO_STATE, TASK_OPEN, TASK_CLOSE. The
+ * reply is a bare WDI_MESSAGE_HEADER echoing the request's port and
+ * transaction id, with the outcome in its Status field.
+ *
+ * Tolerant about the output buffer on purpose: a set that is not
+ * expected to return anything may well arrive with no output buffer at
+ * all, and refusing that with BUFFER_TOO_SHORT would fail a request
+ * that actually succeeded.
+ * ============================================================ */
+static NDIS_STATUS
+VwifiWdiAckHeaderOnly(_In_ PNDIS_OID_REQUEST Req,
+                      _In_ NDIS_STATUS MessageStatus)
+{
+    PVOID  out    = NULL;
+    ULONG  outLen = 0;
+    WDI_MESSAGE_HEADER *hdr;
+    UINT32 transactionId = WDI_TRANSACTION_ID_UNSOLICIT;
+    WDI_PORT_ID portId = 0;
+
+    if (Req->RequestType == NdisRequestMethod &&
+        Req->DATA.METHOD_INFORMATION.InformationBuffer != NULL &&
+        Req->DATA.METHOD_INFORMATION.InputBufferLength >=
+            sizeof(WDI_MESSAGE_HEADER)) {
+        const WDI_MESSAGE_HEADER *in = (const WDI_MESSAGE_HEADER *)
+            Req->DATA.METHOD_INFORMATION.InformationBuffer;
+        transactionId = in->TransactionId;
+        portId        = in->PortId;
+    }
+
+    VwifiOidOutBuffer(Req, &out, &outLen);
+    if (out == NULL || outLen < sizeof(WDI_MESSAGE_HEADER)) {
+        VwifiOidSetWritten(Req, 0);
+        return NDIS_STATUS_SUCCESS;
+    }
+
+    hdr = (WDI_MESSAGE_HEADER *)out;
+    RtlZeroMemory(hdr, sizeof(*hdr));
+    hdr->PortId        = portId;
+    hdr->Status        = MessageStatus;
+    hdr->TransactionId = transactionId;
+    hdr->IhvSpecificId = 0;
+
+    VwifiOidSetWritten(Req, sizeof(WDI_MESSAGE_HEADER));
+    return NDIS_STATUS_SUCCESS;
+}
+
+/* ============================================================
+ * OID_WDI_SET_ADAPTER_CONFIGURATION
+ *
+ * Sent immediately after the capabilities are accepted, and returning
+ * NOT_SUPPORTED for it closes the adapter just as surely as failing the
+ * capabilities did.
+ *
+ * Of everything the message carries, only the configured MAC address
+ * maps onto anything this device has; the rest is firmware policy —
+ * P2P group-owner reset, unreachability detection, NLO scan mode,
+ * PLDR — with no equivalent here. Silently ignoring the MAC would mean
+ * frames going out with an address the OS did not ask for, so it is
+ * pushed down to the device.
+ *
+ * A parse failure is logged and does not fail the OID. The message is
+ * mostly settings we do not implement, and refusing the whole request
+ * because an unrelated container did not decode would trade a cosmetic
+ * problem for a dead adapter.
+ * ============================================================ */
+static NDIS_STATUS
+VwifiHandleSetAdapterConfiguration(_Inout_ PVWIFI_ADAPTER Adapter,
+                                   _In_ PNDIS_OID_REQUEST Req)
+{
+    PVOID       tlv    = NULL;
+    ULONG       tlvLen = 0;
+    UCHAR       mac[6];
+    BOOLEAN     macPresent = FALSE;
+    NDIS_STATUS status;
+
+    status = VwifiGetTlvPayload(Req, &tlv, &tlvLen);
+    if (status != NDIS_STATUS_SUCCESS) {
+        VWIFI_WARN("SET_ADAPTER_CONFIGURATION: no TLV payload (0x%08x %s)",
+                   status, VwifiNdisStatusName(status));
+        return VwifiWdiAckHeaderOnly(Req, NDIS_STATUS_SUCCESS);
+    }
+
+    status = VwifiTlvParseAdapterConfiguration(Adapter->WdiPeerVersion,
+                                               tlv, tlvLen,
+                                               mac, &macPresent);
+    if (status != NDIS_STATUS_SUCCESS) {
+        VWIFI_WARN("SET_ADAPTER_CONFIGURATION: parse failed 0x%08x %s; "
+                   "accepting anyway", status, VwifiNdisStatusName(status));
+        return VwifiWdiAckHeaderOnly(Req, NDIS_STATUS_SUCCESS);
+    }
+
+    if (macPresent) {
+        ULONG out_len = 0;
+
+        VWIFI_INFO("OID: configured MAC %02x:%02x:%02x:%02x:%02x:%02x",
+                   mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+        RtlCopyMemory(Adapter->CurrentMac, mac, 6);
+        status = VwifiCtrlSendSync(Adapter, VWIFI_OP_SET_STA_MAC,
+                                   mac, 6, NULL, &out_len);
+        if (status != NDIS_STATUS_SUCCESS) {
+            VWIFI_ERR("SET_STA_MAC failed 0x%08x %s", status,
+                      VwifiNdisStatusName(status));
+            return VwifiWdiAckHeaderOnly(Req, status);
+        }
+    } else {
+        VWIFI_INFO("OID: adapter configuration accepted (no MAC change)");
+    }
+
+    return VwifiWdiAckHeaderOnly(Req, NDIS_STATUS_SUCCESS);
+}
+
+/* Accept a task: write the M2, return NDIS_STATUS_INDICATION_REQUIRED.
+ *
+ * A task acknowledgement has two independent status fields and this
+ * function used to conflate them:
+ *
+ *   the M2 header's Status   what the port driver reads out of the
+ *                            output buffer. SUCCESS: the request was
+ *                            understood.
+ *   the OID's return value   what MiniportOidRequest hands back to
+ *                            NDIS. INDICATION_REQUIRED: accepted, the
+ *                            outcome follows as the M3.
+ *
+ * VwifiWdiAckHeaderOnly only writes the first. It ALWAYS returns
+ * NDIS_STATUS_SUCCESS, whatever it was passed, so the OID's return
+ * value has to be stated separately -- which is why this reads as two
+ * statements rather than one `return`.
+ *
+ * The previous build returned SUCCESS from both. That came from a
+ * hardware breakpoint on wdiwifi!CScanJob::FinishJob, taken from the
+ * host through QEMU's gdbstub:
+ *
+ *   gate 1  status        = 0x40230001
+ *   gate 2  m_bCancelled  = 0x0
+ *   gate 3  port id       = 0x0
+ *
+ * 0x40230001 is STATUS_NDIS_INDICATION_REQUIRED, and FinishJob writes
+ * WfcPortPropertyGoodScanStartTime only when its status argument is
+ * zero:
+ *
+ *   +0x98  test ebp,ebp / jne skip
+ *   +0xa6  cmp byte ptr [rbx+78Ah],bpl
+ *   +0xd2  SetPropertyBuffer(cache, 0x47, 8, &startTime)
+ *
+ * That sample is real and it does prove the OID's return value reaches
+ * that gate. What it does not prove is that this is the only FinishJob
+ * call for the job: the harness detached after the FIRST hit, so the
+ * scan's real completion -- driven by our M3, and the one that would
+ * carry status 0 -- was never in the sample.
+ *
+ * Returning SUCCESS settled it, against. The driver's own debugcon
+ * trace, same guest, same profile, differing only in this value:
+ *
+ *   INDICATION_REQUIRED   one GET_BSS_ENTRY_LIST after SCAN_COMPLETE
+ *                         SCAN_COMPLETE "for 3 task(s)" -- merged
+ *   SUCCESS               TEN GET_BSS_ENTRY_LIST in 80 ms, all BEFORE
+ *                         SCAN_COMPLETE, all answered "cache is empty"
+ *                         SCAN_COMPLETE "for 1 task(s)", never merged
+ *
+ * SUCCESS makes wdiwifi believe the scan finished the instant the OID
+ * completed: it polls for results that do not exist yet and stops
+ * holding scan tasks open, which is why they stop merging. Our M3 then
+ * arrives 1.6 s later for a job the port driver has already closed. And
+ * the connect still failed -- so SUCCESS fixed nothing and broke the
+ * scan job's lifetime.
+ *
+ * That is also the interesting part of the result. Under SUCCESS gate 1
+ * reads 0 and gates 2 and 3 already passed, so the good-scan property
+ * should have been written on that early FinishJob and the connect
+ * should have gone ahead. It did not. Either the property is still not
+ * written, or it is not the only thing the connect job is waiting on.
+ *
+ * Which leaves a third reading of the same evidence, and it is the one
+ * to test next: the right answer may be neither, but plain
+ * NDIS_STATUS_PENDING with a later NdisMOidRequestComplete. PENDING
+ * keeps the job open the way INDICATION_REQUIRED does, and completes it
+ * with a status of 0 the way SUCCESS does, which is exactly the pair of
+ * properties no single-value return can give. It is not being changed
+ * in the same build as this revert -- two variants at once and neither
+ * result can be attributed.
+ *
+ * scripts/gdb-wdi-connect.sh is what decides it. It stays attached and
+ * prints EVERY hit, so one run says whether FinishJob is called a
+ * second time with status 0 under INDICATION_REQUIRED. If it is not,
+ * PENDING is the answer.
+ *
+ * The M2 itself is unchanged and not in doubt. WABIModel gives every
+ * task a FromIhv message --
+ *
+ *   <message commandId="WDI_TASK_SCAN" type="WDI_SCAN_RESULTS"
+ *            description="No TLV data needed, header is sufficient"
+ *            direction="FromIhv" />
+ *
+ * -- where "header is sufficient" means the header is required, not
+ * that nothing is.
+ *
+ * Callers `return VwifiWdiTaskAccepted(Req)` rather than calling it and
+ * returning a status of their own, so the next task handler cannot
+ * write the M2 and then contradict it.
+ */
+NDIS_STATUS
+VwifiWdiTaskAccepted(_In_ PNDIS_OID_REQUEST Req)
+{
+    /* Two statements, not one `return`. The M2's own Status stays
+     * SUCCESS -- "the request was understood" -- and
+     * VwifiWdiAckHeaderOnly writes only that: it ALWAYS returns
+     * NDIS_STATUS_SUCCESS whatever it is passed. The OID's own return
+     * value is a separate field and has to be stated separately. */
+    (VOID)VwifiWdiAckHeaderOnly(Req, NDIS_STATUS_SUCCESS);
+    return NDIS_STATUS_INDICATION_REQUIRED;
+}
+
+/* Accept a task and keep its OID outstanding: write the M2, return
+ * NDIS_STATUS_PENDING. The caller owns Req from here until it calls
+ * VwifiWdiTaskComplete on it, exactly once.
+ *
+ * This is the third reading described above, and the measurement that
+ * forced it. A four-point breakpoint trace over a whole failed connect,
+ * with the task OIDs returning INDICATION_REQUIRED:
+ *
+ *   [1] CScanJob::FinishJob  status=0x40230001 cancelled=0x0 portid=0x0
+ *   [2] CheckAndUpdateCandidates+0x317  DISCARDING CANDIDATES  1 -> 0
+ *   [3] CheckAndStartConnectProcess+0x1a3  candidates=0
+ *   [1] CScanJob::FinishJob  status=0x40230001
+ *   [1] CScanJob::FinishJob  status=0x40230001
+ *       StartConnectRoamTask -- never reached
+ *
+ * Every scan job in the window finished with status 0x40230001, our own
+ * OID return value, and none with 0. One FinishJob per scan completion,
+ * so there is no second, later call carrying the real outcome -- the
+ * possibility that made the earlier single-shot sample unsafe to act on
+ * is now closed by measurement rather than by argument. The chain the
+ * disassembly predicted then ran in front of the breakpoints: the
+ * property read fails, a candidate list of exactly 1 is thrown away,
+ * and the connect task is never started.
+ *
+ * So the job's completion status is the OID's, and a task's OID has to
+ * end up completed with zero without being completed early. PENDING is
+ * the only NDIS return that does both: NDIS records the request as
+ * outstanding -- the scan job stays open, tasks still merge, no premature
+ * BSS polling -- and NdisMOidRequestComplete supplies the final status
+ * later.
+ *
+ * ORDER, which is the part that is a judgement rather than a
+ * measurement: the OID is completed BEFORE the M3 goes out. FinishJob's
+ * status argument is not our M3's (that has been 0 in every build,
+ * including the ones that failed), so it must be read from the request,
+ * and it has to be 0 by the time the M3 drives the job to finish. The
+ * results are already indicated by then, so completing first does not
+ * repeat what NDIS_STATUS_SUCCESS did -- there the OID completed before
+ * the sweep had found anything at all.
+ *
+ * Only OID_WDI_TASK_SCAN uses this so far. The other twelve task
+ * handlers still return INDICATION_REQUIRED: the scan job is the one
+ * whose FinishJob was measured, and changing all of them at once would
+ * make the next result unattributable again.
+ */
+NDIS_STATUS
+VwifiWdiTaskPending(_In_ PNDIS_OID_REQUEST Req)
+{
+    (VOID)VwifiWdiAckHeaderOnly(Req, NDIS_STATUS_SUCCESS);
+    return NDIS_STATUS_PENDING;
+}
+
+/* Answer a task whose work is ALREADY done: write the M2, complete the
+ * OID with SUCCESS, and leave nothing outstanding.
+ *
+ * Not a general-purpose task return -- SUCCESS on a task that has not
+ * finished is what made wdiwifi poll an empty BSS cache ten times and
+ * stop merging scans. It exists for the one path where the outcome is
+ * genuinely known by the time the handler returns: a scan merged into a
+ * sweep that completed underneath it, whose results are already
+ * indicated. Its M3 goes out before the return, so the ordering is the
+ * same as the normal path's.
+ *
+ * Separate from VwifiWdiTaskPending because VwifiWdiAckHeaderOnly is
+ * static to this file, and wdi_scan.c has no other way to write an M2. */
+NDIS_STATUS
+VwifiWdiTaskAnsweredInline(_In_ PNDIS_OID_REQUEST Req)
+{
+    return VwifiWdiAckHeaderOnly(Req, NDIS_STATUS_SUCCESS);
+}
+
+/* Complete a task OID that VwifiWdiTaskPending left outstanding.
+ *
+ * Exactly once per request. NDIS owns the NDIS_OID_REQUEST until this
+ * is called and frees it afterwards, so a second call is a use after
+ * free and a missing one leaves the WLAN component waiting on a request
+ * that will never come back -- which is how the disconnect task used to
+ * hang adapter teardown. Every path that abandons a scan must come
+ * through here. */
+VOID
+VwifiWdiTaskComplete(_Inout_ PVWIFI_ADAPTER Adapter,
+                     _In_ PNDIS_OID_REQUEST Req,
+                     _In_ NDIS_STATUS Status)
+{
+    if (Req == NULL) return;
+    NdisMOidRequestComplete(Adapter->MiniportAdapterHandle, Req, Status);
+}
+
+/* ============================================================
+ * OID_WDI_TASK_CREATE_PORT / OID_WDI_TASK_DELETE_PORT
+ *
+ * The last step of adapter bring-up, and the first thing that is a
+ * *task* rather than a get or a set: it is answered by an indication
+ * (NDIS_STATUS_WDI_INDICATION_CREATE_PORT_COMPLETE), not by the OID's
+ * output buffer, and the OID itself just returns success to say the
+ * task was accepted.
+ *
+ * A port in WDI is the host's handle on one virtual interface. It
+ * assigns the id -- it is in the request's WDI_MESSAGE_HEADER, not in
+ * the TLV body -- so there is nothing for us to allocate or hand back.
+ * The body says what the port is for: which operation modes the host
+ * may configure on it later, and the NDIS port number it will appear
+ * under.
+ *
+ * A single-radio virtual device has one port and no per-port state to
+ * keep, so creating one is bookkeeping. The device is already running
+ * by this point; the ports the host may go on to add are the
+ * component's abstraction, not the device's.
+ * ============================================================ */
+static NDIS_STATUS
+VwifiHandleTaskCreatePort(_Inout_ PVWIFI_ADAPTER Adapter,
+                          _In_ PNDIS_OID_REQUEST Req)
+{
+    PVOID       tlv    = NULL;
+    ULONG       tlvLen = 0;
+    ULONG       opModeMask = 0;
+    ULONG       ndisPort   = 0;
+    UCHAR       mac[6];
+    BOOLEAN     macPresent = FALSE;
+    NDIS_STATUS status;
+
+    status = VwifiGetTlvPayload(Req, &tlv, &tlvLen);
+    if (status != NDIS_STATUS_SUCCESS) {
+        VWIFI_ERR("CREATE_PORT: no TLV payload (0x%08x %s)",
+                  status, VwifiNdisStatusName(status));
+        return status;
+    }
+
+    status = VwifiTlvParseCreatePort(Adapter->WdiPeerVersion, tlv, tlvLen,
+                                     &opModeMask, &ndisPort,
+                                     mac, &macPresent);
+    if (status != NDIS_STATUS_SUCCESS) {
+        VWIFI_ERR("CREATE_PORT: parse failed 0x%08x %s",
+                  status, VwifiNdisStatusName(status));
+        return status;
+    }
+
+    VWIFI_INFO("OID: create port: wdi port 0x%04x, ndis port %u "
+               "(req ndis %u), opmode mask 0x%x",
+               VwifiGetWdiPortId(Req), ndisPort,
+               Req->PortNumber, opModeMask);
+
+    /* An explicit address means the host wants this port on a MAC other
+     * than the adapter's own. The device has exactly one station
+     * address, so honour it rather than transmit under an address the
+     * host did not choose. */
+    if (macPresent) {
+        ULONG out_len = 0;
+
+        VWIFI_INFO("OID:   port MAC %02x:%02x:%02x:%02x:%02x:%02x",
+                   mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+        RtlCopyMemory(Adapter->CurrentMac, mac, 6);
+        status = VwifiCtrlSendSync(Adapter, VWIFI_OP_SET_STA_MAC,
+                                   mac, 6, NULL, &out_len);
+        if (status != NDIS_STATUS_SUCCESS) {
+            VWIFI_ERR("CREATE_PORT: SET_STA_MAC failed 0x%08x %s",
+                      status, VwifiNdisStatusName(status));
+            /* Report the failure through the completion, not the return
+             * value: the task was accepted, it is its outcome that is
+             * bad, and the host matches that on the transaction id. */
+            VwifiSendWdiIndication(
+                Adapter, VwifiGetWdiPortId(Req), Req->PortNumber,
+                NDIS_STATUS_WDI_INDICATION_CREATE_PORT_COMPLETE,
+                status, VwifiGetWdiTransactionId(Req), NULL, 0);
+            return VwifiWdiTaskAccepted(Req);
+        }
+    }
+
+    /* ndisPort, not Req->PortNumber.
+     *
+     * The two are not the same and the difference is the whole point of
+     * this assignment. Req->PortNumber is the NDIS port the CREATE_PORT
+     * request arrived on, and CREATE_PORT is adapter-scoped -- there is
+     * no port yet -- so it is zero. ndisPort comes out of the request's
+     * WDI_TLV_PORT_ATTRIBUTES and is the number the OS will address the
+     * station port by from here on.
+     *
+     * Recording the wrong one sent every subsequent link-state
+     * indication to the default port instead of the station's, so the
+     * station port was never told what its media state was. */
+    Adapter->NdisPortNumber = ndisPort;
+    Adapter->PortCreated    = TRUE;
+
+    /* State the link, now that there is a port for it to belong to.
+     * Disconnected is the truth here and it is a different thing from
+     * never having said -- NDIS starts an adapter with no media state
+     * asserted, and this driver only ever spoke up on association or
+     * disconnect, so until something connected the OS had heard
+     * nothing at all. */
+    VwifiIndicateLinkState(Adapter, FALSE);
+
+    /* The completion carries a mandatory PortAttributes container --
+     * the created port's MAC and number. It is NOT header-only: that
+     * describes WDI_TASK_CREATE_PORT's own results message, which is a
+     * different thing from WDI_INDICATION_CREATE_PORT_COMPLETE. See the
+     * comment on VwifiTlvGenerateCreatePortComplete. */
+    {
+        PVOID blob    = NULL;
+        ULONG blobLen = 0;
+
+        status = VwifiTlvGenerateCreatePortComplete(
+                     Adapter->WdiPeerVersion, Adapter->CurrentMac,
+                     ndisPort, &blob, &blobLen);
+        if (status != NDIS_STATUS_SUCCESS) {
+            VWIFI_ERR("CREATE_PORT: completion generate failed 0x%08x %s",
+                      status, VwifiNdisStatusName(status));
+            return status;
+        }
+
+        VwifiSendWdiIndication(Adapter, VwifiGetWdiPortId(Req),
+                               Req->PortNumber,
+                               NDIS_STATUS_WDI_INDICATION_CREATE_PORT_COMPLETE,
+                               NDIS_STATUS_SUCCESS,
+                               VwifiGetWdiTransactionId(Req),
+                               blob, blobLen);
+        VwifiTlvFreeGenerated(blob);
+    }
+    return VwifiWdiTaskAccepted(Req);
+}
+
+static NDIS_STATUS
+VwifiHandleTaskDeletePort(_Inout_ PVWIFI_ADAPTER Adapter,
+                          _In_ PNDIS_OID_REQUEST Req)
+{
+    PVOID       tlv    = NULL;
+    ULONG       tlvLen = 0;
+    ULONG       portNumber = 0;
+    NDIS_STATUS status;
+
+    /* Parsed for the log only. The port to delete is identified by the
+     * header's port id like every other port-scoped message; the body's
+     * PortNumber is the NDIS one. A parse failure is not worth failing
+     * a teardown over. */
+    status = VwifiGetTlvPayload(Req, &tlv, &tlvLen);
+    if (status == NDIS_STATUS_SUCCESS) {
+        status = VwifiTlvParseDeletePort(Adapter->WdiPeerVersion,
+                                         tlv, tlvLen, &portNumber);
+        if (status != NDIS_STATUS_SUCCESS) {
+            VWIFI_WARN("DELETE_PORT: parse failed 0x%08x %s; deleting anyway",
+                       status, VwifiNdisStatusName(status));
+        }
+    }
+
+    VWIFI_INFO("OID: delete port %u (ndis port %u)",
+               Req->PortNumber, portNumber);
+
+    Adapter->PortCreated = FALSE;
+
+    VwifiSendWdiIndication(Adapter, VwifiGetWdiPortId(Req), Req->PortNumber,
+                           NDIS_STATUS_WDI_INDICATION_DELETE_PORT_COMPLETE,
+                           NDIS_STATUS_SUCCESS,
+                           VwifiGetWdiTransactionId(Req),
+                           NULL, 0);
+    return VwifiWdiTaskAccepted(Req);
+}
+
+/* ============================================================
+ * OID_WDI_GET_STATISTICS
+ *
+ * The last message in the bring-up trace still answered NOT_SUPPORTED.
+ * Both of its reply containers are mandatory, so it could not be
+ * answered with a bare header the way the sets can -- which is why it
+ * stayed unhandled while everything around it got fixed.
+ *
+ * Answered the same way as the capabilities: generated into the OID's
+ * own output buffer, not indicated. Whether the WLAN component actually
+ * minds a failed statistics query is unknown; it is the only thing left
+ * being refused, and leaving one unexplained refusal in a trace that is
+ * being read for exactly this is not worth the ambiguity.
+ * ============================================================ */
+static NDIS_STATUS
+VwifiHandleGetStatistics(_Inout_ PVWIFI_ADAPTER Adapter,
+                         _In_ PNDIS_OID_REQUEST Req)
+{
+    PVOID       blob    = NULL;
+    ULONG       blobLen = 0;
+    PVOID       out     = NULL;
+    ULONG       outLen  = 0;
+    NDIS_STATUS status;
+    WDI_MESSAGE_HEADER *hdr;
+
+    status = VwifiTlvGenerateStatistics(Adapter->WdiPeerVersion,
+                                        &blob, &blobLen);
+    if (status != NDIS_STATUS_SUCCESS) {
+        VWIFI_ERR("statistics generate failed 0x%08x %s",
+                  status, VwifiNdisStatusName(status));
+        return status;
+    }
+
+    if (blobLen < sizeof(WDI_MESSAGE_HEADER)) {
+        VwifiTlvFreeGenerated(blob);
+        return NDIS_STATUS_FAILURE;
+    }
+
+    hdr = (WDI_MESSAGE_HEADER *)blob;
+    RtlZeroMemory(hdr, sizeof(*hdr));
+    hdr->PortId        = VwifiGetWdiPortId(Req);
+    hdr->Status        = NDIS_STATUS_SUCCESS;
+    hdr->TransactionId = VwifiGetWdiTransactionId(Req);
+
+    VwifiOidOutBuffer(Req, &out, &outLen);
+    if (out == NULL || outLen < blobLen) {
+        VwifiOidSetNeeded(Req, blobLen);
+        VwifiOidSetWritten(Req, 0);
+        VwifiTlvFreeGenerated(blob);
+        return NDIS_STATUS_BUFFER_TOO_SHORT;
+    }
+
+    RtlCopyMemory(out, blob, blobLen);
+    VwifiOidSetWritten(Req, blobLen);
+    VwifiTlvFreeGenerated(blob);
+
+    VWIFI_INFO("OID: reported statistics (%u bytes)", blobLen);
+    return NDIS_STATUS_SUCCESS;
+}
+
+/* ============================================================
+ * OID_WDI_TASK_DOT11_RESET
+ *
+ * Sent immediately after the port is created, and again a moment later.
+ * Returning NOT_SUPPORTED leaves the port in a state the component will
+ * not connect from -- the trace showed it reach TASK_SCAN and stop
+ * there, never issuing TASK_CONNECT.
+ *
+ * "Reset" here is the 802.11 MLME-RESET, not a hardware reset: put the
+ * port back to a known state and, if SetDefaultMIB is set, restore its
+ * MIB defaults. For this device that means dropping any association and
+ * returning to idle, which the disconnect opcode already does. The
+ * rings, the interrupt and the device itself stay up -- resetting those
+ * would be a much bigger hammer than asked for, and would take the
+ * adapter down with it.
+ * ============================================================ */
+static NDIS_STATUS
+VwifiHandleTaskDot11Reset(_Inout_ PVWIFI_ADAPTER Adapter,
+                          _In_ PNDIS_OID_REQUEST Req)
+{
+    PVOID       tlv    = NULL;
+    ULONG       tlvLen = 0;
+    BOOLEAN     setDefaultMib = FALSE;
+    UCHAR       mac[6];
+    BOOLEAN     macPresent = FALSE;
+    NDIS_STATUS status;
+
+    status = VwifiGetTlvPayload(Req, &tlv, &tlvLen);
+    if (status == NDIS_STATUS_SUCCESS) {
+        status = VwifiTlvParseDot11Reset(Adapter->WdiPeerVersion,
+                                         tlv, tlvLen, &setDefaultMib,
+                                         mac, &macPresent);
+        if (status != NDIS_STATUS_SUCCESS) {
+            VWIFI_WARN("DOT11_RESET: parse failed 0x%08x %s; resetting anyway",
+                       status, VwifiNdisStatusName(status));
+        }
+    }
+
+    VWIFI_INFO("OID: dot11 reset (defaultMIB=%u, mac=%u)",
+               setDefaultMib, macPresent);
+
+    /* An explicit address is the port's new MAC across the reset. */
+    if (macPresent) {
+        ULONG out_len = 0;
+
+        RtlCopyMemory(Adapter->CurrentMac, mac, 6);
+        (VOID)VwifiCtrlSendSync(Adapter, VWIFI_OP_SET_STA_MAC,
+                                mac, 6, NULL, &out_len);
+    }
+
+    /* Back to idle. Best-effort: the device rejects a disconnect when
+     * nothing is associated, which is the common case here and not a
+     * reason to fail the reset.
+     *
+     * The RESULT is not best-effort, and discarding it was hiding the
+     * one driver-side explanation for an intermittent
+     * ASSOCIATION_RESULT status=16. Every connect is preceded by this
+     * reset, milliseconds earlier. If the device does not actually
+     * leave the association here -- because the disconnect was
+     * rejected, or timed out, or never reached it -- then the next
+     * connect authenticates from a device that already believes it is
+     * associated, and an AP that agrees has no reason to answer. That
+     * is exactly what "the AP never answered" looks like from inside
+     * the guest, and it is indistinguishable from a medium fault
+     * without this line.
+     *
+     * Logged at INFO when it succeeds and WARN when it does not,
+     * because "rejected, nothing was associated" and "rejected, and we
+     * were" are the same status from here and only the surrounding
+     * trace can tell them apart. */
+    {
+        ULONG out_len = 0;
+        struct vwifi_disconnect_req dreq;
+        NDIS_STATUS dst;
+        BOOLEAN wasAssociated = Adapter->Associated;
+
+        RtlZeroMemory(&dreq, sizeof(dreq));
+        dst = VwifiCtrlSendSync(Adapter, VWIFI_OP_DISCONNECT,
+                                &dreq, sizeof(dreq), NULL, &out_len);
+        if (dst == NDIS_STATUS_SUCCESS) {
+            VWIFI_INFO("OID: dot11 reset: device disconnect accepted "
+                       "(was%s associated)", wasAssociated ? "" : " not");
+        } else if (wasAssociated) {
+            VWIFI_WARN("OID: dot11 reset: device disconnect FAILED 0x%08x %s "
+                       "while associated -- the device may still hold the "
+                       "association, and the next connect will authenticate "
+                       "from a state the AP already thinks is up",
+                       dst, VwifiNdisStatusName(dst));
+        } else {
+            VWIFI_INFO("OID: dot11 reset: device disconnect refused 0x%08x "
+                       "%s, nothing was associated",
+                       dst, VwifiNdisStatusName(dst));
+        }
+    }
+
+    /* And our own idea of the association, which the device call above
+     * does not touch.
+     *
+     * OID_WDI_TASK_DOT11_RESET is documented as "Reset the port's MAC
+     * entity to its initial state" and "Set the port state to INIT
+     * before completing the dot11 reset operation". A driver that tells
+     * the device to disconnect and goes on believing it is associated
+     * has reset the hardware and not itself, and the next thing to read
+     * Adapter->Associated gets an answer that is a reset old.
+     *
+     * The link state goes with it: INIT is a disconnected port, and
+     * saying so is free. */
+    Adapter->Associated = FALSE;
+    RtlZeroMemory(Adapter->Bssid, 6);
+    VwifiIndicateLinkState(Adapter, FALSE);
+
+    /* The BSS cache deliberately survives this.
+     *
+     * It is tempting to read "reset the MAC entity to its initial
+     * state" as covering the scan results too, and dropping them here
+     * would look tidy. It would also be the end of connecting: the
+     * host resets the port and then issues its connect within about ten
+     * milliseconds, far too soon for a fresh scan to have found
+     * anything, so the BSS the connect is built from has to be one we
+     * were already holding.
+     *
+     * We advertise WDI_STATION_CAPABILITIES.BSSListCachemanagement =
+     * TRUE precisely so the host will come and ask us for it via
+     * OID_WDI_GET_BSS_ENTRY_LIST at that moment. Flushing here would
+     * make that answer empty. Only OID_WDI_SET_FLUSH_BSS_ENTRY, which
+     * is the host explicitly asking for a fresh view, may clear it. */
+
+    VwifiSendWdiIndication(Adapter, VwifiGetWdiPortId(Req), Req->PortNumber,
+                           NDIS_STATUS_WDI_INDICATION_DOT11_RESET_COMPLETE,
+                           NDIS_STATUS_SUCCESS,
+                           VwifiGetWdiTransactionId(Req),
+                           NULL, 0);
+    return VwifiWdiTaskAccepted(Req);
+}
+
+/* ============================================================
+ * OID_WDI_SET_RECEIVE_PACKET_FILTER / OID_WDI_SET_MULTICAST_LIST
+ *
+ * Both are plain sets answered with a bare header, and both were
+ * returning NOT_SUPPORTED. The packet filter is the one that matters:
+ * it says which received frames the component wants indicated, and a
+ * port that never gets one configured has no reason to expect data.
+ *
+ * The device's own filter is the raw-capture mask used by monitor mode,
+ * which is a different thing -- these bits are NDIS packet types, not
+ * 802.11 frame classes. In STA mode the device already delivers exactly
+ * the frames addressed to us, so there is nothing to push down and
+ * accepting the filter is honest rather than lazy. Monitor mode still
+ * goes through OID_GEN_CURRENT_PACKET_FILTER above, which does drive
+ * the device.
+ * ============================================================ */
+static NDIS_STATUS
+VwifiHandleSetReceivePacketFilter(_Inout_ PVWIFI_ADAPTER Adapter,
+                                  _In_ PNDIS_OID_REQUEST Req)
+{
+    PVOID       tlv    = NULL;
+    ULONG       tlvLen = 0;
+    ULONG       filter = 0;
+    NDIS_STATUS status;
+
+    status = VwifiGetTlvPayload(Req, &tlv, &tlvLen);
+    if (status == NDIS_STATUS_SUCCESS) {
+        status = VwifiTlvParseReceivePacketFilter(Adapter->WdiPeerVersion,
+                                                  tlv, tlvLen, &filter);
+        if (status != NDIS_STATUS_SUCCESS) {
+            VWIFI_WARN("RECEIVE_PACKET_FILTER: parse failed 0x%08x %s",
+                       status, VwifiNdisStatusName(status));
+        }
+    }
+
+    Adapter->WdiPacketFilter = filter;
+    VWIFI_INFO("OID: receive packet filter 0x%08x", filter);
+
+    return VwifiWdiAckHeaderOnly(Req, NDIS_STATUS_SUCCESS);
+}
+
+static NDIS_STATUS
+VwifiHandleSetMulticastList(_Inout_ PVWIFI_ADAPTER Adapter,
+                            _In_ PNDIS_OID_REQUEST Req)
+{
+    UNREFERENCED_PARAMETER(Adapter);
+
+    /* The list itself is optional in the model and this device has no
+     * multicast filter to program -- the medium delivers what it
+     * delivers and the stack drops what it does not want. Accepted
+     * rather than parsed, because storing a list nothing consults would
+     * only suggest it does something. */
+    VWIFI_INFO("OID: multicast list accepted (device has no filter)");
+    return VwifiWdiAckHeaderOnly(Req, NDIS_STATUS_SUCCESS);
+}
+
+/* ============================================================
+ * The rest of the station surface
+ *
+ * An audit of dot11wdi.h against this dispatcher found 15 of 66 WDI
+ * OIDs handled. Most of the remainder describe features this device
+ * genuinely lacks -- P2P, SoftAP, WoL, protocol and TCP offloads, FTM,
+ * IHV extensions, device services -- and NOT_SUPPORTED is the correct
+ * answer for those.
+ *
+ * These are not those. Every one of them is on the path a station
+ * takes to associate, and every one was being refused. They are
+ * gathered here because the model gives them all the same shape: the
+ * reply is a bare WDI_MESSAGE_HEADER, so accepting one costs a line.
+ * Refusing them cost a test cycle each to discover.
+ *
+ * What each one means for a device with no firmware to configure:
+ *
+ *   SET_PRIVACY_EXEMPTION_LIST  which ethertypes bypass encryption --
+ *       EAPOL, so the 4-way handshake can run before keys exist. The
+ *       device never encrypts on the host's behalf, so every frame is
+ *       already exempt.
+ *   SET_DEFAULT_KEY_ID          which group key index transmits. The
+ *       device tracks key indices itself, from SET_KEY.
+ *   SET_ASSOCIATION_PARAMETERS  per-BSSID association hints.
+ *   SET_CONNECTION_QUALITY      roaming thresholds the host suggests.
+ *   SET_ADVERTISEMENT_INFORMATION  what to advertise in probes.
+ *   SET_POWER_STATE             its one reply container is optional, so
+ *       a header is a complete answer. Nothing here sleeps.
+ *
+ * Accepting a setting this device does not implement is not the same
+ * as pretending it works: none of these change what the radio does,
+ * and refusing them stops the connect before it starts.
+ * ============================================================ */
+static NDIS_STATUS
+VwifiHandleAcceptedSet(_Inout_ PVWIFI_ADAPTER Adapter,
+                       _In_ PNDIS_OID_REQUEST Req,
+                       _In_ PCSTR What)
+{
+    UNREFERENCED_PARAMETER(Adapter);
+    VWIFI_INFO("OID: %s accepted (no device state to change)", What);
+    return VwifiWdiAckHeaderOnly(Req, NDIS_STATUS_SUCCESS);
+}
+
+/* ============================================================
+ * OID_WDI_ABORT_TASK
+ *
+ * Cancel whatever task is running on the port. For this driver that
+ * means the scan -- it is the only task that outlives its OID.
+ *
+ * VwifiHandleTaskScanAbort has existed since the scan was written and
+ * nothing ever called it, because this OID was never dispatched. A
+ * component that wants to stop scanning so it can connect asks here,
+ * gets NOT_SUPPORTED, and the scan it is waiting on never ends. Scans
+ * repeating forever while a connect never starts is what that looks
+ * like from the trace.
+ * ============================================================ */
+static NDIS_STATUS
+VwifiHandleAbortTask(_Inout_ PVWIFI_ADAPTER Adapter,
+                     _In_ PNDIS_OID_REQUEST Req)
+{
+    VWIFI_INFO("OID: abort task");
+    (VOID)VwifiHandleTaskScanAbort(Adapter);
+    return VwifiWdiAckHeaderOnly(Req, NDIS_STATUS_SUCCESS);
+}
+
+/* The raw input of a task whose TLVs this driver does not decode.
+ *
+ * There is a standing temptation to write a parser from a guess at the
+ * layout, and it has gone wrong here before. The bytes cost nothing and
+ * settle it: two captures of the same task -- radio off and radio on,
+ * say -- differ in exactly the field that carries the answer, and the
+ * decoder that follows is then a fact rather than a hypothesis.
+ *
+ * Whatever length actually arrives. An earlier version of this required
+ * at least 24 bytes before printing anything, and every radio-state
+ * request is 21, so it printed nothing at all -- the one case it was
+ * added for.
+ */
+VOID
+VwifiTraceOidInput(_In_z_ PCSTR What, _In_ PNDIS_OID_REQUEST Req)
+{
+    ULONG len = Req->DATA.METHOD_INFORMATION.InputBufferLength;
+    const UCHAR *in =
+        (const UCHAR *)Req->DATA.METHOD_INFORMATION.InformationBuffer;
+    CHAR hex[3 * 32 + 1];
+    ULONG n, i;
+
+    if (in == NULL || len == 0) {
+        VWIFI_INFO("OID: %s, no input", What);
+        return;
+    }
+
+    n = (len > 32) ? 32 : len;
+    for (i = 0; i < n; i++) {
+        static const CHAR d[] = "0123456789abcdef";
+        hex[i * 3 + 0] = d[in[i] >> 4];
+        hex[i * 3 + 1] = d[in[i] & 0xf];
+        hex[i * 3 + 2] = ' ';
+    }
+    hex[n * 3] = '\0';
+
+    /* The WDI message header is the first 16 bytes; the TLVs start
+     * after it, so the interesting part of a short task is the tail. */
+    VWIFI_INFO("OID: %s, %u bytes: %s%s", What, len, hex,
+               (len > 32) ? "..." : "");
+}
+
+/* ============================================================
+ * OID_WDI_TASK_SET_RADIO_STATE
+ *
+ * A task, so it completes by indication. The capabilities report the
+ * radio as always enabled and this device has no way to turn it off,
+ * so the state is accepted and reported complete rather than acted on.
+ * ============================================================ */
+static NDIS_STATUS
+VwifiHandleTaskSetRadioState(_Inout_ PVWIFI_ADAPTER Adapter,
+                             _In_ PNDIS_OID_REQUEST Req)
+{
+    VwifiTraceOidInput("set radio state", Req);
+
+    VWIFI_INFO("OID: set radio state (device radio is always on -- if the "
+               "host asked for OFF, nothing here honours it and nothing "
+               "reports the radio back ON afterwards)");
+
+    VwifiSendWdiIndication(Adapter, VwifiGetWdiPortId(Req), Req->PortNumber,
+                           NDIS_STATUS_WDI_INDICATION_SET_RADIO_STATE_COMPLETE,
+                           NDIS_STATUS_SUCCESS,
+                           VwifiGetWdiTransactionId(Req),
+                           NULL, 0);
+    return VwifiWdiTaskAccepted(Req);
+}
+
+/* ============================================================
  * The real OID dispatcher — replaces the Phase-1 blanket stub.
  * ============================================================ */
 _Use_decl_annotations_
@@ -138,32 +1237,200 @@ VwifiOidRequest(
     PVWIFI_ADAPTER adapter = (PVWIFI_ADAPTER)MiniportAdapterContext;
     NDIS_OID oid;
 
-    if (OidRequest->RequestType == NdisRequestSetInformation) {
-        oid = OidRequest->DATA.SET_INFORMATION.Oid;
+    /* Trace every request before dispatching.
+     *
+     * This is not incidental logging. The WLAN component's reaction to
+     * an OID it does not like is to close the adapter, with nothing
+     * logged on its side and nothing on ours if the OID falls through
+     * to the default arm -- which is how a missing
+     * GET_ADAPTER_CAPABILITIES handler presented as OpenAdapter
+     * succeeding and CloseAdapter arriving 130 microseconds later with
+     * an empty gap between them. The gap is the bug report; keep it
+     * full. */
+    switch (OidRequest->RequestType) {
+    case NdisRequestSetInformation: oid = OidRequest->DATA.SET_INFORMATION.Oid;    break;
+    case NdisRequestMethod:         oid = OidRequest->DATA.METHOD_INFORMATION.Oid; break;
+    default:                        oid = OidRequest->DATA.QUERY_INFORMATION.Oid;  break;
+    }
+    VWIFI_INFO("OID: %s 0x%08x %s",
+               VwifiOidRequestTypeName(OidRequest->RequestType),
+               oid, VwifiOidName(oid));
 
+    /* The M1's own addressing, for every WDI method request.
+     *
+     * Everything this driver sends has been traced for a long time;
+     * what arrives never was. So "we echo the request's transaction id
+     * and port" has been a claim about our source rather than an
+     * observation, and it is exactly the claim that matters: wdiwifi's
+     * Task::OnDeviceIndicationArrived matches a task completion on BOTH
+     * the transaction id (against DeviceCommand::get_CommandToken) and
+     * the port id (against DeviceCommand::get_PortId), and on either
+     * mismatch it returns without storing anything -- so the task ends
+     * up with no output, Task::get_OutputBuffer answers
+     * STATUS_INVALID_DEVICE_STATE, and the job completes as failed
+     * while every trace on this side says success.
+     *
+     * Printing both halves is the only way to see that from here. The
+     * indication trace already prints what goes out; this prints what
+     * came in, in the same units, so the two lines can simply be read
+     * against each other. */
+    if (OidRequest->RequestType == NdisRequestMethod &&
+        OidRequest->DATA.METHOD_INFORMATION.InformationBuffer != NULL &&
+        OidRequest->DATA.METHOD_INFORMATION.InputBufferLength >=
+            sizeof(WDI_MESSAGE_HEADER)) {
+        const WDI_MESSAGE_HEADER *m1 = (const WDI_MESSAGE_HEADER *)
+            OidRequest->DATA.METHOD_INFORMATION.InformationBuffer;
+
+        VWIFI_INFO("OID M1: txn %u wdiport 0x%04x ndisport %u "
+                   "status 0x%08x ihv 0x%08x, in %u out %u bytes",
+                   m1->TransactionId, m1->PortId,
+                   (ULONG)OidRequest->PortNumber,
+                   m1->Status, m1->IhvSpecificId,
+                   OidRequest->DATA.METHOD_INFORMATION.InputBufferLength,
+                   OidRequest->DATA.METHOD_INFORMATION.OutputBufferLength);
+    }
+
+    /* Answered the same way whichever arm it arrives in. WDI's own OIDs
+     * are method requests, but this one is a pure get and the WLAN
+     * component is documented loosely enough that it is not worth
+     * guessing -- handling both costs one case and removes the
+     * question. The trace above records which arm actually fired. */
+    if (oid == OID_WDI_GET_ADAPTER_CAPABILITIES) {
+        return VwifiHandleGetAdapterCapabilities(adapter, OidRequest);
+    }
+    if (oid == OID_WDI_SET_ADAPTER_CONFIGURATION) {
+        return VwifiHandleSetAdapterConfiguration(adapter, OidRequest);
+    }
+    if (oid == OID_WDI_GET_STATISTICS) {
+        return VwifiHandleGetStatistics(adapter, OidRequest);
+    }
+    if (oid == OID_WDI_ABORT_TASK) {
+        return VwifiHandleAbortTask(adapter, OidRequest);
+    }
+    if (oid == OID_WDI_TASK_SET_RADIO_STATE) {
+        return VwifiHandleTaskSetRadioState(adapter, OidRequest);
+    }
+    if (oid == OID_WDI_SET_PRIVACY_EXEMPTION_LIST) {
+        /* Which EtherTypes the OS wants to cross an unauthorized port.
+         *
+         * This is the 802.11 controlled/uncontrolled port rule made
+         * explicit, and on a WPA2 association it is the mechanism that
+         * lets EAPOL through before any key exists. This driver accepts
+         * the list and does nothing with it, which is defensible only
+         * while nothing is encrypted -- and the trace has a WPA2
+         * association where EAPOL-Key message 1 was indicated and
+         * answered SUCCESS and the supplicant still never replied.
+         * Whatever the OS is asking for here is worth reading before
+         * guessing at what else it wants. */
+        VwifiTraceOidInput("privacy exemption list", OidRequest);
+        return VwifiHandleAcceptedSet(adapter, OidRequest,
+                                      "privacy exemption list");
+    }
+    if (oid == OID_WDI_SET_DEFAULT_KEY_ID) {
+        return VwifiHandleAcceptedSet(adapter, OidRequest, "default key id");
+    }
+    if (oid == OID_WDI_SET_ASSOCIATION_PARAMETERS) {
+        return VwifiHandleAcceptedSet(adapter, OidRequest,
+                                      "association parameters");
+    }
+    if (oid == OID_WDI_SET_CONNECTION_QUALITY) {
+        return VwifiHandleAcceptedSet(adapter, OidRequest,
+                                      "connection quality");
+    }
+    if (oid == OID_WDI_SET_ADVERTISEMENT_INFORMATION) {
+        return VwifiHandleAcceptedSet(adapter, OidRequest,
+                                      "advertisement information");
+    }
+    if (oid == OID_WDI_SET_POWER_STATE) {
+        return VwifiHandleAcceptedSet(adapter, OidRequest, "power state");
+    }
+    if (oid == OID_WDI_SET_FLUSH_BSS_ENTRY) {
+        VWIFI_INFO("OID: flush BSS entries");
+        VwifiScanFlushCache(adapter);
+        return VwifiWdiAckHeaderOnly(OidRequest, NDIS_STATUS_SUCCESS);
+    }
+    if (oid == OID_WDI_GET_BSS_ENTRY_LIST) {
+        /* The entries go back as a BSS_ENTRY_LIST indication, exactly as
+         * a scan reports them; the OID itself only needs acknowledging
+         * -- WABIModel's FromIhv message for this command is "No TLV
+         * data needed, header is sufficient". Refusing this is what made
+         * an already-discovered network disappear from `netsh wlan show
+         * networks` and from the UI.
+         *
+         * The request's SSID is logged rather than used. It is the one
+         * place the port driver states, in its own words, which network
+         * it is asking about, and during a connect that is the network
+         * being connected to. Printing it next to the SSID our entries
+         * actually carry turns "the BSS looks right" into a comparison
+         * of the two strings that have to match. Filtering on it would
+         * only ever remove entries, and reporting a superset is within
+         * contract, so nothing is filtered. */
+        PVOID       ssidBuf = NULL;
+        ULONG       ssidBufLen = 0;
+        UCHAR       wantSsid[32];
+        ULONG       wantLen = 0;
+        NDIS_STATUS ssidStatus;
+
+        ssidStatus = VwifiGetTlvPayload(OidRequest, &ssidBuf, &ssidBufLen);
+        if (ssidStatus == NDIS_STATUS_SUCCESS) {
+            ssidStatus = VwifiTlvParseBssListRequest(
+                adapter->WdiPeerVersion, ssidBuf, ssidBufLen,
+                wantSsid, &wantLen);
+        }
+
+        if (ssidStatus != NDIS_STATUS_SUCCESS) {
+            /* Not a warning, and not a defect on either side. WABIModel
+             * marks WDI_TLV_SSID mandatory in this message, but wdiwifi
+             * sends the header and nothing else, so the parser answers
+             * NDIS_STATUS_FILE_NOT_FOUND (0xc001001b) -- which is what
+             * the generated parser returns for "required container not
+             * present", not a malformed buffer.
+             *
+             * The TLV length is printed because it is what distinguishes
+             * the two readings: 0 means there was no container to find
+             * and the request really is "your whole cache", anything
+             * larger means a container we failed to parse. */
+            VWIFI_INFO("OID: cached BSS entry list requested, no SSID "
+                       "container (0x%08x, %u TLV bytes)",
+                       ssidStatus, ssidBufLen);
+        } else if (wantLen == 0) {
+            VWIFI_INFO("OID: cached BSS entry list requested (wildcard)");
+        } else {
+            CHAR  pretty[33];
+            ULONG i;
+            for (i = 0; i < wantLen; i++) {
+                pretty[i] = (wantSsid[i] >= 0x20 && wantSsid[i] < 0x7f)
+                                ? (CHAR)wantSsid[i] : '.';
+            }
+            pretty[wantLen] = '\0';
+            VWIFI_INFO("OID: cached BSS entry list requested for "
+                       "ssid='%s' (%u bytes)", pretty, wantLen);
+        }
+        VwifiScanIndicateCachedBss(adapter, VwifiGetWdiPortId(OidRequest),
+                                   OidRequest->PortNumber);
+        return VwifiWdiAckHeaderOnly(OidRequest, NDIS_STATUS_SUCCESS);
+    }
+
+    if (OidRequest->RequestType == NdisRequestSetInformation) {
         switch (oid) {
-        /* NOTE: OID_DOT11_CURRENT_OPERATION_MODE is NOT how operation
-         * mode reaches a WDI miniport. Per WABIModel.xml the OS sends
-         * OID_WDI_TASK_CHANGE_OPERATION_MODE (a method request carrying
-         * WDI_TLV_OPERATION_MODE) — the Microsoft WLAN component
-         * translates Npcap's Native 802.11 OID into that task before it
-         * gets to us. Handled in the NdisRequestMethod arm below. */
+        /* Both op-mode routes are handled, because they carry different
+         * modes. OID_WDI_TASK_CHANGE_OPERATION_MODE (NdisRequestMethod,
+         * below) can only ever ask for STA — WDI_OPERATION_MODE has no
+         * monitor mode. The Native 802.11 OID here is the only one that
+         * can carry DOT11_OPERATION_MODE_NETWORK_MONITOR, so if monitor
+         * mode works at all it works through this case. */
+        case OID_DOT11_CURRENT_OPERATION_MODE:
+            return VwifiHandleSetOpMode(adapter, OidRequest);
         case OID_DOT11_CURRENT_CHANNEL:
             return VwifiHandleSetChannel(adapter, OidRequest);
         case OID_DOT11_CURRENT_FREQUENCY:
             return VwifiHandleSetFrequency(adapter, OidRequest);
         case OID_GEN_CURRENT_PACKET_FILTER:
             return VwifiHandleSetPacketFilter(adapter, OidRequest);
-        case OID_WDI_SET_ADD_CIPHER_KEYS:
-            return VwifiHandleAddCipherKeys(adapter, OidRequest);
-        case OID_WDI_SET_DELETE_CIPHER_KEYS:
-            return VwifiHandleDeleteCipherKeys(adapter, OidRequest);
         default:
             break;
         }
     } else if (OidRequest->RequestType == NdisRequestQueryInformation) {
-        oid = OidRequest->DATA.QUERY_INFORMATION.Oid;
-
         switch (oid) {
         case OID_DOT11_CURRENT_OPERATION_MODE: {
             PDOT11_CURRENT_OPERATION_MODE mode;
@@ -187,8 +1454,6 @@ VwifiOidRequest(
         }
     } else if (OidRequest->RequestType == NdisRequestMethod) {
         /* WDI tasks arrive as method requests. */
-        oid = OidRequest->DATA.METHOD_INFORMATION.Oid;
-
         switch (oid) {
         case OID_WDI_TASK_SCAN:
             return VwifiHandleTaskScan(adapter, OidRequest);
@@ -198,12 +1463,63 @@ VwifiOidRequest(
             return VwifiHandleTaskDisconnect(adapter, OidRequest);
         case OID_WDI_TASK_CHANGE_OPERATION_MODE:
             return VwifiHandleTaskChangeOpMode(adapter, OidRequest);
+        case OID_WDI_TASK_CREATE_PORT:
+            return VwifiHandleTaskCreatePort(adapter, OidRequest);
+        case OID_WDI_TASK_DELETE_PORT:
+            return VwifiHandleTaskDeletePort(adapter, OidRequest);
+        case OID_WDI_TASK_DOT11_RESET:
+            return VwifiHandleTaskDot11Reset(adapter, OidRequest);
+        case OID_WDI_SET_RECEIVE_PACKET_FILTER:
+            return VwifiHandleSetReceivePacketFilter(adapter, OidRequest);
+        case OID_WDI_SET_MULTICAST_LIST:
+            return VwifiHandleSetMulticastList(adapter, OidRequest);
+
+        /* The keys, and the reason they are HERE and not in the
+         * NdisRequestSetInformation switch above, where they sat
+         * unreachable while the WPA2 handshake was being chased through
+         * nwifi.sys.
+         *
+         * "SET" in a WDI OID name describes the direction of the
+         * message, not the NDIS request type. Every WDI OID -- tasks,
+         * sets and gets alike -- arrives as NdisRequestMethod, because
+         * WDI's M1/M2 exchange needs an input buffer and an output
+         * buffer on the same request. OID_WDI_SET_RECEIVE_PACKET_FILTER
+         * and OID_WDI_SET_MULTICAST_LIST are right above for exactly
+         * that reason; these two were the odd ones out.
+         *
+         * The cost of the misplacement was total and silent: the four-
+         * way handshake completes, wlansvc hands down the PTK and the
+         * GTK, the default case answers NOT_SUPPORTED, no key ever
+         * reaches the device, and the association sits there carrying
+         * nothing while DHCP times out. The log line was
+         * "OID: unhandled 0xe440001d WDI_SET_ADD_CIPHER_KEYS", twice,
+         * which is why the unhandled case prints the OID at all.
+         *
+         * The handlers return a WDI-level status; the M2 header carries
+         * it back, which is what VwifiWdiAckHeaderOnly is for. */
+        case OID_WDI_SET_ADD_CIPHER_KEYS: {
+            NDIS_STATUS keyStatus =
+                VwifiHandleAddCipherKeys(adapter, OidRequest);
+            return VwifiWdiAckHeaderOnly(OidRequest, keyStatus);
+        }
+        case OID_WDI_SET_DELETE_CIPHER_KEYS: {
+            NDIS_STATUS keyStatus =
+                VwifiHandleDeleteCipherKeys(adapter, OidRequest);
+            return VwifiWdiAckHeaderOnly(OidRequest, keyStatus);
+        }
         default:
             break;
         }
     }
 
-    /* Everything else: let the Microsoft WLAN component handle it. */
+    /* Everything else: let the Microsoft WLAN component handle it.
+     *
+     * Logged, not silent. NOT_SUPPORTED is a legitimate answer for most
+     * OIDs, but it is also how a genuinely required one disappears, and
+     * the two are indistinguishable without a line saying which OID
+     * went unanswered. */
+    VWIFI_INFO("OID: unhandled 0x%08x %s -> NOT_SUPPORTED",
+               oid, VwifiOidName(oid));
     return NDIS_STATUS_NOT_SUPPORTED;
 }
 
@@ -222,16 +1538,25 @@ VwifiOidRequest(
  *            description="No TLV data needed, header is sufficient"
  *            direction="FromIhv" />
  *
- * This is the path Npcap's monitor-mode request actually takes: Npcap
- * asks Native 802.11 for dot11_operation_mode_network_monitor, and the
- * Microsoft WLAN component turns that into this task.
+ * This is NOT the path Npcap's monitor-mode request takes, contrary to
+ * what this file used to assume. WDI_OPERATION_MODE covers STA and the
+ * three P2P roles; there is no network-monitor mode, and the string
+ * "monitor" appears nowhere in dot11wdi.h, wditypes.hpp or
+ * WABIModel.xml. So the only mode that can arrive here is STA, and the
+ * shim rejects anything else.
+ *
+ * Monitor mode therefore has to come through the Native 802.11 OID
+ * surface above (OID_DOT11_CURRENT_OPERATION_MODE with
+ * DOT11_OPERATION_MODE_NETWORK_MONITOR, from windot11.h), which is a
+ * plain NDIS set request rather than a WDI task. Whether the Microsoft
+ * WLAN component actually forwards that OID to a WDI miniport is the
+ * open question for Phase 1.5 — see the README.
  * ============================================================ */
 NDIS_STATUS
 VwifiHandleTaskChangeOpMode(_Inout_ PVWIFI_ADAPTER Adapter,
                             _In_ PNDIS_OID_REQUEST Req)
 {
-    ULONG opMode = 0;
-    ULONG devMode;
+    ULONG devMode = 0;
     NDIS_STATUS status;
     PVOID tlvBuf;
     ULONG tlvLen;
@@ -240,24 +1565,13 @@ VwifiHandleTaskChangeOpMode(_Inout_ PVWIFI_ADAPTER Adapter,
     if (status != NDIS_STATUS_SUCCESS) return status;
 
     status = VwifiTlvParseOperationMode(Adapter->WdiPeerVersion,
-                                        tlvBuf, tlvLen, &opMode);
+                                        tlvBuf, tlvLen, &devMode);
     if (status != NDIS_STATUS_SUCCESS) {
         VWIFI_ERR("operation mode parse failed 0x%x", status);
         return status;
     }
 
-    /* WDI_OPERATION_MODE is a bitmask of the same DOT11_OPERATION_MODE_*
-     * values the Native interface uses. */
-    if (opMode & DOT11_OPERATION_MODE_NETWORK_MONITOR) {
-        devMode = VWIFI_MODE_MONITOR;
-        VWIFI_INFO("op mode -> NETWORK_MONITOR");
-    } else if (opMode & DOT11_OPERATION_MODE_EXTENSIBLE_STATION) {
-        devMode = VWIFI_MODE_STA;
-        VWIFI_INFO("op mode -> ExtSTA");
-    } else {
-        VWIFI_WARN("unsupported operation mode 0x%08x", opMode);
-        return NDIS_STATUS_NOT_SUPPORTED;
-    }
+    VWIFI_INFO("op mode -> STA");
 
     status = VwifiSetOpMode(Adapter, devMode);
     if (status != NDIS_STATUS_SUCCESS) return status;
@@ -265,8 +1579,12 @@ VwifiHandleTaskChangeOpMode(_Inout_ PVWIFI_ADAPTER Adapter,
     /* The M0 needs no TLVs; completion arrives as
      * WDI_INDICATION_CHANGE_OPERATION_MODE_COMPLETE, which also needs
      * none. */
-    VwifiSendWdiIndication(Adapter, Req->PortNumber,
+    VwifiSendWdiIndication(Adapter, VwifiGetWdiPortId(Req), Req->PortNumber,
                            NDIS_STATUS_WDI_INDICATION_CHANGE_OPERATION_MODE_COMPLETE,
+                           NDIS_STATUS_SUCCESS,
+                           VwifiGetWdiTransactionId(Req),
                            NULL, 0);
-    return NDIS_STATUS_SUCCESS;
+    /* The M2, like every other task. The outcome already went out as
+     * the indication above; this only says the task was accepted. */
+    return VwifiWdiTaskAccepted(Req);
 }

@@ -90,18 +90,42 @@ struct vwifi_bss {
     uint16_t ssid_len;
     uint8_t  ssid[33];
 
-    /* The complete beacon or probe-response frame as seen on the air.
-     * WDI's BSS entry TLV wants the whole frame (WDI_TLV_BEACON_FRAME /
-     * WDI_TLV_PROBE_RESPONSE_FRAME as byte blobs) and the OS parses the
-     * IEs itself — so keep the frame, not just the IE tail. */
-    uint16_t frame_len;
-    uint8_t  frame[VWIFI_BSS_FRAME_MAX];
-    bool     is_beacon;      /* false => probe response */
+    /* The complete beacon AND probe-response frames as seen on the air,
+     * kept apart rather than one overwriting the other.
+     *
+     * WDI's BSS entry has a separate byte blob for each --
+     * WDI_TLV_BEACON_FRAME and WDI_TLV_PROBE_RESPONSE_FRAME -- and the
+     * OS parses the IEs itself, so keep whole frames rather than IE
+     * tails.
+     *
+     * One slot used to hold whichever arrived last, and during a scan
+     * that is always the probe response: the probe request goes out at
+     * the start of the dwell and the reply follows immediately, while
+     * the beacon is somewhere in the next beacon interval. So every BSS
+     * this device has ever reported was a probe response, and the
+     * Windows driver has never once had a beacon to hand up. */
+    uint16_t beacon_len;
+    uint8_t  beacon[VWIFI_BSS_FRAME_MAX];
+    uint16_t probe_len;
+    uint8_t  probe[VWIFI_BSS_FRAME_MAX];
 
-    /* Set when reported during the current scan, so we emit one
-     * BSS_FOUND per BSS per scan rather than one per beacon. */
-    bool     reported_this_scan;
+    /* Which frame types have already been reported during the current
+     * scan, so we emit per BSS per frame type rather than one event per
+     * beacon received.
+     *
+     * A bitmask rather than a bool because the two frames do not arrive
+     * together. A scan dwell gets the probe response immediately -- it
+     * is a reply to our own probe request -- and the beacon somewhere
+     * in the following beacon interval, which for a 100 TU AP is 102.4
+     * ms against a 100 ms dwell. With a single "reported" flag the
+     * probe response always won the race and the beacon, when one was
+     * heard at all, was held back until some later scan. */
+    uint8_t  reported_this_scan;
 };
+
+#define VWIFI_BSS_RPT_BEACON  0x1
+#define VWIFI_BSS_RPT_PROBE   0x2
+#define VWIFI_BSS_RPT_ALL     (VWIFI_BSS_RPT_BEACON | VWIFI_BSS_RPT_PROBE)
 
 /* Scan state machine. */
 enum vwifi_scan_state {
@@ -244,8 +268,13 @@ struct vwifi_ap {
  *   any failure / timeout          -> IDLE, emit ASSOC_RESULT w/ status
  *
  * Once ASSOCIATED the RX path accepts data frames to/from the BSSID
- * and converts them to 802.3 for the driver; the TX path converts
- * 802.3 from the driver into 802.11 data frames.
+ * and the TX path accepts frames for it. Whether either direction is
+ * converted to or from 802.3 is the driver's choice, not a property
+ * of this state machine: VWIFI_CTRL_RX_80211 asks for MPDUs on
+ * receive, VWIFI_TX_F_80211 declares them on transmit, and the
+ * Windows WDI driver sets both because its stack converts above the
+ * miniport. Without them the device converts, which is what the Linux
+ * driver and the tests use.
  * ============================================================ */
 
 enum vwifi_conn_state {
@@ -255,8 +284,37 @@ enum vwifi_conn_state {
     VWIFI_CONN_ASSOCIATED,
 };
 
-/* How long to wait for an Auth/Assoc Response before giving up. */
-#define VWIFI_CONN_TIMEOUT_MS  1000
+/* How long to wait for an Auth/Assoc Response before giving up.
+ *
+ * Armed once for the Auth Response and again for the Assoc Response, so
+ * a connect has this long per stage rather than in total.
+ *
+ * It was 1000, and that is too short for a real AP on the other side of
+ * the medium. Measured against OpenWrt/hostapd, with the two clocks
+ * lined up:
+ *
+ *   driver   WDI_TASK_CONNECT                       t
+ *   driver   ASSOCIATION_RESULT status=16           t + 1.000 s
+ *   hostapd  authenticated                          18:27:41
+ *   hostapd  associated (aid 1)                     18:27:43
+ *   hostapd  AP-STA-CONNECTED                       18:27:43
+ *
+ * The AP answered and the association SUCCEEDED. This device gave up at
+ * exactly its one-second mark while hostapd was still working through
+ * an exchange that took about two seconds end to end. The station then
+ * reported a failure for a connection the AP considered up, which is
+ * the worst of both: the guest sees "the AP never answered" and the AP
+ * sees an associated station.
+ *
+ * It presented as an intermittent connect failure -- alternating runs,
+ * identical driver -- because it is a race against however long the AP
+ * happens to take, and hostapd is not always slow.
+ *
+ * Five seconds is well clear of the two observed and still bounded.
+ * A virtual medium carrying frames through a userspace controller to
+ * another VM has no business being held to on-air timings; the point of
+ * this timer is to fail eventually, not quickly. */
+#define VWIFI_CONN_TIMEOUT_MS  5000
 
 /* Max association-response IEs we keep to hand back to the driver. */
 #define VWIFI_ASSOC_IE_MAX  512
@@ -277,6 +335,15 @@ struct vwifi_conn {
     /* IEs the driver asked us to include in the Assoc Request. */
     uint16_t req_ie_len;
     uint8_t  req_ies[VWIFI_ASSOC_IE_MAX];
+    /* The BODY of the association request this device actually sent:
+     * capability info and listen interval, then SSID, rates, the RSN
+     * element it builds itself, and any driver-supplied vendor
+     * elements. No 802.11 header -- see conn_send_assoc_req for why
+     * that matters. Reported back with the association result because
+     * a supplicant cannot run a four-way handshake without knowing
+     * which RSN element was exchanged. */
+    uint8_t  sent_frame[VWIFI_ASSOC_IE_MAX];
+    uint16_t sent_frame_len;
 };
 
 struct vwifi_dev {
@@ -572,6 +639,7 @@ static void medium_deliver_rx(struct vwifi_dev *d,
     uint64_t desc_gpa;
     uint32_t idx;
     bool desc_decrypted = false;
+    bool desc_sta_raw   = false;
 
     if (!d->rx.enabled) {
         d->drops++;
@@ -626,6 +694,65 @@ static void medium_deliver_rx(struct vwifi_dev *d,
         if (!sta_is_our_data_frame(d, frame, frame_len)) {
             return;
         }
+        /* Not our own frame handed back to us.
+         *
+         * On a FromDS frame addr3 is the original sender, so addr3 ==
+         * our MAC means this is something we transmitted, bridged back
+         * out the port it arrived on. A medium capture shows the AP
+         * doing exactly that: every ToDS broadcast the station sends
+         * reappears half a millisecond later as a FromDS copy with the
+         * BSSID as transmitter and the station as addr3 -- ARP, MLD,
+         * DHCP DISCOVER, all of it.
+         *
+         * The echo suppression above cannot catch these and should not
+         * try: the AP really did transmit them, and its MAC really is
+         * the one in the medium header. This is the other half of the
+         * same rule, and it belongs in the device rather than in any
+         * driver -- no station is ever handed a frame it sent, real
+         * stacks drop them silently, and passing them up doubles the
+         * receive load with traffic that can only be discarded.
+         *
+         * Checked here rather than inside sta_is_our_data_frame because
+         * that takes a const device and so cannot say what it dropped,
+         * and a silent drop is the thing that makes these logs hard to
+         * read in the first place. */
+        if (memcmp(frame + 16, d->sta_mac, 6) == 0) {
+            VWIFI_TRACE(d, "rx dropped: our own %u-byte frame reflected "
+                           "back by the AP (addr3 is us)", frame_len);
+            d->drops++;
+            d->regs[VWIFI_REG_DIAG_DROPS / 4] = d->drops;
+            return;
+        }
+        /* Who actually put this on the medium.
+         *
+         * The Windows driver's RX trace shows frames arriving whose
+         * 802.3 source is the station's own MAC -- its own DHCP
+         * DISCOVER and its own IPv6 multicast, coming back. Two things
+         * produce that and they need completely different fixes: the
+         * AP flooding a broadcast back out the port it arrived on
+         * (tx_mac is the AP's, and this is someone else's frame to
+         * fix), or this device looping its own transmit into its own
+         * receive (tx_mac is ours, and the echo suppression above is
+         * not working).
+         *
+         * The medium header knows. addr2 of the 802.11 frame is logged
+         * next to it because a reflected frame carries the AP as the
+         * transmitter but the original station as the sender inside. */
+        VWIFI_TRACE(d, "rx: data %u bytes from tx_mac "
+                       "%02x:%02x:%02x:%02x:%02x:%02x "
+                       "addr2 %02x:%02x:%02x:%02x:%02x:%02x "
+                       "addr3 %02x:%02x:%02x:%02x:%02x:%02x%s",
+                    frame_len,
+                    hdr->tx_mac[0], hdr->tx_mac[1], hdr->tx_mac[2],
+                    hdr->tx_mac[3], hdr->tx_mac[4], hdr->tx_mac[5],
+                    frame[10], frame[11], frame[12],
+                    frame[13], frame[14], frame[15],
+                    frame[16], frame[17], frame[18],
+                    frame[19], frame[20], frame[21],
+                    (memcmp(hdr->tx_mac, d->sta_mac, 6) == 0)
+                        ? "  <-- OUR OWN tx_mac: the echo suppression "
+                          "above did not fire"
+                        : "");
     }
 
     /* In monitor mode, honor the raw filter: only forward frame types
@@ -659,9 +786,11 @@ static void medium_deliver_rx(struct vwifi_dev *d,
         return;
     }
 
-    /* In STA mode, hand the driver an 802.3 frame; the 802.11 header
-     * and LLC/SNAP are the device's business, not the driver's. In
-     * monitor mode the raw 802.11 frame goes up untouched. */
+    /* In STA mode, hand the driver whichever shape it asked for:
+     * VWIFI_CTRL_RX_80211 means the plaintext MPDU goes up as it
+     * stands, otherwise the 802.11 header and LLC/SNAP are stripped
+     * and it gets 802.3. In monitor mode the raw 802.11 frame goes up
+     * untouched either way. */
     {
         uint8_t eth[VWIFI_MAX_FRAME_SIZE];
         uint8_t work[VWIFI_MAX_FRAME_SIZE];
@@ -721,13 +850,24 @@ static void medium_deliver_rx(struct vwifi_dev *d,
                 was_decrypted = true;
             }
 
-            out_len = sta_rx_80211_to_8023(d, plain, plain_len,
-                                           eth, sizeof(eth));
-            if (out_len == 0) {
-                /* Not convertible (non-SNAP, malformed, wrong BSS). */
-                return;
+            if (d->ctrl & VWIFI_CTRL_RX_80211) {
+                /* Straight through, header and all. The driver asked
+                 * for MPDUs; converting and having it convert back
+                 * would lose the QoS control field and the sequence
+                 * number on the way. Decryption has already happened
+                 * above, so what goes up is a plaintext MPDU. */
+                out_frame = plain;
+                out_len   = plain_len;
+                desc_sta_raw = true;
+            } else {
+                out_len = sta_rx_80211_to_8023(d, plain, plain_len,
+                                               eth, sizeof(eth));
+                if (out_len == 0) {
+                    /* Not convertible (non-SNAP, malformed, wrong BSS). */
+                    return;
+                }
+                out_frame = eth;
             }
-            out_frame = eth;
         }
 
         if (out_len > desc.buffer_len) {
@@ -748,7 +888,7 @@ static void medium_deliver_rx(struct vwifi_dev *d,
     desc.channel_freq = hdr->channel_freq;
     desc.tsf          = ((uint64_t)hdr->tsf_hi << 32) | hdr->tsf_lo;
     desc.flags        = 0;   /* clear OWN — transfer to driver */
-    if (d->op_mode == VWIFI_MODE_MONITOR) {
+    if (d->op_mode == VWIFI_MODE_MONITOR || desc_sta_raw) {
         desc.flags |= VWIFI_RX_F_RAW;
     }
     if (desc_decrypted) {
@@ -991,9 +1131,15 @@ static struct vwifi_bss *bss_alloc(struct vwifi_dev *d, uint64_t now_us)
     return oldest;   /* table full — recycle the least-recently-seen */
 }
 
-/* Emit a BSS_FOUND event for one table entry. The payload is a
- * vwifi_bss_entry followed by ie_len bytes of raw IEs. */
-static bool bss_emit(struct vwifi_dev *d, const struct vwifi_bss *b)
+/* Emit a BSS_FOUND event carrying one frame. The payload is a
+ * vwifi_bss_entry followed by ie_len bytes of that raw frame.
+ *
+ * One event per frame type, so a BSS the device has both a beacon and
+ * a probe response for produces two. The driver merges them by BSSID;
+ * VWIFI_BSS_F_BEACON in capability_info says which is which. */
+static bool bss_emit_frame(struct vwifi_dev *d, const struct vwifi_bss *b,
+                           const uint8_t *frame, uint16_t frame_len,
+                           bool is_beacon)
 {
     uint8_t payload[sizeof(struct vwifi_bss_entry) + VWIFI_BSS_FRAME_MAX];
     struct vwifi_bss_entry *e = (struct vwifi_bss_entry *)payload;
@@ -1011,21 +1157,39 @@ static bool bss_emit(struct vwifi_dev *d, const struct vwifi_bss *b)
     memcpy(e->ssid, b->ssid, sizeof(e->ssid));
     /* ie_len carries the FULL frame length; the driver hands the whole
      * frame to WDI as WDI_TLV_BEACON_FRAME / _PROBE_RESPONSE_FRAME. */
-    e->ie_len           = b->frame_len;
-    if (b->is_beacon) e->capability_info |= VWIFI_BSS_F_BEACON;
+    e->ie_len           = frame_len;
+    if (is_beacon) e->capability_info |= VWIFI_BSS_F_BEACON;
 
-    memcpy(payload + sizeof(*e), b->frame, b->frame_len);
-    total = sizeof(*e) + b->frame_len;
+    memcpy(payload + sizeof(*e), frame, frame_len);
+    total = sizeof(*e) + frame_len;
 
     VWIFI_TRACE(d, "BSS_FOUND %02x:%02x:%02x:%02x:%02x:%02x "
                    "ssid='%s' freq=%u rssi=%d frame=%u (%s)",
                 b->bssid[0], b->bssid[1], b->bssid[2],
                 b->bssid[3], b->bssid[4], b->bssid[5],
                 b->ssid_len ? (const char *)b->ssid : "<hidden>",
-                b->channel_freq, b->rssi, b->frame_len,
-                b->is_beacon ? "beacon" : "probe-resp");
+                b->channel_freq, b->rssi, frame_len,
+                is_beacon ? "beacon" : "probe-resp");
 
     return vwifi_post_event(d, VWIFI_EV_BSS_FOUND, payload, total);
+}
+
+/* Report everything held for this BSS: the beacon if one has been
+ * heard, the probe response if one has, or both.
+ *
+ * False only if an event could not be posted, so a caller counting
+ * against a budget still sees a full ring as a failure. */
+static bool bss_emit(struct vwifi_dev *d, const struct vwifi_bss *b)
+{
+    bool ok = true;
+
+    if (b->beacon_len) {
+        ok = bss_emit_frame(d, b, b->beacon, b->beacon_len, true);
+    }
+    if (ok && b->probe_len) {
+        ok = bss_emit_frame(d, b, b->probe, b->probe_len, false);
+    }
+    return ok;
 }
 
 /*
@@ -1088,6 +1252,36 @@ static void bss_observe(struct vwifi_dev *d,
         memset(b, 0, sizeof(*b));
         memcpy(b->bssid, bssid, 6);
         b->valid = true;
+    } else if (b->ssid_len != ssid_len ||
+               memcmp(b->ssid, ssid, ssid_len) != 0) {
+        /* Same BSSID, different network.
+         *
+         * This table keeps a beacon and a probe response per BSS and
+         * bss_emit sends both, so an entry is only coherent while the
+         * two describe the same thing. Reconfigure an access point --
+         * new SSID, security switched on -- and they stop: the beacon
+         * slot still holds the old network and the probe slot holds the
+         * new one, and the pair goes up as a single BSS entry that
+         * contradicts itself. A station sees two SSIDs where there is
+         * one radio, one of them advertising Privacy=0 for a network
+         * that now requires WPA2, and a connect to it cannot work.
+         *
+         * Nothing else clears them. The SSID field is overwritten by
+         * whichever frame arrived last, and last_seen_us is refreshed
+         * by either, so the stale frame is neither replaced nor aged
+         * out and survives for as long as the BSS keeps transmitting.
+         *
+         * So when the network behind a BSSID changes, everything
+         * remembered about the old one is discarded. The frame being
+         * processed refills its own slot immediately below. */
+        VWIFI_TRACE(d, "bss %02x:%02x:%02x:%02x:%02x:%02x changed ssid "
+                       "'%.*s' -> '%.*s': dropping the cached beacon and "
+                       "probe response, they describe the old network",
+                    bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5],
+                    (int)b->ssid_len, b->ssid, (int)ssid_len, ssid);
+        b->beacon_len = 0;
+        b->probe_len  = 0;
+        b->reported_this_scan = 0;
     }
 
     b->last_seen_us     = now;
@@ -1098,19 +1292,40 @@ static void bss_observe(struct vwifi_dev *d,
     b->capability_info  = get_le16(fixed + 10);
     b->ssid_len         = ssid_len;
     memcpy(b->ssid, ssid, sizeof(b->ssid));
-    b->is_beacon        = (subtype == IEEE80211_SUBTYPE_BEACON);
+    /* Keep the whole frame — WDI wants it verbatim — in the slot for
+     * its own type, so a probe response never displaces a beacon. */
+    {
+        uint16_t keep = frame_len;
+        if (keep > VWIFI_BSS_FRAME_MAX) keep = VWIFI_BSS_FRAME_MAX;
 
-    /* Keep the whole frame — WDI wants it verbatim. */
-    b->frame_len = frame_len;
-    if (b->frame_len > VWIFI_BSS_FRAME_MAX) b->frame_len = VWIFI_BSS_FRAME_MAX;
-    memcpy(b->frame, frame, b->frame_len);
+        if (subtype == IEEE80211_SUBTYPE_BEACON) {
+            b->beacon_len = keep;
+            memcpy(b->beacon, frame, keep);
+        } else {
+            b->probe_len = keep;
+            memcpy(b->probe, frame, keep);
+        }
+    }
 
-    /* Report during an active scan, once per BSS per scan. */
-    if (d->scan.state == VWIFI_SCAN_DWELL &&
-        !b->reported_this_scan &&
-        bss_matches_scan_ssids(d, b)) {
-        b->reported_this_scan = true;
-        bss_emit(d, b);
+    /* Report during an active scan, once per BSS per frame type.
+     *
+     * bss_emit sends everything held, not just the frame that arrived,
+     * so when the beacon lands after the probe response has already
+     * been reported the pair goes out back to back. The driver stages
+     * one ring drain at a time and merges by BSSID, so consecutive
+     * events become a single BSS entry carrying both blobs -- which is
+     * what WDI_TLV_BSS_ENTRY is shaped for. Re-sending the probe
+     * response costs one event and overwrites itself on arrival. */
+    {
+        uint8_t bit = (subtype == IEEE80211_SUBTYPE_BEACON)
+                          ? VWIFI_BSS_RPT_BEACON : VWIFI_BSS_RPT_PROBE;
+
+        if (d->scan.state == VWIFI_SCAN_DWELL &&
+            !(b->reported_this_scan & bit) &&
+            bss_matches_scan_ssids(d, b)) {
+            b->reported_this_scan |= bit;
+            bss_emit(d, b);
+        }
     }
 }
 
@@ -1226,11 +1441,16 @@ static void scan_send_probe_req(struct vwifi_dev *d, unsigned ssid_idx)
 static void scan_report_cached(struct vwifi_dev *d)
 {
     uint64_t now = d->ops->now_us(d->be);
-    unsigned reported = 0, skipped = 0;
+    unsigned posted = 0, reported = 0, skipped = 0;
     /* Leave half the response ring for SCAN_COMPLETE and for whatever
      * else the device needs to tell the driver while it drains this
      * burst. The driver cannot run concurrently with us, so everything
-     * posted here lands before it gets a chance to free a slot. */
+     * posted here lands before it gets a chance to free a slot.
+     *
+     * Counted in EVENTS, not BSSes: a BSS the device has heard both a
+     * beacon and a probe response from costs two. Counting BSSes here
+     * would let a full table post twice the budget and use up the half
+     * of the ring this reservation exists to protect. */
     unsigned budget = (d->ctrl_rsp.mask + 1) / 2;
 
     for (unsigned i = 0; i < VWIFI_BSS_MAX; i++) {
@@ -1254,17 +1474,27 @@ static void scan_report_cached(struct vwifi_dev *d)
         /* Never silently truncate: anything the budget or a full ring
          * costs us gets counted and logged. A short scan that looks
          * complete is the bug this function exists to fix. */
-        if (reported >= budget || !bss_emit(d, b)) {
-            skipped++;
-            continue;
+        {
+            unsigned need = (b->beacon_len ? 1u : 0u) +
+                            (b->probe_len  ? 1u : 0u);
+
+            if (need == 0) continue;   /* nothing to report it with */
+
+            if (posted + need > budget || !bss_emit(d, b)) {
+                skipped++;
+                continue;
+            }
+            posted += need;
         }
-        b->reported_this_scan = true;
+        /* bss_emit sent every frame this entry holds, so nothing is
+         * left for the dwell path above to add. */
+        b->reported_this_scan = VWIFI_BSS_RPT_ALL;
         reported++;
     }
 
     if (reported || skipped) {
-        VWIFI_TRACE(d, "scan: reported %u cached BSS, %u withheld",
-                    reported, skipped);
+        VWIFI_TRACE(d, "scan: reported %u cached BSS (%u events), "
+                       "%u withheld", reported, posted, skipped);
     }
 }
 
@@ -1399,6 +1629,37 @@ static int32_t op_scan(struct vwifi_dev *d, const void *in_buf, uint32_t in_len)
     if (d->conn.state == VWIFI_CONN_AUTH_SENT ||
         d->conn.state == VWIFI_CONN_ASSOC_SENT) return -16;
 
+    /* Nor out from under a 4-way handshake, which is the same kind of
+     * exchange and was not covered by the test above.
+     *
+     * Measured, not assumed. In a WPA2 connect from the Windows guest,
+     * wlansvc issued a scan 0 ms after the connect task; the device
+     * accepted it because the association had already finished, and
+     * swept 13 channels at 100 ms each. On the medium capture the AP's
+     * EAPOL M1 went out 60 ms into that sweep, with the station three
+     * channels away, and the hub's channel filter dropped it. The
+     * retry a second later happened to land in the one moment the
+     * sweep was back on the AP's channel, which is the only reason any
+     * M1 was seen at all. The station deauthenticated 1.6 s later,
+     * having never completed a handshake it was never on channel for.
+     *
+     * "Associated on a secure BSS with no pairwise key" is exactly the
+     * handshake window: the key arrives at the end of it. On an open
+     * network there is no window and this does not apply.
+     *
+     * -EBUSY rather than a silent refusal because the Windows driver
+     * already knows what to do with it -- it holds the scan and
+     * answers it when the connect settles, rather than failing the job
+     * (see the deferral in wdi_scan.c). */
+    if (d->conn.state == VWIFI_CONN_ASSOCIATED &&
+        d->conn.akm_suite != VWIFI_AKM_NONE &&
+        !d->keys.pairwise.valid) {
+        VWIFI_TRACE(d, "scan refused: 4-way handshake in flight "
+                       "(associated, akm 0x%04x, no pairwise key yet)",
+                    d->conn.akm_suite);
+        return -16;
+    }
+
     memset(&d->scan, 0, sizeof(d->scan));
 
     /* Build the channel list from the 2.4 GHz mask. A zero mask means
@@ -1459,7 +1720,7 @@ static int32_t op_scan(struct vwifi_dev *d, const void *in_buf, uint32_t in_len)
 
     /* Clear per-scan reporting flags so every live BSS is re-reported. */
     for (unsigned i = 0; i < VWIFI_BSS_MAX; i++) {
-        d->bss[i].reported_this_scan = false;
+        d->bss[i].reported_this_scan = 0;
     }
 
     d->scan.saved_channel = d->channel;
@@ -1542,16 +1803,104 @@ static void conn_send_auth_req(struct vwifi_dev *d)
                       d->ops->now_us(d->be), false);
 }
 
+/* The RSN element for an association request.
+ *
+ * WDI never hands one down. It describes the security the OS wants as
+ * an auth algorithm and a pair of cipher lists and leaves the element
+ * itself to be constructed further down -- the driver's connect parser
+ * says as much, and nothing below it was doing the constructing. So an
+ * association request for a WPA2 network went out carrying an SSID and
+ * a rate set and nothing else, and hostapd answered it with status 40,
+ * WLAN_STATUS_INVALID_IE: an RSN network cannot associate a station
+ * that did not say which ciphers it intends to use.
+ *
+ * Layout is 802.11-2020 9.4.2.24: version, group cipher suite, a
+ * counted list of pairwise suites, a counted list of AKM suites, then
+ * the capability field. One of each is all this device offers, which
+ * makes the body twenty bytes -- the same size the AP advertises in the
+ * beacon it answers with.
+ */
+#define IEEE80211_EID_RSN  48
+
+static const uint8_t rsn_oui[3] = { 0x00, 0x0F, 0xAC };
+
+/* Our cipher enum to the 802.11 suite selector's last byte. Zero means
+ * "nothing sensible to send", which the caller treats as "do not build
+ * an element at all" rather than sending a malformed one. */
+static uint8_t rsn_cipher_selector(uint16_t cipher)
+{
+    switch (cipher) {
+    case VWIFI_CIPHER_WEP40:   return 1;
+    case VWIFI_CIPHER_TKIP:    return 2;
+    case VWIFI_CIPHER_CCMP128: return 4;
+    case VWIFI_CIPHER_WEP104:  return 5;
+    case VWIFI_CIPHER_GCMP256: return 9;
+    default:                   return 0;
+    }
+}
+
+static uint8_t rsn_akm_selector(uint16_t akm)
+{
+    switch (akm) {
+    case VWIFI_AKM_8021X: return 1;
+    case VWIFI_AKM_PSK:   return 2;
+    case VWIFI_AKM_SAE:   return 8;
+    default:              return 0;
+    }
+}
+
+static uint16_t ie_put_rsn(uint8_t *buf, uint16_t len,
+                           uint16_t akm, uint16_t pairwise, uint16_t group)
+{
+    uint8_t akm_sel      = rsn_akm_selector(akm);
+    uint8_t pairwise_sel = rsn_cipher_selector(pairwise);
+    uint8_t group_sel    = rsn_cipher_selector(group);
+
+    if (akm_sel == 0 || pairwise_sel == 0) return len;
+    /* An AP that advertises RSN always names a group cipher; if the
+     * request did not, the pairwise one is the only honest guess. */
+    if (group_sel == 0) group_sel = pairwise_sel;
+
+    buf[len++] = IEEE80211_EID_RSN;
+    buf[len++] = 20;
+
+    put_le16(buf + len, 1);                 /* version */
+    len += 2;
+
+    memcpy(buf + len, rsn_oui, 3); len += 3;
+    buf[len++] = group_sel;
+
+    put_le16(buf + len, 1); len += 2;       /* one pairwise suite */
+    memcpy(buf + len, rsn_oui, 3); len += 3;
+    buf[len++] = pairwise_sel;
+
+    put_le16(buf + len, 1); len += 2;       /* one AKM suite */
+    memcpy(buf + len, rsn_oui, 3); len += 3;
+    buf[len++] = akm_sel;
+
+    put_le16(buf + len, 0);                 /* RSN capabilities */
+    len += 2;
+
+    return len;
+}
+
 static void conn_send_assoc_req(struct vwifi_dev *d)
 {
     /* mgmt header + fixed body + SSID + rates + whatever the driver adds */
     uint8_t frame[IEEE80211_MGMT_HDR_LEN + 4 + (2 + 33) +
-                  (2 + 8) + (2 + 4) + VWIFI_ASSOC_IE_MAX];
+                  (2 + 8) + (2 + 4) + (2 + 20) + VWIFI_ASSOC_IE_MAX];
     uint16_t len = mgmt_hdr(d, frame, IEEE80211_SUBTYPE_ASSOC_REQ,
                             d->conn.bssid, d->conn.bssid);
+    uint16_t rsn_bytes = 0;
 
-    /* Assoc body: capability info (2), listen interval (2). */
-    put_le16(frame + len, 0x0431);   /* ESS + short preamble/slot */
+    /* Assoc body: capability info (2), listen interval (2).
+     *
+     * Privacy tracks the network, rather than being hardcoded: an RSN
+     * association whose request claims the link is unprotected is
+     * contradicting the RSN element it carries. */
+    put_le16(frame + len,
+             (uint16_t)(0x0431 |
+                        ((d->conn.akm_suite != VWIFI_AKM_NONE) ? 0x0010 : 0)));
     len += 2;
     put_le16(frame + len, 10);       /* listen interval */
     len += 2;
@@ -1567,14 +1916,68 @@ static void conn_send_assoc_req(struct vwifi_dev *d)
      * status 1, and the SSID element alone is not enough to associate. */
     len = ie_put_supp_rates(frame, len, d->conn.channel_freq);
 
-    /* Driver-supplied IEs (RSN element for WPA2, etc). */
+    /* RSN, when the connect asked for a protected network. Built here
+     * because nothing above builds it -- see ie_put_rsn. */
+    {
+        uint16_t before = len;
+
+        len = ie_put_rsn(frame, len, d->conn.akm_suite,
+                         d->conn.cipher_pairwise, d->conn.cipher_group);
+        rsn_bytes = (uint16_t)(len - before);
+    }
+
+    /* Driver-supplied IEs (vendor elements; WDI passes only those). */
     if (d->conn.req_ie_len) {
         memcpy(frame + len, d->conn.req_ies, d->conn.req_ie_len);
         len += d->conn.req_ie_len;
     }
 
-    VWIFI_TRACE(d, "conn: -> Assoc Request (ssid='%s', %u extra IE bytes)",
-                d->conn.ssid, d->conn.req_ie_len);
+    /* Keep what went out: the management frame BODY -- capability info
+     * and listen interval, then the IEs -- and not the 802.11 header.
+     *
+     * This is the whole WPA2 bug, and it is settled by disassembly
+     * rather than by argument. nwifi.sys runs the four-way handshake
+     * in the kernel; it arms itself in the ASSOCIATION_COMPLETION
+     * handler (nwifi+0x202a0), and the arming step looks for the RSN
+     * element in the association request we report back:
+     *
+     *   1c00203fb  al = params->bReAssocReq
+     *              ecx = bReAssocReq ? 10 : 4        <- fixed-field len
+     *              ptr = params + uAssocReqOffset + ecx
+     *              len = uAssocReqSize - ecx
+     *              call find_element(ptr, len, id=48)   ; 48 = RSN
+     *   1c002044b  retry with the other fixed-field length
+     *   1c00204b4  both failed -> bail, port never armed
+     *
+     * Four bytes for an association request, ten for a reassociation
+     * request -- exactly the fixed-field lengths, and no allowance for
+     * a 24-byte MAC header. So the blob has to start at the fixed
+     * fields. Handing over the whole frame made nwifi walk elements
+     * from addr1[0]: element id 0x02, length 0x11, and off into the
+     * weeds. It never found the RSN element, never set the port's
+     * armed flag (port+0x1710), and so never routed EAPOL-Key message
+     * 1 to the handshake handler at nwifi+0x196d8 -- which is why the
+     * frame reached nwifi in every capture and message 2 was never
+     * sent.
+     *
+     * The IE block alone is equally wrong, and was what this sent
+     * before: nwifi would then skip the first four IE bytes instead.
+     * Neither end of the frame -- the body is the answer. */
+    {
+        uint16_t keep = (uint16_t)(len - IEEE80211_MGMT_HDR_LEN);
+
+        if (keep > sizeof(d->conn.sent_frame)) {
+            keep = (uint16_t)sizeof(d->conn.sent_frame);
+        }
+        memcpy(d->conn.sent_frame, frame + IEEE80211_MGMT_HDR_LEN, keep);
+        d->conn.sent_frame_len = keep;
+    }
+
+    VWIFI_TRACE(d, "conn: -> Assoc Request (ssid='%s', %u RSN bytes "
+                   "[akm %u cipher %u/%u], %u extra IE bytes)",
+                d->conn.ssid, rsn_bytes, d->conn.akm_suite,
+                d->conn.cipher_pairwise, d->conn.cipher_group,
+                d->conn.req_ie_len);
     medium_send_frame(d, frame, len, 0, d->conn.channel_freq,
                       d->ops->now_us(d->be), false);
 }
@@ -1596,24 +1999,34 @@ static void conn_send_deauth(struct vwifi_dev *d, uint16_t reason)
 static void conn_emit_assoc_result(struct vwifi_dev *d, uint16_t status_code,
                                    const uint8_t *resp_ies, uint16_t ie_len)
 {
-    uint8_t payload[sizeof(struct vwifi_assoc_result) + VWIFI_ASSOC_IE_MAX];
+    uint8_t payload[sizeof(struct vwifi_assoc_result) +
+                    2 * VWIFI_ASSOC_IE_MAX];
     struct vwifi_assoc_result *r = (struct vwifi_assoc_result *)payload;
+    uint16_t req_len = d->conn.sent_frame_len;
 
     if (ie_len > VWIFI_ASSOC_IE_MAX) ie_len = VWIFI_ASSOC_IE_MAX;
+    if (req_len > VWIFI_ASSOC_IE_MAX) req_len = VWIFI_ASSOC_IE_MAX;
 
     memset(r, 0, sizeof(*r));
     memcpy(r->bssid, d->conn.bssid, 6);
     r->status_code = status_code;
     r->aid         = d->conn.aid;
     r->ie_len      = ie_len;
+    r->req_ie_len  = req_len;
     if (ie_len && resp_ies) {
         memcpy(payload + sizeof(*r), resp_ies, ie_len);
     }
+    /* Our own request IEs after the AP's, so a reader that knows only
+     * about ie_len reads exactly what it always did. */
+    if (req_len) {
+        memcpy(payload + sizeof(*r) + ie_len, d->conn.sent_frame, req_len);
+    }
 
-    VWIFI_TRACE(d, "conn: ASSOC_RESULT status=%u aid=%u ies=%u",
-                status_code, d->conn.aid, ie_len);
+    VWIFI_TRACE(d, "conn: ASSOC_RESULT status=%u aid=%u resp ies=%u "
+                   "req ies=%u",
+                status_code, d->conn.aid, ie_len, req_len);
     vwifi_post_event(d, VWIFI_EV_ASSOC_RESULT, payload,
-                     sizeof(*r) + ie_len);
+                     sizeof(*r) + ie_len + req_len);
 }
 
 static void conn_fail(struct vwifi_dev *d, uint16_t status_code)
@@ -1659,8 +2072,7 @@ static void conn_rx_assoc_resp(struct vwifi_dev *d,
                                const uint8_t *frame, uint16_t frame_len)
 {
     const uint8_t *body = frame + IEEE80211_MGMT_HDR_LEN;
-    uint16_t status, aid, ie_len;
-    const uint8_t *ies;
+    uint16_t status, aid;
 
     if (d->conn.state != VWIFI_CONN_ASSOC_SENT) return;
     if (frame_len < IEEE80211_MGMT_HDR_LEN + 6) return;
@@ -1669,8 +2081,7 @@ static void conn_rx_assoc_resp(struct vwifi_dev *d,
     /* Assoc Response body: capability (2), status (2), AID (2), IEs. */
     status = get_le16(body + 2);
     aid    = get_le16(body + 4) & 0x3FFF;   /* top two bits are reserved */
-    ies    = body + 6;
-    ie_len = (uint16_t)(frame_len - IEEE80211_MGMT_HDR_LEN - 6);
+
 
     timer_clear(d, &d->timers.conn_us);
 
@@ -1685,7 +2096,19 @@ static void conn_rx_assoc_resp(struct vwifi_dev *d,
     d->conn.state = VWIFI_CONN_ASSOCIATED;
 
     VWIFI_TRACE(d, "conn: ASSOCIATED aid=%u", aid);
-    conn_emit_assoc_result(d, IEEE80211_STATUS_SUCCESS, ies, ie_len);
+    /* The response frame BODY, for the same reason as the request, and
+     * with the same evidence behind it. nwifi reads this one at
+     * nwifi+0x20f34:
+     *
+     *   r9d = uAssocRespSize ; if (r9d < 6) bail
+     *   r8  = params + 6 + uAssocRespOffset
+     *   r9d = uAssocRespSize - 6
+     *   call parse_ies(r8, r9d)
+     *
+     * Six bytes: capability, status code, AID. Again no allowance for
+     * a MAC header, so again the blob starts at the fixed fields. */
+    conn_emit_assoc_result(d, IEEE80211_STATUS_SUCCESS, body,
+                           (uint16_t)(frame_len - IEEE80211_MGMT_HDR_LEN));
 }
 
 /* Handle a Deauth/Disassoc from the AP. */
@@ -1790,7 +2213,33 @@ static int32_t op_disconnect(struct vwifi_dev *d,
     uint16_t reason = 3;   /* STA is leaving */
 
     if (in_len >= sizeof(*req)) reason = req->reason_code;
-    if (d->conn.state == VWIFI_CONN_IDLE) return 0;
+
+    /* Already idle -- and the event still goes out.
+     *
+     * This used to return success and post nothing, on the reasoning
+     * that there was no association to tear down. True, and it cost
+     * five seconds every time: the driver completes
+     * OID_WDI_TASK_DISCONNECT on the DISCONNECTED event, so with no
+     * event it waits out its whole watchdog before answering the OS.
+     *
+     * Measured on the WPA2 bring-up: the AP disassociated us at
+     * t=1020.045, wlansvc sent its own disconnect at t=1021.045 into a
+     * device that was already idle, and the completion did not go up
+     * until t=1026.061 -- "no DISCONNECTED event from the device --
+     * completing the disconnect anyway".
+     *
+     * The request was "disconnect" and the outcome is "disconnected",
+     * so saying so is not a lie about state, it is an answer. The
+     * event is idempotent by design: the driver's handler clears
+     * association state that is already clear. */
+    if (d->conn.state == VWIFI_CONN_IDLE) {
+        ev.reason_code = reason;
+        ev.local       = 1;
+        VWIFI_TRACE(d, "conn: disconnect requested while already idle "
+                       "-- confirming anyway (reason %u)", reason);
+        vwifi_post_event(d, VWIFI_EV_DISCONNECTED, &ev, sizeof(ev));
+        return 0;
+    }
 
     if (d->conn.state == VWIFI_CONN_ASSOCIATED) {
         conn_send_deauth(d, reason);
@@ -1839,7 +2288,14 @@ static bool conn_rx_mgmt(struct vwifi_dev *d,
 /* Connect timeout — no Auth/Assoc Response arrived in time. */
 static void conn_timeout(struct vwifi_dev *d)
 {
-    VWIFI_TRACE(d, "conn: timeout in state %u", d->conn.state);
+    /* Which stage ran out, by name. "timeout in state 1" needs the
+     * enum to hand at the moment the log is meant to be answering a
+     * question, and the two stages fail for different reasons: no Auth
+     * Response means the AP never engaged, while no Assoc Response
+     * means it did and then went quiet. */
+    VWIFI_TRACE(d, "conn: %s Response timed out after %u ms",
+                (d->conn.state == VWIFI_CONN_AUTH_SENT) ? "Auth" : "Assoc",
+                VWIFI_CONN_TIMEOUT_MS);
     /* 802.11 status 16 = "authentication sequence timeout"; use it for
      * both stages so the driver sees a definite failure code. */
     conn_fail(d, 16);
@@ -2217,6 +2673,7 @@ static int32_t op_stop_ap(struct vwifi_dev *d)
 
 static const uint8_t llc_snap_hdr[6] = { 0xAA, 0xAA, 0x03, 0x00, 0x00, 0x00 };
 
+
 /* Convert an 802.3 frame from the driver into an 802.11 data frame.
  * Returns the 802.11 frame length, or 0 if the input is malformed. */
 static uint16_t sta_tx_8023_to_80211(struct vwifi_dev *d,
@@ -2325,6 +2782,31 @@ static bool eth_is_eapol(const uint8_t *eth, uint16_t eth_len)
 {
     if (eth_len < ETH_HDR_LEN) return false;
     return (((uint16_t)eth[12] << 8) | eth[13]) == ETHERTYPE_EAPOL;
+}
+
+/* The same question asked of a frame that is already 802.11.
+ *
+ * A driver that hands over MPDUs (see VWIFI_TX_F_80211) still needs its
+ * EAPOL frames left in the clear, and the EtherType is no longer at
+ * offset 12: it sits after the 802.11 header and the LLC/SNAP header.
+ * Reading offset 12 of an MPDU lands in the middle of addr2 and would
+ * answer "not EAPOL" for the handshake frames -- which encrypts them
+ * with a key the AP has not derived, and deadlocks WPA2 exactly the way
+ * the note above warns about. */
+static bool frame80211_is_eapol(const uint8_t *frame, uint16_t frame_len)
+{
+    uint16_t hdr_len = IEEE80211_DATA_HDR_LEN;
+
+    if (frame_len < IEEE80211_DATA_HDR_LEN) return false;
+    if (((frame[0] >> 2) & 0x3) != 2) return false;      /* not data */
+    if ((frame[0] >> 4) & 0x08) hdr_len += 2;            /* QoS control */
+
+    if (frame_len < hdr_len + LLC_SNAP_LEN) return false;
+    if (memcmp(frame + hdr_len, llc_snap_hdr, sizeof(llc_snap_hdr)) != 0) {
+        return false;
+    }
+    return (((uint16_t)frame[hdr_len + 6] << 8) |
+             frame[hdr_len + 7]) == ETHERTYPE_EAPOL;
 }
 
 static struct vwifi_key_slot *key_slot_for_tx(struct vwifi_dev *d)
@@ -2629,27 +3111,53 @@ static void process_tx_ring(struct vwifi_dev *d)
                     bool inject = (desc.flags & VWIFI_TX_F_INJECT) != 0;
 
                     if (!inject && d->op_mode == VWIFI_MODE_STA) {
-                        /* STA mode: the driver hands us 802.3; build
-                         * the 802.11 data frame here. */
+                        /* STA mode. VWIFI_TX_F_80211 says the driver
+                         * already built the MPDU; without it the frame
+                         * is 802.3 and the header is built here. */
                         uint8_t frame80211[VWIFI_MAX_FRAME_SIZE];
                         uint16_t len;
+
+                        bool pre80211 =
+                            (desc.flags & VWIFI_TX_F_80211) != 0;
 
                         if (d->conn.state != VWIFI_CONN_ASSOCIATED) {
                             VWIFI_TRACE(d, "tx dropped: not associated");
                             d->drops++;
                         } else {
-                            len = sta_tx_8023_to_80211(d, frame, desc.frame_len,
-                                                       frame80211,
-                                                       sizeof(frame80211));
+                            if (pre80211) {
+                                /* Already an MPDU -- the driver built
+                                 * the header. Encapsulating again would
+                                 * make a frame whose destination MAC is
+                                 * the first six bytes of the original
+                                 * 802.11 header, which the AP silently
+                                 * drops. */
+                                if (desc.frame_len > sizeof(frame80211) ||
+                                    desc.frame_len < IEEE80211_DATA_HDR_LEN) {
+                                    len = 0;
+                                } else {
+                                    memcpy(frame80211, frame, desc.frame_len);
+                                    len = desc.frame_len;
+                                }
+                            } else {
+                                len = sta_tx_8023_to_80211(d, frame,
+                                                           desc.frame_len,
+                                                           frame80211,
+                                                           sizeof(frame80211));
+                            }
                             if (len == 0) {
-                                VWIFI_TRACE(d, "tx dropped: bad 802.3 frame");
+                                VWIFI_TRACE(d, "tx dropped: bad %s frame",
+                                            pre80211 ? "802.11" : "802.3");
                                 d->drops++;
                             } else {
                                 /* Encrypt unless this is EAPOL (the
                                  * handshake must run in the clear) or
                                  * no key is installed yet. */
                                 struct vwifi_key_slot *ks = key_slot_for_tx(d);
-                                bool eapol = eth_is_eapol(frame, desc.frame_len);
+                                bool eapol =
+                                    pre80211
+                                        ? frame80211_is_eapol(frame,
+                                                              desc.frame_len)
+                                        : eth_is_eapol(frame, desc.frame_len);
 
                                 if (ks && !eapol) {
                                     int elen = vwifi_ccmp_encrypt(

@@ -48,6 +48,21 @@ void __cdecl operator delete(void *p)
     }
 }
 
+/* There is deliberately no `operator delete(void *, ULONG_PTR)` to pair
+ * with the AllocationContext new above.
+ *
+ * It cannot exist. ULONG_PTR *is* size_t on x64, so that signature is
+ * the same function as the sized delete below -- defining both is
+ * C2084, "already has a body". Which in turn means a placement
+ * expression `new (ctx) T()` is ill-formed here: the matching
+ * deallocation function would be the usual sized one, and C2956
+ * rejects that outright.
+ *
+ * So the library's context-carrying new is only ever reached through
+ * the library's own internal `new T`, never through a placement form
+ * written by us. Code here that wants a zeroed object from the pool
+ * calls ExAllocatePool2 directly -- see tlv_shim.cpp. */
+
 /* Sized delete — C++14 emits calls to this form. Without it the link
  * fails with an unresolved external on newer toolchains. */
 void __cdecl operator delete(void *p, size_t Size)

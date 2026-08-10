@@ -38,7 +38,11 @@ VwifiRxNblPoolCreate(_Inout_ PVWIFI_ADAPTER Adapter)
     params.ProtocolId      = NDIS_PROTOCOL_ID_DEFAULT;
     params.fAllocateNetBuffer = TRUE;
     params.PoolTag         = VWIFI_POOL_TAG;
-    params.ContextSize     = 0;
+    /* Sized here, not per allocation. Every NBL from this pool then
+     * carries its context already, and the allocation calls ask for
+     * none -- see VWIFI_RX_NBL_CONTEXT_SIZE for why asking per
+     * allocation failed. */
+    params.ContextSize     = VWIFI_RX_NBL_CONTEXT_SIZE;
 
     Adapter->RxNblPool = NdisAllocateNetBufferListPool(
         Adapter->MiniportAdapterHandle, &params);
@@ -114,11 +118,25 @@ VwifiRxDrainMonitor(_Inout_ PVWIFI_ADAPTER Adapter)
     PNET_BUFFER_LIST indicate_head = NULL;
     PNET_BUFFER_LIST indicate_tail = NULL;
     ULONG indicated = 0;
+    /* Two independent stops, because the loop's own exit condition is
+     * not trustworthy on its own -- see VWIFI_ADAPTER::RxOutstanding.
+     * `guard` bounds the pass to one lap of the ring no matter what the
+     * descriptors say; the outstanding check keeps the lap from being
+     * reachable in the first place. */
+    ULONG guard = 0;
 
     for (;;) {
         ULONG idx = ring->NextIndex & ring->Mask;
         struct vwifi_rx_desc *d = (struct vwifi_rx_desc *)
             ((PUCHAR)ring->VirtualAddress + idx * ring->DescSize);
+
+        if (++guard > ring->NumDescs) {
+            VWIFI_WARN("%s: drained a full ring (%u descriptors) in one "
+                       "pass without finding an armed slot -- stopping. "
+                       "%d slot(s) outstanding",
+                       "rx(mon)", ring->NumDescs, Adapter->RxOutstanding);
+            break;
+        }
 
         if (d->flags & VWIFI_DESC_F_OWN) {
             break;   /* still owned by device */
@@ -128,6 +146,18 @@ VwifiRxDrainMonitor(_Inout_ PVWIFI_ADAPTER Adapter)
          * are Phase 3's path. In Phase 1.5 the device only sets RAW
          * in monitor mode, so anything without it we just re-arm. */
         if (!(d->flags & VWIFI_RX_F_RAW) || d->frame_len == 0) {
+            goto rearm;
+        }
+
+        /* Stop one slot short of owning the whole ring. The frame is
+         * dropped and its slot re-armed -- which is safe precisely
+         * because no NBL has taken it yet -- so the device keeps a
+         * place to write and the drain keeps making progress. Losing
+         * frames while the returns catch up beats lapping. */
+        if (Adapter->RxOutstanding >= (LONG)(ring->NumDescs - 1)) {
+            VWIFI_TAL_ONCE("rx(mon): all but one RX slot outstanding -- "
+                           "dropping frames until the component returns "
+                           "some");
             goto rearm;
         }
 
@@ -148,7 +178,7 @@ VwifiRxDrainMonitor(_Inout_ PVWIFI_ADAPTER Adapter)
             }
 
             PNET_BUFFER_LIST nbl = NdisAllocateNetBufferAndNetBufferList(
-                Adapter->RxNblPool, sizeof(VWIFI_RX_NBL_CONTEXT), 0,
+                Adapter->RxNblPool, 0, 0,
                 mdl, 0, d->frame_len);
             if (!nbl) {
                 VWIFI_WARN("rx: NBL alloc failed, dropping frame");
@@ -158,9 +188,7 @@ VwifiRxDrainMonitor(_Inout_ PVWIFI_ADAPTER Adapter)
 
             /* Remember which slot backs this NBL so we can re-arm it
              * on return. */
-            PVWIFI_RX_NBL_CONTEXT ctx =
-                (PVWIFI_RX_NBL_CONTEXT)NET_BUFFER_LIST_CONTEXT_DATA_START(nbl);
-            ctx->SlotIndex = idx;
+            VwifiRxNblSetSlot(nbl, idx);
 
             /* Build and attach the DOT11_EXTSTA_RECV_CONTEXT. This is
              * the OOB info Npcap turns into radiotap. */
@@ -198,6 +226,9 @@ VwifiRxDrainMonitor(_Inout_ PVWIFI_ADAPTER Adapter)
             }
             indicate_tail = nbl;
             indicated++;
+            /* The slot now belongs to this NBL and stays un-armed until
+             * VwifiMiniportReturnNetBufferLists gives it back. */
+            InterlockedIncrement(&Adapter->RxOutstanding);
 
             /* NOTE: we do NOT re-arm this slot here — it stays owned by
              * the NBL until VwifiReturnNetBufferLists reclaims it. We
@@ -247,9 +278,7 @@ VwifiMiniportReturnNetBufferLists(
     for (nbl = NetBufferLists; nbl; nbl = next) {
         next = NET_BUFFER_LIST_NEXT_NBL(nbl);
 
-        PVWIFI_RX_NBL_CONTEXT ctx =
-            (PVWIFI_RX_NBL_CONTEXT)NET_BUFFER_LIST_CONTEXT_DATA_START(nbl);
-        ULONG slot = ctx->SlotIndex;
+        ULONG slot = VwifiRxNblGetSlot(nbl);
 
         /* Free the MDL we allocated, then the NBL. */
         PNET_BUFFER nb = NET_BUFFER_LIST_FIRST_NB(nbl);
@@ -259,7 +288,33 @@ VwifiMiniportReturnNetBufferLists(
         }
         NdisFreeNetBufferList(nbl);
 
-        /* Re-arm the RX slot so the device can reuse it. */
+        InterlockedDecrement(&adapter->RxOutstanding);
+
+        /* Checked before it is used as an index, because the three
+         * writes below go through whatever this produces.
+         *
+         * There is no defensible way for a returned NBL to name a slot
+         * outside the ring, and that is exactly why it has to be
+         * tested: the failure is silent and unbounded. An unchecked
+         * index here does not corrupt a frame, it writes six bytes to
+         * an arbitrary kernel address, and the machine dies later
+         * somewhere with no connection to this driver at all.
+         *
+         * Leaking the slot is the right answer when it happens. The
+         * ring loses one descriptor; the drain already copes with slots
+         * that never come back, and it beats the alternative by a
+         * distance that does not need arguing. */
+        if (slot >= adapter->RxRing.NumDescs) {
+            VWIFI_ERR("rx return: NBL %p names ring slot %u, but the ring "
+                      "has %u -- refusing to re-arm it. The slot is lost; "
+                      "writing through this index would not have been.",
+                      nbl, slot, adapter->RxRing.NumDescs);
+            continue;
+        }
+
+        /* Re-arm the RX slot so the device can reuse it, and account
+         * for it: this is the moment the slot stops being outstanding,
+         * and the drain's lap guard reads that count. */
         struct vwifi_rx_desc *d = (struct vwifi_rx_desc *)
             ((PUCHAR)adapter->RxRing.VirtualAddress
              + slot * adapter->RxRing.DescSize);

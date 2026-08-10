@@ -297,6 +297,23 @@ int main(void)
     arm_all_rsp_slots();
     printf("  associated (open auth, WPA2 pending handshake): PASS\n");
 
+    /* ---- 1b. No channel hopping while the handshake is in flight ----
+     *
+     * A scan sweeps the radio across thirteen channels; the AP's EAPOL
+     * goes out on one of them. A Windows guest lost its M1 exactly this
+     * way -- wlansvc asked for a scan 0 ms after the connect, the
+     * device took it because the association was already over, and the
+     * frame arrived with the station three channels away. Refusing it
+     * with -EBUSY is what the driver's existing deferral expects. */
+    {
+        struct vwifi_scan_req sr = { 0 };
+        sr.channel_mask_24 = 0x3FFE;
+        sr.dwell_ms        = 100;
+        assert(ctrl_send(VWIFI_OP_SCAN, &sr, sizeof(sr)) == -16);
+        arm_all_rsp_slots();
+    }
+    printf("  scan refused while the 4-way handshake is pending: PASS\n");
+
     /* ---- 2. EAPOL before keys must be unencrypted ---- */
     uint8_t eapol[64];
     memset(eapol, 0, sizeof(eapol));
@@ -340,6 +357,19 @@ int main(void)
     assert(find_event(VWIFI_EV_KEY_INSTALLED) != NULL);
     arm_all_rsp_slots();
     printf("  PTK installed -> KEY_INSTALLED event: PASS\n");
+
+    /* ---- 4b. And with the key in, the radio is free to sweep again.
+     * The refusal above has to be a window, not a new permanent rule --
+     * a station that can never scan while associated can never roam. */
+    {
+        struct vwifi_scan_req sr = { 0 };
+        sr.channel_mask_24 = 0x3FFE;
+        sr.dwell_ms        = 100;
+        assert(ctrl_send(VWIFI_OP_SCAN, &sr, sizeof(sr)) == 0);
+        assert(ctrl_send(VWIFI_OP_SCAN_ABORT, NULL, 0) == 0);
+        arm_all_rsp_slots();
+    }
+    printf("  scan allowed once the pairwise key is installed: PASS\n");
 
     /* ---- 5. Data after keys is CCMP-encrypted and the AP can
      *          decrypt it back to the exact original payload ---- */
