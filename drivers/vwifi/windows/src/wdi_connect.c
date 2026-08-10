@@ -318,8 +318,12 @@ VwifiIndicateConnectComplete(_Inout_ PVWIFI_ADAPTER Adapter,
      * places. See the refusal path in VwifiHandleTaskScan. This is the
      * moment it is safe to let go: after CONNECT_COMPLETE, so finishing
      * the scan job cannot start a second connect task on top of this
-     * one. No-op if nothing was held. */
-    VwifiScanReleaseDeferred(Adapter);
+     * one. No-op if nothing was held.
+     *
+     * Not in this same millisecond, though: see
+     * VWIFI_SCAN_POST_CONNECT_GRACE_MS. Finishing the scan job on top
+     * of CONNECT_COMPLETE costs the peer-config step that follows it. */
+    VwifiScanReleaseDeferred(Adapter, FALSE);
 }
 
 /* The disconnect task's completion -- and it has to be this message.
@@ -594,7 +598,7 @@ VwifiConnectOnDisconnected(_Inout_ PVWIFI_ADAPTER Adapter,
      * before the release below so a scan held behind a handshake that
      * never finished is let go here rather than waiting on a watchdog. */
     Adapter->HandshakePending = FALSE;
-    VwifiScanReleaseDeferred(Adapter);
+    VwifiScanReleaseDeferred(Adapter, TRUE);
 
     /* The peer goes with the association. Indicated before the
      * disassociation and the link-state change for the same reason the

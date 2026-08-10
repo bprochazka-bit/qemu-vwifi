@@ -260,6 +260,6 @@ VwifiKeysOnInstalled(_Inout_ PVWIFI_ADAPTER Adapter,
         Adapter->HandshakePending = FALSE;
         VWIFI_INFO("4-way handshake complete -- the radio is free to "
                    "sweep again");
-        VwifiScanReleaseDeferred(Adapter);
+        VwifiScanReleaseDeferred(Adapter, TRUE);
     }
 }

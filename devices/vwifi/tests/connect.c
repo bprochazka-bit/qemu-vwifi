@@ -779,6 +779,33 @@ int main(void)
         printf("  ASSOC_RESULT carries the request IEs incl. RSN: PASS\n");
     }
 
+    /* ---- 10. A disconnect while already idle still confirms ----
+     *
+     * The driver completes OID_WDI_TASK_DISCONNECT on the DISCONNECTED
+     * event and nothing else, so a silent success costs it a full
+     * five-second watchdog. That is not hypothetical: the AP
+     * disassociated the station, wlansvc sent its own disconnect one
+     * second later into a device that had already gone idle, and the
+     * completion did not reach the OS for another five seconds. */
+    {
+        struct vwifi_ctrl_rsp_desc *e;
+        struct vwifi_disconnect_ev *ev;
+
+        arm_all_rsp_slots();
+        mock_backend_clear_events(g_mock);
+
+        /* Nothing is associated at this point -- the block above
+         * disconnected -- so this is the already-idle path. */
+        assert(ctrl_send(VWIFI_OP_DISCONNECT, NULL, 0) == 0);
+
+        e = find_event(VWIFI_EV_DISCONNECTED);
+        assert(e != NULL);
+        ev = event_payload(e);
+        assert(ev->local == 1);
+        printf("  disconnect while already idle still emits "
+               "DISCONNECTED: PASS\n");
+    }
+
     printf("connect: PASS\n");
     free(g_dev);
     mock_backend_free(g_mock);

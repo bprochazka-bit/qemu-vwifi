@@ -2213,7 +2213,33 @@ static int32_t op_disconnect(struct vwifi_dev *d,
     uint16_t reason = 3;   /* STA is leaving */
 
     if (in_len >= sizeof(*req)) reason = req->reason_code;
-    if (d->conn.state == VWIFI_CONN_IDLE) return 0;
+
+    /* Already idle -- and the event still goes out.
+     *
+     * This used to return success and post nothing, on the reasoning
+     * that there was no association to tear down. True, and it cost
+     * five seconds every time: the driver completes
+     * OID_WDI_TASK_DISCONNECT on the DISCONNECTED event, so with no
+     * event it waits out its whole watchdog before answering the OS.
+     *
+     * Measured on the WPA2 bring-up: the AP disassociated us at
+     * t=1020.045, wlansvc sent its own disconnect at t=1021.045 into a
+     * device that was already idle, and the completion did not go up
+     * until t=1026.061 -- "no DISCONNECTED event from the device --
+     * completing the disconnect anyway".
+     *
+     * The request was "disconnect" and the outcome is "disconnected",
+     * so saying so is not a lie about state, it is an answer. The
+     * event is idempotent by design: the driver's handler clears
+     * association state that is already clear. */
+    if (d->conn.state == VWIFI_CONN_IDLE) {
+        ev.reason_code = reason;
+        ev.local       = 1;
+        VWIFI_TRACE(d, "conn: disconnect requested while already idle "
+                       "-- confirming anyway (reason %u)", reason);
+        vwifi_post_event(d, VWIFI_EV_DISCONNECTED, &ev, sizeof(ev));
+        return 0;
+    }
 
     if (d->conn.state == VWIFI_CONN_ASSOCIATED) {
         conn_send_deauth(d, reason);

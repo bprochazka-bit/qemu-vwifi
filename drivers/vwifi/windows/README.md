@@ -2002,6 +2002,62 @@ connect task behind it is still held — failing it was measured tearing
 the association down 15 ms later — but bounded at 200 ms rather than
 ten seconds.
 
+## WPA2 end to end, and the two defects the working link exposed
+
+The link now carries traffic: `192.168.1.110`, default gateway, DNS,
+and `ping 8.8.8.8` at 4 ms. Connect to both keys installed is 234 ms;
+DHCP goes out 32 ms after that. Across the session, `rx ind ok 187,
+not-ok 0` with no leaked slots and no stuck pauses.
+
+Two things were still wrong, and both only became visible once
+associations were succeeding.
+
+**Finishing a scan job on top of `CONNECT_COMPLETE` costs the peer
+config.** A connect in the same session failed while the next one
+succeeded, and the QEMU trace names the trigger:
+
+```
+16:17:07.992490  conn: -> Assoc Request
+16:17:10.791742  conn: ASSOCIATED aid=1          <- 2.799 s
+16:17:14.794221  conn: <- Deauth from AP, reason 15
+```
+
+No retransmission — the AP simply took 2.8 seconds to answer. Nothing
+on our side of the air went wrong, but the *consequence* was ours: a
+scan that arrived during the connect was held for it and released the
+instant `CONNECT_COMPLETE` went up, and `TalTxRxPeerConfig` never
+followed. Four EAPOL-Key message 1s were buffered against an
+unconfigured peer (`the component has not configured this peer for
+data yet`, 1 → 4) and discarded on the flush; reason 15 is 4-way
+handshake timeout.
+
+Three observations of the same ordering, all consistent:
+
+| SCAN_COMPLETE after CONNECT_COMPLETE | peer configured |
+| --- | --- |
+| ~1.6 s (device swept for real) | yes |
+| 200 ms (handshake hold) | yes |
+| 0 ms (released inline) | **no** |
+
+What the WLAN component does with a finished scan job is re-evaluate
+its candidates, and doing that while the connect job is still walking
+its post-connect sequence costs the step that configures the peer.
+`VwifiScanReleaseDeferred` now takes an `Immediately` flag: the
+connect-complete path arms a 200 ms grace and lets the watchdog drain
+the hold, while disconnect and teardown still release at once. A slow
+association is no longer a failed one.
+
+**A disconnect against an already-idle device cost a flat five
+seconds.** `op_disconnect` returned success and posted nothing when
+`conn.state == VWIFI_CONN_IDLE`, and the driver completes
+`OID_WDI_TASK_DISCONNECT` on the `DISCONNECTED` event and nothing
+else — so it waited out its whole watchdog. Measured: the AP
+disassociated us at t=1020.045, wlansvc sent its own disconnect at
+t=1021.045 into a device that was already idle, and the completion did
+not reach the OS until t=1026.061. The device confirms the event on
+that path now; the request was "disconnect" and the outcome is
+"disconnected".
+
 ## Where the EAPOL frame dies, verified
 
 pktmon component IDs are reassigned every boot — they have been

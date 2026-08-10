@@ -860,7 +860,12 @@ ULONG       VwifiScanTaskState(_In_ PVWIFI_ADAPTER Adapter);
 /* Complete any scan held because the device would not sweep while it
  * was associating. Called from the connect task's completion; a no-op
  * when nothing is held. */
-VOID        VwifiScanReleaseDeferred(_Inout_ PVWIFI_ADAPTER Adapter);
+/* Immediately == FALSE gives the WLAN component a grace period after
+ * CONNECT_COMPLETE before the held scan is answered; see
+ * VWIFI_SCAN_POST_CONNECT_GRACE_MS. Disconnect and teardown paths
+ * pass TRUE -- there is no post-connect sequence left to protect. */
+VOID        VwifiScanReleaseDeferred(_Inout_ PVWIFI_ADAPTER Adapter,
+                                     _In_ BOOLEAN Immediately);
 VOID        VwifiScanOnBssFound(_Inout_ PVWIFI_ADAPTER Adapter,
                                 _In_reads_bytes_(PayloadLen) const VOID *Payload,
                                 _In_ ULONG PayloadLen);

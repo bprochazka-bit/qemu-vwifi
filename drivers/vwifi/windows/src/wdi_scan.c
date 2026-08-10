@@ -103,6 +103,16 @@ typedef struct _VWIFI_SCAN_TASK
      * sweep that went missing. */
     volatile LONG DeferredForConnect;
 
+    /* What the watchdog currently means, in milliseconds.
+     *
+     * It is a backstop for a sweep that went missing (VWIFI_SCAN_STALE_MS)
+     * and it is the ordinary drain for a deferred hold (the two short
+     * grace values), and the watchdog cannot tell those apart from the
+     * flags alone -- so reaching it is a warning in one case and
+     * business as usual in the other. Written whenever the timer is
+     * armed. */
+    ULONG DeferHoldMs;
+
     /* Fires if SCAN_COMPLETE never arrives. See VwifiScanWatchdog --
      * the lazy check this replaces could not fire in the one case it
      * existed for. */
@@ -206,6 +216,34 @@ typedef struct _VWIFI_SCAN_TASK
  * second; 200 ms is comfortably inside both. See the refusal path in
  * VwifiHandleTaskScan. */
 #define VWIFI_SCAN_HANDSHAKE_HOLD_MS 200
+
+/* How long after CONNECT_COMPLETE a scan held behind the connect waits
+ * before it is answered.
+ *
+ * Zero was the old value -- the release was inline, in the same
+ * millisecond -- and it is what breaks the connect when an association
+ * runs slow. What the WLAN component does with a finished scan job is
+ * re-evaluate its candidates, and doing that while the connect job is
+ * still walking its post-connect sequence costs the step that
+ * configures the peer for data. TX then stays paused on
+ * WDI_TX_PAUSE_REASON_PEER_CREATE for the life of an association the
+ * OS believes is up.
+ *
+ * Three observations, all consistent:
+ *
+ *   SCAN_COMPLETE ~1.6 s after CONNECT_COMPLETE   peer configured
+ *   SCAN_COMPLETE  200 ms after CONNECT_COMPLETE  peer configured
+ *   SCAN_COMPLETE    0 ms after CONNECT_COMPLETE  never configured
+ *
+ * The last of those is a real failed connect: the AP took 2.8 s to
+ * answer an association request, so the held scan was released the
+ * instant the connect finished, four EAPOL-Key message 1s were
+ * buffered against an unconfigured peer, and the AP gave up with
+ * reason 15 -- 4-way handshake timeout.
+ *
+ * Same value as the handshake hold, and for a related reason: what
+ * both are buying is room between one completion and the next. */
+#define VWIFI_SCAN_POST_CONNECT_GRACE_MS 200
 
 /* ============================================================
  * Indicate the accumulated BSS entries
@@ -430,20 +468,21 @@ VwifiScanWatchdog(_In_ PVOID SystemSpecific1,
      * completing for this to fire at all -- rare, and still no reason
      * to report a scan as broken. */
     if (task->DeferredForConnect) {
-        /* Two arrival routes with different meanings. A hold behind a
-         * connect TASK reaching its watchdog means the connect died
-         * without completing, which is rare and worth a warning. A hold
-         * taken only because the handshake was running is EXPECTED to
-         * end here -- see VWIFI_SCAN_HANDSHAKE_HOLD_MS -- and is the
-         * ordinary way that scan gets its answer, so it is not news. */
-        if (adapter->HandshakePending) {
-            VWIFI_INFO("scan held for the 4-way handshake -- answering it "
-                       "as a no-op so the key install is not queued "
-                       "behind it");
-        } else {
+        /* Two arrival routes with different meanings, told apart by how
+         * long the timer was armed for rather than by guessing from the
+         * flags. Reaching the LONG one means the connect died without
+         * completing, which is rare and worth a warning. Reaching a
+         * short one is the ordinary drain -- the grace after
+         * CONNECT_COMPLETE, or the cap on a hold taken during the
+         * handshake -- and is not news. */
+        if (task->DeferHoldMs >= VWIFI_SCAN_STALE_MS) {
             VWIFI_WARN("scan deferred behind a connect never drained after "
                        "%u ms -- the connect did not complete; answering it "
-                       "as a no-op scan anyway", VWIFI_SCAN_STALE_MS);
+                       "as a no-op scan anyway", task->DeferHoldMs);
+        } else {
+            VWIFI_INFO("scan held %u ms behind the connect -- answering it "
+                       "as a no-op now that the post-connect sequence has "
+                       "had its turn", task->DeferHoldMs);
         }
         VwifiIndicateScanComplete(adapter, NDIS_STATUS_SUCCESS);
         return;
@@ -1011,6 +1050,7 @@ VwifiHandleTaskScan(_Inout_ PVWIFI_ADAPTER Adapter,
     if (task->Watchdog) {
         LARGE_INTEGER due;
         due.QuadPart = -((LONGLONG)VWIFI_SCAN_STALE_MS * 10000LL);
+        task->DeferHoldMs = VWIFI_SCAN_STALE_MS;
         NdisSetTimerObject(task->Watchdog, due, 0, NULL);
     }
 
@@ -1127,6 +1167,7 @@ VwifiHandleTaskScan(_Inout_ PVWIFI_ADAPTER Adapter,
             LARGE_INTEGER due;
             due.QuadPart =
                 -((LONGLONG)VWIFI_SCAN_HANDSHAKE_HOLD_MS * 10000LL);
+            task->DeferHoldMs = VWIFI_SCAN_HANDSHAKE_HOLD_MS;
             (VOID)NdisCancelTimerObject(task->Watchdog);
             NdisSetTimerObject(task->Watchdog, due, 0, NULL);
         }
@@ -1210,11 +1251,34 @@ VwifiHandleTaskScan(_Inout_ PVWIFI_ADAPTER Adapter,
  * A no-op unless a scan is actually being held, so the connect path can
  * call it unconditionally. */
 VOID
-VwifiScanReleaseDeferred(_Inout_ PVWIFI_ADAPTER Adapter)
+VwifiScanReleaseDeferred(_Inout_ PVWIFI_ADAPTER Adapter,
+                         _In_ BOOLEAN Immediately)
 {
     PVWIFI_SCAN_TASK task = Adapter->ScanTask;
 
     if (!task || !task->Active || !task->DeferredForConnect) return;
+
+    /* A connect that has just completed gets the grace period; a
+     * disconnect or a teardown does not, because there is no
+     * post-connect sequence left to walk into and an OID left
+     * outstanding across a teardown is worse than an early answer.
+     * See VWIFI_SCAN_POST_CONNECT_GRACE_MS for what the grace buys. */
+    if (!Immediately && task->Watchdog) {
+        LARGE_INTEGER due;
+
+        due.QuadPart =
+            -((LONGLONG)VWIFI_SCAN_POST_CONNECT_GRACE_MS * 10000LL);
+        task->DeferHoldMs = VWIFI_SCAN_POST_CONNECT_GRACE_MS;
+        (VOID)NdisCancelTimerObject(task->Watchdog);
+        NdisSetTimerObject(task->Watchdog, due, 0, NULL);
+
+        VWIFI_INFO("connect finished -- the %u scan task(s) held behind "
+                   "it are answered in %u ms, not now: finishing a scan "
+                   "job on top of CONNECT_COMPLETE costs the peer config",
+                   task->TransactionCount,
+                   VWIFI_SCAN_POST_CONNECT_GRACE_MS);
+        return;
+    }
 
     /* Released at CONNECT_COMPLETE, including on a secure BSS where the
      * 4-way handshake has not started yet.
