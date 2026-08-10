@@ -1816,12 +1816,41 @@ adapter: `0x888E`, `EXEMPT_ON_KEY_MAPPING_KEY_UNAVAILABLE`, unicast —
 pairwise key is already installed for that peer.** The exemption is
 doing exactly what it says; the premise is wrong.
 
-Why it believes that is not established, and it is the open question.
-No trace of any connect attempt contains `OID_WDI_SET_ADD_CIPHER_KEYS`
-— the handshake never gets far enough for the OS to install a key —
-and this driver never sends `WDI_INDICATION_CIPHER_KEY_UPDATED`. The
-next step is to find what writes `[cipherctx+0x58]` in nwifi and what
-drives it.
+**The key structure, and what writes it.** `BCryptGenerateSymmetricKey`
+is called from three places in nwifi; one of them takes `lea rdx,
+[rdi+0x58]` as its `phKey` out-parameter, which is what puts a handle
+in that field. Immediately after it succeeds:
+
+```
+mov  DWORD PTR [rdi],ebp          ; +0x00  key id
+mov  QWORD PTR [rdi+0x8],0x1      ; +0x08  packet number, starts at 1
+```
+
+matching the CCMP header the transmit path builds from `+0x00` and
+`+0x08`. So `+0x58` is a `BCRYPT_KEY_HANDLE` and it is non-NULL exactly
+when a key has been installed.
+
+`[peer+0x60]` is the base of an array of these contexts, 0x60 bytes
+each — the install helper at `nwifi+0x2a3bc` indexes it as
+`base + (index+1)*0x60` for default keys, so **element 0 is the
+key-mapping (pairwise) key** and elements 1-4 are the default/group
+keys. The receive gate reads element 0.
+
+Element 0 is written by exactly one function, `nwifi+0x1c2fc`, which
+requires privacy on (`[ctx+0x15f8]`), cipher `4` (CCMP), and a 16-byte
+key, destroys any previous handle, and installs at `base+0` with
+`r8d = 0`. It has two callers. The management-frame-protection path
+(`nwifi+0x1cb28`, ciphers `6`/`12` — BIP and BIP-GMAC-256) installs
+into slots 1-4 and never touches element 0.
+
+So the question is now exactly: **what makes `nwifi+0x1c2fc` run, or
+leaves its handle alive, when no handshake has completed?** Nothing in
+any captured trace contains `OID_WDI_SET_ADD_CIPHER_KEYS`, and this
+driver never sends `WDI_INDICATION_CIPHER_KEY_UPDATED`. The two
+candidates are a key installed during this association, and a key left
+over from an earlier one that the disconnect path did not destroy —
+`nwifi+0x27550` is the destructor and it is called on the install path
+before each new key.
 
 ## Where the EAPOL frame dies, verified
 
