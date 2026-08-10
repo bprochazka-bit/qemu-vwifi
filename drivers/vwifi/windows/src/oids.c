@@ -1427,10 +1427,6 @@ VwifiOidRequest(
             return VwifiHandleSetFrequency(adapter, OidRequest);
         case OID_GEN_CURRENT_PACKET_FILTER:
             return VwifiHandleSetPacketFilter(adapter, OidRequest);
-        case OID_WDI_SET_ADD_CIPHER_KEYS:
-            return VwifiHandleAddCipherKeys(adapter, OidRequest);
-        case OID_WDI_SET_DELETE_CIPHER_KEYS:
-            return VwifiHandleDeleteCipherKeys(adapter, OidRequest);
         default:
             break;
         }
@@ -1477,6 +1473,40 @@ VwifiOidRequest(
             return VwifiHandleSetReceivePacketFilter(adapter, OidRequest);
         case OID_WDI_SET_MULTICAST_LIST:
             return VwifiHandleSetMulticastList(adapter, OidRequest);
+
+        /* The keys, and the reason they are HERE and not in the
+         * NdisRequestSetInformation switch above, where they sat
+         * unreachable while the WPA2 handshake was being chased through
+         * nwifi.sys.
+         *
+         * "SET" in a WDI OID name describes the direction of the
+         * message, not the NDIS request type. Every WDI OID -- tasks,
+         * sets and gets alike -- arrives as NdisRequestMethod, because
+         * WDI's M1/M2 exchange needs an input buffer and an output
+         * buffer on the same request. OID_WDI_SET_RECEIVE_PACKET_FILTER
+         * and OID_WDI_SET_MULTICAST_LIST are right above for exactly
+         * that reason; these two were the odd ones out.
+         *
+         * The cost of the misplacement was total and silent: the four-
+         * way handshake completes, wlansvc hands down the PTK and the
+         * GTK, the default case answers NOT_SUPPORTED, no key ever
+         * reaches the device, and the association sits there carrying
+         * nothing while DHCP times out. The log line was
+         * "OID: unhandled 0xe440001d WDI_SET_ADD_CIPHER_KEYS", twice,
+         * which is why the unhandled case prints the OID at all.
+         *
+         * The handlers return a WDI-level status; the M2 header carries
+         * it back, which is what VwifiWdiAckHeaderOnly is for. */
+        case OID_WDI_SET_ADD_CIPHER_KEYS: {
+            NDIS_STATUS keyStatus =
+                VwifiHandleAddCipherKeys(adapter, OidRequest);
+            return VwifiWdiAckHeaderOnly(OidRequest, keyStatus);
+        }
+        case OID_WDI_SET_DELETE_CIPHER_KEYS: {
+            NDIS_STATUS keyStatus =
+                VwifiHandleDeleteCipherKeys(adapter, OidRequest);
+            return VwifiWdiAckHeaderOnly(OidRequest, keyStatus);
+        }
         default:
             break;
         }

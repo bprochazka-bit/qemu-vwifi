@@ -1951,6 +1951,57 @@ the *bare IE block* is equally wrong and was what the device sent
 before — nwifi would then skip the first four bytes of the first IE.
 Neither end of the frame; the body.
 
+**Confirmed on hardware.** With the body reported instead of the frame,
+the handshake runs. From pktmon, one association:
+
+```
+16:02:25.964461  Rx  131 bytes  EAPOL   <- message 1
+16:02:25.964575  Tx  153 bytes  EAPOL   -> message 2
+16:02:26.080045  Rx  187 bytes  EAPOL   <- message 3
+16:02:26.080121  Tx  131 bytes  EAPOL   -> message 4
+```
+
+116 milliseconds, and the first EAPOL frame this project has ever
+transmitted. The driver log shows the same exchange from below —
+`TAL TxDataSend ... SNAP EtherType 0x888e (EAPOL)` — and
+`resp ies=31 req ies=52`, the body lengths, as the marker that the fix
+is in the build.
+
+## Two defects the working handshake exposed
+
+Neither could be seen while the handshake never completed.
+
+**1. The cipher-key OIDs were dispatched on the wrong request type.**
+`OID_WDI_SET_ADD_CIPHER_KEYS` was handled under
+`NdisRequestSetInformation`. Every WDI OID — task, set and get alike —
+arrives as `NdisRequestMethod`, because the M1/M2 exchange needs an
+input and an output buffer on one request. So the handshake completed,
+wlansvc handed down the PTK and the GTK, and both fell through to
+`OID: unhandled 0xe440001d WDI_SET_ADD_CIPHER_KEYS -> NOT_SUPPORTED`.
+No key reached the device, the link carried nothing, and DHCP timed
+out. The handler and its TLV parser had been written and correct the
+whole time; only the `case` was in the wrong switch.
+
+**2. The deferred scan deadlocked the key install.**
+`VwifiScanReleaseDeferred` held a scan past `CONNECT_COMPLETE` until
+the pairwise key arrived, so the station would not leave its channel
+during the handshake. But NDIS serialises OID requests: an outstanding
+WDI task blocks every later OID, and the OID that ends the handshake
+is `OID_WDI_SET_ADD_CIPHER_KEYS`. The scan waited for the key, the key
+waited for the scan, and the ten-second watchdog was the only exit.
+Measured precisely: association at t=131.648, all four EAPOL messages
+done by t=131.851, then complete silence on the OID channel until the
+watchdog fired at t=141.663 — at which point the entire post-
+association sequence arrived in one burst.
+
+The hold is now released at `CONNECT_COMPLETE`. What keeps the radio
+on channel is the device, which refuses `op_scan` with `-EBUSY` while
+associated on a secure BSS with no pairwise key; that guard never
+needed the OID pipeline stopped. A scan refused mid-handshake with no
+connect task behind it is still held — failing it was measured tearing
+the association down 15 ms later — but bounded at 200 ms rather than
+ten seconds.
+
 ## Where the EAPOL frame dies, verified
 
 pktmon component IDs are reassigned every boot — they have been

@@ -196,6 +196,17 @@ typedef struct _VWIFI_SCAN_TASK
  * is far enough past that to mean the completion is never coming. */
 #define VWIFI_SCAN_STALE_MS          10000
 
+/* The cap on a scan held only because a 4-way handshake is running.
+ *
+ * Nothing will drain that hold: the OID that ends the handshake cannot
+ * be delivered while this one is outstanding, because NDIS serialises
+ * OID requests. So the watchdog is not a backstop here, it is the exit,
+ * and it has to be short. A handshake takes about 150 ms of wall clock
+ * once the pipeline is free, and the AP retransmits message 1 every
+ * second; 200 ms is comfortably inside both. See the refusal path in
+ * VwifiHandleTaskScan. */
+#define VWIFI_SCAN_HANDSHAKE_HOLD_MS 200
+
 /* ============================================================
  * Indicate the accumulated BSS entries
  * ============================================================ */
@@ -419,9 +430,21 @@ VwifiScanWatchdog(_In_ PVOID SystemSpecific1,
      * completing for this to fire at all -- rare, and still no reason
      * to report a scan as broken. */
     if (task->DeferredForConnect) {
-        VWIFI_WARN("scan deferred behind a connect never drained after "
-                   "%u ms -- the connect did not complete; answering it "
-                   "as a no-op scan anyway", VWIFI_SCAN_STALE_MS);
+        /* Two arrival routes with different meanings. A hold behind a
+         * connect TASK reaching its watchdog means the connect died
+         * without completing, which is rare and worth a warning. A hold
+         * taken only because the handshake was running is EXPECTED to
+         * end here -- see VWIFI_SCAN_HANDSHAKE_HOLD_MS -- and is the
+         * ordinary way that scan gets its answer, so it is not news. */
+        if (adapter->HandshakePending) {
+            VWIFI_INFO("scan held for the 4-way handshake -- answering it "
+                       "as a no-op so the key install is not queued "
+                       "behind it");
+        } else {
+            VWIFI_WARN("scan deferred behind a connect never drained after "
+                       "%u ms -- the connect did not complete; answering it "
+                       "as a no-op scan anyway", VWIFI_SCAN_STALE_MS);
+        }
         VwifiIndicateScanComplete(adapter, NDIS_STATUS_SUCCESS);
         return;
     }
@@ -1006,9 +1029,11 @@ VwifiHandleTaskScan(_Inout_ PVWIFI_ADAPTER Adapter,
          * the scan 0 ms after CONNECT_COMPLETE, this branch read the
          * connect as finished, failed the OID with 0xc0000001, and
          * wlansvc tore the association down 15 ms later. */
-        BOOLEAN connecting = ((VwifiConnectTaskState(Adapter) &
-                               VWIFI_TASK_CONNECT_PENDING) != 0 ||
-                              Adapter->HandshakePending) ? TRUE : FALSE;
+        BOOLEAN connectTask = ((VwifiConnectTaskState(Adapter) &
+                                VWIFI_TASK_CONNECT_PENDING) != 0)
+                                  ? TRUE : FALSE;
+        BOOLEAN handshake   = Adapter->HandshakePending;
+        BOOLEAN connecting  = (connectTask || handshake) ? TRUE : FALSE;
 
         if (!connecting) {
             /* Rejected before the scan ever started, so no SCAN_COMPLETE
@@ -1079,11 +1104,42 @@ VwifiHandleTaskScan(_Inout_ PVWIFI_ADAPTER Adapter,
          */
         InterlockedExchange(&task->DeferredForConnect, 1);
 
-        VWIFI_INFO("device refused SCAN while a connect is in flight; "
-                   "holding txn %u until the connect completes (failing "
-                   "it aborts the post-connect sequence; answering it "
-                   "now starts a second connect task)",
-                   task->Requesters[0].TransactionId);
+        /* How long the hold may last, and why the two reasons differ.
+         *
+         * A connect TASK in flight is drained by
+         * VwifiIndicateConnectComplete, which is milliseconds away, so
+         * the long watchdog is only a backstop for a connect that never
+         * completes at all.
+         *
+         * A handshake with no connect task behind it has no such drain:
+         * CONNECT_COMPLETE has already fired, and what ends the
+         * handshake is OID_WDI_SET_ADD_CIPHER_KEYS -- an OID that
+         * cannot arrive while this one is outstanding, because NDIS
+         * serialises them. Holding on the full watchdog therefore
+         * guarantees the ten-second stall this deferral was never meant
+         * to cause. The channel is not at risk either way: the device
+         * refuses the sweep on its own for as long as the pairwise key
+         * is missing, which is the guard that actually matters.
+         *
+         * So bound it. Long enough not to churn, short enough that the
+         * key install is never meaningfully delayed. */
+        if (!connectTask && task->Watchdog) {
+            LARGE_INTEGER due;
+            due.QuadPart =
+                -((LONGLONG)VWIFI_SCAN_HANDSHAKE_HOLD_MS * 10000LL);
+            (VOID)NdisCancelTimerObject(task->Watchdog);
+            NdisSetTimerObject(task->Watchdog, due, 0, NULL);
+        }
+
+        VWIFI_INFO("device refused SCAN while %s; holding txn %u for at "
+                   "most %u ms (failing it tears the association down; "
+                   "answering it during a connect task starts a second "
+                   "connect)",
+                   connectTask ? "a connect task is in flight"
+                               : "the 4-way handshake is running",
+                   task->Requesters[0].TransactionId,
+                   connectTask ? VWIFI_SCAN_STALE_MS
+                               : VWIFI_SCAN_HANDSHAKE_HOLD_MS);
 
         /* Adopt the request, then re-read Active.
          *
@@ -1160,25 +1216,35 @@ VwifiScanReleaseDeferred(_Inout_ PVWIFI_ADAPTER Adapter)
 
     if (!task || !task->Active || !task->DeferredForConnect) return;
 
-    /* Not yet, if a 4-way handshake is still running.
+    /* Released at CONNECT_COMPLETE, including on a secure BSS where the
+     * 4-way handshake has not started yet.
      *
-     * CONNECT_COMPLETE fires at association, which on a secure BSS is
-     * the START of the handshake, not the end of the connect in any
-     * sense the radio cares about. Releasing here would let the sweep
-     * begin exactly when the EAPOL exchange needs the station to stay
-     * on channel -- which is what was measured: M1 transmitted 60 ms
-     * into a 13-channel sweep and never seen by the station at all.
+     * This used to hold on past CONNECT_COMPLETE until the pairwise key
+     * arrived, on the reasoning that the handshake needs the station to
+     * stay on channel and CONNECT_COMPLETE fires at association, before
+     * a single EAPOL frame moves. The reasoning is sound and the
+     * mechanism was the wrong one, because it deadlocks:
      *
-     * VwifiKeysOnInstalled releases it instead, and a disconnect
-     * releases it too, so there is no path where the hold outlives the
-     * thing it is waiting for. */
-    if (Adapter->HandshakePending) {
-        VWIFI_INFO("holding the %u scan task(s) past CONNECT_COMPLETE -- "
-                   "the 4-way handshake still needs the channel",
-                   task->TransactionCount);
-        return;
-    }
-
+     *   NDIS serialises OID requests. A WDI task held outstanding
+     *   blocks EVERY subsequent OID, and the OID the handshake is
+     *   waiting for is OID_WDI_SET_ADD_CIPHER_KEYS. So the scan waits
+     *   for the key, the key waits for the scan, and the only exit is
+     *   the 10-second watchdog.
+     *
+     * Measured exactly that way: association at t=131.648, all four
+     * EAPOL messages done by t=131.851, then nothing at all on the OID
+     * channel until the watchdog fired at t=141.663 -- whereupon the
+     * whole post-association sequence arrived in one burst, keys
+     * included. Ten seconds of a connect spent waiting for this
+     * function to give up.
+     *
+     * What actually keeps the radio on channel is the device: op_scan
+     * refuses with -EBUSY while associated on a secure BSS with no
+     * pairwise key. That refusal is the guard, and it does not need the
+     * OID pipeline stopped to work. HandshakePending still governs the
+     * refusal path in VwifiHandleTaskScan -- see the comment there
+     * about why a scan refused mid-handshake is answered rather than
+     * held -- but it no longer gates this release. */
     VWIFI_INFO("connect finished -- releasing the %u scan task(s) held "
                "behind it", task->TransactionCount);
 
