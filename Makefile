@@ -350,8 +350,8 @@ qemu-clean: check-qemu-src
 # kernel headers. Both QEMU device models keep their logic in a portable
 # core that the tests drive through a mock backend.
 
-.PHONY: test test-medium test-devices
-test: test-medium test-devices
+.PHONY: test test-medium test-devices test-pseudohost
+test: test-medium test-devices test-pseudohost
 
 test-medium: $(BUILD)/vwifi-medium
 	VWIFI_MEDIUM=$(BUILD)/vwifi-medium python3 medium/tests/harness.py
@@ -359,6 +359,12 @@ test-medium: $(BUILD)/vwifi-medium
 test-devices:
 	$(MAKE) -C devices/vwifi test
 	$(MAKE) -C devices/ath9k test-crypto test-wep test-tkip test-ampdu
+
+# The pseudo-host suite is pure Python (stdlib only): crypto KATs, the
+# WPA2 four-way handshake against an in-process authenticator, the
+# netstack/DHCP, and a full connect against an in-process mock hub+AP.
+test-pseudohost:
+	python3 -m unittest discover -s pseudohost/tests -p 'test_*.py'
 
 # ---------- Clean ----------
 

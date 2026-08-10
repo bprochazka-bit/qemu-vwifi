@@ -199,6 +199,7 @@ guest survive a hub restart.
 | Build the Linux (AR9285) device | [`devices/ath9k/README.md`](devices/ath9k/README.md) |
 | Build the vwifi-virt device | [`devices/vwifi/README.md`](devices/vwifi/README.md) |
 | Write or build a guest driver | [`drivers/README.md`](drivers/README.md) |
+| Populate the medium with virtual hosts (no VM) — workstations, printers, a NAS | [`pseudohost/README.md`](pseudohost/README.md) |
 | Change anything on the wire | [`abi/README.md`](abi/README.md) |
 | Watch a medium in a browser | [`medium/controller/README.md`](medium/controller/README.md) |
 
