@@ -2058,6 +2058,61 @@ not reach the OS until t=1026.061. The device confirms the event on
 that path now; the request was "disconnect" and the outcome is
 "disconnected".
 
+Both confirmed on the next run. `TAL peer config` lands 16 ms after
+`CONNECT_COMPLETE` and the held scan is answered 203 ms later — `scan
+held 200 ms behind the connect -- answering it as a no-op now that the
+post-connect sequence has had its turn` — with the keys following
+immediately and DHCP 16 ms after that.
+
+The device confirming a disconnect it had nothing to do needed one
+follow-up in the driver, though. `VwifiConnectOnDisconnected` announced
+a disassociation unconditionally, so a confirmation for an idle port
+produced this:
+
+```
+indicating DISASSOCIATION (locally-initiated)
+IND: LINK_STATE disconnected on ndisport 0
+OID: dot11 reset: device disconnect accepted (was not associated)
+IND: LINK_STATE disconnected on ndisport 0
+```
+
+A disassociation for an association that never existed, plus a
+redundant link-state-down. The task completions stay unconditional —
+answering an outstanding `OID_WDI_TASK_DISCONNECT` promptly is the
+whole point — but the announcements are now gated on having believed
+we were associated.
+
+## Two open items, closed by measurement
+
+**DHCP is not ours.** The medium capture shows the DISCOVERs leaving
+correctly: CCMP under the pairwise key, KeyID 0, PN counting up from 1,
+ToDS with DA `ff:ff:ff:ff:ff:ff`.
+
+```
++17.2385  TX bcast 376   DISCOVER #1   -- not relayed by the AP, no answer
++22.2376  TX bcast 376   DISCOVER #2   -- relayed, still no answer
++25.3018  TX bcast 376   DISCOVER #3   -- relayed
++25.5812  RX  us   376   OFFER, 280 ms later
+```
+
+Every other broadcast and multicast frame we sent in that window comes
+back from the AP as a group-addressed copy under the GTK (KeyID 1),
+byte-length for byte-length. DISCOVER #1 does not, and the reason is
+visible in the handshake immediately before it: the AP was still
+retransmitting message 3 at +17.2125, twenty-six milliseconds before
+the DISCOVER went out, so it had not yet processed our message 4 or
+installed its side of the pairwise key. DISCOVER #2 was relayed onto
+the medium and still went unanswered, which puts that loss beyond the
+AP entirely. Nothing in the driver or the device to change; a real
+client hits the same race, which is what DHCP retries are for.
+
+**`beacon=0` is not a defect either.** A beacon interval of 100 TU is
+102.4 ms against a 100 ms dwell, so the two drift and a dwell can miss
+the beacon completely. The device already knows this — see
+`scan_report_cached` — and reports the BSS from its own table either
+way, which is why the entry is complete apart from that one frame. The
+probe response covers it and the association works from it.
+
 ## Where the EAPOL frame dies, verified
 
 pktmon component IDs are reassigned every boot — they have been

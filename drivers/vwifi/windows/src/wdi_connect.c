@@ -588,6 +588,10 @@ VwifiConnectOnDisconnected(_Inout_ PVWIFI_ADAPTER Adapter,
     const struct vwifi_disconnect_ev *ev = Payload;
     BOOLEAN local = FALSE;
     PVWIFI_CONNECT_TASK task = Adapter->ConnectTask;
+    /* Read before it is cleared: this event now arrives for a device
+     * that was already idle, and there is nothing to announce the end
+     * of in that case. See the indications at the bottom. */
+    BOOLEAN wasAssociated = Adapter->Associated;
 
     if (PayloadLen >= sizeof(*ev)) local = ev->local ? TRUE : FALSE;
 
@@ -618,6 +622,31 @@ VwifiConnectOnDisconnected(_Inout_ PVWIFI_ADAPTER Adapter,
      * not an else. */
     if (task && task->DisconnectPending) {
         VwifiIndicateDisconnectComplete(Adapter, NDIS_STATUS_SUCCESS);
+    }
+
+    /* The announcements, and only if there was an association to
+     * announce the end of.
+     *
+     * The task completions above are unconditional -- an outstanding
+     * OID_WDI_TASK_DISCONNECT has to be answered whatever the port was
+     * doing, and answering it promptly is exactly why the device now
+     * confirms a disconnect it had nothing to do. These two are
+     * different: a disassociation indication for an association that
+     * never existed is a statement about the port that is not true,
+     * and it arrives paired with a redundant link-state-down.
+     *
+     * Seen in the log the moment the device started confirming:
+     *
+     *   indicating DISASSOCIATION (locally-initiated)
+     *   IND: LINK_STATE disconnected on ndisport 0
+     *   OID: dot11 reset: device disconnect accepted (was not associated)
+     *   IND: LINK_STATE disconnected on ndisport 0
+     *
+     * Windows tolerated it. That is not a reason to keep saying it. */
+    if (!wasAssociated) {
+        VWIFI_INFO("device confirmed a disconnect for a port that was not "
+                   "associated -- tasks completed, nothing announced");
+        return;
     }
 
     VwifiIndicateDisassociation(Adapter, local);
