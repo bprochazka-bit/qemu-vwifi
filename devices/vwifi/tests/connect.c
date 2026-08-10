@@ -405,15 +405,16 @@ int main(void)
         assert(memcmp(ar->bssid, AP_MAC, 6) == 0);
         assert(ar->status_code == 0);
         assert(ar->aid == 7);              /* top two bits masked off */
-        /* The whole response frame, not the IE block: WDI reports it as
-         * ASSOCIATION_RESPONSE_FRAME and keeps a separate TLV for bare
-         * IEs. Header (24) + capability/status/AID (6) + the rates IE. */
-        assert(ar->ie_len == aplen);
+        /* The response frame BODY, not the whole frame and not the bare
+         * IE block: capability/status/AID (6) then the IEs. nwifi.sys
+         * indexes it as params + 6 + offset, with no allowance for an
+         * 802.11 header -- see conn_rx_assoc_resp. */
+        assert(ar->ie_len == aplen - 24);
         const uint8_t *rsp = (const uint8_t *)ar + sizeof(*ar);
-        assert(((rsp[0] >> 4) & 0xF) == 1);          /* Assoc Response */
-        assert(memcmp(rsp + 10, AP_MAC, 6) == 0);    /* addr2 = the AP */
+        assert(le16(rsp + 2) == 0);              /* status = success */
+        assert((le16(rsp + 4) & 0x3FFF) == 7);   /* AID */
         {
-            const uint8_t *ies = rsp + 24 + 6;
+            const uint8_t *ies = rsp + 6;
             assert(ies[0] == 1 && ies[1] == 4);      /* rates, where it was */
         }
     }
@@ -754,11 +755,13 @@ int main(void)
             assert(ar->status_code == 0);
             assert(ar->req_ie_len > 0);
 
-            /* A whole Association Request frame: header (24) plus
-             * capability and listen interval (4) before the IEs. */
+            /* An Association Request frame BODY: capability and listen
+             * interval (4) before the IEs, and no 802.11 header --
+             * nwifi.sys skips exactly the fixed fields when it hunts
+             * for the RSN element. See conn_send_assoc_req. */
             req = (const uint8_t *)ar + sizeof(*ar) + ar->ie_len;
-            assert(((req[0] >> 4) & 0xF) == 0);      /* Assoc Request */
-            off = 24 + 4;
+            assert((le16(req) & 0x0010) != 0);   /* Privacy in caps */
+            off = 4;
             while (off + 2 <= ar->req_ie_len &&
                    off + 2 + req[off + 1] <= ar->req_ie_len) {
                 if (req[off] == 48) { rsnie = req + off; break; }

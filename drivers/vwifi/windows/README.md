@@ -1843,14 +1843,113 @@ key, destroys any previous handle, and installs at `base+0` with
 (`nwifi+0x1cb28`, ciphers `6`/`12` — BIP and BIP-GMAC-256) installs
 into slots 1-4 and never touches element 0.
 
-So the question is now exactly: **what makes `nwifi+0x1c2fc` run, or
-leaves its handle alive, when no handshake has completed?** Nothing in
-any captured trace contains `OID_WDI_SET_ADD_CIPHER_KEYS`, and this
-driver never sends `WDI_INDICATION_CIPHER_KEY_UPDATED`. The two
-candidates are a key installed during this association, and a key left
-over from an earlier one that the disconnect path did not destroy —
+So the question became: **what makes `nwifi+0x1c2fc` run, or leaves its
+handle alive, when no handshake has completed?** Nothing in any
+captured trace contains `OID_WDI_SET_ADD_CIPHER_KEYS`, and this driver
+never sends `WDI_INDICATION_CIPHER_KEY_UPDATED`. The two candidates
+were a key installed during this association, and a key left over from
+an earlier one that the disconnect path did not destroy —
 `nwifi+0x27550` is the destructor and it is called on the install path
 before each new key.
+
+**Both were wrong, and following them is what led to the real answer.**
+A clean-boot test — reboot, WPA2 connect as the very first wireless
+action, no earlier association of any kind — failed identically, which
+rules out leftover state. And the key block that `nwifi+0x1c2fc` reads
+from (`sec+0x3d0`, three lengths and a 96-byte buffer) is *zeroed at
+the end of each handshake* (`nwifi+0x1f2c1`) and is empty on a fresh
+port, so nothing could have installed a key during this association
+either. The premise had to be false: no key was ever installed, and
+the gate at `nwifi+0x2a13d` is not where the frame dies.
+
+It dies one level up, for a reason that turns out to be entirely ours.
+See **"nwifi.sys is the supplicant"** below.
+
+## nwifi.sys is the supplicant, and we never armed it
+
+The whole investigation up to here rested on an unexamined assumption:
+that `nwifi.sys` converts frames and `ndisuio.sys` carries EAPOL to a
+supplicant somewhere above. That is true for 802.1X/EAP. It is **not**
+true for the WPA2 four-way handshake, which Windows runs *in the
+kernel, inside nwifi.sys*.
+
+`nwifi+0x196d8` is the EAPOL-Key handler. It parses the key descriptor
+(`Key Length` at body+3 big-endian, bounds 1..32; `Key Nonce` at
+body+13), derives the PTK from the PMK stored at `port+0x1adc`, and
+replies. So "EAPOL-M1 enters nwifi's lower edge and never appears at
+its upper edge" — the pktmon picture we had been reading as a drop —
+is *correct behaviour*. The defect was never a missing frame. It was a
+missing **reply**.
+
+The handler only runs if the receive dispatcher (`nwifi+0x52d04`)
+routes the frame to it, and that requires, among other things:
+
+```
+1c001978e  cmp DWORD PTR [port+0x1710],0   ; the "armed" flag
+1c0019795  je  <bail>
+1c001979b  mov ecx,DWORD PTR [port+0x1718] ; the negotiated auth algo
+1c00197a1  lea eax,[rcx-0x6]
+1c00197a4  cmp eax,0x4
+1c00197a7  ja  <bail>                      ; must be RSNA..OWE (6..10)
+```
+
+Both of those fields are written in exactly one place: `nwifi+0x202a0`,
+the security half of the `NDIS_STATUS_DOT11_ASSOCIATION_COMPLETION`
+handler. That function is a gauntlet, and every gate in it is fed from
+the association result **this driver reports**:
+
+| Address | Requirement | What feeds it |
+| --- | --- | --- |
+| `+0x202df` | active auth personality == the default one | — |
+| `+0x20300` | `AuthAlgo - 6 <= 4`, i.e. RSNA/RSNA-PSK/WPA3/SAE/OWE | `AuthAlgorithm` |
+| `+0x2030d` | `uAssocReqOffset != 0` | `AssociationRequestFrame` present |
+| `+0x20318` | `uAssocReqSize >= 10` | its length |
+| `+0x203fb` | **element 48 (RSN) found in the association request** | its *contents* |
+| `+0x20f3b` | `uAssocRespSize >= 6` | `AssociationResponseFrame` |
+
+The RSN search is the one that failed. `nwifi+0x203fb`:
+
+```
+al   = params->bReAssocReq
+ecx  = bReAssocReq ? 10 : 4          ; the fixed-field length
+ptr  = params + uAssocReqOffset + ecx
+len  = uAssocReqSize - ecx
+call find_element(ptr, len, id=48)   ; nwifi+0x33ac8, STATUS_NOT_FOUND on miss
+```
+
+and `nwifi+0x2044b` retries with the *other* fixed-field length before
+giving up at `nwifi+0x204b4`. Four bytes for an association request
+(capability + listen interval), ten for a reassociation request (plus
+the current-AP address). **There is no allowance anywhere in that
+arithmetic for a 24-byte 802.11 MAC header** — so
+`WDI_TLV_ASSOCIATION_REQUEST_FRAME` means the management frame *body*,
+not the frame.
+
+We were sending the whole frame. nwifi therefore started walking
+elements at `addr1[0]`: element id `0x02`, length `0x11`, seventeen
+bytes on, and off into the sequence-control field. It never found the
+RSN element on either attempt, bailed, and left `port+0x1710` at zero.
+An unarmed port never routes EAPOL-Key to `nwifi+0x196d8`, so message 2
+was never built, and the AP timed the handshake out and disassociated —
+which is exactly the log, in every capture, for months.
+
+The same arithmetic applies to the response: `nwifi+0x20f44` reads it
+as `params + 6 + uAssocRespOffset` (capability, status code, AID).
+Body, again.
+
+This also explains, retrospectively, every negative result recorded
+above. Ciphers, `PortAuthorized`, the encapsulation table, TIDs, the
+receive contract — none of them could have mattered, because the code
+that would have consumed them was never reached. And open networks
+were unaffected throughout because `nwifi+0x202a0` bails at its first
+gate for `AuthAlgo` outside 6..10; an open association never enters
+this path at all.
+
+Fixed in `conn_send_assoc_req` and `conn_rx_assoc_resp`: both blobs are
+now stored and reported from `IEEE80211_MGMT_HDR_LEN` onward. Note that
+the *bare IE block* is equally wrong and was what the device sent
+before — nwifi would then skip the first four bytes of the first IE.
+Neither end of the frame; the body.
 
 ## Where the EAPOL frame dies, verified
 

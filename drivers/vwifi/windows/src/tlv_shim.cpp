@@ -769,13 +769,16 @@ VwifiTlvGenerateAssociationResult(
     entry.ActivePhyTypeList.ElementCount = nActivePhys;
     entry.ActivePhyTypeList.pElements    = activePhys;
 
-    /* The AP's association-response frame, verbatim -- and verbatim now
-     * means the frame, which it did not before. This carried the bare
-     * IE block for most of the project's life. Nothing exercised the
-     * difference until WPA2 needed the OS to read the exchange back:
-     * WDI has WDI_TLV_ASSOCIATION_RESPONSE_FRAME and
-     * WDI_TLV_ASSOCIATION_RESPONSE_IES as separate elements, so the
-     * frame slot wants a frame. */
+    /* The AP's association-response frame BODY: capability, status
+     * code, AID, then the IEs. Not the bare IE block, and not the
+     * whole frame either -- both were tried and both were wrong.
+     *
+     * The consumer settles it. nwifi.sys reads this at nwifi+0x20f34
+     * as `params + 6 + uAssocRespOffset`, length `uAssocRespSize - 6`,
+     * six being capability + status + AID. There is no allowance
+     * anywhere in that arithmetic for a 24-byte 802.11 header, so
+     * "frame" here means the management frame body. The device now
+     * hands us exactly that; see conn_rx_assoc_resp. */
     if (Ies != nullptr && Result->ie_len > 0) {
         entry.AssociationResponseFrame.ElementCount = Result->ie_len;
         entry.AssociationResponseFrame.pElements = const_cast<UINT8 *>(Ies);
@@ -797,10 +800,18 @@ VwifiTlvGenerateAssociationResult(
      * Which is exactly what the trace showed: EAPOL-Key message 1
      * arrives, reaches the component, and message 2 is never sent.
      *
-     * A frame, like its counterpart above. Reporting the IE block here
-     * instead made Windows reject the association outright, in
-     * thirty-three milliseconds rather than the second and a half it
-     * had previously spent waiting for a handshake. */
+     * A body, like its counterpart above -- capability info and listen
+     * interval, then the IEs. This is THE field the whole WPA2 failure
+     * hung on. nwifi.sys arms its in-kernel supplicant in the
+     * NDIS_STATUS_DOT11_ASSOCIATION_COMPLETION handler, and the arming
+     * step (nwifi+0x203fb) searches this blob for element 48, the RSN
+     * element, skipping exactly 4 bytes for an association request or
+     * 10 for a reassociation request -- the fixed-field lengths, with
+     * no header allowance. It tries both and gives up if neither
+     * finds the element (nwifi+0x204b4), leaving the port's armed flag
+     * clear, and a port that is not armed never routes EAPOL-Key to
+     * the handshake handler. See conn_send_assoc_req for the full
+     * chain. */
     if (ReqIes != nullptr && ReqIeLen > 0) {
         entry.AssociationRequestFrame.ElementCount = ReqIeLen;
         entry.AssociationRequestFrame.pElements = const_cast<UINT8 *>(ReqIes);

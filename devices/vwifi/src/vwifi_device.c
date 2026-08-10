@@ -335,11 +335,13 @@ struct vwifi_conn {
     /* IEs the driver asked us to include in the Assoc Request. */
     uint16_t req_ie_len;
     uint8_t  req_ies[VWIFI_ASSOC_IE_MAX];
-    /* The IE block of the association request this device actually
-     * sent -- SSID, rates, the RSN element it builds itself, and any
-     * driver-supplied vendor elements. Reported back with the
-     * association result because a supplicant cannot run a four-way
-     * handshake without knowing which RSN element was exchanged. */
+    /* The BODY of the association request this device actually sent:
+     * capability info and listen interval, then SSID, rates, the RSN
+     * element it builds itself, and any driver-supplied vendor
+     * elements. No 802.11 header -- see conn_send_assoc_req for why
+     * that matters. Reported back with the association result because
+     * a supplicant cannot run a four-way handshake without knowing
+     * which RSN element was exchanged. */
     uint8_t  sent_frame[VWIFI_ASSOC_IE_MAX];
     uint16_t sent_frame_len;
 };
@@ -1930,21 +1932,44 @@ static void conn_send_assoc_req(struct vwifi_dev *d)
         len += d->conn.req_ie_len;
     }
 
-    /* Keep what went out -- the whole frame, header and fixed fields
-     * included, not just the IE block.
+    /* Keep what went out: the management frame BODY -- capability info
+     * and listen interval, then the IEs -- and not the 802.11 header.
      *
-     * WDI has both WDI_TLV_ASSOCIATION_REQUEST_FRAME and
-     * WDI_TLV_ASSOCIATION_REQUEST_IES, so the distinction is deliberate
-     * and the driver reports this one as the frame. Sending an IE block
-     * in the frame's place made Windows reject the association in
-     * thirty-three milliseconds rather than wait for a handshake. */
+     * This is the whole WPA2 bug, and it is settled by disassembly
+     * rather than by argument. nwifi.sys runs the four-way handshake
+     * in the kernel; it arms itself in the ASSOCIATION_COMPLETION
+     * handler (nwifi+0x202a0), and the arming step looks for the RSN
+     * element in the association request we report back:
+     *
+     *   1c00203fb  al = params->bReAssocReq
+     *              ecx = bReAssocReq ? 10 : 4        <- fixed-field len
+     *              ptr = params + uAssocReqOffset + ecx
+     *              len = uAssocReqSize - ecx
+     *              call find_element(ptr, len, id=48)   ; 48 = RSN
+     *   1c002044b  retry with the other fixed-field length
+     *   1c00204b4  both failed -> bail, port never armed
+     *
+     * Four bytes for an association request, ten for a reassociation
+     * request -- exactly the fixed-field lengths, and no allowance for
+     * a 24-byte MAC header. So the blob has to start at the fixed
+     * fields. Handing over the whole frame made nwifi walk elements
+     * from addr1[0]: element id 0x02, length 0x11, and off into the
+     * weeds. It never found the RSN element, never set the port's
+     * armed flag (port+0x1710), and so never routed EAPOL-Key message
+     * 1 to the handshake handler at nwifi+0x196d8 -- which is why the
+     * frame reached nwifi in every capture and message 2 was never
+     * sent.
+     *
+     * The IE block alone is equally wrong, and was what this sent
+     * before: nwifi would then skip the first four IE bytes instead.
+     * Neither end of the frame -- the body is the answer. */
     {
-        uint16_t keep = len;
+        uint16_t keep = (uint16_t)(len - IEEE80211_MGMT_HDR_LEN);
 
         if (keep > sizeof(d->conn.sent_frame)) {
             keep = (uint16_t)sizeof(d->conn.sent_frame);
         }
-        memcpy(d->conn.sent_frame, frame, keep);
+        memcpy(d->conn.sent_frame, frame + IEEE80211_MGMT_HDR_LEN, keep);
         d->conn.sent_frame_len = keep;
     }
 
@@ -2071,12 +2096,19 @@ static void conn_rx_assoc_resp(struct vwifi_dev *d,
     d->conn.state = VWIFI_CONN_ASSOCIATED;
 
     VWIFI_TRACE(d, "conn: ASSOCIATED aid=%u", aid);
-    /* The whole response frame, for the same reason as the request:
-     * the driver reports it as ASSOCIATION_RESPONSE_FRAME, and WDI has
-     * a separate TLV for bare IEs. This has always sent the IE block,
-     * which no path exercised until WPA2 needed the OS to read the
-     * exchange back. */
-    conn_emit_assoc_result(d, IEEE80211_STATUS_SUCCESS, frame, frame_len);
+    /* The response frame BODY, for the same reason as the request, and
+     * with the same evidence behind it. nwifi reads this one at
+     * nwifi+0x20f34:
+     *
+     *   r9d = uAssocRespSize ; if (r9d < 6) bail
+     *   r8  = params + 6 + uAssocRespOffset
+     *   r9d = uAssocRespSize - 6
+     *   call parse_ies(r8, r9d)
+     *
+     * Six bytes: capability, status code, AID. Again no allowance for
+     * a MAC header, so again the blob starts at the fixed fields. */
+    conn_emit_assoc_result(d, IEEE80211_STATUS_SUCCESS, body,
+                           (uint16_t)(frame_len - IEEE80211_MGMT_HDR_LEN));
 }
 
 /* Handle a Deauth/Disassoc from the AP. */
