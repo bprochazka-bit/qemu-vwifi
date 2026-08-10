@@ -761,7 +761,6 @@ NDIS_STATUS VwifiInjectFrame(_Inout_ PVWIFI_ADAPTER Adapter,
 /* ath9k rate code -> ucDataRate in 500 kbps units, for the
  * DOT11_EXTSTA_RECV_CONTEXT. Both RX drains attach one, so both need
  * this; it lives in monitor.c because that path had it first. */
-UCHAR       VwifiRateCodeTo500Kbps(UCHAR RateCode);
 
 /* Control helpers to push mode/channel/filter to the device. */
 NDIS_STATUS VwifiSetOpMode(_Inout_ PVWIFI_ADAPTER Adapter, ULONG Mode);
@@ -893,10 +892,10 @@ ULONG       VwifiConnectTaskState(_In_ PVWIFI_ADAPTER Adapter);
 /* Rate-limited tracing for the per-frame handlers.
  *
  * Shared between wdi_tal.c and wdi_data.c: both sit on paths that can
- * run at DISPATCH_LEVEL and at whatever rate the component likes, and
- * logging every call would drown the trace that made either file
- * necessary. ONCE announces a path exists; FIRST(n) shows the first n
- * calls in full, for the handlers whose SHAPE is the open question. */
+ * run at DISPATCH_LEVEL and at whatever rate the component likes, so
+ * logging every call would drown everything else in the trace. ONCE
+ * says a path was taken at all; FIRST(n) shows the first n calls and
+ * then goes quiet. */
 #define VWIFI_TAL_ONCE(fmt, ...)                                    \
     do {                                                            \
         static LONG _vwifi_once = 0;                                \
@@ -913,11 +912,10 @@ ULONG       VwifiConnectTaskState(_In_ PVWIFI_ADAPTER Adapter);
         }                                                           \
     } while (0)
 
-/* Neither of the two above is TAL-specific despite the name; they are
- * "log this once" and "log the first n". Same thing, subsystem-neutral
- * name, for use outside the TAL. */
+/* Neither of the two above is TAL-specific despite the name; this is
+ * the same "log this once" under a subsystem-neutral name, for use
+ * outside the TAL. */
 #define VWIFI_ONCE(fmt, ...)      VWIFI_TAL_ONCE(fmt, ##__VA_ARGS__)
-#define VWIFI_FIRST(n, fmt, ...)  VWIFI_TAL_FIRST(n, fmt, ##__VA_ARGS__)
 
 /* How many transfers we tell the component it may have outstanding.
  *

@@ -383,7 +383,6 @@ VwifiTalTxTargetDescInit(
 
     /* No per-frame target descriptor to build: this device takes whole
      * frames through the TX ring, not a descriptor the TAL prepares. */
-    VWIFI_TAL_ONCE("TAL TxTargetDescInit (first call)");
     *pWifiStatus = NDIS_STATUS_SUCCESS;
 }
 
@@ -394,8 +393,6 @@ VwifiTalTxTargetDescDeInit(
 {
     UNREFERENCED_PARAMETER(MiniportTalTxRxContext);
     UNREFERENCED_PARAMETER(pNBL);
-
-    VWIFI_TAL_ONCE("TAL TxTargetDescDeInit (first call)");
 }
 
 static VOID
@@ -416,12 +413,9 @@ VwifiTalTxDataSend(
      * because a silently stalled TX path looks exactly like a working
      * one until something tries to use it.
      *
-     * This handler had never fired in any trace before peers existed,
-     * and that was not a coincidence: WDI addresses data by (port,
-     * peer, TID) and holds TX paused on WDI_TX_PAUSE_REASON_PEER_CREATE
-     * until a peer exists. Whether it fires NOW is the measurement that
-     * says the peer indication took, so the first calls are logged in
-     * full rather than announced once. */
+     * This handler cannot fire before a peer exists: WDI addresses
+     * data by (port, peer, TID) and holds TX paused on
+     * WDI_TX_PAUSE_REASON_PEER_CREATE until one does. */
     VWIFI_TAL_FIRST(8, "TAL TxDataSend: port %u peer %u tid %u -- %u queued, "
                        "%u active",
                     PortId, PeerId, ExTid, NumQueueFrames, NumActiveFrames);
@@ -457,8 +451,6 @@ VwifiTalTxTalSendComplete(
     UNREFERENCED_PARAMETER(MiniportTalTxRxContext);
     UNREFERENCED_PARAMETER(pNBL);
     UNREFERENCED_PARAMETER(TxFrameStatus);
-
-    VWIFI_TAL_ONCE("TAL TxTalSendComplete (first call)");
 }
 
 static VOID
@@ -661,7 +653,6 @@ VwifiTalRxPpduRssi(
      * and monitor.c puts it straight into the radiotap header. A fixed
      * mid-scale value is honest here in a way an invented dBm reading
      * would not be. */
-    VWIFI_TAL_ONCE("TAL RxPpduRssi (first call)");
     *pRssi = 60;
 }
 

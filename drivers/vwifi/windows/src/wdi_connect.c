@@ -274,16 +274,6 @@ VwifiIndicateAssociationResult(_Inout_ PVWIFI_ADAPTER Adapter,
                Result->aid, Result->ie_len, Result->req_ie_len,
                Params->AkmSuite);
 
-    /* So a trace from a probe build can never be mistaken for a trace
-     * from a real one. The switches are in tlv_shim.h; this line
-     * disappears when they are all off. */
-#ifdef VWIFI_PROBE_NAME
-    if (Params->AkmSuite != VWIFI_AKM_NONE) {
-        VWIFI_WARN("*** PROBE BUILD: %s on a secure BSS. This build is a "
-                   "diagnostic, not a fix. ***", VWIFI_PROBE_NAME);
-    }
-#endif
-
     VwifiSendWdiIndication(Adapter, task->WdiPortId, task->PortId,
                            NDIS_STATUS_WDI_INDICATION_ASSOCIATION_RESULT,
                            NDIS_STATUS_SUCCESS,

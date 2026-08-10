@@ -663,28 +663,15 @@ VwifiTlvGenerateAssociationResult(
      * PortAuthorized as the cause; it was simply the field that had
      * been changed.
      *
-     * FALSE is still what the model says is true at this moment -- the
-     * handshake has not run -- so it stays the default. The probe
-     * below is how the claim gets tested properly rather than asserted
-     * a second time. */
+     * FALSE is what the model says is true at this moment -- the
+     * handshake has not run -- and a probe build that reported TRUE
+     * confirmed it changes nothing: the association stood for its full
+     * four seconds either way and ended on the AP's handshake timeout.
+     * The real defect was elsewhere entirely; see the association
+     * request body in VwifiTlvGenerateAssociationResult below. */
     entry.AssociationResultParameters.PortAuthorized =
         (Params->AkmSuite == VWIFI_AKM_NONE) ? TRUE : FALSE;
 
-#if VWIFI_PROBE_PORT_AUTHORIZED
-    /* PROBE. The last field left. Ciphers have been eliminated by
-     * measurement, the receive contract and the rest of the
-     * association description have been checked against the headers
-     * and WABIModel.xml, and the frame still dies inside nwifi.sys.
-     *
-     * Association holds and EAPOL reaches ndisuio: the controlled port
-     *   is the gate, the earlier result was a misattribution, and the
-     *   question becomes how a real driver opens it.
-     * Association is torn down in tens of milliseconds again, on a
-     *   build without the two defects that were present last time: the
-     *   original conclusion was right after all, and this driver has
-     *   no remaining lever in the association result. */
-    entry.AssociationResultParameters.PortAuthorized = TRUE;
-#endif
 
     /* The negotiated algorithms and the band. All four were left at
      * zero, and zero is not a valid value for three of them:
@@ -710,20 +697,6 @@ VwifiTlvGenerateAssociationResult(
     entry.AssociationResultParameters.BandID = band;
     entry.AssociationResultParameters.DSInfo = WDI_DS_UNKNOWN;
 
-#if VWIFI_PROBE_REPORT_CIPHER_NONE
-    /* PROBE, already run and answered: the association was ACCEPTED
-     * with both data ciphers reported as NONE on a WPA2-PSK profile --
-     * so the OS does not cross-check the reported cipher against the
-     * profile -- and all four EAPOL frames were still discarded inside
-     * nwifi.sys. The ciphers are not the gate. Kept switched off
-     * rather than deleted so the result is not re-derived. */
-    if (Params->AkmSuite != VWIFI_AKM_NONE) {
-        entry.AssociationResultParameters.UnicastCipherAlgorithm =
-            WDI_CIPHER_ALGO_NONE;
-        entry.AssociationResultParameters.MulticastDataCipherAlgorithm =
-            WDI_CIPHER_ALGO_NONE;
-    }
-#endif
 
     /* ActivePhyTypeList is MANDATORY here, and leaving it empty is what
      * made every association fail.

@@ -172,107 +172,29 @@ VwifiTalTxOneNbl(_Inout_ PVWIFI_ADAPTER Adapter, _In_ PNET_BUFFER_LIST Nbl)
             flat = NdisGetDataBuffer(nb, len, alloc, 1, 0);
         }
 
-        /* What shape is a WDI TX frame?
+        /* VWIFI_TX_F_80211 says this frame is already a complete
+         * MPDU and the device must not encapsulate it again, so the
+         * one thing worth checking is that it still is one. A silent
+         * change of shape underneath that flag produces a frame the
+         * device mangles rather than one it rejects, which is the
+         * hardest kind of failure to see from either end.
          *
-         * An MPDU, per the frame-format contract in vwifi_drv.h --
-         * this dump is what established that, and it stays because a
-         * silent change of shape underneath us is the one thing the
-         * flag we pass below cannot survive.
-         *
-         * It is decoded AS an MPDU, which is a correction. The
-         * original version tested bytes 12-13 for an EtherType first
-         * and only fell through to the 802.11 test if that failed --
-         * but in an MPDU bytes 12-13 are the middle of addr1, so the
-         * "802.3, the device's assumption holds" branch was reachable
-         * by coincidence on a frame that was nothing of the kind.
-         * Reading it as 802.11 first and 802.3 only as the fallback
-         * puts the burden of proof on the right side.
-         *
-         * Frame control is bytes 0-1: bits 2-3 of byte 0 are the type
-         * (2 = data), bits 4-7 the subtype (bit 3 set = QoS, which
-         * adds 2 bytes to the header). Then LLC/SNAP, whose last two
-         * bytes are the EtherType the payload actually has. */
-        if (flat != NULL && len >= 24) {
-            ULONG type = (flat[0] >> 2) & 0x3;
-            ULONG hlen = 24 + (((flat[0] & 0x80) && type == 2) ? 2u : 0u);
-            ULONG et   = (len >= hlen + 8)
-                             ? (((ULONG)flat[hlen + 6] << 8) | flat[hlen + 7])
-                             : 0;
-
-            VWIFI_TAL_ONCE(
-                "TAL tx: first frame %u bytes: fc %02x %02x dur %02x %02x "
-                "| a1 %02x:%02x:%02x:%02x:%02x:%02x "
-                "| a2 %02x:%02x:%02x:%02x:%02x:%02x "
-                "| a3 %02x:%02x:%02x:%02x:%02x:%02x | seq %02x %02x -- %s",
-                len,
-                flat[0], flat[1], flat[2], flat[3],
-                flat[4], flat[5], flat[6], flat[7], flat[8], flat[9],
-                flat[10], flat[11], flat[12], flat[13], flat[14], flat[15],
-                flat[16], flat[17], flat[18], flat[19], flat[20], flat[21],
-                flat[22], flat[23],
-                (type == 2)
-                    ? "802.11 DATA MPDU, as expected -- sent with "
-                      "VWIFI_TX_F_80211 so the device passes it through "
-                      "rather than encapsulating it again"
-                    : (type == 0)
-                        ? "802.11 MANAGEMENT frame on the data path -- "
-                          "unexpected"
-                        : "NOT an 802.11 data frame -- shape unknown, the "
-                          "addresses above are not addresses");
-
-            if (type == 2 && et != 0) {
-                VWIFI_TAL_ONCE(
-                    "TAL tx:   hdr %u bytes%s, SNAP EtherType 0x%04x (%s)",
-                    hlen, (hlen == 26) ? " (QoS)" : "", et,
-                    (et == 0x0800) ? "IPv4"
-                                   : (et == 0x0806) ? "ARP"
-                                   : (et == 0x86dd) ? "IPv6"
-                                   : (et == 0x888e) ? "EAPOL"
-                                                    : "other");
-            }
-        }
-
-        /* The request side of the same exchange.
-         *
-         * Printed so the two transaction ids can be put next to each
-         * other without a packet capture: an offer whose xid does not
-         * match the discover that asked for it is a frame the stack is
-         * right to drop, and that is indistinguishable from every other
-         * failure at the level of "DHCP does not complete".
-         *
-         * This one is an MPDU, so the offsets are the 802.11 header
-         * (24, plus 2 if QoS), then LLC/SNAP (8), then IP (20) and UDP
-         * (8) before BOOTP starts. */
-        if (flat != NULL && len >= 24 && ((flat[0] >> 2) & 0x3) == 2) {
-            ULONG hdr = 24;
-
-            if (flat[0] & 0x80) hdr += 2;   /* QoS control */
-            {
-                ULONG ip = hdr + 8;
-                ULONG udp = ip + 20;
-                ULONG bootp = udp + 8;
-
-                if (len >= bootp + 44 &&
-                    flat[hdr + 6] == 0x08 && flat[hdr + 7] == 0x00 &&
-                    flat[ip + 9] == 17 &&
-                    ((flat[udp] << 8) | flat[udp + 1]) == 68 &&
-                    ((flat[udp + 2] << 8) | flat[udp + 3]) == 67) {
-                    VWIFI_TAL_FIRST(3,
-                        "TAL tx:   DHCP op %u xid %02x%02x%02x%02x "
-                        "flags %02x%02x chaddr %02x:%02x:%02x:%02x:%02x:%02x",
-                        flat[bootp],
-                        flat[bootp + 4], flat[bootp + 5],
-                        flat[bootp + 6], flat[bootp + 7],
-                        flat[bootp + 10], flat[bootp + 11],
-                        flat[bootp + 28], flat[bootp + 29], flat[bootp + 30],
-                        flat[bootp + 31], flat[bootp + 32], flat[bootp + 33]);
-                }
-            }
+         * Frame control is bytes 0-1: bits 2-3 of byte 0 are the type,
+         * and 2 is data. Decoded as 802.11 and not as Ethernet -- in
+         * an MPDU, bytes 12-13 are the middle of addr1, so testing
+         * them for an EtherType finds one by coincidence often enough
+         * to be misleading. */
+        if (flat != NULL && len >= 24 && ((flat[0] >> 2) & 0x3) != 2) {
+            VWIFI_TAL_FIRST(4, "TAL tx: frame of %u bytes is not an 802.11 "
+                               "data MPDU (fc %02x %02x) -- sending it with "
+                               "VWIFI_TX_F_80211 anyway; see the frame-format "
+                               "contract in vwifi_drv.h",
+                            len, flat[0], flat[1]);
         }
 
         /* VWIFI_TX_F_80211: what the component hands down is a
-         * complete MPDU, header and all -- confirmed off the wire by
-         * the dump above. The device must not encapsulate it again. */
+         * complete MPDU, header and all. The device must not
+         * encapsulate it again. */
         st = (flat != NULL)
                  ? VwifiTxDataFrame(Adapter, flat, len, VWIFI_TX_F_80211)
                  : NDIS_STATUS_FAILURE;
@@ -596,38 +518,15 @@ VwifiTalRxIndicate(_Inout_ PVWIFI_ADAPTER Adapter,
         return;
     }
 
-    /* What the component handed back, before we write a single field.
+    /* Two members written, the rest left as the allocator returned it.
      *
-     * This driver fills in exactly two members of the structure below
-     * and leaves the rest at whatever the allocator left there. That is
-     * fine if the allocator zeroes it and not fine at all if it does
-     * not: the RX metadata carries the frame's encryption and exemption
-     * state, and residue that claims a frame arrived protected is a
-     * frame the 802.11 layer discards above us -- on an open network,
-     * silently, after answering SUCCESS to the indication. Which is
-     * precisely the shape of the problem still outstanding.
-     *
-     * Raw bytes rather than named fields, because naming them would be
-     * asserting a layout this driver has never verified. Once. */
-    {
-        const UCHAR *raw = (const UCHAR *)md;
-
-        VWIFI_TAL_ONCE("TAL rx: fresh frame metadata at %p reads "
-                       "%02x %02x %02x %02x %02x %02x %02x %02x "
-                       "%02x %02x %02x %02x %02x %02x %02x %02x "
-                       "%02x %02x %02x %02x %02x %02x %02x %02x "
-                       "%02x %02x %02x %02x %02x %02x %02x %02x",
-                       md,
-                       raw[0],  raw[1],  raw[2],  raw[3],
-                       raw[4],  raw[5],  raw[6],  raw[7],
-                       raw[8],  raw[9],  raw[10], raw[11],
-                       raw[12], raw[13], raw[14], raw[15],
-                       raw[16], raw[17], raw[18], raw[19],
-                       raw[20], raw[21], raw[22], raw[23],
-                       raw[24], raw[25], raw[26], raw[27],
-                       raw[28], raw[29], raw[30], raw[31]);
-    }
-
+     * That is safe because the allocator zeroes it -- checked once by
+     * dumping the raw bytes of a fresh block, which came back all
+     * zero. Worth knowing rather than assuming: the RX metadata
+     * carries the frame's encryption and exemption state, and residue
+     * claiming a frame arrived protected is a frame the 802.11 layer
+     * discards above us, silently, after answering SUCCESS to the
+     * indication. */
     md->pNBL = Nbl;
     md->u.rxMetaData.PayloadType = WDI_FRAME_MSDU;
 

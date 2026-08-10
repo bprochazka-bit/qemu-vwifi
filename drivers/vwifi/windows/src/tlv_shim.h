@@ -27,53 +27,6 @@
 
 #pragma once
 
-/* ============================================================
- * DIAGNOSTIC PROBES
- *
- * At most one of these may be 1, and none of them may ship set.
- * They deliberately misreport a field of the association result to
- * find out which one gates the WPA2 handshake, and a build with one
- * enabled announces itself in the trace so its log can never be
- * mistaken for a real one.
- *
- * They live here rather than in the .cpp because wdi_connect.c prints
- * the banner and tlv_shim.cpp does the misreporting, and a probe that
- * is on in one file and off in the other is worse than no probe.
- *
- * History, so nobody repeats a run:
- *
- *   CIPHER_NONE -- ran. The association was ACCEPTED with the data
- *     ciphers reported as NONE on a WPA2-PSK profile, so the OS does
- *     not cross-check the reported cipher against the profile. All
- *     four EAPOL frames were still discarded by nwifi.sys. The
- *     ciphers are not the gate.
- *
- *   PORT_AUTHORIZED -- ran, and answered two things. The association
- *     was NOT torn down: it stood for the full four seconds and ended
- *     with the AP's own handshake timeout, exactly as it does with
- *     FALSE. So the 28 ms disconnect once blamed on this field was a
- *     misattribution to two defects fixed since (18a7a0e, 7fb9481).
- *     But TRUE does not open the path either -- every EAPOL retry
- *     still died in nwifi.sys. PortAuthorized is not the gate.
- *
- * Every field of WDI_ASSOCIATION_RESULT_PARAMETERS has now been either
- * varied by probe or verified against WABIModel.xml, and none of them
- * is the gate. The next idea should not be another field of this
- * message.
- * ============================================================ */
-#define VWIFI_PROBE_REPORT_CIPHER_NONE   0
-#define VWIFI_PROBE_PORT_AUTHORIZED      0
-
-#if (VWIFI_PROBE_REPORT_CIPHER_NONE + VWIFI_PROBE_PORT_AUTHORIZED) > 1
-#error "enable at most one diagnostic probe at a time"
-#endif
-
-#if VWIFI_PROBE_REPORT_CIPHER_NONE
-#  define VWIFI_PROBE_NAME "reporting the negotiated data ciphers as NONE"
-#elif VWIFI_PROBE_PORT_AUTHORIZED
-#  define VWIFI_PROBE_NAME "reporting PortAuthorized=TRUE"
-#endif
-
 #include <ndis.h>
 #include "vwifi_abi.h"
 

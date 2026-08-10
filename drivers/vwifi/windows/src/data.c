@@ -106,14 +106,6 @@ VwifiRxDrainSta(_Inout_ PVWIFI_ADAPTER Adapter)
      * reachable in the first place. */
     ULONG guard = 0;
 
-    /* An associated link that carries no traffic gives two very
-     * different silences, and until now they looked identical in the
-     * trace: the RX interrupt never firing at all, and it firing with
-     * an empty ring every time. The first means nothing is arriving
-     * from the medium; the second means frames are arriving and being
-     * dropped somewhere between here and the component. */
-    VWIFI_TAL_ONCE("rx(sta): the RX DPC has fired at least once");
-
     for (;;) {
         ULONG idx = ring->NextIndex & ring->Mask;
         struct vwifi_rx_desc *d = (struct vwifi_rx_desc *)
@@ -167,81 +159,6 @@ VwifiRxDrainSta(_Inout_ PVWIFI_ADAPTER Adapter)
             PUCHAR frame_va = (PUCHAR)Adapter->RxBufferPoolVa
                             + (SIZE_T)idx * VWIFI_RX_BUFFER_SIZE;
 
-            /* What is actually arriving, and in what shape.
-             *
-             * An 802.11 MPDU now, not 802.3: addr1 at 4, addr2 at 10,
-             * addr3 at 16, then LLC/SNAP and the EtherType. pktmon
-             * settled the contract -- it showed wdiwifi converting
-             * 802.3 to 802.11 on the way down and showed not one
-             * received packet reaching NDIS while this driver was
-             * handing up Ethernet.
-             *
-             * The offsets below are computed rather than written out
-             * because a QoS data frame carries two more header bytes
-             * and getting that wrong silently shifts every field. */
-            if (d->frame_len >= 34 && ((frame_va[0] >> 2) & 0x3) == 2) {
-                ULONG hdr = 24;
-                ULONG snap, etype;
-
-                /* Subtype bit 3 (0x80 of frame control byte 0) marks a
-                 * QoS data frame, which carries two extra header bytes.
-                 * Only meaningful once the type is known to be data,
-                 * hence the test above. */
-                if (frame_va[0] & 0x80) hdr += 2;           /* QoS control */
-                snap  = hdr + 8;                            /* LLC/SNAP */
-                etype = hdr + 6;
-
-                VWIFI_TAL_FIRST(4,
-                    "rx(sta): frame %u bytes: a1 %02x:%02x:%02x:%02x:%02x:%02x "
-                    "a2 %02x:%02x:%02x:%02x:%02x:%02x "
-                    "a3 %02x:%02x:%02x:%02x:%02x:%02x fc %02x%02x type %02x%02x",
-                    d->frame_len,
-                    frame_va[4], frame_va[5], frame_va[6],
-                    frame_va[7], frame_va[8], frame_va[9],
-                    frame_va[10], frame_va[11], frame_va[12],
-                    frame_va[13], frame_va[14], frame_va[15],
-                    frame_va[16], frame_va[17], frame_va[18],
-                    frame_va[19], frame_va[20], frame_va[21],
-                    frame_va[0], frame_va[1],
-                    frame_va[etype], frame_va[etype + 1]);
-
-                /* Ports second, and only when they exist. 67 -> 68 is
-                 * the DHCP offer this link keeps not getting. */
-                if (frame_va[etype] == 0x08 && frame_va[etype + 1] == 0x00 &&
-                    d->frame_len >= snap + 28 &&
-                    frame_va[snap + 9] == 17) {
-                    ULONG udp   = snap + 20;
-                    ULONG sport = (ULONG)((frame_va[udp] << 8) | frame_va[udp + 1]);
-                    ULONG dport = (ULONG)((frame_va[udp + 2] << 8) | frame_va[udp + 3]);
-
-                    VWIFI_TAL_FIRST(4, "rx(sta):   UDP %u -> %u", sport, dport);
-
-                    /* The offer, in full, on its own counter: is it
-                     * addressed to this station, does its transaction id
-                     * match what this station asked, and is the hardware
-                     * address in the payload ours. Any one of those being
-                     * wrong is a frame Windows is right to ignore, and
-                     * none of them show up in "UDP 67 -> 68". */
-                    if (sport == 67 && dport == 68 &&
-                        d->frame_len >= udp + 8 + 44) {
-                        ULONG b = udp + 8;   /* BOOTP */
-
-                        VWIFI_TAL_FIRST(3,
-                            "rx(sta):   DHCP op %u xid %02x%02x%02x%02x "
-                            "flags %02x%02x yiaddr %u.%u.%u.%u "
-                            "chaddr %02x:%02x:%02x:%02x:%02x:%02x",
-                            frame_va[b],
-                            frame_va[b + 4], frame_va[b + 5],
-                            frame_va[b + 6], frame_va[b + 7],
-                            frame_va[b + 10], frame_va[b + 11],
-                            frame_va[b + 16], frame_va[b + 17],
-                            frame_va[b + 18], frame_va[b + 19],
-                            frame_va[b + 28], frame_va[b + 29], frame_va[b + 30],
-                            frame_va[b + 31], frame_va[b + 32], frame_va[b + 33]);
-                    }
-                }
-            }
-
             PMDL mdl = NdisAllocateMdl(Adapter->MiniportAdapterHandle,
                                        frame_va, d->frame_len);
             if (!mdl) {
@@ -262,29 +179,23 @@ VwifiRxDrainSta(_Inout_ PVWIFI_ADAPTER Adapter)
 
             VwifiRxNblSetSlot(nbl, idx);
 
-            /* Say what shape this MSDU is, but do not keep it on the
-             * NBL.
+            /* Every frame is indicated on VWIFI_WDI_RX_TID_NON_QOS,
+             * and no per-frame TID is kept.
              *
              * A QoS data frame (subtype bit 3, i.e. 0x80 of frame
              * control byte 0) carries a QoS control field at offset 24
-             * whose low four bits would be its TID. Every frame this
-             * station has ever received is non-QoS, so the indication
-             * below and the held-frame announcement in wdi_data.c both
-             * name VWIFI_WDI_RX_TID_NON_QOS -- read the comment on that
-             * constant before changing it, because the value the header
-             * documents bugchecks NDIS.
+             * whose low four bits would be its TID; nothing this
+             * station receives is QoS, so the indication below and the
+             * held-frame announcement in wdi_data.c both name the same
+             * constant. Read the comment on it before changing the
+             * value -- what the header documents bugchecks NDIS.
              *
              * The TID was briefly stored in MiniportReserved[3] so the
-             * announcement could recover it; the component overwrites
-             * that slot while it holds the frame, and the announcement
-             * duly reported "tid 160". If the QoS branch below ever
-             * fires, that is the moment to find somewhere safe to keep
-             * a per-frame TID -- until then there is nothing to keep. */
-            VWIFI_TAL_FIRST(4, "rx(sta): frame is %s -- indicating on "
-                               "extended TID %u",
-                            ((frame_va[0] & 0x80) && d->frame_len >= 26)
-                                ? "QoS (UNEXPECTED)" : "non-QoS",
-                            VWIFI_WDI_RX_TID_NON_QOS);
+             * announcement could recover it. The component overwrites
+             * that slot while it holds the frame. If QoS receive ever
+             * becomes real, that is the moment to find somewhere safe
+             * to keep a per-frame TID -- until then there is nothing
+             * to keep. */
 
             /* No DOT11_EXTSTA_RECV_CONTEXT here, deliberately.
              *
@@ -292,8 +203,7 @@ VwifiRxDrainSta(_Inout_ PVWIFI_ADAPTER Adapter)
              * and on the argument that both directions now carry 802.11
              * MPDUs so both should describe the reception the same way.
              * The argument was wrong about which interface it was
-             * talking to, and the code said so itself: "whether it is
-             * what the receive path is missing is not established".
+             * talking to.
              *
              * DOT11_EXTSTA_RECV_CONTEXT belongs to the NATIVE 802.11
              * receive path, where a miniport calls
@@ -311,12 +221,11 @@ VwifiRxDrainSta(_Inout_ PVWIFI_ADAPTER Adapter)
              * interface is not extra information, it is a pointer the
              * component did not put there.
              *
-             * And it is not needed: this link obtained a DHCP lease on
-             * an open network before this code existed. Whatever is
-             * eating EAPOL, the absence of a receive context is not it.
+             * And it is not needed: this link carries traffic, WPA2
+             * included, without one.
              *
-             * The per-slot RxRecvContext array stays -- monitor.c uses
-             * it -- and so does VwifiRateCodeTo500Kbps. */
+             * The per-slot RxRecvContext array stays; monitor.c uses
+             * it on the path where the structure does belong. */
 
             NET_BUFFER_LIST_STATUS(nbl) = NDIS_STATUS_SUCCESS;
             NET_BUFFER_LIST_NEXT_NBL(nbl) = NULL;
