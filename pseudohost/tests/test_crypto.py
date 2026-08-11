@@ -79,6 +79,35 @@ class TestCCMP(unittest.TestCase):
         self.assertIsNone(crypto.ccmp_decrypt(crypto.AES128(bytes([1]) * 16),
                                               enc))
 
+    def test_ccmp_header_pn_is_low_byte_first(self):
+        # The CCMP header stores PN0 (least significant) at offset 0.
+        # This is the byte order real 802.11 devices use; getting it
+        # backwards is self-consistent but fails interop (it did).
+        hdr = crypto.ccmp_build_header(bytes([0, 0, 0, 0, 0, 7]), 0)
+        self.assertEqual(hdr.hex(), "0700002000000000")
+        pn, kid = crypto.ccmp_parse_header(hdr)
+        self.assertEqual(pn, bytes([0, 0, 0, 0, 0, 7]))
+        self.assertEqual(kid, 0)
+
+    def test_interop_kat_matches_reference_c(self):
+        # Exact bytes produced by devices/vwifi/src/vwifi_crypto.c
+        # (vwifi_ccmp_encrypt) for this key/PN/frame.  If our output
+        # diverges, a real vwifi device will drop our CCMP frames.
+        key = bytes.fromhex("0f0e0d0c0b0a09080706050403020100")
+        plain = bytes.fromhex(
+            "08010000021122334400" "5254008bc782" "ffffffffffff" "1000"
+            "aaaa030000000800" "404142434445464748494a4b4c4d4e4f50515253")
+        expect = bytes.fromhex(
+            "084100000211223344005254008bc782ffffffffffff1000"
+            "0700002000000000539cfdfa5dfb85d0616a79b33f58fb9e"
+            "2f2dd311fa21af55e5896e92fbf39945760232b3")
+        enc = crypto.ccmp_encrypt(crypto.AES128(key), plain,
+                                  bytes([0, 0, 0, 0, 0, 7]), 0)
+        self.assertEqual(enc, expect)
+        # and the reference ciphertext decrypts back to our plaintext
+        out = crypto.ccmp_decrypt(crypto.AES128(key), expect)
+        self.assertEqual(out[0], plain)
+
     def test_pn_carry(self):
         self.assertEqual(crypto.pn_increment(bytes([0, 0, 0, 0, 0, 0xFF])),
                          bytes([0, 0, 0, 0, 1, 0]))

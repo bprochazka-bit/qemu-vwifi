@@ -396,14 +396,23 @@ def _ccmp_aad(hdr):
 
 
 def ccmp_build_header(pn, key_id):
-    """The 8-byte CCMP header: PN0 PN1 rsvd keyid|ExtIV PN2 PN3 PN4 PN5."""
-    return bytes([pn[0], pn[1], 0x00, (key_id << 6) | 0x20,
-                  pn[2], pn[3], pn[4], pn[5]])
+    """The 8-byte CCMP header: PN0 PN1 rsvd keyid|ExtIV PN2 PN3 PN4 PN5.
+
+    The header stores the packet number low byte first (PN0 = least
+    significant, at offset 0).  Our `pn` array is big-endian — pn[0] is
+    the most significant byte, pn[5] the least — the same convention the
+    nonce uses (memcpy of pn as PN5..PN0) and that pn_increment carries
+    from.  So the header takes pn reversed.  This has to match the real
+    802.11 device byte-for-byte or CCMP interop silently fails the MIC.
+    """
+    return bytes([pn[5], pn[4], 0x00, (key_id << 6) | 0x20,
+                  pn[3], pn[2], pn[1], pn[0]])
 
 
 def ccmp_parse_header(hdr8):
     key_id = (hdr8[3] >> 6) & 0x03
-    pn = bytes([hdr8[0], hdr8[1], hdr8[4], hdr8[5], hdr8[6], hdr8[7]])
+    # Rebuild the big-endian pn (PN5..PN0) from the header's low-first layout.
+    pn = bytes([hdr8[7], hdr8[6], hdr8[5], hdr8[4], hdr8[1], hdr8[0]])
     return pn, key_id
 
 

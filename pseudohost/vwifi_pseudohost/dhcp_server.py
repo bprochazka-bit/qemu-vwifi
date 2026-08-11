@@ -66,33 +66,41 @@ class DHCPServer:
         if payload[236:240] != dhcp.MAGIC_COOKIE:
             return
         xid = payload[4:8]
+        # BOOTP flags: the top bit is the broadcast flag.  A client that
+        # sets it (Windows does) wants the reply broadcast, and drops a
+        # unicast one — so we must honor it or DHCP never completes.
+        flags = (payload[10] << 8) | payload[11]
+        bcast = bool(flags & 0x8000)
         chaddr = bytes(payload[28:34])
         opts = dhcp.DHCPClient._parse_opts(payload[240:])
         mtype = opts.get(dhcp.OPT_MSGTYPE, b"\x00")[0]
         if mtype == dhcp.DISCOVER:
             ip = self._allocate(chaddr)
             if ip:
-                self.log("DHCP DISCOVER from %s -> OFFER %s" % (
-                    _mac(chaddr), netstack.ip_str(ip)))
-                self._reply(xid, chaddr, ip, dhcp.OFFER)
+                self.log("DHCP DISCOVER from %s -> OFFER %s%s" % (
+                    _mac(chaddr), netstack.ip_str(ip),
+                    " (bcast)" if bcast else ""))
+                self._reply(xid, chaddr, ip, dhcp.OFFER, bcast)
         elif mtype == dhcp.REQUEST:
             req_ip = opts.get(dhcp.OPT_REQ_IP)
             ip = self._allocate(chaddr)
             if req_ip and ip and bytes(req_ip) != ip:
-                self._reply(xid, chaddr, ip, dhcp.NAK)
+                self._reply(xid, chaddr, ip, dhcp.NAK, bcast)
                 return
             if ip:
-                self.log("DHCP REQUEST from %s -> ACK %s" % (
-                    _mac(chaddr), netstack.ip_str(ip)))
-                self._reply(xid, chaddr, ip, dhcp.ACK)
+                self.log("DHCP REQUEST from %s -> ACK %s%s" % (
+                    _mac(chaddr), netstack.ip_str(ip),
+                    " (bcast)" if bcast else ""))
+                self._reply(xid, chaddr, ip, dhcp.ACK, bcast)
         elif mtype == dhcp.RELEASE:
             self.leases.pop(chaddr, None)
 
     # -- egress ------------------------------------------------------------
-    def _reply(self, xid, chaddr, yiaddr, mtype):
+    def _reply(self, xid, chaddr, yiaddr, mtype, bcast=False):
+        flags = 0x8000 if bcast else 0
         bootp = struct.pack(
             ">BBBBIHH4s4s4s4s16s64s128s",
-            2, 1, 6, 0, struct.unpack(">I", xid)[0], 0, 0,
+            2, 1, 6, 0, struct.unpack(">I", xid)[0], 0, flags,
             bytes(4), yiaddr if mtype != dhcp.NAK else bytes(4),
             self.server_ip, bytes(4),
             chaddr + bytes(10), bytes(64), bytes(128))
@@ -107,11 +115,14 @@ class DHCPServer:
                                                              self.lease_secs)
         opts += bytes([dhcp.OPT_END])
         payload = bootp + bytes(opts)
-        # Reply unicast to the station's hardware address; the AP link
-        # turns the L2 override into a FromDS frame to that station.
+        # A broadcast-flag client wants the reply at L2 broadcast (the AP
+        # link sends it as a group-addressed frame, GTK-encrypted on a
+        # secured network); otherwise unicast to the station's hardware
+        # address, which the AP link turns into a FromDS frame to it.
+        dst_mac = netstack.BROADCAST_MAC if bcast else chaddr
         self.stack.send_udp("255.255.255.255", dhcp.DHCP_CLIENT_PORT, payload,
                             src_port=dhcp.DHCP_SERVER_PORT,
-                            src_ip=self.server_ip, dst_mac=chaddr)
+                            src_ip=self.server_ip, dst_mac=dst_mac)
 
 
 def _mac(b):
