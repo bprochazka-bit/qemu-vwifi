@@ -52,6 +52,26 @@ class HandshakeError(Exception):
     pass
 
 
+def verify_eapol_mic(kck, eapol):
+    """Verify an EAPOL-Key MIC (HMAC-SHA1-128, key desc version 2).
+
+    The MIC covers the EAPOL PDU as declared by the 802.1X Packet Body
+    Length field (bytes 2-3), not any trailing padding a transmitter may
+    have appended to reach a minimum frame size.  Computing it over the
+    padded frame is a real interop failure mode, so honour the declared
+    length when it is present and sane, and fall back to the whole buffer
+    otherwise.
+    """
+    if len(eapol) < _OFF_KEYDATA:
+        return False
+    declared = 4 + struct.unpack_from(">H", eapol, 2)[0]
+    n = declared if _OFF_KEYDATA <= declared <= len(eapol) else len(eapol)
+    recv = bytes(eapol[_OFF_MIC : _OFF_MIC + 16])
+    tmp = bytearray(eapol[:n])
+    tmp[_OFF_MIC : _OFF_MIC + 16] = b"\x00" * 16
+    return crypto.eapol_mic(kck, bytes(tmp)) == recv
+
+
 class Supplicant:
     """Drives one WPA2-PSK four-way handshake to completion."""
 
@@ -102,10 +122,7 @@ class Supplicant:
         return bytes(f)
 
     def _verify_mic(self, eapol):
-        recv_mic = bytes(eapol[_OFF_MIC : _OFF_MIC + 16])
-        tmp = bytearray(eapol)
-        tmp[_OFF_MIC : _OFF_MIC + 16] = b"\x00" * 16
-        return crypto.eapol_mic(self.kck, bytes(tmp)) == recv_mic
+        return verify_eapol_mic(self.kck, eapol)
 
     # -- state machine -----------------------------------------------------
     def handle(self, eapol):

@@ -39,13 +39,15 @@ class Authenticator:
         self.snonce = None
         self.kck = self.kek = self.tk = None
         self.replay = 0
+        self._msg3 = None                       # cached, for retransmits
         self.completed = False
+        self.verbose = False
         self._log = log or (lambda *a: None)
 
     # -- message 1 ---------------------------------------------------------
     def start(self):
         """Build EAPOL-Key message 1 (ANonce) to send to the station."""
-        self.replay += 1
+        self.replay = 1
         info = 2 | sup.KI_TYPE_PAIRWISE | sup.KI_ACK
         return self._frame(info, self.anonce, b"", mic=False)
 
@@ -64,19 +66,45 @@ class Authenticator:
 
         # message 2: has MIC, not Secure, carries the SNonce.
         if (key_info & sup.KI_MIC) and not secure:
-            self.snonce = bytes(eapol[sup._OFF_NONCE : sup._OFF_NONCE + 32])
+            snonce = bytes(eapol[sup._OFF_NONCE : sup._OFF_NONCE + 32])
+            # A retransmitted msg2 with the same SNonce must get the *same*
+            # msg3 back — same replay counter, same everything.  hostapd
+            # does this; incrementing the replay counter (or re-keying)
+            # on every retransmit makes stricter supplicants (Windows/WDI)
+            # lose the thread and then fail msg4's MIC.  Only re-derive
+            # when the SNonce actually changes (a genuinely new attempt).
+            if snonce == self.snonce and self._msg3 is not None:
+                self._log("authenticator: msg2 retransmit — resending msg3")
+                return self._msg3
+            self.snonce = snonce
             self.kck, self.kek, self.tk = crypto.ptk_from_pmk(
                 self.pmk, self.aa, self.spa, self.anonce, self.snonce)
             if not self._verify_mic(eapol):
                 raise sup.HandshakeError("msg2 MIC verification failed")
-            self._log("authenticator: msg2 rx (SNonce) — sending msg3")
-            return self._build_msg3()
+            if self.verbose:
+                self._log("authenticator: msg2 rx snonce=%s kck=%s" % (
+                    self.snonce[:4].hex(), self.kck[:4].hex()))
+            else:
+                self._log("authenticator: msg2 rx (SNonce) — sending msg3")
+            self._msg3 = self._build_msg3()
+            return self._msg3
 
         # message 4: has MIC and Secure, empty key data.
         if (key_info & sup.KI_MIC) and secure:
             if self.kck is None:
                 raise sup.HandshakeError("msg4 before msg2")
             if not self._verify_mic(eapol):
+                if self.verbose:
+                    recv = bytes(eapol[sup._OFF_MIC : sup._OFF_MIC + 16])
+                    tmp = bytearray(eapol)
+                    tmp[sup._OFF_MIC : sup._OFF_MIC + 16] = b"\x00" * 16
+                    got = crypto.eapol_mic(self.kck, bytes(tmp))
+                    rep = struct.unpack_from(">Q", eapol, sup._OFF_REPLAY)[0]
+                    self._log("authenticator: msg4 MIC FAIL len=%d replay=%d "
+                              "kck=%s recv_mic=%s calc_mic=%s" % (
+                                  len(eapol), rep, self.kck[:4].hex(),
+                                  recv.hex(), got.hex()))
+                    self._log("authenticator: msg4 hex=%s" % eapol.hex())
                 raise sup.HandshakeError("msg4 MIC verification failed")
             self.completed = True
             self._log("authenticator: msg4 rx — keys installed")
@@ -85,7 +113,9 @@ class Authenticator:
         return None
 
     def _build_msg3(self):
-        self.replay += 1
+        # msg3's replay counter is msg1's + 1 and stays fixed across
+        # retransmits (see the msg2 handler).
+        self.replay = 2
         # GTK KDE: dd len 00-0F-AC 01 keyid rsvd || GTK, padded to /8.
         kde_body = bytes([0x00, 0x0F, 0xAC, 0x01, self.gtk_key_id & 0x03,
                           0x00]) + self.gtk
@@ -117,7 +147,4 @@ class Authenticator:
         return bytes(f)
 
     def _verify_mic(self, eapol):
-        recv = bytes(eapol[sup._OFF_MIC : sup._OFF_MIC + 16])
-        tmp = bytearray(eapol)
-        tmp[sup._OFF_MIC : sup._OFF_MIC + 16] = b"\x00" * 16
-        return crypto.eapol_mic(self.kck, bytes(tmp)) == recv
+        return sup.verify_eapol_mic(self.kck, eapol)

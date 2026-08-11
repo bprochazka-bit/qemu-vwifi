@@ -233,6 +233,7 @@ class PseudoAP:
                                      gtk_key_id=self.gtk_key_id,
                                      rsn_ie=dot11.rsn_ie_ccmp_psk(),
                                      log=self._slog)
+            sta.auth.verbose = self.verbose
             self._tx_eapol(sta_mac, sta.auth.start())
         else:
             sta.keyed = True
@@ -285,8 +286,11 @@ class PseudoAP:
         try:
             resp = sta.auth.handle(eapol)
         except HandshakeError as e:
+            # Log and keep the station: a stale or duplicate EAPOL frame
+            # shouldn't tear down the association — a retransmitted, valid
+            # msg4 can still complete the handshake.  (A genuinely wrong
+            # passphrase simply never keys, which is correct.)
             self._slog("4way(%s): %s" % (dot11.mac_str(sta_mac), e))
-            self.stations.pop(sta_mac, None)
             return
         if resp is not None:
             self._tx_eapol(sta_mac, resp)

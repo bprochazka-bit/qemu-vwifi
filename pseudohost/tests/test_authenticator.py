@@ -53,6 +53,28 @@ class TestAuthSupplicant(unittest.TestCase):
         with self.assertRaises(supplicant.HandshakeError):
             self._run("correcthorse1", "wrongwrong")
 
+    def test_msg2_retransmit_resends_identical_msg3(self):
+        # A retransmitted msg2 (same SNonce) must get the byte-identical
+        # msg3 back — same replay counter — so a strict supplicant that
+        # loses the first msg3 doesn't end up with mismatched state and a
+        # failing msg4 MIC.
+        aa = dot11.mac_bytes("02:11:22:33:44:00")
+        spa = dot11.mac_bytes("02:aa:bb:cc:dd:ee")
+        rsn = dot11.rsn_ie_ccmp_psk()
+        pmk = crypto.wpa_pmk("correcthorse1", b"Lab-AP-1")
+        auth = Authenticator(pmk, aa, spa, os.urandom(16), rsn_ie=rsn)
+        supp = supplicant.Supplicant(pmk, spa, aa, rsn)
+
+        m1 = auth.start()
+        m2 = supp.handle(m1)
+        m3a = auth.handle(m2)
+        m3b = auth.handle(m2)              # retransmitted msg2
+        self.assertEqual(m3a, m3b)          # identical msg3, same replay
+        # and the handshake still completes off either msg3
+        m4 = supp.handle(m3b)
+        self.assertIsNone(auth.handle(m4))
+        self.assertTrue(auth.completed)
+
     def test_installed_keys_interoperate_over_ccmp(self):
         # The whole point: the keys the two sides install must decrypt
         # each other's CCMP frames.
