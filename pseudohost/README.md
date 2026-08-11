@@ -239,12 +239,47 @@ the gateway (`10.10.10.254/24`), and `--gateway` / `--netmask` /
 DHCP server allocates across the whole scope — any prefix, not just /24 —
 and never hands out the gateway or its own address.
 
+### NAT — real network access, on by default
+
+Like a home router, the AP **masquerades** its stations' off-subnet
+traffic out onto the *real* host network and relays the answers back, so a
+station on the virtual air can reach the actual internet. It is on by
+default; `--no-nat` turns it off (endpoint-only — the AP still terminates
+IP for its own gateway address and bridges station-to-station, but nothing
+leaves the medium).
+
+```bash
+# stations get real network access through the host (default):
+./pseudoap --sock /tmp/vwifi.sock --essid Office --channel 6 --encryption open
+
+# pin the host interface / source address the NAT sends from:
+./pseudoap --sock /tmp/vwifi.sock --essid Office --channel 6 \
+           --encryption open --nat-interface eth0
+#                                            ^ an interface name or a source IPv4
+
+# no upstream — keep everything on the virtual medium:
+./pseudoap --sock /tmp/vwifi.sock --essid Isolated --no-nat
+```
+
+The NAT (`nat.py`) is a transport-layer NAPT built on ordinary host
+sockets — no root, no TUN, no raw sockets for the common case. TCP
+connections are terminated at the AP and bridged to a fresh host socket to
+the real destination; UDP flows get a connected host datagram socket;
+ICMP echo is forwarded through a Linux "ping" socket when the platform
+allows it (and quietly disabled, without affecting TCP/UDP, when it does
+not). `--nat-interface` takes an interface name (resolved to its IPv4) or
+a source address to `bind()` outbound sockets to — the "specify a host
+interface" knob. When NAT is on, DHCP hands stations the host's own
+upstream resolver (from `/etc/resolv.conf`, else `8.8.8.8`) so name
+resolution works *through* the NAT; `--dns` overrides it.
+
 It beacons and answers probes, runs open-system Auth/Assoc, drives the
 **Authenticator** side of the WPA2-PSK four-way handshake per station
 (`authenticator.py`, the mirror of `supplicant.py`), and installs
 per-station CCMP keys. It is the DS: it terminates IP for its own gateway
-address (ARP, ICMP, a **DHCP server**, and any TCP/UDP services) and
-bridges frames between associated stations. `--services lpd,nas,http`
+address (ARP, ICMP, a **DHCP server**, and any TCP/UDP services), bridges
+frames between associated stations, and by default **NATs** everything
+else out to the real host network (see below). `--services lpd,nas,http`
 runs those on the AP itself.
 
 Because both sides share the same crypto, 802.11 and medium code, a
@@ -266,6 +301,7 @@ pseudohost/
     authenticator.py  the AP side of the four-way handshake
     station.py        scan -> auth -> assoc -> keys; the radio state machine
     accesspoint.py    PseudoAP: beacon/assoc/handshake, the DS, bridging
+    nat.py            userspace NAPT: masquerade stations to the real host
     netstack.py       ARP / IPv4 / ICMP / UDP / TCP demux; the host stack
     tcp.py            minimal server-side TCP (for TCP services)
     dhcp.py           DHCPv4 client

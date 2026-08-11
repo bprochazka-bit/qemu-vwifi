@@ -23,6 +23,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from vwifi_pseudohost.accesspoint import PseudoAP                 # noqa: E402
+from vwifi_pseudohost.nat import resolve_bind_ip                  # noqa: E402
 from vwifi_pseudohost.netstack import parse_cidr                  # noqa: E402
 from vwifi_pseudohost.mdns import Advert, MDNSResponder            # noqa: E402
 from vwifi_pseudohost.netservices import (                        # noqa: E402
@@ -52,6 +53,23 @@ def _services_for(name):
         return [UDPEchoService()]
     raise ValueError("unknown service '%s' (known: lpd, nas, http, echo)"
                      % name)
+
+
+def _upstream_dns():
+    """A resolver a NAT'd station can reach: the host's first non-loopback
+    nameserver from /etc/resolv.conf, or a public fallback.  (A loopback
+    stub like 127.0.0.53 is unreachable across the NAT, so skip it.)"""
+    try:
+        with open("/etc/resolv.conf") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 2 and parts[0] == "nameserver":
+                    ip = parts[1]
+                    if not ip.startswith("127.") and ":" not in ip:
+                        return ip
+    except OSError:
+        pass
+    return "8.8.8.8"
 
 
 def build_parser():
@@ -84,7 +102,16 @@ def build_parser():
                    help="first DHCP pool address (default: .100)")
     p.add_argument("--pool-end", default=None,
                    help="last DHCP pool address (default: .200)")
-    p.add_argument("--dns", default=None, help="DNS server handed out (opt)")
+    p.add_argument("--dns", default=None,
+                   help="DNS server handed out to stations (default: the "
+                        "host's upstream resolver when NAT is on, else the "
+                        "AP itself)")
+    p.add_argument("--no-nat", dest="nat", action="store_false",
+                   help="do not masquerade station traffic to the real host "
+                        "network (NAT is on by default)")
+    p.add_argument("--nat-interface", default=None, metavar="IFACE|IP",
+                   help="host interface name or source IPv4 the NAT sends "
+                        "from (default: the host's default route)")
     p.add_argument("--services", default="",
                    help="comma list of services to run: lpd,nas,http,echo")
     p.add_argument("--duration", type=float, default=None,
@@ -131,12 +158,29 @@ def main(argv=None):
     pool = (args.pool_start or plan.get("pool_start") or base + ".100",
             args.pool_end or plan.get("pool_end") or base + ".200")
 
+    # Where the NAT sources its packets on the real host.
+    nat_bind_ip = None
+    if args.nat and args.nat_interface:
+        try:
+            nat_bind_ip = resolve_bind_ip(args.nat_interface)
+        except ValueError as e:
+            print(str(e), file=sys.stderr)
+            return 2
+
+    # DNS handed out: when NAT is on, a station needs a resolver it can
+    # actually reach *through* the NAT, so default to the host's upstream
+    # (an off-subnet address that gets masqueraded) rather than the AP,
+    # which serves no DNS.  Without NAT, keep the old default (the AP).
+    dns = args.dns
+    if dns is None and args.nat:
+        dns = _upstream_dns()
+
     ap = PseudoAP(args.sock, args.essid, channel=args.channel,
                   encryption=args.encryption, passphrase=args.passphrase,
                   bssid=args.bssid, node_id=args.node_id,
                   gateway_ip=gateway, netmask=netmask, pool=pool,
-                  dns=args.dns, services=services, log=log,
-                  verbose=args.verbose)
+                  dns=dns, services=services, log=log,
+                  verbose=args.verbose, nat=args.nat, nat_bind_ip=nat_bind_ip)
 
     def _sig(_s, _f):
         ap.stop()

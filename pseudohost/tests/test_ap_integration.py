@@ -9,6 +9,7 @@
 # network.  Nothing here is mocked except the hub's fan-out.
 #
 import os
+import socket
 import sys
 import threading
 import time
@@ -111,6 +112,54 @@ class TestWPA2AP(unittest.TestCase):
                                passphrase="wrongpass1",
                                node_id="it-h-bad", log=lambda m: None)
                 self.assertFalse(h.start(connect_timeout=6.0))
+                h.close()
+        finally:
+            hub.stop()
+
+
+class TestNATEndToEnd(unittest.TestCase):
+    """The whole path: a station associates, leases, and reaches a real
+    host socket through the AP's NAT — station -> 802.11 -> AP DS -> NAT ->
+    a genuine loopback socket -> back again."""
+
+    def test_station_reaches_real_host_via_nat(self):
+        # A loopback UDP echo server stands in for "the real network".
+        srv = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        srv.bind(("127.0.0.1", 0))
+        port = srv.getsockname()[1]
+
+        def serve():
+            try:
+                data, addr = srv.recvfrom(1024)
+                srv.sendto(b"pong:" + data, addr)
+            except OSError:
+                pass
+            finally:
+                srv.close()
+        threading.Thread(target=serve, daemon=True).start()
+
+        hub = PyHub()
+        hub.start()
+        try:
+            with _APThread(hub, essid="NatNet", channel=6, encryption="open"):
+                h = PseudoHost(hub.sock_path, "NatNet", node_id="it-nat",
+                               log=lambda m: None)
+                self.assertTrue(h.start(connect_timeout=10.0),
+                                "host did not associate")
+                self.assertTrue(_lease(h), "no DHCP lease from the AP")
+
+                got = []
+                h.stack.register_udp(55555, lambda *a: got.append(a))
+                # 127.0.0.1 is off the AP subnet, so this leaves via the
+                # default gateway (the AP) and is masqueraded out.
+                deadline = time.time() + 8.0
+                while time.time() < deadline and not got:
+                    h.stack.send_udp("127.0.0.1", port, b"ping",
+                                     src_port=55555)
+                    h.run(duration=0.3)
+                self.assertTrue(got, "no reply came back through the NAT")
+                # payload = got[0][4]; it echoed our datagram
+                self.assertEqual(got[0][4], b"pong:ping")
                 h.close()
         finally:
             hub.stop()
