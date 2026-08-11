@@ -108,13 +108,26 @@ A profile is deliberately thin — a persona is mostly fingerprint knobs
 device type is a dozen lines, not a new stack. The shipped profiles
 (`--profile`) are:
 
-| profile   | persona             | TTL | stands in for |
-|-----------|---------------------|-----|---------------|
-| `generic` | generic             | 64  | a bare host (ICMP only) |
-| `linux`   | linux-workstation   | 64  | a Linux client |
-| `windows` | windows-workstation | 128 | a Windows client |
-| `printer` | network-printer     | 255 | an IPP/JetDirect print server |
-| `nas`     | nas                 | 64  | SMB/NFS storage |
+| profile      | persona             | TTL | stands in for |
+|--------------|---------------------|-----|---------------|
+| `generic`    | generic             | 64  | a bare host (ICMP only) |
+| `linux`      | linux-workstation   | 64  | a Linux client |
+| `windows`    | windows-workstation | 128 | a Windows client |
+| `printer`    | network-printer     | 255 | an IPP/JetDirect print server |
+| `nas`        | nas                 | 64  | SMB/NFS storage |
+| `voip`       | voip-phone          | 64  | a SIP desk phone (answers OPTIONS on 5060) |
+| `chromecast` | chromecast          | 64  | a Google Cast receiver (mDNS `_googlecast._tcp`) |
+| `hp-mfp`     | hp-mfp              | 255 | an HP print/scan/fax MFP (mDNS `_ipp` + `_uscan`) |
+
+The last three show the service framework doing real work over the live
+UDP path: `voip` answers SIP `OPTIONS` with a phone-like `200 OK`, and
+`chromecast` and `hp-mfp` run the shared mDNS responder (`mdns.py`) so
+they are discoverable by `avahi-browse` / `dns-sd` — a Chromecast as a
+Cast receiver, the MFP as both a printer (`_ipp._tcp`) and a scanner
+(`_uscan._tcp`), which is what makes it a multifunction rather than a
+plain print server. Their richer protocols (Cast/TLS on 8009, IPP,
+eSCL, SNMP) are advertised as ports now and become listeners when the
+TCP layer lands.
 
 ## Services — designed in from the start
 
@@ -160,6 +173,7 @@ pseudohost/
     station.py      scan -> auth -> assoc -> keys; the radio state machine
     netstack.py     ARP / IPv4 / ICMP / UDP; the userspace host stack
     dhcp.py         DHCPv4 client
+    mdns.py         multicast-DNS / DNS-SD responder (Chromecast, MFP)
     services.py     Service base class + registry (the extension seam)
     host.py         PseudoHost — the inheritable base class
     profiles/       one subclass per device kind

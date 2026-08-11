@@ -14,6 +14,9 @@
 from .workstation import LinuxWorkstation, WindowsWorkstation
 from .printer import NetworkPrinter
 from .nas import NAS
+from .voip import VoIPPhone
+from .chromecast import Chromecast
+from .hp_mfp import HPMultifunction
 from ..host import PseudoHost
 
 
@@ -29,6 +32,9 @@ PROFILES = {
     "windows": WindowsWorkstation,
     "printer": NetworkPrinter,
     "nas": NAS,
+    "voip": VoIPPhone,
+    "chromecast": Chromecast,
+    "hp-mfp": HPMultifunction,
 }
 
 
