@@ -53,7 +53,8 @@ class PseudoHost:
     icmp = True
 
     def __init__(self, sock_path, essid, passphrase=None, node_id=None,
-                 hostname=None, mac=None, scan_time=3.0, log=None):
+                 hostname=None, mac=None, scan_time=3.0, log=None,
+                 print_dir=None):
         self.sock_path = sock_path
         self.essid = essid
         self.passphrase = passphrase
@@ -75,6 +76,9 @@ class PseudoHost:
         self.tcp = TCPStack(self.stack, log=self._slog)
         self.dhcp = DHCPClient(self.stack, hostname=self.hostname,
                                log=self._slog)
+        # Where accepted print jobs go (printer profiles); None -> discard.
+        from .printing import PrintSink
+        self.print_sink = PrintSink(print_dir, log=self._slog)
         self.registry = ServiceRegistry(self)
 
         self._running = False

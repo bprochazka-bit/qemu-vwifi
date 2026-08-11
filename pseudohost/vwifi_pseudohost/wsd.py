@@ -49,6 +49,11 @@ A_RESOLVE = NS_WSD + "/Resolve"
 A_RESOLVEMATCH = NS_WSD + "/ResolveMatches"
 A_GET = NS_TRANSFER + "/Get"
 A_GETRESPONSE = NS_TRANSFER + "/GetResponse"
+# WSD Print (wprt) operations, sent to the device XAddrs (5357).
+A_GETELEMENTS_RESP = NS_WPRT + "/GetPrinterElementsResponse"
+A_CREATEJOB_RESP = NS_WPRT + "/CreatePrintJobResponse"
+A_SENDDOC_RESP = NS_WPRT + "/SendDocumentResponse"
+A_ADDDOC_RESP = NS_WPRT + "/AddDocumentResponse"
 
 TO_DISCOVERY = "urn:schemas-xmlsoap-org:ws:2005:04:discovery"
 # The device advertises itself as a WSD Device that is a print device.
@@ -123,6 +128,12 @@ class WSDDevice:
         ip = ".".join(str(x) for x in (self.host.stack.ip or bytes(4)))
         return "http://%s:%d/%s" % (ip, WSD_HTTP_PORT,
                                     self.uuid.split(":")[-1])
+
+    def print_svc_uuid(self):
+        # A distinct-but-stable UUID for the hosted print service (the
+        # device is ...-8000-..., the service ...-8001-...).
+        h = self.host.mac.hex()
+        return "urn:uuid:%s-%s-1000-8001-%s" % (h[:8], h[8:12], h)
 
 
 class WSDiscoveryService(Service):
@@ -219,12 +230,22 @@ class WSDiscoveryService(Service):
                        src_port=WSD_PORT)
 
 
-class WSDMetadataService(TCPService):
-    """Serves the WS-Transfer Get (device metadata) Windows fetches from
-    the XAddrs URL in the ProbeMatch."""
+class WSDHttpService(TCPService):
+    """The device's WSD HTTP endpoint (the XAddrs, TCP 5357).
+
+    Handles the WS-Transfer Get (device metadata) that Windows fetches to
+    show the device, and the WSD Print operations that let it be added and
+    printed to: GetPrinterElements, CreatePrintJob, and SendDocument
+    (whose MTOM attachment is the actual document — handed to the host's
+    print sink).
+    """
 
     name = "wsd-http"
     tcp_ports = (WSD_HTTP_PORT,)
+
+    def __init__(self):
+        super().__init__()
+        self._job = 0
 
     def on_connect(self, conn):
         conn.data["buf"] = bytearray()
@@ -237,44 +258,87 @@ class WSDMetadataService(TCPService):
         if head_end < 0:
             return
         if conn.data["need"] is None:
-            m = re.search(rb"content-length:\s*(\d+)", bytes(buf), re.I)
+            m = re.search(rb"content-length:\s*(\d+)", bytes(buf[:head_end]),
+                          re.I)
             conn.data["need"] = head_end + 4 + (int(m.group(1)) if m else 0)
         if len(buf) < conn.data["need"]:
-            return                              # wait for the full body
-        body_text = bytes(buf).decode("utf-8", "replace")
-        req_msgid = _find(body_text, "MessageID") or ""
-        resp = self._metadata(req_msgid)
+            return                              # wait for the whole body
+        resp = self._dispatch(bytes(buf), head_end)
         http = (b"HTTP/1.1 200 OK\r\n"
                 b"Content-Type: application/soap+xml; charset=utf-8\r\n"
                 b"Content-Length: " + str(len(resp)).encode() + b"\r\n"
                 b"Connection: close\r\n\r\n" + resp)
-        self.log("metadata Get -> 200")
         conn.send(http)
         conn.close()
 
+    # -- request dispatch --------------------------------------------------
+    def _dispatch(self, raw, head_end):
+        headers = raw[:head_end].decode("latin1", "replace")
+        body = raw[head_end + 4:]
+        soap, binary = _split_mtom(headers, body)
+        text = soap.decode("utf-8", "replace")
+        action = _find(text, "Action") or ""
+        msgid = _find(text, "MessageID") or ""
+
+        if action.endswith("/Get"):
+            self.log("metadata Get -> 200")
+            return self._metadata(msgid)
+        if action.endswith("/GetPrinterElements"):
+            self.log("GetPrinterElements -> 200")
+            return self._printer_elements(msgid)
+        if action.endswith("/CreatePrintJob"):
+            self._job += 1
+            jobname = _find(text, "JobName") or "job%d" % self._job
+            self._cur_jobname = jobname
+            self.log("CreatePrintJob '%s' -> job %d" % (jobname, self._job))
+            return self._create_job_resp(msgid, self._job)
+        if action.endswith("/SendDocument") or action.endswith("/AddDocument"):
+            self._accept_document(text, binary)
+            resp_action = (A_SENDDOC_RESP if action.endswith("/SendDocument")
+                           else A_ADDDOC_RESP)
+            return self._doc_resp(msgid, resp_action, self._job)
+        # Unknown op: an empty ack keeps the client from erroring hard.
+        return self._metadata(msgid)
+
+    def _accept_document(self, text, binary):
+        sink = getattr(self.host, "print_sink", None)
+        name = getattr(self, "_cur_jobname", None) or _find(text, "JobName") \
+            or "wsd-job"
+        if sink is not None:
+            sink.write_job(binary or b"", jobname=name, source="wsd-print")
+        else:
+            self.log("SendDocument: %d bytes but no print sink" % len(binary))
+
+    # -- responses ---------------------------------------------------------
     def _metadata(self, relates_to):
         dev = WSDDevice(self.host)
-        # ThisModel + ThisDevice + Relationship(Host + hosted PrintService)
+        ip = _ip(self.host.stack.ip or bytes(4))
         this_model = (
             '<wsdp:ThisModel><wsdp:Manufacturer>%s</wsdp:Manufacturer>'
             '<wsdp:ModelName>%s</wsdp:ModelName>'
             '<wsdp:ModelNumber>%s</wsdp:ModelNumber>'
             '<wsdp:PresentationUrl>http://%s/</wsdp:PresentationUrl>'
             '</wsdp:ThisModel>'
-            % (dev.manufacturer, dev.model, dev.model_number,
-               _ip(self.host.stack.ip or bytes(4))))
+            % (dev.manufacturer, dev.model, dev.model_number, ip))
         this_device = (
             '<wsdp:ThisDevice><wsdp:FriendlyName>%s</wsdp:FriendlyName>'
             '<wsdp:FirmwareVersion>1.0</wsdp:FirmwareVersion>'
             '<wsdp:SerialNumber>%s</wsdp:SerialNumber></wsdp:ThisDevice>'
             % (dev.friendly, self.host.mac.hex()))
-        svc_id = dev.uuid + "/PrintService"
+        # Host is the device; the print service is a *Hosted* service with
+        # its own endpoint — this is the shape Windows needs to turn the
+        # device into an addable printer.
         relationship = (
             '<wsdp:Relationship Type="%s/host">'
             '<wsdp:Host><wsa:EndpointReference><wsa:Address>%s</wsa:Address>'
+            '</wsa:EndpointReference></wsdp:Host>'
+            '<wsdp:Hosted><wsa:EndpointReference><wsa:Address>%s</wsa:Address>'
             '</wsa:EndpointReference><wsdp:Types>wprt:PrintServiceType'
-            '</wsdp:Types><wsdp:ServiceId>%s</wsdp:ServiceId></wsdp:Host>'
-            '</wsdp:Relationship>' % (NS_WSDP, dev.uuid, svc_id))
+            '</wsdp:Types><wsdp:ServiceId>%s</wsdp:ServiceId>'
+            '<wsdp:HardwareId>%s</wsdp:HardwareId></wsdp:Hosted>'
+            '</wsdp:Relationship>'
+            % (NS_WSDP, dev.uuid, dev.print_svc_uuid(), dev.print_svc_uuid(),
+               "PseudoPrinter"))
         sections = (
             '<wsdp:MetadataSection Dialect="%s/ThisModel">%s'
             '</wsdp:MetadataSection>'
@@ -288,6 +352,88 @@ class WSDMetadataService(TCPService):
         hdr = _hdr(A_GETRESPONSE, _new_msgid(), relates_to=relates_to,
                    to=NS_WSA + "/role/anonymous")
         return _envelope(hdr, body)
+
+    def _printer_elements(self, relates_to):
+        dev = WSDDevice(self.host)
+        desc = (
+            '<wprt:PrinterDescription>'
+            '<wprt:ColorSupported>true</wprt:ColorSupported>'
+            '<wprt:DeviceId>MFG:%s;MDL:%s;CLS:PRINTER;'
+            'CMD:PCL,PostScript,PDF,URF;</wprt:DeviceId>'
+            '<wprt:MultipleDocumentJobsSupported>false'
+            '</wprt:MultipleDocumentJobsSupported>'
+            '<wprt:PagesPerMinute>20</wprt:PagesPerMinute>'
+            '<wprt:PrinterName><wprt:Name xml:lang="en-US">%s</wprt:Name>'
+            '</wprt:PrinterName>'
+            '<wprt:PrinterInfo><wprt:Name xml:lang="en-US">'
+            'Simulated by vwifi-pseudohost</wprt:Name></wprt:PrinterInfo>'
+            '</wprt:PrinterDescription>'
+            % (dev.manufacturer, dev.model, dev.friendly))
+        status = (
+            '<wprt:PrinterStatus><wprt:PrinterState>Idle</wprt:PrinterState>'
+            '<wprt:PrinterPrimaryStateReason>None'
+            '</wprt:PrinterPrimaryStateReason>'
+            '<wprt:QueuedJobCount>0</wprt:QueuedJobCount>'
+            '</wprt:PrinterStatus>')
+        body = (
+            '<wprt:GetPrinterElementsResponse><wprt:PrinterElements>'
+            '<wprt:ElementData Name="wprt:PrinterDescription" Valid="true">%s'
+            '</wprt:ElementData>'
+            '<wprt:ElementData Name="wprt:PrinterStatus" Valid="true">%s'
+            '</wprt:ElementData>'
+            '</wprt:PrinterElements></wprt:GetPrinterElementsResponse>'
+            % (desc, status))
+        hdr = _hdr(A_GETELEMENTS_RESP, _new_msgid(), relates_to=relates_to,
+                   to=NS_WSA + "/role/anonymous")
+        return _envelope(hdr, body)
+
+    def _create_job_resp(self, relates_to, job_id):
+        body = ('<wprt:CreatePrintJobResponse><wprt:JobId>%d</wprt:JobId>'
+                '</wprt:CreatePrintJobResponse>' % job_id)
+        hdr = _hdr(A_CREATEJOB_RESP, _new_msgid(), relates_to=relates_to,
+                   to=NS_WSA + "/role/anonymous")
+        return _envelope(hdr, body)
+
+    def _doc_resp(self, relates_to, action, job_id):
+        body = ('<wprt:SendDocumentResponse><wprt:JobId>%d</wprt:JobId>'
+                '</wprt:SendDocumentResponse>' % job_id)
+        hdr = _hdr(action, _new_msgid(), relates_to=relates_to,
+                   to=NS_WSA + "/role/anonymous")
+        return _envelope(hdr, body)
+
+
+# Back-compat alias: the metadata endpoint is now the full HTTP endpoint.
+WSDMetadataService = WSDHttpService
+
+
+def _split_mtom(headers, body):
+    """Split a request body into (soap_bytes, binary_bytes).
+
+    A SendDocument is multipart/related (MTOM): the SOAP is the
+    application/xop+xml part and the document is the binary part.  Any
+    other request is plain SOAP with no attachment.
+    """
+    m = re.search(r"boundary=\"?([^\";\r\n]+)\"?", headers, re.I)
+    if "multipart/related" not in headers.lower() or not m:
+        return body, b""
+    boundary = ("--" + m.group(1)).encode("latin1")
+    soap = b""
+    binary = b""
+    for part in body.split(boundary):
+        if not part or part in (b"--", b"--\r\n", b"\r\n"):
+            continue
+        he = part.find(b"\r\n\r\n")
+        if he < 0:
+            continue
+        phdr = part[:he].decode("latin1", "replace").lower()
+        pbody = part[he + 4:]
+        if pbody.endswith(b"\r\n"):
+            pbody = pbody[:-2]
+        if "xop+xml" in phdr or "soap+xml" in phdr:
+            soap = pbody
+        elif pbody:
+            binary = pbody
+    return soap, binary
 
 
 def _find(text, tag):

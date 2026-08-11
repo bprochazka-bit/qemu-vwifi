@@ -22,7 +22,8 @@
 from ..host import PseudoHost
 from ..mdns import Advert, MDNSResponder
 from ..services import Service
-from ..wsd import WSDiscoveryService, WSDMetadataService
+from ..printing import JetDirectService
+from ..wsd import WSDiscoveryService, WSDHttpService
 
 # A plausible model string; TXT records below mirror what an HP MFP
 # publishes so a scan of the mDNS records reads like the real thing.
@@ -90,6 +91,7 @@ class HPMultifunction(PseudoHost):
     wsd_model = HP_MODEL
     wsd_model_number = "9015"
     # WSD is what stock Windows uses for "Network" and "Add a printer";
-    # mDNS covers macOS / IPP-Everywhere clients.
-    services = [MFPPortsService, _mfp_mdns,
-                WSDiscoveryService, WSDMetadataService]
+    # mDNS covers macOS / IPP-Everywhere clients; JetDirect/9100 is the
+    # raw path that always prints.
+    services = [MFPPortsService, _mfp_mdns, JetDirectService,
+                WSDiscoveryService, WSDHttpService]

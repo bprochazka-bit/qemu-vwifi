@@ -80,6 +80,10 @@ class ClientSim:
             seg = sdu[ihl:]
             sport, dport, seq, ack, off_flags = struct.unpack_from(
                 ">HHIIH", seg, 0)
+            # The egress list is shared across all ClientSims on this
+            # server; only take segments addressed to *our* connection.
+            if dport != self.sport or sport != self.dport:
+                continue
             data_off = (off_flags >> 12) * 4
             flags = off_flags & 0x3F
             payload = seg[data_off:]

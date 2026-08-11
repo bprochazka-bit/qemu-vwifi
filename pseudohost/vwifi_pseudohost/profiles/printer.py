@@ -12,7 +12,8 @@
 #
 from ..host import PseudoHost
 from ..services import Service
-from ..wsd import WSDiscoveryService, WSDMetadataService
+from ..printing import JetDirectService
+from ..wsd import WSDiscoveryService, WSDHttpService
 
 
 class PrinterService(Service):
@@ -37,5 +38,7 @@ class NetworkPrinter(PseudoHost):
     wsd_manufacturer = "HP"
     wsd_model = "HP LaserJet"
     wsd_model_number = "PH01"
-    # WSD makes it discoverable by stock Windows (Network / Add a printer).
-    services = [PrinterService, WSDiscoveryService, WSDMetadataService]
+    # WSD makes it discoverable by stock Windows (Network / Add a printer);
+    # JetDirect/9100 is the raw path that always prints.
+    services = [PrinterService, JetDirectService,
+                WSDiscoveryService, WSDHttpService]

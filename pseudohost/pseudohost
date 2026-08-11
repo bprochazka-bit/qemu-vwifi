@@ -44,6 +44,9 @@ def build_parser():
                    help="DHCP/host name (default: the profile's)")
     p.add_argument("--mac", default=None,
                    help="station MAC, e.g. 02:1a:11:aa:bb:cc (default: random)")
+    p.add_argument("--print-dir", default=None,
+                   help="for printer profiles: write accepted print jobs to "
+                        "files in this directory (default: discard to null)")
     p.add_argument("--scan-time", type=float, default=3.0,
                    help="seconds to look for the ESSID before giving up")
     p.add_argument("--connect-timeout", type=float, default=20.0,
@@ -71,7 +74,7 @@ def main(argv=None):
 
     host = profile(args.sock, args.essid, passphrase=args.passphrase,
                    node_id=args.node_id, hostname=args.hostname, mac=args.mac,
-                   scan_time=args.scan_time, log=log)
+                   scan_time=args.scan_time, log=log, print_dir=args.print_dir)
 
     stop = {"flag": False}
 

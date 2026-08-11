@@ -135,13 +135,32 @@ transports back the rest:
   device on port 1990 (how Bambu Studio finds a printer, with the
   DevModel/DevName headers); `smart-screen` advertises a UPnP
   rootdevice + MediaRenderer + DIAL on 1900.
-- **WSD** (`wsd.py`) — WS-Discovery on 3702 plus the metadata HTTP
+- **WSD** (`wsd.py`) — WS-Discovery on 3702 plus the device HTTP
   endpoint on 5357. This is what stock **Windows** uses for "Network"
   and the "Add a printer" scan (it does not browse mDNS/Bonjour without
-  extra software): the printer/`hp-mfp` profiles answer a WS-Discovery
-  Probe with a ProbeMatch and serve the device metadata (manufacturer,
-  model, friendly name, hosted print service) Windows fetches to show
-  the device. Submitting jobs over WSD Print is a later phase.
+  extra software): the printer/`hp-mfp` profiles answer a Probe with a
+  ProbeMatch, serve the device metadata (with the print service as a
+  `Hosted` service), and answer the WSD Print operations
+  (`GetPrinterElements`, `CreatePrintJob`, `SendDocument`) so the device
+  is addable and printable.
+
+### Printing
+
+Printer profiles accept jobs two ways: **raw JetDirect on TCP 9100**
+(what a Windows "Standard TCP/IP Port" prints over — the always-works
+path) and **WSD Print** (for a WSD-added printer). Both hand the document
+to the host's print sink:
+
+```bash
+# write each job to a file (…/0001-name.pdf, .ps, .pcl, …):
+./pseudohost --sock /tmp/vwifi.sock --essid Lab --passphrase … \
+             --profile hp-mfp --print-dir /tmp/printouts
+
+# or omit --print-dir to accept and discard jobs (to null)
+```
+
+The sink records the exact bytes and sniffs a file extension (PDF/PS/PCL/
+XPS); it never renders — a simulator captures what was sent.
 
 Their richer protocols (Cast/TLS 8009, IPP, eSCL, SNMP, MQTTS 8883,
 FTPS 990, the UPnP description HTTP) are advertised as ports now and
@@ -246,7 +265,8 @@ pseudohost/
     dhcp_server.py    DHCPv4 server (the AP's lease pool)
     mdns.py           multicast-DNS / DNS-SD responder
     ssdp.py           SSDP / UPnP discovery responder
-    wsd.py            WS-Discovery + metadata (Windows printer discovery)
+    wsd.py            WS-Discovery + metadata + WSD Print (Windows)
+    printing.py       print sink (file/null) + raw JetDirect (9100)
     services.py       Service / UDPService / TCPService base + registry
     netservices.py    LPD, HTTP, NAS/SMB (TCP-backed services)
     host.py           PseudoHost — the inheritable base class
