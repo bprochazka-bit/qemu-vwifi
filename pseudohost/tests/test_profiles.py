@@ -15,7 +15,7 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from vwifi_pseudohost import mdns, netstack               # noqa: E402
+from vwifi_pseudohost import mdns, netstack, ssdp          # noqa: E402
 from vwifi_pseudohost import ieee80211 as dot11            # noqa: E402
 from vwifi_pseudohost.profiles import (PROFILES, get_profile,  # noqa: E402
                                        profile_names)
@@ -184,6 +184,60 @@ class TestSIP(unittest.TestCase):
         self.assertIsNone(_last_udp_payload(h.station))
 
 
+def _msearch(st):
+    return ("M-SEARCH * HTTP/1.1\r\n"
+            "HOST: 239.255.255.250:1900\r\n"
+            'MAN: "ssdp:discover"\r\n'
+            "MX: 2\r\n"
+            "ST: %s\r\n\r\n" % st).encode()
+
+
+class TestSSDP(unittest.TestCase):
+    def test_bambu_msearch_response(self):
+        h = FakeHost("3DP-Bambu-Den", dot11.mac_bytes("02:83:8c:11:22:33"))
+        from vwifi_pseudohost.profiles.bambu import _bambu_ssdp, BAMBU_NT
+        svc = _bambu_ssdp()
+        svc.bind(h)
+        deliver_udp(h, "192.168.5.9", 51000, ssdp.SSDP_PORT + 90,  # 1990
+                    _msearch(BAMBU_NT), src_mac="02:00:00:00:00:bb")
+        resp = _last_udp_payload(h.station)
+        self.assertIsNotNone(resp, "Bambu did not answer M-SEARCH")
+        text = resp.decode()
+        self.assertTrue(text.startswith("HTTP/1.1 200 OK"))
+        self.assertIn("ST: " + BAMBU_NT, text)
+        self.assertIn("DevModel.bambu.com:", text)
+        self.assertIn("LOCATION: 192.168.5.20", text)      # bare IP
+
+    def test_smartscreen_mediarenderer_response(self):
+        h = FakeHost("SmartDisplay-Den", dot11.mac_bytes("02:71:47:aa:bb:cc"))
+        from vwifi_pseudohost.profiles.smart_screen import _screen_ssdp
+        svc = _screen_ssdp()
+        svc.bind(h)
+        deliver_udp(h, "192.168.5.9", 51000, ssdp.SSDP_PORT,
+                    _msearch("urn:schemas-upnp-org:device:MediaRenderer:1"),
+                    src_mac="02:00:00:00:00:cc")
+        resp = _last_udp_payload(h.station)
+        self.assertIsNotNone(resp)
+        text = resp.decode()
+        self.assertIn("MediaRenderer:1", text)
+        self.assertIn("LOCATION: http://192.168.5.20:8080/description.xml",
+                      text)
+
+    def test_ssdp_all_matches_every_target(self):
+        h = FakeHost("SmartDisplay-Den", dot11.mac_bytes("02:71:47:aa:bb:cc"))
+        from vwifi_pseudohost.profiles.smart_screen import _screen_ssdp
+        svc = _screen_ssdp()
+        svc.bind(h)
+        # ssdp:all should draw a reply for each advertised target.
+        before = len(h.station.sent)
+        deliver_udp(h, "192.168.5.9", 51000, ssdp.SSDP_PORT,
+                    _msearch("ssdp:all"), src_mac="02:00:00:00:00:cc")
+        # 3 targets (rootdevice, MediaRenderer, DIAL) -> 3 responses.
+        ip_frames = [s for s in h.station.sent[before:]
+                     if s[1] == dot11.ETH_P_IP]
+        self.assertGreaterEqual(len(ip_frames), 3)
+
+
 class TestAllProfilesBind(unittest.TestCase):
     def test_every_profile_instantiates_and_binds(self):
         for name in profile_names():
@@ -206,6 +260,9 @@ class TestAllProfilesBind(unittest.TestCase):
         self.assertEqual(ttls["chromecast"], 64)
         self.assertEqual(ttls["voip"], 64)
         self.assertEqual(ttls["hp-mfp"], 255)
+        self.assertEqual(ttls["bambu"], 64)
+        self.assertEqual(ttls["smart-screen"], 64)
+        self.assertEqual(ttls["pos"], 64)
 
 
 if __name__ == "__main__":

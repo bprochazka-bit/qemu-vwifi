@@ -17,6 +17,9 @@ from .nas import NAS
 from .voip import VoIPPhone
 from .chromecast import Chromecast
 from .hp_mfp import HPMultifunction
+from .bambu import BambuLabPrinter
+from .smart_screen import SmartScreen
+from .pos import POSTerminal
 from ..host import PseudoHost
 
 
@@ -35,6 +38,9 @@ PROFILES = {
     "voip": VoIPPhone,
     "chromecast": Chromecast,
     "hp-mfp": HPMultifunction,
+    "bambu": BambuLabPrinter,
+    "smart-screen": SmartScreen,
+    "pos": POSTerminal,
 }
 
 

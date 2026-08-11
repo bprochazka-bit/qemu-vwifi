@@ -115,19 +115,30 @@ device type is a dozen lines, not a new stack. The shipped profiles
 | `windows`    | windows-workstation | 128 | a Windows client |
 | `printer`    | network-printer     | 255 | an IPP/JetDirect print server |
 | `nas`        | nas                 | 64  | SMB/NFS storage |
-| `voip`       | voip-phone          | 64  | a SIP desk phone (answers OPTIONS on 5060) |
-| `chromecast` | chromecast          | 64  | a Google Cast receiver (mDNS `_googlecast._tcp`) |
-| `hp-mfp`     | hp-mfp              | 255 | an HP print/scan/fax MFP (mDNS `_ipp` + `_uscan`) |
+| `voip`         | voip-phone       | 64  | a SIP desk phone (answers OPTIONS on 5060) |
+| `chromecast`   | chromecast       | 64  | a Google Cast receiver (mDNS `_googlecast._tcp`) |
+| `hp-mfp`       | hp-mfp           | 255 | an HP print/scan/fax MFP (mDNS `_ipp` + `_uscan`) |
+| `bambu`        | bambu-3dprinter  | 64  | a Bambu Lab 3D printer (SSDP `:1990`, MQTTS/FTPS/RTSP) |
+| `smart-screen` | smart-screen     | 64  | a smart display (SSDP UPnP MediaRenderer + DIAL) |
+| `pos`          | pos-terminal     | 64  | a Square-style POS terminal (mDNS pairing/status) |
 
-The last three show the service framework doing real work over the live
-UDP path: `voip` answers SIP `OPTIONS` with a phone-like `200 OK`, and
-`chromecast` and `hp-mfp` run the shared mDNS responder (`mdns.py`) so
-they are discoverable by `avahi-browse` / `dns-sd` — a Chromecast as a
-Cast receiver, the MFP as both a printer (`_ipp._tcp`) and a scanner
-(`_uscan._tcp`), which is what makes it a multifunction rather than a
-plain print server. Their richer protocols (Cast/TLS on 8009, IPP,
-eSCL, SNMP) are advertised as ports now and become listeners when the
-TCP layer lands.
+These show the service framework doing real work over the live UDP path.
+`voip` answers SIP `OPTIONS` with a phone-like `200 OK`. Two discovery
+transports back the rest:
+
+- **mDNS** (`mdns.py`) — `chromecast` (a Cast receiver), `hp-mfp` (both a
+  printer `_ipp._tcp` and a scanner `_uscan._tcp` — what makes it a
+  multifunction), the `smart-screen`'s HTTP UI, and the `pos` terminal's
+  pairing/status records. Discoverable with `avahi-browse` / `dns-sd`.
+- **SSDP / UPnP** (`ssdp.py`) — answers `M-SEARCH` and announces
+  `ssdp:alive`. `bambu` advertises its vendor `urn:bambulab-com:...`
+  device on port 1990 (how Bambu Studio finds a printer, with the
+  DevModel/DevName headers); `smart-screen` advertises a UPnP
+  rootdevice + MediaRenderer + DIAL on 1900.
+
+Their richer protocols (Cast/TLS 8009, IPP, eSCL, SNMP, MQTTS 8883,
+FTPS 990, the UPnP description HTTP) are advertised as ports now and
+become listeners when the TCP/TLS layer lands.
 
 ## Services — designed in from the start
 
@@ -173,7 +184,8 @@ pseudohost/
     station.py      scan -> auth -> assoc -> keys; the radio state machine
     netstack.py     ARP / IPv4 / ICMP / UDP; the userspace host stack
     dhcp.py         DHCPv4 client
-    mdns.py         multicast-DNS / DNS-SD responder (Chromecast, MFP)
+    mdns.py         multicast-DNS / DNS-SD responder (Chromecast, MFP, ...)
+    ssdp.py         SSDP / UPnP discovery responder (Bambu, smart screen)
     services.py     Service base class + registry (the extension seam)
     host.py         PseudoHost — the inheritable base class
     profiles/       one subclass per device kind
