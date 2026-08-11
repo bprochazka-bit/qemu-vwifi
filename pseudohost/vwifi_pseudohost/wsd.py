@@ -325,20 +325,21 @@ class WSDHttpService(TCPService):
             '<wsdp:FirmwareVersion>1.0</wsdp:FirmwareVersion>'
             '<wsdp:SerialNumber>%s</wsdp:SerialNumber></wsdp:ThisDevice>'
             % (dev.friendly, self.host.mac.hex()))
-        # Host is the device; the print service is a *Hosted* service with
-        # its own endpoint — this is the shape Windows needs to turn the
-        # device into an addable printer.
+        # Host is the device (marked as a print device); the print service
+        # is a *Hosted* service whose endpoint is the HTTP address Windows
+        # POSTs GetPrinterElements/CreatePrintJob to.  This is the shape
+        # Windows needs to turn the discovered device into a printer.
         relationship = (
             '<wsdp:Relationship Type="%s/host">'
             '<wsdp:Host><wsa:EndpointReference><wsa:Address>%s</wsa:Address>'
-            '</wsa:EndpointReference></wsdp:Host>'
+            '</wsa:EndpointReference>'
+            '<wsdp:Types>wprt:PrintDeviceType</wsdp:Types></wsdp:Host>'
             '<wsdp:Hosted><wsa:EndpointReference><wsa:Address>%s</wsa:Address>'
-            '</wsa:EndpointReference><wsdp:Types>wprt:PrintServiceType'
-            '</wsdp:Types><wsdp:ServiceId>%s</wsdp:ServiceId>'
-            '<wsdp:HardwareId>%s</wsdp:HardwareId></wsdp:Hosted>'
+            '</wsa:EndpointReference>'
+            '<wsdp:Types>wprt:PrintDeviceType</wsdp:Types>'
+            '<wsdp:ServiceId>%s</wsdp:ServiceId></wsdp:Hosted>'
             '</wsdp:Relationship>'
-            % (NS_WSDP, dev.uuid, dev.print_svc_uuid(), dev.print_svc_uuid(),
-               "PseudoPrinter"))
+            % (NS_WSDP, dev.uuid, dev.xaddr(), dev.print_svc_uuid()))
         sections = (
             '<wsdp:MetadataSection Dialect="%s/ThisModel">%s'
             '</wsdp:MetadataSection>'

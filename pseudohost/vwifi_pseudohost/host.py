@@ -54,12 +54,13 @@ class PseudoHost:
 
     def __init__(self, sock_path, essid, passphrase=None, node_id=None,
                  hostname=None, mac=None, scan_time=3.0, log=None,
-                 print_dir=None):
+                 print_dir=None, verbose=False):
         self.sock_path = sock_path
         self.essid = essid
         self.passphrase = passphrase
         self.hostname = hostname or self.hostname
         self.log = log or _stderr_log
+        self.verbose = verbose
 
         self.mac = dot11.mac_bytes(mac) if mac else self._make_mac()
         self.node_id = node_id or ("ph-%s-%s" % (
@@ -69,6 +70,7 @@ class PseudoHost:
         self.station = station_mod.Station(
             self.client, essid, passphrase=passphrase, mac=self.mac,
             log=self._slog, scan_time=scan_time)
+        self.station.verbose = verbose
         self.stack = NetStack(self.station, hostname=self.hostname,
                               log=self._slog)
         self.stack.ttl = self.os_ttl

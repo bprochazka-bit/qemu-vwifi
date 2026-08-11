@@ -95,7 +95,7 @@ class TestWSDMetadata(unittest.TestCase):
         self.assertIn("HP OfficeJet Pro 9015", text)              # model
         self.assertIn("<wsdp:Manufacturer>HP</wsdp:Manufacturer>", text)
         self.assertIn("HP-OfficeJet-Den", text)                   # friendly
-        self.assertIn("PrintServiceType", text)                   # hosted svc
+        self.assertIn("PrintDeviceType", text)                   # hosted svc
         self.assertIn("urn:uuid:get-1", text)                     # RelatesTo
 
 

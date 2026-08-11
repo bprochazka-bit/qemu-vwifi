@@ -55,6 +55,9 @@ def build_parser():
                    help="after leasing, ping this IPv4 address once")
     p.add_argument("--duration", type=float, default=None,
                    help="run for N seconds then exit (default: run forever)")
+    p.add_argument("-v", "--verbose", action="store_true",
+                   help="log every received data frame (source, ethertype) "
+                        "on top of the per-service logs, to diagnose traffic")
     p.add_argument("-q", "--quiet", action="store_true",
                    help="suppress the progress log")
     return p
@@ -74,7 +77,8 @@ def main(argv=None):
 
     host = profile(args.sock, args.essid, passphrase=args.passphrase,
                    node_id=args.node_id, hostname=args.hostname, mac=args.mac,
-                   scan_time=args.scan_time, log=log, print_dir=args.print_dir)
+                   scan_time=args.scan_time, log=log, print_dir=args.print_dir,
+                   verbose=args.verbose)
 
     stop = {"flag": False}
 

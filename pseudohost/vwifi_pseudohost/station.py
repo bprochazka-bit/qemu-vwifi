@@ -73,6 +73,7 @@ class Station:
         self.keys = KeySet()
         self.sup = None
         self.on_eth_rx = None          # callback(src, dst, ethertype, sdu)
+        self.verbose = False
         self._bss_seen = {}
         self._pmk = None
         if passphrase:
@@ -275,6 +276,9 @@ class Station:
         if ethertype == dot11.ETH_P_PAE:
             self._on_eapol(src, sdu)
             return
+        if self.verbose and self.state == ST_RUN:
+            self.log("rx %s->%s ethertype 0x%04x (%d bytes)" % (
+                dot11.mac_str(src), dot11.mac_str(dst), ethertype, len(sdu)))
         if self.state == ST_RUN and self.on_eth_rx:
             self.on_eth_rx(src, dst, ethertype, sdu)
 
