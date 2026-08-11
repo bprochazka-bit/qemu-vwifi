@@ -1,0 +1,134 @@
+#!/usr/bin/env python3
+#
+# vwifi-pseudohost — access-point command-line entry point
+#
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# Beacon a network on the vwifi medium that pseudo-hosts (and real VMs)
+# can associate to.  Specify the ESSID, channel and encryption; the BSSID
+# is optional (random locally-administered if omitted).  Optionally run
+# services on the AP — an LPD print daemon, a NAS, a web page.
+#
+#   ./pseudoap --sock /tmp/vwifi.sock --essid Lab-AP-1 --channel 6 \
+#              --encryption wpa2 --passphrase correcthorse1
+#
+#   ./pseudoap --sock /tmp/vwifi.sock --essid Office --channel 11 \
+#              --encryption open --services lpd,nas
+#
+import argparse
+import os
+import signal
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from vwifi_pseudohost.accesspoint import PseudoAP                 # noqa: E402
+from vwifi_pseudohost.mdns import Advert, MDNSResponder            # noqa: E402
+from vwifi_pseudohost.netservices import (                        # noqa: E402
+    LPDService, HTTPService, NASHTTPService, SMBService)
+from vwifi_pseudohost.services import UDPEchoService              # noqa: E402
+
+
+def _nas_mdns():
+    return MDNSResponder(
+        advert_factory=lambda h: [
+            Advert("_smb._tcp.local", h.hostname, 445, [b"model=PseudoNAS"]),
+            Advert("_http._tcp.local", h.hostname, 5000, [b"path=/"]),
+        ],
+        announce_period=30.0)
+
+
+# name -> list of service instances it expands to
+def _services_for(name):
+    name = name.strip().lower()
+    if name == "lpd":
+        return [LPDService()]
+    if name == "http":
+        return [HTTPService()]
+    if name == "nas":
+        return [SMBService(), NASHTTPService(), _nas_mdns()]
+    if name == "echo":
+        return [UDPEchoService()]
+    raise ValueError("unknown service '%s' (known: lpd, nas, http, echo)"
+                     % name)
+
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="pseudoap",
+        description="Beacon a vwifi network as a simulated access point.")
+    p.add_argument("--sock", required=True,
+                   help="path to the vwifi-medium hub socket")
+    p.add_argument("--essid", required=True, help="network name to beacon")
+    p.add_argument("--channel", type=int, default=6,
+                   help="channel to operate on (default: 6)")
+    p.add_argument("--encryption", default="open", choices=["open", "wpa2"],
+                   help="encryption type (default: open)")
+    p.add_argument("--passphrase", default=None,
+                   help="WPA2-PSK passphrase (required for --encryption wpa2)")
+    p.add_argument("--bssid", default=None,
+                   help="BSSID, e.g. 02:11:22:33:44:00 (default: random)")
+    p.add_argument("--node-id", default=None,
+                   help="name shown to the hub (default: auto)")
+    p.add_argument("--gateway", default="192.168.4.1",
+                   help="the AP's own IPv4 address / default gateway")
+    p.add_argument("--netmask", default="255.255.255.0")
+    p.add_argument("--pool-start", default=None,
+                   help="first DHCP pool address (default: .100)")
+    p.add_argument("--pool-end", default=None,
+                   help="last DHCP pool address (default: .200)")
+    p.add_argument("--dns", default=None, help="DNS server handed out (opt)")
+    p.add_argument("--services", default="",
+                   help="comma list of services to run: lpd,nas,http,echo")
+    p.add_argument("--duration", type=float, default=None,
+                   help="run for N seconds then exit (default: forever)")
+    p.add_argument("-q", "--quiet", action="store_true")
+    return p
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    if args.encryption == "wpa2" and not args.passphrase:
+        print("--encryption wpa2 requires --passphrase", file=sys.stderr)
+        return 2
+
+    services = []
+    for name in filter(None, (s.strip() for s in args.services.split(","))):
+        try:
+            services += _services_for(name)
+        except ValueError as e:
+            print(str(e), file=sys.stderr)
+            return 2
+
+    def log(msg):
+        if not args.quiet:
+            print(msg, file=sys.stderr, flush=True)
+
+    base = args.gateway.rsplit(".", 1)[0]
+    pool = (args.pool_start or base + ".100", args.pool_end or base + ".200")
+
+    ap = PseudoAP(args.sock, args.essid, channel=args.channel,
+                  encryption=args.encryption, passphrase=args.passphrase,
+                  bssid=args.bssid, node_id=args.node_id,
+                  gateway_ip=args.gateway, netmask=args.netmask, pool=pool,
+                  dns=args.dns, services=services, log=log)
+
+    def _sig(_s, _f):
+        ap.stop()
+    signal.signal(signal.SIGINT, _sig)
+    signal.signal(signal.SIGTERM, _sig)
+
+    try:
+        ap.start()
+    except (FileNotFoundError, ConnectionRefusedError) as e:
+        print("cannot reach hub at %s: %s" % (args.sock, e), file=sys.stderr)
+        return 1
+    try:
+        ap.run(duration=args.duration)
+    finally:
+        ap.close()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

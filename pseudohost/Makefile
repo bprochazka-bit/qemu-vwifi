@@ -14,8 +14,13 @@ help:
 	@echo
 	@echo "  make test        run the full suite (stdlib unittest)"
 	@echo
+	@echo "  join a network as a host:"
 	@echo "  ./pseudohost --sock /tmp/vwifi.sock --essid <ESSID> \\"
-	@echo "               [--passphrase <psk>] [--profile linux|windows|printer|nas]"
+	@echo "               [--passphrase <psk>] [--profile linux|printer|bambu|...]"
+	@echo
+	@echo "  beacon a network as an AP:"
+	@echo "  ./pseudoap   --sock /tmp/vwifi.sock --essid <ESSID> --channel 6 \\"
+	@echo "               [--encryption wpa2 --passphrase <psk>] [--services lpd,nas]"
 
 test:
 	$(PYTHON) -m unittest discover -s tests -p 'test_*.py'

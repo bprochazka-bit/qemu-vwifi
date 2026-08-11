@@ -47,12 +47,20 @@ class Service:
         self.stack = host.stack
         for port in self.udp_ports:
             self.stack.register_udp(port, self._udp_trampoline(port))
+        tcp = getattr(host, "tcp", None)
+        if tcp is not None:
+            self._register_tcp(tcp)
         self.on_start()
 
     def _udp_trampoline(self, port):
         def cb(src_ip, src_port, dst_ip, dst_port, payload):
             self.on_udp(src_ip, src_port, dst_ip, dst_port, payload)
         return cb
+
+    def _register_tcp(self, tcp):
+        # Plain services advertise tcp_ports but do not listen; a
+        # TCPService overrides this to become a real listener.
+        pass
 
     # -- hooks a subclass overrides ---------------------------------------
     def on_start(self):
@@ -72,6 +80,37 @@ class Service:
     def log(self, msg):
         if self.host:
             self.host.log("svc[%s]: %s" % (self.name, msg))
+
+
+class TCPService(Service):
+    """A service that actually accepts TCP connections.
+
+    Subclass, set the ports it serves (listen_ports, defaulting to
+    tcp_ports), and override the connection hooks:
+
+        on_connect(conn)          a peer connected
+        on_data(conn, data)       bytes arrived (may be called repeatedly)
+        on_close(conn)            the peer half-closed
+
+    Write back with conn.send(bytes) and finish with conn.close().  The
+    ports are served only when the host has a TCP stack attached (every
+    PseudoHost and PseudoAP does); otherwise they are advertisement only.
+    """
+
+    listen_ports = ()
+
+    def _register_tcp(self, tcp):
+        for port in (self.listen_ports or self.tcp_ports):
+            tcp.listen(port, self)
+
+    def on_connect(self, conn):
+        pass
+
+    def on_data(self, conn, data):
+        pass
+
+    def on_close(self, conn):
+        pass
 
 
 class UDPService(Service):

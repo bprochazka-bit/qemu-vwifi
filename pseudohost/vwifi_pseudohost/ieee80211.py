@@ -219,6 +219,55 @@ def build_deauth(sa, bssid, reason, seq):
     return bytes(b)
 
 
+# ---- AP-side management frames -------------------------------------------
+
+def build_beacon(bssid, ssid, freq, privacy, seq, da=BROADCAST,
+                 subtype=STYPE_BEACON):
+    """A beacon (or, with subtype=ProbeResp and a unicast da, a probe
+    response).  Capability carries the Privacy bit and an RSN element
+    when the network is secured."""
+    b = mgmt_header(subtype, da, bssid, bssid, seq)
+    cap = 0x0421 | (0x0010 if privacy else 0)      # ESS + short pre/slot
+    b += struct.pack("<QHH", 0, 100, cap)          # tsf, beacon int, cap
+    b += ie(EID_SSID, ssid)
+    b += supp_rate_ies()
+    b += ie(EID_DS_PARAMS, bytes([freq_to_chan(freq)]))
+    if privacy:
+        b += rsn_ie_ccmp_psk()
+    return bytes(b)
+
+
+def build_auth_resp(bssid, da, seq, status=STATUS_SUCCESS):
+    b = mgmt_header(STYPE_AUTH, da, bssid, bssid, seq)
+    b += struct.pack("<HHH", AUTH_ALG_OPEN, 2, status)   # alg, seq 2, status
+    return bytes(b)
+
+
+def build_assoc_resp(bssid, da, aid, seq, status=STATUS_SUCCESS):
+    b = mgmt_header(STYPE_ASSOC_RESP, da, bssid, bssid, seq)
+    b += struct.pack("<HHH", 0x0421, status, aid)        # cap, status, AID
+    b += supp_rate_ies()
+    return bytes(b)
+
+
+def build_data_fromds(bssid, sa, da, eth_payload, protected=False, seq=0):
+    """A FromDS non-QoS data frame (AP -> station).
+
+    addr1=RA=DA (the station), addr2=TA=BSSID, addr3=SA (original sender:
+    the AP itself, or another station when bridging).
+    """
+    ethertype, sdu = eth_payload
+    b = bytearray(24)
+    b[0] = FTYPE_DATA << 2
+    b[1] = FC1_FROMDS | (FC1_PROTECTED if protected else 0)
+    b[4:10] = da
+    b[10:16] = bssid
+    b[16:22] = sa
+    struct.pack_into("<H", b, 22, (seq & 0x0FFF) << 4)
+    b += LLC_SNAP + struct.pack(">H", ethertype) + sdu
+    return bytes(b)
+
+
 def frame_type_subtype(frame):
     fc = frame[0]
     return (fc >> 2) & 0x3, (fc >> 4) & 0xF

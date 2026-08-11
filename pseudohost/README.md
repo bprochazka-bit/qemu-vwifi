@@ -156,40 +156,82 @@ class Service:
     def tick(self): ...     # for announcements (mDNS/SSDP-style)
 ```
 
-Phase 1 wires the **UDP** path end to end, so a `UDPService` subclass is
-fully live today (`UDPEchoService` is a working example — `nc -u <ip> 7`
-and your bytes come back). The framework is built around "a service owns
-some ports and some behaviour" rather than around UDP specifically, so
-the `tcp_ports` a printer or NAS advertises become real listeners once
-the TCP layer lands — a later phase that is purely additive: no profile
-and no service signature changes.
+Both transports are live. A `UDPService` answers datagrams
+(`UDPEchoService` — `nc -u <ip> 7` and your bytes come back); a
+`TCPService` accepts connections over the built-in minimal TCP
+(`tcp.py`) and gets `on_connect` / `on_data` / `on_close` hooks with a
+`conn.send()` / `conn.close()` back-channel. The shipped TCP services
+(`netservices.py`) are real enough to use:
+
+- **`LPDService`** — an RFC 1179 line-printer daemon on 515 that accepts
+  an actual `lpr` job and accounts its bytes;
+- **`HTTPService`** — a one-page HTTP/1.0 server (a device admin UI);
+- **`SMBService` / `NASHTTPService`** — an SMB-shaped presence on 139/445
+  plus a NAS admin page, which with an mDNS `_smb._tcp` advert reads as a
+  file server to a scan.
+
+The framework is built around "a service owns some ports and some
+behaviour," so the same `Service` runs on a workstation, a printer, or an
+**access point** unchanged.
 
 That is the deliberate design consequence the request asked us to
-consider up front: **the netstack, the station, and the service
-framework are three separable layers**, and a device profile only ever
-touches the top one. A printer, a NAS, and a Linux box are the same
-station and the same IP stack with different services and different
-fingerprints.
+consider up front: **the station/AP link, the netstack, and the service
+framework are separable layers**, and a device profile (or an AP) only
+ever touches the top one. A printer, a NAS, and a Linux box are the same
+IP stack with different services and different fingerprints.
+
+## Access points
+
+The medium has an AP side too: `PseudoAP` (CLI `pseudoap`) beacons a
+network that pseudo-hosts and real VMs can associate to. Give it an
+ESSID, a channel, an encryption type and optionally a BSSID:
+
+```bash
+./pseudoap --sock /tmp/vwifi.sock --essid Lab-AP-1 --channel 6 \
+           --encryption wpa2 --passphrase correcthorse1
+
+./pseudoap --sock /tmp/vwifi.sock --essid Office --channel 11 \
+           --encryption open --services lpd,nas
+```
+
+It beacons and answers probes, runs open-system Auth/Assoc, drives the
+**Authenticator** side of the WPA2-PSK four-way handshake per station
+(`authenticator.py`, the mirror of `supplicant.py`), and installs
+per-station CCMP keys. It is the DS: it terminates IP for its own gateway
+address (ARP, ICMP, a **DHCP server**, and any TCP/UDP services) and
+bridges frames between associated stations. `--services lpd,nas,http`
+runs those on the AP itself.
+
+Because both sides share the same crypto, 802.11 and medium code, a
+`PseudoAP` and a `PseudoHost` interoperate for real — the test suite
+associates one to the other across an in-process hub and pulls a DHCP
+lease across the encrypted link.
 
 ## Layout
 
 ```
 pseudohost/
-  pseudohost                     the CLI (phase-1 entry point)
+  pseudohost                     the station CLI (join a network)
+  pseudoap                       the AP CLI (beacon a network)
   vwifi_pseudohost/
-    crypto.py       AES-128, CCMP, PRF, PBKDF2, AES key wrap, EAPOL MIC
-    ieee80211.py    802.11 frame + IE build/parse; Ethernet <-> 802.11
-    medium.py       the hub transport (abi/vwifi.h wire protocol)
-    supplicant.py   the WPA2-PSK four-way handshake
-    station.py      scan -> auth -> assoc -> keys; the radio state machine
-    netstack.py     ARP / IPv4 / ICMP / UDP; the userspace host stack
-    dhcp.py         DHCPv4 client
-    mdns.py         multicast-DNS / DNS-SD responder (Chromecast, MFP, ...)
-    ssdp.py         SSDP / UPnP discovery responder (Bambu, smart screen)
-    services.py     Service base class + registry (the extension seam)
-    host.py         PseudoHost — the inheritable base class
-    profiles/       one subclass per device kind
-  tests/            stdlib unittest; run.sh runs them all
+    crypto.py         AES-128, CCMP, PRF, PBKDF2, AES key wrap, EAPOL MIC
+    ieee80211.py      802.11 frame + IE build/parse; Ethernet <-> 802.11
+    medium.py         the hub transport (abi/vwifi.h wire protocol)
+    supplicant.py     the STA side of the WPA2-PSK four-way handshake
+    authenticator.py  the AP side of the four-way handshake
+    station.py        scan -> auth -> assoc -> keys; the radio state machine
+    accesspoint.py    PseudoAP: beacon/assoc/handshake, the DS, bridging
+    netstack.py       ARP / IPv4 / ICMP / UDP / TCP demux; the host stack
+    tcp.py            minimal server-side TCP (for TCP services)
+    dhcp.py           DHCPv4 client
+    dhcp_server.py    DHCPv4 server (the AP's lease pool)
+    mdns.py           multicast-DNS / DNS-SD responder
+    ssdp.py           SSDP / UPnP discovery responder
+    services.py       Service / UDPService / TCPService base + registry
+    netservices.py    LPD, HTTP, NAS/SMB (TCP-backed services)
+    host.py           PseudoHost — the inheritable base class
+    profiles/         one subclass per device kind
+  tests/              stdlib unittest; run.sh runs them all
 ```
 
 ## Tests
@@ -200,24 +242,28 @@ pseudohost/
 
 The suite needs no medium and no network. It covers the crypto against
 known-answer vectors (AES/FIPS-197, PBKDF2/PTK, CCMP round-trip mirroring
-`devices/vwifi/tests/crypto.c`, RFC 3394 key wrap), the four-way
-handshake against an in-process authenticator, the netstack and DHCP,
-and a **full end-to-end connect** — scan, associate, handshake, lease —
-against an in-process mock hub+AP over a real Unix socket, for both open
-and WPA2 networks (and a wrong-passphrase case that must *fail*).
+`devices/vwifi/tests/crypto.c`, RFC 3394 key wrap), the `Supplicant` and
+`Authenticator` run against each other, the netstack, DHCP client and
+server, the TCP layer and the LPD/HTTP services, the profiles' mDNS/SSDP
+responders, and two **full end-to-end connects** over a real Unix
+socket: a pseudo-host against a mock AP, and a real `PseudoHost` against
+a real `PseudoAP` across an in-process hub — each for open and WPA2, with
+a wrong-passphrase case that must *fail*.
 
 ## Roadmap
 
-Phase 1 is a keyed station with ARP/ICMP/DHCP/UDP and the service seam.
-The natural next phases, in rough order:
+Now in place: keyed stations *and* access points, DHCP client and server,
+ARP/ICMP/UDP and a minimal TCP with LPD/HTTP/NAS services, and mDNS/SSDP
+discovery. The natural next steps, in rough order:
 
-- **TCP** — a minimal connection layer, which lights up the `tcp_ports`
-  the printer/NAS profiles already advertise (IPP/631, JetDirect/9100,
-  SMB/445, HTTP/80).
-- **Real service protocols** — mDNS/SSDP/NBNS presence, an SNMP agent, a
-  tiny HTTP admin page, an IPP responder — each a `Service` subclass.
-- **More link security** — WPA3-SAE and WPA2-Enterprise (the device
-  already models SAE auth on the AP side).
+- **Richer service protocols** — an SNMP agent, an IPP/eSCL responder, a
+  real (if minimal) SMB2 negotiate, NBNS/LLMNR — each a `Service`
+  subclass over the existing UDP/TCP layers.
+- **More link security** — WPA3-SAE and WPA2-Enterprise (the frame code
+  already models SAE auth).
+- **TCP completeness** — retransmission and out-of-order reassembly, for
+  lossy or bridged-to-real-radio mediums where the lossless assumption
+  no longer holds.
 - **IPv6** — SLAAC and ICMPv6, for hosts that would have it.
 
-Each is additive against the three-layer split above.
+Each is additive against the layer split above.

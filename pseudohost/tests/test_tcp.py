@@ -1,0 +1,117 @@
+#
+# vwifi-pseudohost — TCP layer test
+#
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+import os
+import sys
+import unittest
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.dirname(__file__))
+
+from tcp_client import ServerHost, ClientSim          # noqa: E402
+from vwifi_pseudohost.services import TCPService       # noqa: E402
+from vwifi_pseudohost.netservices import (              # noqa: E402
+    LPDService, HTTPService)
+
+
+class EchoTCP(TCPService):
+    name = "echo-tcp"
+    tcp_ports = (7,)
+
+    def on_connect(self, conn):
+        conn.data["log"] = []
+
+    def on_data(self, conn, data):
+        conn.send(data)                        # echo it straight back
+
+
+class BannerTCP(TCPService):
+    name = "banner"
+    tcp_ports = (9999,)
+
+    def on_connect(self, conn):
+        conn.send(b"HELLO FROM PSEUDOHOST\r\n")
+
+
+class TestTCP(unittest.TestCase):
+    def _server(self, service, port):
+        srv = ServerHost()
+        s = service()
+        s.bind(srv)
+        # TCPService.bind registered the listener on srv.tcp
+        return srv
+
+    def test_handshake_and_echo(self):
+        srv = self._server(EchoTCP, 7)
+        c = ClientSim(srv, dport=7)
+        self.assertTrue(c.connect(), "TCP handshake failed")
+        c.send(b"round-trip")
+        self.assertEqual(c.recv(), b"round-trip")
+
+    def test_banner_on_connect(self):
+        srv = self._server(BannerTCP, 9999)
+        c = ClientSim(srv, dport=9999)
+        self.assertTrue(c.connect())
+        self.assertEqual(c.recv(), b"HELLO FROM PSEUDOHOST\r\n")
+
+    def test_multiple_sends(self):
+        srv = self._server(EchoTCP, 7)
+        c = ClientSim(srv, dport=7)
+        self.assertTrue(c.connect())
+        c.send(b"one ")
+        self.assertEqual(c.recv(), b"one ")
+        c.send(b"two")
+        self.assertEqual(c.recv(), b"two")
+
+    def test_connection_to_closed_port_resets(self):
+        srv = self._server(EchoTCP, 7)
+        c = ClientSim(srv, dport=8)            # nothing listening on 8
+        # connect() returns False because it gets RST, not SYN|ACK
+        self.assertFalse(c.connect())
+
+
+class TestNetServices(unittest.TestCase):
+    def test_http_serves_page(self):
+        srv = ServerHost()
+        HTTPService().bind(srv)
+        c = ClientSim(srv, dport=80)
+        self.assertTrue(c.connect())
+        c.send(b"GET / HTTP/1.0\r\nHost: x\r\n\r\n")
+        resp = c.recv()
+        self.assertTrue(resp.startswith(b"HTTP/1.0 200 OK"))
+        self.assertIn(b"<h1>", resp)
+
+    def test_lpd_receives_a_job(self):
+        srv = ServerHost()
+        lpd = LPDService()
+        lpd.bind(srv)
+        c = ClientSim(srv, dport=515)
+        self.assertTrue(c.connect())
+
+        # RFC 1179: receive-a-job, then a control file, then a data file.
+        c.send(b"\x02lp\n")
+        self.assertEqual(c.recv(), b"\x00")
+
+        ctl = b"Hlaptop\nPuser\nfdfA001laptop\n"
+        c.send(b"\x02%d cfA001laptop\n" % len(ctl))
+        self.assertEqual(c.recv(), b"\x00")
+        c.send(ctl + b"\x00")
+        self.assertEqual(c.recv(), b"\x00")
+
+        job = b"the print job payload\n"
+        c.send(b"\x03%d dfA001laptop\n" % len(job))
+        self.assertEqual(c.recv(), b"\x00")
+        c.send(job + b"\x00")
+        self.assertEqual(c.recv(), b"\x00")
+
+        # The daemon should have accounted the data-file bytes.
+        # (one connection -> one conn object in the stack)
+        conns = list(srv.tcp.conns.values())
+        self.assertTrue(conns)
+        self.assertEqual(conns[0].data["job"], len(job))
+
+
+if __name__ == "__main__":
+    unittest.main()

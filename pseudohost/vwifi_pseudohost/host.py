@@ -35,6 +35,7 @@ from .dhcp import DHCPClient
 from .medium import MediumClient
 from .netstack import NetStack
 from .services import ServiceRegistry
+from .tcp import TCPStack
 
 
 def _stderr_log(msg):
@@ -71,6 +72,7 @@ class PseudoHost:
                               log=self._slog)
         self.stack.ttl = self.os_ttl
         self.stack.set_icmp_enabled(self.icmp)
+        self.tcp = TCPStack(self.stack, log=self._slog)
         self.dhcp = DHCPClient(self.stack, hostname=self.hostname,
                                log=self._slog)
         self.registry = ServiceRegistry(self)

@@ -64,6 +64,7 @@ class NetStack:
         self.dns = None
         self.arp_cache = {}                    # ip_bytes -> (mac, expiry)
         self._udp_handlers = {}                # dst_port -> callback
+        self._tcp = None                       # optional TCPStack
         self._icmp_enabled = True
         # Default IPv4 TTL — a cheap but effective OS fingerprint.  A
         # device profile overrides it (Linux 64, Windows 128, many
@@ -88,6 +89,10 @@ class NetStack:
     def register_udp(self, port, handler):
         """handler(src_ip, src_port, dst_ip, dst_port, payload)."""
         self._udp_handlers[port] = handler
+
+    def attach_tcp(self, tcp_stack):
+        """Attach a TCPStack; TCP segments for us are handed to it."""
+        self._tcp = tcp_stack
 
     # ---- egress ----------------------------------------------------------
     def send_eth(self, dst_mac, ethertype, payload):
@@ -214,6 +219,8 @@ class NetStack:
             self._on_icmp(src, dst, body)
         elif proto == IPPROTO_UDP:
             self._on_udp(src, dst, body)
+        elif proto == IPPROTO_TCP and self._tcp is not None:
+            self._tcp.on_segment(src, dst, body)
 
     # ---- ICMP ------------------------------------------------------------
     def _on_icmp(self, src, dst, body):
