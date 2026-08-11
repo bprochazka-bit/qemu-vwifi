@@ -22,6 +22,7 @@
 from ..host import PseudoHost
 from ..mdns import Advert, MDNSResponder
 from ..services import Service
+from ..wsd import WSDiscoveryService, WSDMetadataService
 
 # A plausible model string; TXT records below mirror what an HP MFP
 # publishes so a scan of the mDNS records reads like the real thing.
@@ -29,17 +30,18 @@ HP_MODEL = "HP OfficeJet Pro 9015"
 
 
 class MFPPortsService(Service):
-    """The port surface of the multifunction; SNMP probes are logged."""
+    """The port surface of the multifunction; SNMP probes are logged.
+
+    WS-Discovery (UDP 3702) and its metadata HTTP (TCP 5357) are owned by
+    the WSD services, not advertised here, so there's no handler clash.
+    """
     name = "hp-mfp"
-    udp_ports = (161, 3702)                     # SNMP, WS-Discovery
-    tcp_ports = (80, 443, 515, 631, 9100,       # web, LPD, IPP, JetDirect
-                 5357, 8080, 8290)              # WSD, eSCL, HP scan
+    udp_ports = (161,)                          # SNMP
+    tcp_ports = (80, 443, 515, 631, 9100, 8080, 8290)  # web, LPD, IPP, scan
 
     def on_udp(self, src_ip, src_port, dst_ip, dst_port, payload):
         if dst_port == 161:
             self.log("SNMP probe from %d.%d.%d.%d" % tuple(src_ip))
-        elif dst_port == 3702:
-            self.log("WS-Discovery probe from %d.%d.%d.%d" % tuple(src_ip))
 
 
 def _mfp_adverts(host):
@@ -83,4 +85,11 @@ class HPMultifunction(PseudoHost):
     hostname = "HP-OfficeJet-PH01"
     mac_oui = bytes([0x02, 0x60, 0xB0])        # HP-like locally-administered
     icmp = True
-    services = [MFPPortsService, _mfp_mdns]
+    # What the WSD metadata Get reports to Windows (the name it shows).
+    wsd_manufacturer = "HP"
+    wsd_model = HP_MODEL
+    wsd_model_number = "9015"
+    # WSD is what stock Windows uses for "Network" and "Add a printer";
+    # mDNS covers macOS / IPP-Everywhere clients.
+    services = [MFPPortsService, _mfp_mdns,
+                WSDiscoveryService, WSDMetadataService]

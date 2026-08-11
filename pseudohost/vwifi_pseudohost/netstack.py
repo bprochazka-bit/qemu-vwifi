@@ -151,8 +151,15 @@ class NetStack:
         nexthop = dst_ip
         if self.netmask and not self._same_subnet(dst_ip):
             nexthop = self.gateway or dst_ip
-        if dst_ip == b"\xff\xff\xff\xff" or (dst_ip[0] & 0xF0) == 0xE0:
-            self.send_eth(BROADCAST_MAC, ETH_P_IP, pkt)   # bcast/mcast
+        if dst_ip == b"\xff\xff\xff\xff":
+            self.send_eth(BROADCAST_MAC, ETH_P_IP, pkt)
+            return
+        if (dst_ip[0] & 0xF0) == 0xE0:                    # IPv4 multicast
+            # Proper multicast MAC (01:00:5e + low 23 bits) rather than L2
+            # broadcast, so a picky client's filter still delivers it.
+            mac = bytes([0x01, 0x00, 0x5E, dst_ip[1] & 0x7F,
+                         dst_ip[2], dst_ip[3]])
+            self.send_eth(mac, ETH_P_IP, pkt)
             return
         mac = self._arp_lookup(nexthop)
         if mac is None:

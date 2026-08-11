@@ -135,6 +135,13 @@ transports back the rest:
   device on port 1990 (how Bambu Studio finds a printer, with the
   DevModel/DevName headers); `smart-screen` advertises a UPnP
   rootdevice + MediaRenderer + DIAL on 1900.
+- **WSD** (`wsd.py`) — WS-Discovery on 3702 plus the metadata HTTP
+  endpoint on 5357. This is what stock **Windows** uses for "Network"
+  and the "Add a printer" scan (it does not browse mDNS/Bonjour without
+  extra software): the printer/`hp-mfp` profiles answer a WS-Discovery
+  Probe with a ProbeMatch and serve the device metadata (manufacturer,
+  model, friendly name, hosted print service) Windows fetches to show
+  the device. Submitting jobs over WSD Print is a later phase.
 
 Their richer protocols (Cast/TLS 8009, IPP, eSCL, SNMP, MQTTS 8883,
 FTPS 990, the UPnP description HTTP) are advertised as ports now and
@@ -239,6 +246,7 @@ pseudohost/
     dhcp_server.py    DHCPv4 server (the AP's lease pool)
     mdns.py           multicast-DNS / DNS-SD responder
     ssdp.py           SSDP / UPnP discovery responder
+    wsd.py            WS-Discovery + metadata (Windows printer discovery)
     services.py       Service / UDPService / TCPService base + registry
     netservices.py    LPD, HTTP, NAS/SMB (TCP-backed services)
     host.py           PseudoHost — the inheritable base class

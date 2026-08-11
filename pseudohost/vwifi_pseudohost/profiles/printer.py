@@ -12,6 +12,7 @@
 #
 from ..host import PseudoHost
 from ..services import Service
+from ..wsd import WSDiscoveryService, WSDMetadataService
 
 
 class PrinterService(Service):
@@ -33,4 +34,8 @@ class NetworkPrinter(PseudoHost):
     hostname = "HPLJ-PH01"
     mac_oui = bytes([0x02, 0x60, 0xB0])    # HP-like locally-administered OUI
     icmp = True
-    services = [PrinterService]
+    wsd_manufacturer = "HP"
+    wsd_model = "HP LaserJet"
+    wsd_model_number = "PH01"
+    # WSD makes it discoverable by stock Windows (Network / Add a printer).
+    services = [PrinterService, WSDiscoveryService, WSDMetadataService]
