@@ -108,6 +108,26 @@ class TestCCMP(unittest.TestCase):
         out = crypto.ccmp_decrypt(crypto.AES128(key), expect)
         self.assertEqual(out[0], plain)
 
+    def test_interop_kat_qos_matches_reference_c(self):
+        # A QoS data frame (subtype 8) encrypted by vwifi_crypto.c.  The
+        # CCMP AAD keeps subtype bit b7, which marks the QoS frame; a mask
+        # that clears it decrypts non-QoS fine but fails every QoS frame,
+        # which is exactly how a real (QoS-using) Windows client broke.
+        key = bytes.fromhex("0f0e0d0c0b0a09080706050403020100")
+        plain = bytes.fromhex(
+            "88010000021122334400" "5254008bc782" "ffffffffffff" "1000"
+            "0000"                                  # QoS control (TID 0)
+            "aaaa030000000800" "606162636465666768696a6b")
+        expect = bytes.fromhex(
+            "884100000211223344005254008bc782ffffffffffff1000"
+            "00000700002000000000539cfdfa5dfb85d0414a59931f78"
+            "dbbe0f0df331b6ab26dd950dbf23")
+        enc = crypto.ccmp_encrypt(crypto.AES128(key), plain,
+                                  bytes([0, 0, 0, 0, 0, 7]), 0)
+        self.assertEqual(enc, expect)
+        out = crypto.ccmp_decrypt(crypto.AES128(key), expect)
+        self.assertEqual(out[0], plain)
+
     def test_pn_carry(self):
         self.assertEqual(crypto.pn_increment(bytes([0, 0, 0, 0, 0, 0xFF])),
                          bytes([0, 0, 0, 0, 1, 0]))

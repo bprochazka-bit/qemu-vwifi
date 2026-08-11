@@ -89,6 +89,10 @@ def build_parser():
                    help="comma list of services to run: lpd,nas,http,echo")
     p.add_argument("--duration", type=float, default=None,
                    help="run for N seconds then exit (default: forever)")
+    p.add_argument("-v", "--verbose", action="store_true",
+                   help="log every received data frame (decrypt result, "
+                        "ethertype) — use this to diagnose a client that "
+                        "associates but can't pass traffic")
     p.add_argument("-q", "--quiet", action="store_true")
     return p
 
@@ -131,7 +135,8 @@ def main(argv=None):
                   encryption=args.encryption, passphrase=args.passphrase,
                   bssid=args.bssid, node_id=args.node_id,
                   gateway_ip=gateway, netmask=netmask, pool=pool,
-                  dns=args.dns, services=services, log=log)
+                  dns=args.dns, services=services, log=log,
+                  verbose=args.verbose)
 
     def _sig(_s, _f):
         ap.stop()

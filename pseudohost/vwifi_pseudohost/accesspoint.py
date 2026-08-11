@@ -76,7 +76,7 @@ class PseudoAP:
                  passphrase=None, bssid=None, node_id=None,
                  gateway_ip="192.168.4.1", netmask="255.255.255.0",
                  pool=("192.168.4.100", "192.168.4.200"), dns=None,
-                 services=(), log=None):
+                 services=(), log=None, verbose=False):
         self.sock_path = sock_path
         self.essid = essid.encode() if isinstance(essid, str) else bytes(essid)
         self.channel = channel
@@ -85,6 +85,7 @@ class PseudoAP:
         self.secured = self.encryption not in ("open", "none", "")
         self.passphrase = passphrase
         self.log = log or _stderr_log
+        self.verbose = verbose
 
         if self.secured and not passphrase:
             raise ValueError("encryption %r needs a passphrase" % encryption)
@@ -242,15 +243,27 @@ class PseudoAP:
         sta = self.stations.get(ta)
         if frame[1] & dot11.FC1_PROTECTED:
             if sta is None or sta.ptk_aes is None:
+                if self.verbose:
+                    self._slog("rx: protected data from %s but no key yet"
+                               % dot11.mac_str(ta))
                 return
             out = crypto.ccmp_decrypt(sta.ptk_aes, frame)
             if out is None:
+                if self.verbose:
+                    _t, _s = dot11.frame_type_subtype(frame)
+                    self._slog("rx: CCMP decrypt FAILED from %s (subtype %d, "
+                               "%d bytes)" % (dot11.mac_str(ta), _s, len(frame)))
                 return
             frame = out[0]
         parsed = dot11.parse_data_frame(frame)
         if parsed is None:
+            if self.verbose:
+                self._slog("rx: unparseable data from %s" % dot11.mac_str(ta))
             return
         sa, da, ethertype, sdu = parsed
+        if self.verbose:
+            self._slog("rx data %s -> %s ethertype 0x%04x (%d bytes)" % (
+                dot11.mac_str(sa), dot11.mac_str(da), ethertype, len(sdu)))
         if ethertype == dot11.ETH_P_PAE:
             self._on_eapol(ta, sdu)
             return

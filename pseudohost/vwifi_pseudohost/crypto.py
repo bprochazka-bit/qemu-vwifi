@@ -328,7 +328,11 @@ _FCTL_PROTECTED = 0x40
 _FCTL_RETRY = 0x08     # byte 1 bit
 _FCTL_PM = 0x10        # byte 1 bit
 _FCTL_MOREDATA = 0x20  # byte 1 bit
-_STYPE_MASK = 0x00F0   # subtype bits in the 16-bit frame control
+# CCMP AAD masks subtype bits b4 b5 b6 only (0x0070) — NOT b7. b7 is what
+# distinguishes a QoS data frame (subtype 8) from plain data (subtype 0),
+# and it stays in the AAD. Masking it (0x00F0) makes the AAD disagree with
+# every real device on QoS frames, so the MIC fails and nothing decrypts.
+_STYPE_MASK = 0x0070   # matches vwifi_crypto.c and the mac80211 kernel path
 
 
 def _fc(hdr):
