@@ -162,6 +162,13 @@ to the host's print sink:
 The sink records the exact bytes and sniffs a file extension (PDF/PS/PCL/
 XPS); it never renders — a simulator captures what was sent.
 
+Adding a printer on Windows via **Add a printer → TCP/IP address** works
+because the profile runs a small **SNMP agent** (`snmp.py`, UDP 161): the
+Standard-TCP/IP-Port wizard SNMP-walks the device to identify it, and the
+agent answers the system group, the Host Resources device table (marking
+it a printer, Idle) and the Printer-MIB name, so Windows recognises the
+model and finishes the port as raw:9100.
+
 Their richer protocols (Cast/TLS 8009, IPP, eSCL, SNMP, MQTTS 8883,
 FTPS 990, the UPnP description HTTP) are advertised as ports now and
 become listeners when the TCP/TLS layer lands.
@@ -267,6 +274,7 @@ pseudohost/
     ssdp.py           SSDP / UPnP discovery responder
     wsd.py            WS-Discovery + metadata + WSD Print (Windows)
     printing.py       print sink (file/null) + raw JetDirect (9100)
+    snmp.py           minimal SNMP agent (printer identity, UDP 161)
     services.py       Service / UDPService / TCPService base + registry
     netservices.py    LPD, HTTP, NAS/SMB (TCP-backed services)
     host.py           PseudoHost — the inheritable base class

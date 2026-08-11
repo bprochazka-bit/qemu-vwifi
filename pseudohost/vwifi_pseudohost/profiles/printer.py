@@ -13,20 +13,15 @@
 from ..host import PseudoHost
 from ..services import Service
 from ..printing import JetDirectService
+from ..snmp import SNMPAgent
 from ..wsd import WSDiscoveryService, WSDHttpService
 
 
 class PrinterService(Service):
-    """The port surface and (soon) protocols of a print server."""
+    """The TCP port surface of a print server (SNMP is its own agent)."""
 
     name = "printer"
-    udp_ports = (161,)                     # SNMP — status/inventory queries
     tcp_ports = (515, 631, 9100)           # LPD, IPP, raw JetDirect
-
-    def on_udp(self, src_ip, src_port, dst_ip, dst_port, payload):
-        # SNMP GET handling is a later phase; for now just note the probe
-        # so a scan of the pseudo-printer is at least visible in the log.
-        self.log("SNMP probe from %d.%d.%d.%d" % tuple(src_ip))
 
 
 class NetworkPrinter(PseudoHost):
@@ -39,6 +34,7 @@ class NetworkPrinter(PseudoHost):
     wsd_model = "HP LaserJet"
     wsd_model_number = "PH01"
     # WSD makes it discoverable by stock Windows (Network / Add a printer);
-    # JetDirect/9100 is the raw path that always prints.
-    services = [PrinterService, JetDirectService,
+    # SNMP lets the "Standard TCP/IP Port" wizard identify it; JetDirect/
+    # 9100 is the raw path that always prints.
+    services = [PrinterService, JetDirectService, SNMPAgent,
                 WSDiscoveryService, WSDHttpService]

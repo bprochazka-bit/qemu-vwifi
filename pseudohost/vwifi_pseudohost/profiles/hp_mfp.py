@@ -23,6 +23,7 @@ from ..host import PseudoHost
 from ..mdns import Advert, MDNSResponder
 from ..services import Service
 from ..printing import JetDirectService
+from ..snmp import SNMPAgent
 from ..wsd import WSDiscoveryService, WSDHttpService
 
 # A plausible model string; TXT records below mirror what an HP MFP
@@ -33,16 +34,11 @@ HP_MODEL = "HP OfficeJet Pro 9015"
 class MFPPortsService(Service):
     """The port surface of the multifunction; SNMP probes are logged.
 
-    WS-Discovery (UDP 3702) and its metadata HTTP (TCP 5357) are owned by
-    the WSD services, not advertised here, so there's no handler clash.
+    WS-Discovery (UDP 3702) / metadata (TCP 5357) are owned by the WSD
+    services and SNMP (UDP 161) by the SNMP agent, so nothing clashes.
     """
     name = "hp-mfp"
-    udp_ports = (161,)                          # SNMP
     tcp_ports = (80, 443, 515, 631, 9100, 8080, 8290)  # web, LPD, IPP, scan
-
-    def on_udp(self, src_ip, src_port, dst_ip, dst_port, payload):
-        if dst_port == 161:
-            self.log("SNMP probe from %d.%d.%d.%d" % tuple(src_ip))
 
 
 def _mfp_adverts(host):
@@ -93,5 +89,5 @@ class HPMultifunction(PseudoHost):
     # WSD is what stock Windows uses for "Network" and "Add a printer";
     # mDNS covers macOS / IPP-Everywhere clients; JetDirect/9100 is the
     # raw path that always prints.
-    services = [MFPPortsService, _mfp_mdns, JetDirectService,
+    services = [MFPPortsService, _mfp_mdns, JetDirectService, SNMPAgent,
                 WSDiscoveryService, WSDHttpService]
