@@ -53,6 +53,36 @@ class TestAuthSupplicant(unittest.TestCase):
         with self.assertRaises(supplicant.HandshakeError):
             self._run("correcthorse1", "wrongwrong")
 
+    def test_msg4_from_earlier_snonce_still_completes(self):
+        # Windows/WDI regenerates its SNonce on a msg2 retransmit and can
+        # commit to the *earlier* SNonce for msg4, after the AP has already
+        # seen a newer one.  The AP must accept msg4 against any candidate.
+        aa = dot11.mac_bytes("02:11:22:33:44:00")
+        spa = dot11.mac_bytes("02:aa:bb:cc:dd:ee")
+        rsn = dot11.rsn_ie_ccmp_psk()
+        pmk = crypto.wpa_pmk("correcthorse1", b"Lab-AP-1")
+        gtk = os.urandom(16)
+        auth = Authenticator(pmk, aa, spa, gtk, rsn_ie=rsn)
+        m1 = auth.start()
+
+        # Supplicant A: the SNonce the client ultimately commits to.
+        supp_a = supplicant.Supplicant(pmk, spa, aa, rsn)
+        m2_a = supp_a.handle(m1)
+        m3_a = auth.handle(m2_a)            # candidate A registered
+
+        # Supplicant B: a *newer* msg2 the AP sees afterwards (different
+        # SNonce), which would overwrite a single-KCK authenticator.
+        supp_b = supplicant.Supplicant(pmk, spa, aa, rsn)
+        m2_b = supp_b.handle(m1)
+        self.assertNotEqual(supp_a.snonce, supp_b.snonce)
+        auth.handle(m2_b)                   # candidate B registered (latest)
+
+        # The client finishes off msg3 for A (the earlier SNonce).
+        m4_a = supp_a.handle(m3_a)
+        self.assertIsNone(auth.handle(m4_a))
+        self.assertTrue(auth.completed)
+        self.assertEqual(auth.tk, supp_a.tk)   # installed the right PTK
+
     def test_msg2_retransmit_resends_identical_msg3(self):
         # A retransmitted msg2 (same SNonce) must get the byte-identical
         # msg3 back — same replay counter — so a strict supplicant that
