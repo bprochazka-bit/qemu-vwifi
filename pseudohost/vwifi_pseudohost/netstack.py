@@ -50,6 +50,51 @@ def ip_bytes(s):
     return bytes(int(x) for x in s.split("."))
 
 
+def ip_to_int(b):
+    return struct.unpack(">I", ip_bytes(b))[0]
+
+
+def int_to_ip(n):
+    return struct.pack(">I", n & 0xFFFFFFFF)
+
+
+def parse_cidr(cidr):
+    """Turn a CIDR like "10.10.10.0/24" into an addressing plan.
+
+    Returns a dict of dotted-quad strings: network, netmask, gateway,
+    pool_start, pool_end.  The gateway is the address's host part when
+    one is given ("10.10.10.1/24") else the first usable address; the
+    pool defaults to the .100-.200 window when it fits inside the subnet
+    and otherwise spans every usable address (skipping the gateway).
+    """
+    import ipaddress
+
+    iface = ipaddress.ip_interface(str(cidr).strip())
+    net = iface.network
+    if net.version != 4:
+        raise ValueError("only IPv4 CIDR is supported")
+    network = int(net.network_address)
+    bcast = int(net.broadcast_address)
+
+    gw = int(iface.ip) if int(iface.ip) != network else network + 1
+
+    lo, hi = network + 2, bcast - 1          # usable minus net and gateway
+    if hi < lo:                              # /31, /32 — degenerate
+        lo, hi = network, bcast
+    ps, pe = network + 100, network + 200
+    if not (lo <= ps <= hi and lo <= pe <= hi):
+        ps, pe = lo, hi
+
+    q = lambda n: ip_str(int_to_ip(n))       # noqa: E731
+    return {
+        "network": q(network),
+        "netmask": str(net.netmask),
+        "gateway": q(gw),
+        "pool_start": q(ps),
+        "pool_end": q(pe),
+    }
+
+
 class NetStack:
     """One host's L2/L3.  Bound to a Station for egress."""
 

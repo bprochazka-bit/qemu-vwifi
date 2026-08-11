@@ -35,7 +35,13 @@ class DHCPServer:
                            else bytes(base[:3] + [100]))
         self.pool_end = (netstack.ip_bytes(pool_end) if pool_end
                          else bytes(base[:3] + [200]))
-        self._next = self.pool_start[3]
+        # Integer pool so a scope can span octet boundaries (any prefix,
+        # not just /24), and skip the server's own and the gateway address.
+        self._pool_lo = netstack.ip_to_int(self.pool_start)
+        self._pool_hi = netstack.ip_to_int(self.pool_end)
+        self._next = self._pool_lo
+        self._reserved = {netstack.ip_to_int(self.server_ip),
+                          netstack.ip_to_int(self.gateway)}
         self.leases = {}                       # mac -> ip_bytes
         stack.register_udp(dhcp.DHCP_SERVER_PORT, self._on_udp)
 
@@ -43,12 +49,15 @@ class DHCPServer:
     def _allocate(self, mac):
         if mac in self.leases:
             return self.leases[mac]
-        if self._next > self.pool_end[3]:
-            return None                         # pool exhausted
-        ip = bytes(self.pool_start[:3] + bytes([self._next]))
-        self._next += 1
-        self.leases[mac] = ip
-        return ip
+        while self._next <= self._pool_hi:
+            n = self._next
+            self._next += 1
+            if n in self._reserved:
+                continue
+            ip = netstack.int_to_ip(n)
+            self.leases[mac] = ip
+            return ip
+        return None                             # pool exhausted
 
     # -- ingress -----------------------------------------------------------
     def _on_udp(self, src_ip, src_port, dst_ip, dst_port, payload):

@@ -23,6 +23,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from vwifi_pseudohost.accesspoint import PseudoAP                 # noqa: E402
+from vwifi_pseudohost.netstack import parse_cidr                  # noqa: E402
 from vwifi_pseudohost.mdns import Advert, MDNSResponder            # noqa: E402
 from vwifi_pseudohost.netservices import (                        # noqa: E402
     LPDService, HTTPService, NASHTTPService, SMBService)
@@ -70,9 +71,15 @@ def build_parser():
                    help="BSSID, e.g. 02:11:22:33:44:00 (default: random)")
     p.add_argument("--node-id", default=None,
                    help="name shown to the hub (default: auto)")
-    p.add_argument("--gateway", default="192.168.4.1",
-                   help="the AP's own IPv4 address / default gateway")
-    p.add_argument("--netmask", default="255.255.255.0")
+    p.add_argument("--subnet", default=None,
+                   help="DHCP scope in CIDR, e.g. 10.10.10.0/24 — sets the "
+                        "gateway, netmask and pool in one go (10.10.10.1/24 "
+                        "picks the gateway explicitly). Individual --gateway "
+                        "/ --netmask / --pool-* override it.")
+    p.add_argument("--gateway", default=None,
+                   help="the AP's own IPv4 address / default gateway "
+                        "(default: 192.168.4.1, or .1 of --subnet)")
+    p.add_argument("--netmask", default=None)
     p.add_argument("--pool-start", default=None,
                    help="first DHCP pool address (default: .100)")
     p.add_argument("--pool-end", default=None,
@@ -104,13 +111,26 @@ def main(argv=None):
         if not args.quiet:
             print(msg, file=sys.stderr, flush=True)
 
-    base = args.gateway.rsplit(".", 1)[0]
-    pool = (args.pool_start or base + ".100", args.pool_end or base + ".200")
+    # Addressing: a --subnet CIDR sets gateway/netmask/pool; individual
+    # flags override whichever fields they name.
+    plan = {"gateway": "192.168.4.1", "netmask": "255.255.255.0",
+            "pool_start": None, "pool_end": None}
+    if args.subnet:
+        try:
+            plan = parse_cidr(args.subnet)
+        except ValueError as e:
+            print("bad --subnet %r: %s" % (args.subnet, e), file=sys.stderr)
+            return 2
+    gateway = args.gateway or plan["gateway"]
+    netmask = args.netmask or plan["netmask"]
+    base = gateway.rsplit(".", 1)[0]
+    pool = (args.pool_start or plan.get("pool_start") or base + ".100",
+            args.pool_end or plan.get("pool_end") or base + ".200")
 
     ap = PseudoAP(args.sock, args.essid, channel=args.channel,
                   encryption=args.encryption, passphrase=args.passphrase,
                   bssid=args.bssid, node_id=args.node_id,
-                  gateway_ip=args.gateway, netmask=args.netmask, pool=pool,
+                  gateway_ip=gateway, netmask=netmask, pool=pool,
                   dns=args.dns, services=services, log=log)
 
     def _sig(_s, _f):

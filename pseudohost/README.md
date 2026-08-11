@@ -192,7 +192,19 @@ ESSID, a channel, an encryption type and optionally a BSSID:
 
 ./pseudoap --sock /tmp/vwifi.sock --essid Office --channel 11 \
            --encryption open --services lpd,nas
+
+# DHCP scope as CIDR — sets gateway, netmask and pool in one flag:
+./pseudoap --sock /tmp/vwifi.sock --essid Lab --channel 6 \
+           --encryption open --subnet 10.10.10.0/24
 ```
+
+`--subnet` accepts CIDR (`10.10.10.0/24`); the gateway defaults to the
+first address (`.1`) and the pool to the `.100`–`.200` window, or the
+whole usable range on a subnet too small for it. Write host bits to pin
+the gateway (`10.10.10.254/24`), and `--gateway` / `--netmask` /
+`--pool-start` / `--pool-end` still override any field individually. The
+DHCP server allocates across the whole scope — any prefix, not just /24 —
+and never hands out the gateway or its own address.
 
 It beacons and answers probes, runs open-system Auth/Assoc, drives the
 **Authenticator** side of the WPA2-PSK four-way handshake per station
