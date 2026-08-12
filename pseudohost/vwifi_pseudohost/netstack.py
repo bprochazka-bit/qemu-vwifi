@@ -110,6 +110,7 @@ class NetStack:
         self.arp_cache = {}                    # ip_bytes -> (mac, expiry)
         self._udp_handlers = {}                # dst_port -> callback
         self._tcp = None                       # optional TCPStack
+        self._forward = None                   # optional off-subnet handler
         self._icmp_enabled = True
         # Default IPv4 TTL — a cheap but effective OS fingerprint.  A
         # device profile overrides it (Linux 64, Windows 128, many
@@ -138,6 +139,18 @@ class NetStack:
     def attach_tcp(self, tcp_stack):
         """Attach a TCPStack; TCP segments for us are handed to it."""
         self._tcp = tcp_stack
+
+    def set_forward_handler(self, fn):
+        """Route packets that are *not* for this host to fn instead of
+        dropping them.  fn(src_ip, dst_ip, proto, transport_body) — this is
+        the hook the AP's NAT uses to masquerade a station's off-subnet
+        traffic out to the real host network.  None restores endpoint-only
+        behaviour (silently drop anything not addressed to us)."""
+        self._forward = fn
+
+    def same_subnet(self, ip):
+        """True if ip is on this host's directly-connected subnet."""
+        return self._same_subnet(ip_bytes(ip))
 
     # ---- egress ----------------------------------------------------------
     def send_eth(self, dst_mac, ethertype, payload):
@@ -266,7 +279,9 @@ class NetStack:
         body = p[ihl:]
         if self.ip and dst != self.ip and dst != b"\xff\xff\xff\xff" \
                 and (dst[0] & 0xF0) != 0xE0:
-            return                                     # not for us
+            if self._forward is not None:              # NAT / router path
+                self._forward(src, dst, proto, body)
+            return                                     # not our address
         if proto == IPPROTO_ICMP:
             self._on_icmp(src, dst, body)
         elif proto == IPPROTO_UDP:

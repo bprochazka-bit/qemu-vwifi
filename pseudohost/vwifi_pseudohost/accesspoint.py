@@ -13,7 +13,10 @@
 #     per station (authenticator.py) and installs per-station CCMP keys;
 #   - is the DS: it terminates IP for its own gateway address (ARP, ICMP,
 #     a DHCP *server*, and any TCP/UDP services), and bridges frames
-#     between associated stations.
+#     between associated stations;
+#   - by default NATs a station's off-subnet traffic out to the real host
+#     network (nat.py), so an associated station reaches the actual
+#     internet the way it would through a home router.
 #
 # It reuses the same crypto, 802.11 and medium code the station side
 # uses, so a pseudo-host and a pseudo-AP interoperate for real — see
@@ -28,6 +31,7 @@ from . import crypto
 from .authenticator import Authenticator
 from .dhcp_server import DHCPServer
 from .medium import MediumClient
+from .nat import NAT
 from .netstack import NetStack
 from .services import ServiceRegistry
 from .supplicant import HandshakeError
@@ -76,7 +80,8 @@ class PseudoAP:
                  passphrase=None, bssid=None, node_id=None,
                  gateway_ip="192.168.4.1", netmask="255.255.255.0",
                  pool=("192.168.4.100", "192.168.4.200"), dns=None,
-                 services=(), log=None, verbose=False):
+                 services=(), log=None, verbose=False,
+                 nat=True, nat_bind_ip=None):
         self.sock_path = sock_path
         self.essid = essid.encode() if isinstance(essid, str) else bytes(essid)
         self.channel = channel
@@ -113,6 +118,13 @@ class PseudoAP:
         self.registry = ServiceRegistry(self)
         self._service_specs = list(services)
 
+        # NAT: masquerade stations' off-subnet traffic out to the real host.
+        # On by default — a station associated to this AP gets real network
+        # access, like a home router; nat_bind_ip pins the host source IP.
+        self.nat = (NAT(self.stack, bind_ip=nat_bind_ip, log=self._slog,
+                        verbose=verbose)
+                    if nat else None)
+
         self.stations = {}
         self._next_aid = 1
         self.seq = dot11.SeqCounter()
@@ -132,10 +144,12 @@ class PseudoAP:
         self.client.connect()
         self.client.send_hello()
         self.client.set_channel(self.freq)
-        self._slog("beaconing '%s' on ch %d (%s) bssid=%s" % (
+        self._slog("beaconing '%s' on ch %d (%s) bssid=%s%s" % (
             self.essid.decode(errors="replace"), self.channel,
             self.encryption if self.secured else "open",
-            dot11.mac_str(self.bssid)))
+            dot11.mac_str(self.bssid),
+            (" nat->%s" % (self.nat.bind_ip or "host default"))
+            if self.nat else ""))
         for svc in self._service_specs:
             self.registry.add(svc)
         self._running = True
@@ -152,24 +166,37 @@ class PseudoAP:
                 self._send_beacon()
                 self._last_beacon = now
             self.registry.tick()
+            if self.nat:
+                self.nat.tick()
 
     def stop(self):
         self._running = False
 
     def close(self):
+        if self.nat:
+            self.nat.close()
         self.client.close()
 
     def _pump(self, timeout):
         import select
-        r, _, _ = select.select([self.client], [], [], timeout)
-        if not r:
-            return
-        try:
-            for rx in self.client.recv_frames():
-                self._on_rx(rx)
-        except ConnectionError as e:
-            self._slog("medium: %s" % e)
-            self._running = False
+        rl = [self.client]
+        wl = []
+        if self.nat:
+            rl += self.nat.rlist()
+            wl += self.nat.wlist()
+        r, w, _ = select.select(rl, wl, [], timeout)
+        for s in w:
+            self.nat.handle_writable(s)
+        for s in r:
+            if s is self.client:
+                try:
+                    for rx in self.client.recv_frames():
+                        self._on_rx(rx)
+                except ConnectionError as e:
+                    self._slog("medium: %s" % e)
+                    self._running = False
+            elif self.nat:
+                self.nat.handle_readable(s)
 
     # ---- beacon ---------------------------------------------------------
     def _send_beacon(self):
