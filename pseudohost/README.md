@@ -162,12 +162,22 @@ to the host's print sink:
 The sink records the exact bytes and sniffs a file extension (PDF/PS/PCL/
 XPS); it never renders — a simulator captures what was sent.
 
-Adding a printer on Windows via **Add a printer → TCP/IP address** works
-because the profile runs a small **SNMP agent** (`snmp.py`, UDP 161): the
-Standard-TCP/IP-Port wizard SNMP-walks the device to identify it, and the
-agent answers the system group, the Host Resources device table (marking
-it a printer, Idle) and the Printer-MIB name, so Windows recognises the
-model and finishes the port as raw:9100.
+Three discovery/print paths are covered, matching how a real HP OfficeJet
+behaves on the wire:
+
+- **IPP Everywhere** (`ipp.py`, TCP 631) — the modern driverless path
+  (Windows 10+/macOS/CUPS). The device is advertised over mDNS
+  `_ipp._tcp` with the full IPP-Everywhere TXT record, and the IPP server
+  answers `Get-Printer-Attributes` (so the client adds it with no driver)
+  and `Print-Job` / `Create-Job`+`Send-Document` (handling chunked
+  bodies and `Expect: 100-continue`), landing the document in the sink.
+- **SNMP** (`snmp.py`, UDP 161) — the "Standard TCP/IP Port" wizard
+  SNMP-walks the device; the agent answers the system group, the Host
+  Resources device table (a printer, Idle) and the Printer-MIB name.
+- **Raw JetDirect** (TCP 9100) — the lowest-common-denominator that
+  always prints.
+
+WSD (`wsd.py`) is also served for older Windows discovery.
 
 Their richer protocols (Cast/TLS 8009, IPP, eSCL, SNMP, MQTTS 8883,
 FTPS 990, the UPnP description HTTP) are advertised as ports now and
@@ -310,6 +320,7 @@ pseudohost/
     ssdp.py           SSDP / UPnP discovery responder
     wsd.py            WS-Discovery + metadata + WSD Print (Windows)
     printing.py       print sink (file/null) + raw JetDirect (9100)
+    ipp.py            IPP Everywhere server (driverless add + print, 631)
     snmp.py           minimal SNMP agent (printer identity, UDP 161)
     services.py       Service / UDPService / TCPService base + registry
     netservices.py    LPD, HTTP, NAS/SMB (TCP-backed services)

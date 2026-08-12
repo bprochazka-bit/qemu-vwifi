@@ -13,15 +13,16 @@
 from ..host import PseudoHost
 from ..services import Service
 from ..printing import JetDirectService
+from ..ipp import IPPService
 from ..snmp import SNMPAgent
 from ..wsd import WSDiscoveryService, WSDHttpService
 
 
 class PrinterService(Service):
-    """The TCP port surface of a print server (SNMP is its own agent)."""
+    """The TCP port surface of a print server (SNMP/IPP/9100 own theirs)."""
 
     name = "printer"
-    tcp_ports = (515, 631, 9100)           # LPD, IPP, raw JetDirect
+    tcp_ports = (515,)                     # LPD (advertisement)
 
 
 class NetworkPrinter(PseudoHost):
@@ -33,8 +34,8 @@ class NetworkPrinter(PseudoHost):
     wsd_manufacturer = "HP"
     wsd_model = "HP LaserJet"
     wsd_model_number = "PH01"
-    # WSD makes it discoverable by stock Windows (Network / Add a printer);
-    # SNMP lets the "Standard TCP/IP Port" wizard identify it; JetDirect/
-    # 9100 is the raw path that always prints.
-    services = [PrinterService, JetDirectService, SNMPAgent,
+    # IPP (631) is the modern driverless add+print path (mDNS _ipp._tcp);
+    # WSD makes it discoverable by older Windows; SNMP lets the "Standard
+    # TCP/IP Port" wizard identify it; JetDirect/9100 always prints raw.
+    services = [PrinterService, IPPService, JetDirectService, SNMPAgent,
                 WSDiscoveryService, WSDHttpService]

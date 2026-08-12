@@ -23,6 +23,7 @@ from ..host import PseudoHost
 from ..mdns import Advert, MDNSResponder
 from ..services import Service
 from ..printing import JetDirectService
+from ..ipp import IPPService
 from ..snmp import SNMPAgent
 from ..wsd import WSDiscoveryService, WSDHttpService
 
@@ -38,19 +39,31 @@ class MFPPortsService(Service):
     services and SNMP (UDP 161) by the SNMP agent, so nothing clashes.
     """
     name = "hp-mfp"
-    tcp_ports = (80, 443, 515, 631, 9100, 8080, 8290)  # web, LPD, IPP, scan
+    tcp_ports = (80, 443, 515, 8080, 8290)     # web, LPD, scan (IPP/9100 own theirs)
 
 
 def _mfp_adverts(host):
     """IPP + scanner + web mDNS adverts for the multifunction."""
     inst = host.hostname                        # e.g. "HP-OfficeJet-PH01"
     common_ty = ("ty=" + HP_MODEL).encode()
+    from ..wsd import uuid_from_mac
+    uuid = uuid_from_mac(host.mac).split(":")[-1].encode()
+    # The TXT set Windows / macOS / CUPS read for IPP-Everywhere driverless
+    # add: txtvers/qtotal/rp/ty/product/pdl/URF/UUID plus the capability
+    # hints.  Modelled on a real HP OfficeJet's _ipp._tcp record.
     ipp_txt = [
+        b"txtvers=1", b"qtotal=1",
         b"rp=ipp/print",
         common_ty,
-        b"pdl=application/pdf,image/urf,image/jpeg",
-        b"URF=CP1,PQ4-5,RS300-600,SRGB24,V1.4,W8,DM1",
+        ("product=(%s)" % HP_MODEL).encode(),
+        b"pdl=application/pdf,image/urf,image/pwg-raster,image/jpeg",
+        b"URF=CP1,PQ4-5,RS300-600,SRGB24,W8,V1.4,DM1",
+        b"UUID=" + uuid,
+        b"adminurl=http://" + host.hostname.encode() + b".local./",
+        b"priority=50",
         b"Color=T", b"Duplex=T", b"Scan=T", b"Fax=T",
+        b"mopria-certified=1.3",
+        b"kind=document,envelope,photo",
         b"note=Front Office",
     ]
     scan_txt = [
@@ -89,5 +102,5 @@ class HPMultifunction(PseudoHost):
     # WSD is what stock Windows uses for "Network" and "Add a printer";
     # mDNS covers macOS / IPP-Everywhere clients; JetDirect/9100 is the
     # raw path that always prints.
-    services = [MFPPortsService, _mfp_mdns, JetDirectService, SNMPAgent,
-                WSDiscoveryService, WSDHttpService]
+    services = [MFPPortsService, _mfp_mdns, IPPService, JetDirectService,
+                SNMPAgent, WSDiscoveryService, WSDHttpService]
