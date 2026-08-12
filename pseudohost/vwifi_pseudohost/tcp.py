@@ -39,6 +39,14 @@ FIN_WAIT_1 = "FIN_WAIT_1"
 CLOSED = "CLOSED"
 
 WINDOW = 64240
+# We never fragment IP (DF is set) and advertise no MSS option, so every
+# outbound segment must fit a single link frame on its own: keep the
+# payload comfortably under a 1500-byte MTU (1400 + 20 TCP + 20 IP = 1440).
+# A response larger than this (e.g. WSD device metadata, an IPP attribute
+# set) is split across several segments; without this a client such as
+# Windows' WSDAPI silently drops the oversized packet and the exchange
+# looks like it "completed" while the peer got nothing usable.
+MSS = 1400
 
 
 def _u32(x):
@@ -78,13 +86,25 @@ class TCPConn:
                            src_ip=self.local_ip)
 
     def send(self, data):
-        """Send application data to the peer."""
+        """Send application data to the peer, split into MSS-sized segments.
+
+        The medium is lossless and in-order, so we can stream the segments
+        back to back with no retransmit timer; PSH is set only on the last
+        one.  Splitting is mandatory, not an optimisation: an oversized
+        single segment would need IP fragmentation we do not do, and the
+        peer drops it.
+        """
         if self.state not in (ESTABLISHED, CLOSE_WAIT):
             return
         if not data:
             return
-        self._segment(PSH | ACK, data)
-        self.snd_nxt = _u32(self.snd_nxt + len(data))
+        off, n = 0, len(data)
+        while off < n:
+            chunk = data[off:off + MSS]
+            off += len(chunk)
+            flags = ACK | (PSH if off >= n else 0)
+            self._segment(flags, chunk)
+            self.snd_nxt = _u32(self.snd_nxt + len(chunk))
 
     def close(self):
         if self.state in (ESTABLISHED,):

@@ -10,7 +10,12 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.dirname(__file__))
 
+import struct                                           # noqa: E402
+
 from tcp_client import ServerHost, ClientSim          # noqa: E402
+from vwifi_pseudohost import netstack                   # noqa: E402
+from vwifi_pseudohost import ieee80211 as dot11         # noqa: E402
+from vwifi_pseudohost import tcp                         # noqa: E402
 from vwifi_pseudohost.services import TCPService       # noqa: E402
 from vwifi_pseudohost.netservices import (              # noqa: E402
     LPDService, HTTPService)
@@ -33,6 +38,17 @@ class BannerTCP(TCPService):
 
     def on_connect(self, conn):
         conn.send(b"HELLO FROM PSEUDOHOST\r\n")
+
+
+class BigTCP(TCPService):
+    """Sends one payload larger than the MSS in a single send() call."""
+
+    name = "big"
+    tcp_ports = (1234,)
+    PAYLOAD = bytes((i * 7) & 0xFF for i in range(5000))
+
+    def on_connect(self, conn):
+        conn.send(self.PAYLOAD)
 
 
 class TestTCP(unittest.TestCase):
@@ -64,6 +80,33 @@ class TestTCP(unittest.TestCase):
         self.assertEqual(c.recv(), b"one ")
         c.send(b"two")
         self.assertEqual(c.recv(), b"two")
+
+    def test_large_response_is_segmented_to_mss(self):
+        # A response bigger than the MSS must go out as several segments,
+        # each small enough to fit one un-fragmented link frame, and the
+        # client must reassemble the exact bytes.  Regression: a single
+        # oversized segment is silently dropped by real peers (WSDAPI).
+        srv = self._server(BigTCP, 1234)
+        c = ClientSim(srv, dport=1234)
+        self.assertTrue(c.connect())
+        got = c.recv()
+        self.assertEqual(got, BigTCP.PAYLOAD)
+
+        # Inspect the raw egress: every data segment's IP packet must be
+        # within a 1500-byte MTU, and it must have taken more than one.
+        data_segs = 0
+        for _dst, et, sdu in srv.station.sent:
+            if et != dot11.ETH_P_IP or sdu[9] != netstack.IPPROTO_TCP:
+                continue
+            ihl = (sdu[0] & 0x0F) * 4
+            seg = sdu[ihl:]
+            off_flags = struct.unpack_from(">H", seg, 12)[0]
+            payload = seg[(off_flags >> 12) * 4:]
+            if payload:
+                data_segs += 1
+                self.assertLessEqual(len(sdu), 1500, "IP packet exceeds MTU")
+                self.assertLessEqual(len(payload), tcp.MSS)
+        self.assertGreater(data_segs, 1, "payload was not segmented")
 
     def test_connection_to_closed_port_resets(self):
         srv = self._server(EchoTCP, 7)
