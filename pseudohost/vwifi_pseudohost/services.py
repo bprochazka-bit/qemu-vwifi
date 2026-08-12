@@ -81,6 +81,28 @@ class Service:
         if self.host:
             self.host.log("svc[%s]: %s" % (self.name, msg))
 
+    def dump(self, label, data):
+        """Log a raw payload verbatim, but only under -v (verbose).
+
+        Wire diagnostics: printable text (SOAP/HTTP) is shown as-is with a
+        line prefix; anything binary falls back to a hex preview.  Silent
+        unless the host was started verbose, so normal runs stay quiet.
+        """
+        if not self.host or not getattr(self.host, "verbose", False):
+            return
+        if isinstance(data, (bytes, bytearray)):
+            printable = sum(9 <= b <= 13 or 32 <= b <= 126 for b in data)
+            if data and printable / len(data) > 0.85:
+                body = bytes(data).decode("latin1")
+            else:
+                body = " ".join("%02x" % b for b in data[:256])
+                if len(data) > 256:
+                    body += " ... (%d bytes)" % len(data)
+        else:
+            body = str(data)
+        text = "\n".join("  | " + ln for ln in body.split("\n"))
+        self.log("%s (%d bytes):\n%s" % (label, len(data), text))
+
 
 class TCPService(Service):
     """A service that actually accepts TCP connections.

@@ -190,6 +190,8 @@ class WSDiscoveryService(Service):
         action = _find(text, "Action")
         if action is None:
             return
+        self.dump("WSD %s from %s" % (action.rsplit("/", 1)[-1], _ip(src_ip)),
+                  payload)
         msg_id = _find(text, "MessageID") or ""
         if action.endswith("/Probe"):
             self._probe_match(src_ip, src_port, text, msg_id)
@@ -276,11 +278,13 @@ class WSDHttpService(TCPService):
             conn.data["need"] = head_end + 4 + (int(m.group(1)) if m else 0)
         if len(buf) < conn.data["need"]:
             return                              # wait for the whole body
+        self.dump("WSD-HTTP request", bytes(buf))
         resp = self._dispatch(bytes(buf), head_end)
         http = (b"HTTP/1.1 200 OK\r\n"
                 b"Content-Type: application/soap+xml; charset=utf-8\r\n"
                 b"Content-Length: " + str(len(resp)).encode() + b"\r\n"
                 b"Connection: close\r\n\r\n" + resp)
+        self.dump("WSD-HTTP response", http)
         conn.send(http)
         conn.close()
 
