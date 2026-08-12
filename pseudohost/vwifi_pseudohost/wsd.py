@@ -40,6 +40,10 @@ NS_WSD = "http://schemas.xmlsoap.org/ws/2005/04/discovery"
 NS_WSDP = "http://schemas.xmlsoap.org/ws/2006/02/devprof"
 NS_WPRT = "http://schemas.microsoft.com/windows/2006/08/wdp/print"
 NS_TRANSFER = "http://schemas.xmlsoap.org/ws/2004/09/transfer"
+# WS-MetadataExchange: the Metadata / MetadataSection wrapper elements a
+# WS-Transfer Get returns live in *this* namespace, not devprof.  Windows
+# silently drops a device whose metadata wrapper is mis-namespaced.
+NS_MEX = "http://schemas.xmlsoap.org/ws/2004/09/mex"
 
 A_HELLO = NS_WSD + "/Hello"
 A_BYE = NS_WSD + "/Bye"
@@ -97,10 +101,10 @@ def _envelope(header, body):
         '<?xml version="1.0" encoding="utf-8"?>'
         '<soap:Envelope'
         ' xmlns:soap="%s" xmlns:wsa="%s" xmlns:wsd="%s"'
-        ' xmlns:wsdp="%s" xmlns:wprt="%s">'
+        ' xmlns:wsdp="%s" xmlns:wprt="%s" xmlns:mex="%s">'
         '<soap:Header>%s</soap:Header>'
         '<soap:Body>%s</soap:Body></soap:Envelope>'
-        % (NS_SOAP, NS_WSA, NS_WSD, NS_WSDP, NS_WPRT, header, body)
+        % (NS_SOAP, NS_WSA, NS_WSD, NS_WSDP, NS_WPRT, NS_MEX, header, body)
     ).encode("utf-8")
 
 
@@ -333,23 +337,27 @@ class WSDHttpService(TCPService):
             '<wsdp:Relationship Type="%s/host">'
             '<wsdp:Host><wsa:EndpointReference><wsa:Address>%s</wsa:Address>'
             '</wsa:EndpointReference>'
-            '<wsdp:Types>wprt:PrintDeviceType</wsdp:Types></wsdp:Host>'
+            '<wsdp:Types>%s</wsdp:Types></wsdp:Host>'
             '<wsdp:Hosted><wsa:EndpointReference><wsa:Address>%s</wsa:Address>'
             '</wsa:EndpointReference>'
             '<wsdp:Types>wprt:PrintDeviceType</wsdp:Types>'
             '<wsdp:ServiceId>%s</wsdp:ServiceId></wsdp:Hosted>'
             '</wsdp:Relationship>'
-            % (NS_WSDP, dev.uuid, dev.xaddr(), dev.print_svc_uuid()))
+            % (NS_WSDP, dev.uuid, DEVICE_TYPES, dev.xaddr(),
+               dev.print_svc_uuid()))
+        # The Metadata / MetadataSection wrapper elements are WS-Metadata-
+        # Exchange (mex:), not devprof: Windows parses the sections by that
+        # namespace and drops the device if the wrapper is mis-namespaced.
         sections = (
-            '<wsdp:MetadataSection Dialect="%s/ThisModel">%s'
-            '</wsdp:MetadataSection>'
-            '<wsdp:MetadataSection Dialect="%s/ThisDevice">%s'
-            '</wsdp:MetadataSection>'
-            '<wsdp:MetadataSection Dialect="%s/Relationship">%s'
-            '</wsdp:MetadataSection>'
+            '<mex:MetadataSection Dialect="%s/ThisModel">%s'
+            '</mex:MetadataSection>'
+            '<mex:MetadataSection Dialect="%s/ThisDevice">%s'
+            '</mex:MetadataSection>'
+            '<mex:MetadataSection Dialect="%s/Relationship">%s'
+            '</mex:MetadataSection>'
             % (NS_WSDP, this_model, NS_WSDP, this_device,
                NS_WSDP, relationship))
-        body = '<wsdp:Metadata>%s</wsdp:Metadata>' % sections
+        body = '<mex:Metadata>%s</mex:Metadata>' % sections
         hdr = _hdr(A_GETRESPONSE, _new_msgid(), relates_to=relates_to,
                    to=NS_WSA + "/role/anonymous")
         return _envelope(hdr, body)

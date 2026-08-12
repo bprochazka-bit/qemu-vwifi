@@ -97,6 +97,14 @@ class TestWSDMetadata(unittest.TestCase):
         self.assertIn("HP-OfficeJet-Den", text)                   # friendly
         self.assertIn("PrintDeviceType", text)                   # hosted svc
         self.assertIn("urn:uuid:get-1", text)                     # RelatesTo
+        # The metadata wrapper MUST be WS-MetadataExchange (mex:), not
+        # devprof: Windows drops the device from the Network folder if the
+        # Metadata / MetadataSection elements are mis-namespaced.
+        self.assertIn('xmlns:mex="http://schemas.xmlsoap.org/ws/2004/09/mex"',
+                      text)
+        self.assertIn("<mex:Metadata>", text)
+        self.assertIn("mex:MetadataSection", text)
+        self.assertNotIn("<wsdp:Metadata>", text)
 
 
 if __name__ == "__main__":
