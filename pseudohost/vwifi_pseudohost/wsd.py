@@ -44,6 +44,11 @@ NS_TRANSFER = "http://schemas.xmlsoap.org/ws/2004/09/transfer"
 # WS-Transfer Get returns live in *this* namespace, not devprof.  Windows
 # silently drops a device whose metadata wrapper is mis-namespaced.
 NS_MEX = "http://schemas.xmlsoap.org/ws/2004/09/mex"
+# PnP-X (Plug and Play Extensions).  Function Discovery uses the
+# <pnpx:DeviceCategory> in ThisModel to categorise a WSD device and
+# publish it into the Explorer "Network" folder; a device metadata with
+# no PnP-X category is parsed but never rendered as a device tile.
+NS_PNPX = "http://schemas.microsoft.com/windows/pnpx/2005/10"
 
 A_HELLO = NS_WSD + "/Hello"
 A_BYE = NS_WSD + "/Bye"
@@ -101,10 +106,11 @@ def _envelope(header, body):
         '<?xml version="1.0" encoding="utf-8"?>'
         '<soap:Envelope'
         ' xmlns:soap="%s" xmlns:wsa="%s" xmlns:wsd="%s"'
-        ' xmlns:wsdp="%s" xmlns:wprt="%s" xmlns:mex="%s">'
+        ' xmlns:wsdp="%s" xmlns:wprt="%s" xmlns:mex="%s" xmlns:pnpx="%s">'
         '<soap:Header>%s</soap:Header>'
         '<soap:Body>%s</soap:Body></soap:Envelope>'
-        % (NS_SOAP, NS_WSA, NS_WSD, NS_WSDP, NS_WPRT, NS_MEX, header, body)
+        % (NS_SOAP, NS_WSA, NS_WSD, NS_WSDP, NS_WPRT, NS_MEX, NS_PNPX,
+           header, body)
     ).encode("utf-8")
 
 
@@ -126,6 +132,9 @@ class WSDDevice:
         self.manufacturer = getattr(host, "wsd_manufacturer", "PseudoHost")
         self.model = getattr(host, "wsd_model", self.friendly)
         self.model_number = getattr(host, "wsd_model_number", "1.0")
+        # PnP-X device category (space-delimited list); this is what puts
+        # the device under the right heading in Explorer's Network folder.
+        self.pnpx_category = getattr(host, "pnpx_category", "Printers")
         self.instance = 1
 
     def xaddr(self):
@@ -317,13 +326,19 @@ class WSDHttpService(TCPService):
     def _metadata(self, relates_to):
         dev = WSDDevice(self.host)
         ip = _ip(self.host.stack.ip or bytes(4))
+        # <pnpx:DeviceCategory> is the PnP-X extension that categorises the
+        # device for the Network folder; without it Windows renders no tile.
         this_model = (
             '<wsdp:ThisModel><wsdp:Manufacturer>%s</wsdp:Manufacturer>'
+            '<wsdp:ManufacturerUrl>http://%s/</wsdp:ManufacturerUrl>'
             '<wsdp:ModelName>%s</wsdp:ModelName>'
             '<wsdp:ModelNumber>%s</wsdp:ModelNumber>'
+            '<wsdp:ModelUrl>http://%s/</wsdp:ModelUrl>'
             '<wsdp:PresentationUrl>http://%s/</wsdp:PresentationUrl>'
+            '<pnpx:DeviceCategory>%s</pnpx:DeviceCategory>'
             '</wsdp:ThisModel>'
-            % (dev.manufacturer, dev.model, dev.model_number, ip))
+            % (dev.manufacturer, ip, dev.model, dev.model_number, ip, ip,
+               dev.pnpx_category))
         this_device = (
             '<wsdp:ThisDevice><wsdp:FriendlyName>%s</wsdp:FriendlyName>'
             '<wsdp:FirmwareVersion>1.0</wsdp:FirmwareVersion>'

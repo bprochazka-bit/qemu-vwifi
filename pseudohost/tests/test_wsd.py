@@ -105,6 +105,12 @@ class TestWSDMetadata(unittest.TestCase):
         self.assertIn("<mex:Metadata>", text)
         self.assertIn("mex:MetadataSection", text)
         self.assertNotIn("<wsdp:Metadata>", text)
+        # PnP-X DeviceCategory: without it Windows parses the metadata but
+        # never publishes the device into the Explorer "Network" folder.
+        self.assertIn('xmlns:pnpx="http://schemas.microsoft.com/windows/'
+                      'pnpx/2005/10"', text)
+        self.assertIn("<pnpx:DeviceCategory>Printers</pnpx:DeviceCategory>",
+                      text)
 
 
 if __name__ == "__main__":
