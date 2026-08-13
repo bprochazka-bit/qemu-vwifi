@@ -26,6 +26,7 @@
 # and Windows is lenient about namespace prefixes on the wire.
 #
 import re
+import time
 
 from .services import Service, TCPService
 
@@ -67,6 +68,13 @@ A_ADDDOC_RESP = NS_WPRT + "/AddDocumentResponse"
 TO_DISCOVERY = "urn:schemas-xmlsoap-org:ws:2005:04:discovery"
 # The device advertises itself as a WSD Device that is a print device.
 DEVICE_TYPES = "wsdp:Device wprt:PrintDeviceType"
+# The hosted print SERVICE inside the device is a different WSD type from
+# the device itself: the device is wprt:PrintDeviceType, the service that
+# hosts the print operations is wprt:PrinterServiceType. Windows keys the
+# print functionality off the hosted PrinterServiceType, so getting this
+# wrong (naming the service PrintDeviceType) leaves the device fetched but
+# never turned into a usable printer — Windows re-probes it in a loop.
+PRINT_SERVICE_TYPES = "wprt:PrinterServiceType"
 
 
 def uuid_from_mac(mac):
@@ -135,7 +143,13 @@ class WSDDevice:
         # PnP-X device category (space-delimited list); this is what puts
         # the device under the right heading in Explorer's Network folder.
         self.pnpx_category = getattr(host, "pnpx_category", "Printers")
-        self.instance = 1
+        # WS-Discovery AppSequence InstanceId: MUST change each time the
+        # device (re)starts so a client discards state cached under a prior
+        # instance. A constant "1" means Windows treats every restart as the
+        # same boot and can keep serving a stale/rejected metadata version
+        # from its cache forever — fatal when iterating on the metadata. A
+        # start-time epoch is monotonic across restarts and fits the field.
+        self.instance = int(time.time())
 
     def xaddr(self):
         ip = ".".join(str(x) for x in (self.host.stack.ip or bytes(4)))
@@ -359,11 +373,11 @@ class WSDHttpService(TCPService):
             '<wsdp:Types>%s</wsdp:Types></wsdp:Host>'
             '<wsdp:Hosted><wsa:EndpointReference><wsa:Address>%s</wsa:Address>'
             '</wsa:EndpointReference>'
-            '<wsdp:Types>wprt:PrintDeviceType</wsdp:Types>'
+            '<wsdp:Types>%s</wsdp:Types>'
             '<wsdp:ServiceId>%s</wsdp:ServiceId></wsdp:Hosted>'
             '</wsdp:Relationship>'
             % (NS_WSDP, dev.uuid, DEVICE_TYPES, dev.xaddr(),
-               dev.print_svc_uuid()))
+               PRINT_SERVICE_TYPES, dev.print_svc_uuid()))
         # The Metadata / MetadataSection wrapper elements are WS-Metadata-
         # Exchange (mex:), not devprof: Windows parses the sections by that
         # namespace and drops the device if the wrapper is mis-namespaced.

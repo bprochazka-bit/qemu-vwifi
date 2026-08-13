@@ -49,6 +49,20 @@ class TestWSDiscovery(unittest.TestCase):
         self.assertIn("10.1.2.100:5357", text)                    # XAddrs
         self.assertIn("urn:uuid:probe-0001", text)                # RelatesTo
 
+    def test_appsequence_instance_id_is_per_boot(self):
+        # A constant InstanceId lets Windows keep stale metadata cached
+        # across restarts; it must reflect the boot (a time epoch here).
+        _h, svc = self._svc()
+        self.assertGreater(svc.dev.instance, 1)
+        import re as _re
+        h2, svc2 = self._svc()
+        deliver_udp(h2, "10.1.2.5", 50000, wsd.WSD_PORT, PROBE,
+                    src_mac="02:00:00:00:00:05")
+        text = _last_udp_payload(h2.station).decode()
+        m = _re.search(r'InstanceId="(\d+)"', text)
+        self.assertIsNotNone(m)
+        self.assertGreater(int(m.group(1)), 1)
+
     def test_probe_wrong_type_ignored(self):
         h, svc = self._svc()
         probe = PROBE.replace(b"wprt:PrintDeviceType", b"foo:SomethingElse")
@@ -95,7 +109,13 @@ class TestWSDMetadata(unittest.TestCase):
         self.assertIn("HP OfficeJet Pro 9015", text)              # model
         self.assertIn("<wsdp:Manufacturer>HP</wsdp:Manufacturer>", text)
         self.assertIn("HP-OfficeJet-Den", text)                   # friendly
-        self.assertIn("PrintDeviceType", text)                   # hosted svc
+        # The device is a wprt:PrintDeviceType; the hosted print service it
+        # contains is a wprt:PrinterServiceType. Windows keys the printer
+        # off the hosted PrinterServiceType, so both must be present with
+        # the right one on the Hosted element.
+        self.assertIn("wprt:PrintDeviceType", text)               # device
+        self.assertIn(
+            "<wsdp:Types>wprt:PrinterServiceType</wsdp:Types>", text)  # svc
         self.assertIn("urn:uuid:get-1", text)                     # RelatesTo
         # The metadata wrapper MUST be WS-MetadataExchange (mex:), not
         # devprof: Windows drops the device from the Network folder if the
