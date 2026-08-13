@@ -107,13 +107,14 @@ class TestWSDMetadata(unittest.TestCase):
         self.assertTrue(resp.startswith(b"HTTP/1.1 200"))
         text = resp.decode()
         self.assertIn("HP OfficeJet Pro 9015", text)              # model
-        self.assertIn("<wsdp:Manufacturer>HP</wsdp:Manufacturer>", text)
+        self.assertIn('<wsdp:Manufacturer xml:lang="en">HP</wsdp:Manufacturer>',
+                      text)
         self.assertIn("HP-OfficeJet-Den", text)                   # friendly
-        # The device is a wprt:PrintDeviceType; the hosted print service it
-        # contains is a wprt:PrinterServiceType. Windows keys the printer
-        # off the hosted PrinterServiceType, so both must be present with
-        # the right one on the Hosted element.
-        self.assertIn("wprt:PrintDeviceType", text)               # device
+        # Modelled on the real HP: the Relationship carries the print
+        # service as the only member, with NO <wsdp:Host> (a Host marked
+        # PrintDeviceType makes Windows look for print at the device
+        # endpoint), and the hosted service is a wprt:PrinterServiceType.
+        self.assertNotIn("<wsdp:Host>", text)
         self.assertIn(
             "<wsdp:Types>wprt:PrinterServiceType</wsdp:Types>", text)  # svc
         # PnP-X: Windows needs a HardwareId + CompatibleId on the hosted

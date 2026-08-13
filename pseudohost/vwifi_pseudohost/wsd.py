@@ -374,58 +374,65 @@ class WSDHttpService(TCPService):
     def _metadata(self, relates_to):
         dev = WSDDevice(self.host)
         ip = _ip(self.host.stack.ip or bytes(4))
-        # <pnpx:DeviceCategory> is the PnP-X extension that categorises the
-        # device for the Network folder; without it Windows renders no tile.
+        # The whole metadata document is modelled element-for-element on a
+        # real HP OfficeJet's — the device Windows actually accepts and
+        # renders in the Network folder — because matching a working device
+        # is the only reliable target for Windows' opaque WSD validation.
+        #
+        # ThisDevice first (that is the order the real device uses), with
+        # xml:lang on the human-readable strings.
+        this_device = (
+            '<wsdp:ThisDevice>'
+            '<wsdp:FriendlyName xml:lang="en">%s</wsdp:FriendlyName>'
+            '<wsdp:FirmwareVersion>1.0</wsdp:FirmwareVersion>'
+            '<wsdp:SerialNumber>%s</wsdp:SerialNumber></wsdp:ThisDevice>'
+            % (dev.friendly, self.host.mac.hex()))
+        # ThisModel: both the PnP-X and Device Foundation categories, no
+        # ModelUrl (the real device omits it).
         this_model = (
-            '<wsdp:ThisModel><wsdp:Manufacturer>%s</wsdp:Manufacturer>'
+            '<wsdp:ThisModel>'
+            '<wsdp:Manufacturer xml:lang="en">%s</wsdp:Manufacturer>'
             '<wsdp:ManufacturerUrl>http://%s/</wsdp:ManufacturerUrl>'
-            '<wsdp:ModelName>%s</wsdp:ModelName>'
+            '<wsdp:ModelName xml:lang="en">%s</wsdp:ModelName>'
             '<wsdp:ModelNumber>%s</wsdp:ModelNumber>'
-            '<wsdp:ModelUrl>http://%s/</wsdp:ModelUrl>'
             '<wsdp:PresentationUrl>http://%s/</wsdp:PresentationUrl>'
             '<pnpx:DeviceCategory>%s</pnpx:DeviceCategory>'
             '<df:DeviceCategory>%s</df:DeviceCategory>'
             '</wsdp:ThisModel>'
-            % (dev.manufacturer, ip, dev.model, dev.model_number, ip, ip,
+            % (dev.manufacturer, ip, dev.model, dev.model_number, ip,
                dev.pnpx_category, dev.df_category))
-        this_device = (
-            '<wsdp:ThisDevice><wsdp:FriendlyName>%s</wsdp:FriendlyName>'
-            '<wsdp:FirmwareVersion>1.0</wsdp:FirmwareVersion>'
-            '<wsdp:SerialNumber>%s</wsdp:SerialNumber></wsdp:ThisDevice>'
-            % (dev.friendly, self.host.mac.hex()))
-        # Host is the device (marked as a print device); the print service
-        # is a *Hosted* service whose endpoint is the HTTP address Windows
-        # POSTs GetPrinterElements/CreatePrintJob to.  This is the shape
-        # Windows needs to turn the discovered device into a printer.
+        # Relationship: like the real printer, the print service is the only
+        # member and there is NO <wsdp:Host> — a <wsdp:Host> marked
+        # PrintDeviceType makes Windows look for the print service at the
+        # device endpoint (a urn:uuid with no HTTP address) instead of at
+        # this Hosted HTTP endpoint. The ServiceId is the http form the real
+        # device uses. The Hosted endpoint stays the reachable :5357 address
+        # (where this process serves the print operations), and carries the
+        # PnP-X HardwareId + CompatibleId Windows needs to build the node.
+        service_id = "http://%s/PrintService" % dev.uuid.split(":")[-1]
         relationship = (
             '<wsdp:Relationship Type="%s/host">'
-            '<wsdp:Host><wsa:EndpointReference><wsa:Address>%s</wsa:Address>'
-            '</wsa:EndpointReference>'
-            '<wsdp:Types>%s</wsdp:Types></wsdp:Host>'
             '<wsdp:Hosted><wsa:EndpointReference><wsa:Address>%s</wsa:Address>'
             '</wsa:EndpointReference>'
             '<wsdp:Types>%s</wsdp:Types>'
             '<wsdp:ServiceId>%s</wsdp:ServiceId>'
-            # PnP-X hardware + compatible id: Windows needs both on the
-            # hosted print service to build the printer's device node.
             '<pnpx:HardwareId>%s</pnpx:HardwareId>'
             '<pnpx:CompatibleId>%s</pnpx:CompatibleId>'
             '</wsdp:Hosted>'
             '</wsdp:Relationship>'
-            % (NS_WSDP, dev.uuid, DEVICE_TYPES, dev.xaddr(),
-               PRINT_SERVICE_TYPES, dev.print_svc_uuid(),
+            % (NS_WSDP, dev.xaddr(), PRINT_SERVICE_TYPES, service_id,
                dev.hardware_id, dev.compatible_id))
         # The Metadata / MetadataSection wrapper elements are WS-Metadata-
         # Exchange (mex:), not devprof: Windows parses the sections by that
         # namespace and drops the device if the wrapper is mis-namespaced.
         sections = (
-            '<mex:MetadataSection Dialect="%s/ThisModel">%s'
-            '</mex:MetadataSection>'
             '<mex:MetadataSection Dialect="%s/ThisDevice">%s'
+            '</mex:MetadataSection>'
+            '<mex:MetadataSection Dialect="%s/ThisModel">%s'
             '</mex:MetadataSection>'
             '<mex:MetadataSection Dialect="%s/Relationship">%s'
             '</mex:MetadataSection>'
-            % (NS_WSDP, this_model, NS_WSDP, this_device,
+            % (NS_WSDP, this_device, NS_WSDP, this_model,
                NS_WSDP, relationship))
         body = '<mex:Metadata>%s</mex:Metadata>' % sections
         hdr = _hdr(A_GETRESPONSE, _new_msgid(), relates_to=relates_to,
