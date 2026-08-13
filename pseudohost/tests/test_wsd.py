@@ -204,6 +204,67 @@ class TestWSDMetadata(unittest.TestCase):
         self.assertIn("ActionNotSupported", resp)
         self.assertNotIn("<wsdp:ThisModel>", resp)
 
+    def test_notify_dest_parsing(self):
+        sub = ('<wse:Subscribe><wse:Delivery><wse:NotifyTo><wsa:Address>'
+               'http://192.168.1.99:5357/sink-uuid</wsa:Address>'
+               '</wse:NotifyTo></wse:Delivery></wse:Subscribe>')
+        d = wsd._notify_dest(sub)
+        self.assertEqual(d["ip"], "192.168.1.99")
+        self.assertEqual(d["port"], 5357)
+        self.assertEqual(d["path"], "/sink-uuid")
+        self.assertIsNone(wsd._notify_dest("<no notifyto/>"))
+
+    def _host_with_tcp(self):
+        import time
+        from vwifi_pseudohost import tcp
+        h = FakeHost("HP-OfficeJet-PH01", dot11.mac_bytes("00:01:e6:c1:23:45"),
+                     ip="192.168.1.127")
+        h.tcp = tcp.TCPStack(h.stack)
+        # Peer MAC already learned (as it is from the incoming Subscribe).
+        h.stack.arp_cache[netstack.ip_bytes("192.168.1.99")] = (
+            dot11.mac_bytes("52:54:00:8b:c7:82"), time.time() + 120)
+        return h
+
+    def test_subscribe_records_sub_and_queues_event(self):
+        h = self._host_with_tcp()
+        svc = wsd.WSDHttpService()
+        svc.bind(h)
+        req = ('<soap:Envelope xmlns:wse="http://schemas.xmlsoap.org/ws/'
+               '2004/08/eventing" xmlns:wsa="http://schemas.xmlsoap.org/ws/'
+               '2004/08/addressing"><soap:Body><wse:Subscribe><wse:Delivery>'
+               '<wse:NotifyTo><wsa:Address>http://192.168.1.99:5357/sink'
+               '</wsa:Address></wse:NotifyTo></wse:Delivery>'
+               '<wse:Expires>PT1H</wse:Expires></wse:Subscribe></soap:Body>'
+               '</soap:Envelope>')
+        svc._subscribe_resp("urn:uuid:s", req)
+        self.assertEqual(len(svc._subs), 1)
+        self.assertEqual(len(svc._event_q), 1)     # initial status primed
+
+    def test_tick_opens_outbound_connection_to_sink(self):
+        import struct
+        h = self._host_with_tcp()
+        svc = wsd.WSDHttpService()
+        svc.bind(h)
+        req = ('<wse:Subscribe xmlns:wse="x" xmlns:wsa="y"><wse:NotifyTo>'
+               '<wsa:Address>http://192.168.1.99:5357/sink</wsa:Address>'
+               '</wse:NotifyTo></wse:Subscribe>')
+        # Minimal record; _notify_dest tolerates the namespaces above.
+        dest = wsd._notify_dest(req)
+        svc._subs.append({"id": "urn:uuid:i", "dest": dest, "filter": ""})
+        svc._queue_event(dest, svc._printer_change_event("urn:uuid:i", dest))
+        h.station.sent.clear()
+        svc.tick()
+        syn = None
+        for _dst, et, sdu in h.station.sent:
+            if et != dot11.ETH_P_IP or sdu[9] != netstack.IPPROTO_TCP:
+                continue
+            ihl = (sdu[0] & 0xF) * 4
+            dip = ".".join(str(x) for x in sdu[16:20])
+            flags = struct.unpack(">H", sdu[ihl + 12:ihl + 14])[0] & 0x3F
+            if flags & 0x02:                       # SYN
+                syn = dip
+        self.assertEqual(syn, "192.168.1.99")      # active open to the sink
+
     def test_set_event_rate_acknowledged(self):
         # Windows sends SetEventRate while a print queue is open; a Fault
         # (the old behaviour) crashes the spooler. It must be acked.

@@ -31,6 +31,7 @@ ACK = 0x10
 
 # connection states
 LISTEN = "LISTEN"
+SYN_SENT = "SYN_SENT"                       # active open, awaiting SYN|ACK
 SYN_RCVD = "SYN_RCVD"
 ESTABLISHED = "ESTABLISHED"
 CLOSE_WAIT = "CLOSE_WAIT"
@@ -126,10 +127,42 @@ class TCPStack:
         self.log = log or (lambda *a: None)
         self.listeners = {}                    # port -> service
         self.conns = {}                        # (rip, rport, lport) -> conn
+        self._ephemeral = 49152                # next outbound local port
         stack.attach_tcp(self)
 
     def listen(self, port, service):
         self.listeners[port] = service
+
+    # -- active open (client) ---------------------------------------------
+    def connect(self, remote_ip, remote_port, handler):
+        """Open an outbound connection to remote_ip:remote_port.
+
+        `handler` is called like a service: on_connect(conn) once the
+        handshake completes (send the request there), on_data(conn, bytes)
+        for the reply, on_close(conn) when the peer closes. Used to push
+        WS-Eventing notifications back to a subscriber. The medium is
+        lossless, so no SYN retransmit timer is needed.
+        """
+        remote_ip = netstack.ip_bytes(remote_ip)
+        lport = self._next_ephemeral()
+        conn = TCPConn(self.stack, self.stack.ip, lport, remote_ip,
+                       remote_port, self)
+        conn.service = handler
+        conn.state = SYN_SENT
+        self.conns[conn.key] = conn
+        conn._segment(SYN)                      # SYN, seq = iss
+        conn.snd_nxt = _u32(conn.snd_nxt + 1)
+        return conn
+
+    def _next_ephemeral(self):
+        for _ in range(16384):
+            self._ephemeral += 1
+            if self._ephemeral > 65535:
+                self._ephemeral = 49152
+            if not any(lport == self._ephemeral
+                       for (_r, _p, lport) in self.conns):
+                return self._ephemeral
+        return self._ephemeral
 
     # -- ingress -----------------------------------------------------------
     def on_segment(self, src_ip, dst_ip, seg):
@@ -167,6 +200,19 @@ class TCPStack:
         self.conns[conn.key] = conn
 
     def _deliver(self, conn, seq, ack, flags, payload):
+        if conn.state == SYN_SENT:
+            # Expect the peer's SYN|ACK to our active open; finish the
+            # handshake and hand the connection to the client handler.
+            if (flags & SYN) and (flags & ACK) and ack == conn.snd_nxt:
+                conn.snd_una = ack
+                conn.rcv_nxt = _u32(seq + 1)
+                conn.state = ESTABLISHED
+                conn._ack()
+                self._call(conn, "on_connect")
+            elif flags & SYN and not (flags & ACK):
+                pass                            # simultaneous open: ignore
+            return
+
         if conn.state == SYN_RCVD:
             if (flags & ACK) and ack == conn.snd_nxt:
                 conn.snd_una = ack

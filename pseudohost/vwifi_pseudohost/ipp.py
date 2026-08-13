@@ -194,6 +194,14 @@ class IPPService(TCPService):
             sink.write_job(doc or b"", jobname=jobname, source="ipp")
         elif doc:
             self.log("received %d-byte job but no print sink" % len(doc))
+        # Tell the WSD event source (if any) so it pushes a
+        # PrinterElementsChangeEvent to subscribers — a live status update.
+        src = getattr(self.host, "wsd_event_source", None)
+        if src is not None:
+            try:
+                src.notify_printer_change()
+            except Exception:
+                pass
 
     def _resp(self, status, reqid, printer_group):
         out = struct.pack(">HHI", 0x0200, status, reqid)      # IPP 2.0

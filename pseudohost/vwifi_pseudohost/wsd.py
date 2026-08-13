@@ -335,6 +335,13 @@ class WSDHttpService(TCPService):
     def __init__(self):
         super().__init__()
         self._job = 0
+        self._subs = []          # active WS-Eventing subscriptions
+        self._event_q = []       # pending (dest, http_bytes) to push out
+
+    def on_start(self):
+        # Register as the printer's event source so the IPP printer can ask
+        # us to push a WSD event when a job arrives/completes.
+        self.host.wsd_event_source = self
 
     def on_connect(self, conn):
         conn.data["buf"] = bytearray()
@@ -633,6 +640,17 @@ class WSDHttpService(TCPService):
         dev = WSDDevice(self.host)
         expires = _find(req_text, "Expires") or "PT1H"
         sub_id = _new_msgid()
+
+        # Record the subscription so we can push events to it. The NotifyTo
+        # address is the sink Windows opened to receive notifications.
+        dest = _notify_dest(req_text)
+        filt = _find(req_text, "Filter") or ""
+        if dest is not None:
+            self._subs.append({"id": sub_id, "dest": dest, "filter": filt})
+            # Prime the subscriber with the current printer status, which
+            # also proves the outbound event path works.
+            self._queue_event(dest, self._printer_change_event(sub_id, dest))
+
         body = (
             '<wse:SubscribeResponse><wse:SubscriptionManager>'
             '<wsa:Address>%s</wsa:Address>'
@@ -646,6 +664,60 @@ class WSDHttpService(TCPService):
         hdr = _hdr(A_SUBSCRIBE_RESP, _new_msgid(), relates_to=relates_to,
                    to=NS_WSA + "/role/anonymous")
         return _envelope(hdr, body)
+
+    # -- outbound event delivery ------------------------------------------
+    def notify_printer_change(self):
+        """Queue a PrinterElementsChangeEvent for every subscriber. Called by
+        the IPP printer when a job arrives/completes so Windows gets a live
+        status push instead of only seeing changes when it next polls."""
+        for sub in self._subs:
+            self._queue_event(sub["dest"],
+                              self._printer_change_event(sub["id"], sub["dest"]))
+
+    def _queue_event(self, dest, soap):
+        self._event_q.append((dest, _http_post(dest, soap)))
+
+    def _printer_change_event(self, sub_id, dest):
+        queued = self._queued_job_count()
+        state = "Processing" if queued else "Idle"
+        status = (
+            '<wprt:PrinterStatus><wprt:PrinterState>%s</wprt:PrinterState>'
+            '<wprt:PrinterPrimaryStateReason>None'
+            '</wprt:PrinterPrimaryStateReason>'
+            '<wprt:QueuedJobCount>%d</wprt:QueuedJobCount>'
+            '</wprt:PrinterStatus>' % (state, queued))
+        body = (
+            '<wprt:PrinterElementsChangeEvent><wprt:PrinterElements>'
+            '<wprt:ElementData Name="wprt:PrinterStatus" Valid="true">%s'
+            '</wprt:ElementData></wprt:PrinterElements>'
+            '</wprt:PrinterElementsChangeEvent>' % status)
+        # The subscription's Identifier is echoed as a reference parameter
+        # in the notification header so the client can match it.
+        hdr = ('<wsa:To>%s</wsa:To><wse:Identifier>%s</wse:Identifier>'
+               % (dest["url"], sub_id))
+        hdr += ('<wsa:Action>%s/PrinterElementsChangeEvent</wsa:Action>'
+                '<wsa:MessageID>%s</wsa:MessageID>' % (NS_WPRT, _new_msgid()))
+        return _envelope(hdr, body)
+
+    def _queued_job_count(self):
+        # 0 unless a job is mid-flight; the IPP printer marks jobs complete
+        # immediately, so this is a best-effort snapshot.
+        return 0
+
+    def tick(self):
+        # Flush queued events one connection per tick; the outbound TCP
+        # handshake completes across a few poll cycles.
+        if not self._event_q:
+            return
+        tcp = getattr(self.host, "tcp", None)
+        if tcp is None:
+            self._event_q.clear()
+            return
+        dest, req = self._event_q.pop(0)
+        try:
+            tcp.connect(dest["ip"], dest["port"], _EventPoster(req))
+        except Exception as e:
+            self.log("event push to %s failed: %s" % (dest.get("url"), e))
 
     def _renew_resp(self, relates_to, req_text):
         expires = _find(req_text, "Expires") or "PT1H"
@@ -737,6 +809,50 @@ def _find(text, tag):
 
 def _ip(b):
     return ".".join(str(x) for x in b)
+
+
+def _notify_dest(sub_text):
+    """Parse the WS-Eventing NotifyTo sink out of a Subscribe request.
+
+    Returns {"url", "ip", "port", "path"} or None. The address looks like
+    http://192.168.1.99:5357/<uuid>; only IPv4 literals are handled (the
+    virtual network has no DNS)."""
+    m = re.search(r"NotifyTo>.*?<[\w:]*Address>\s*([^<\s]+)", sub_text, re.S)
+    if not m:
+        return None
+    url = m.group(1).strip()
+    u = re.match(r"https?://(\d+\.\d+\.\d+\.\d+)(?::(\d+))?(/[^\s]*)?$", url)
+    if not u:
+        return None
+    return {"url": url, "ip": u.group(1),
+            "port": int(u.group(2) or 80), "path": u.group(3) or "/"}
+
+
+def _http_post(dest, soap_bytes):
+    """Frame a SOAP body as an HTTP POST to a NotifyTo sink."""
+    return (
+        ("POST %s HTTP/1.1\r\nHost: %s:%d\r\n"
+         "Content-Type: application/soap+xml; charset=utf-8\r\n"
+         "Content-Length: %d\r\nConnection: close\r\n\r\n"
+         % (dest["path"], dest["ip"], dest["port"], len(soap_bytes))).encode()
+        + soap_bytes)
+
+
+class _EventPoster:
+    """A one-shot outbound-connection handler: on connect, send the request;
+    close as soon as the peer answers (WS-Eventing sinks reply 202)."""
+
+    def __init__(self, request):
+        self._req = request
+
+    def on_connect(self, conn):
+        conn.send(self._req)
+
+    def on_data(self, conn, _data):
+        conn.close()
+
+    def on_close(self, conn):
+        pass
 
 
 def wsd_services():
