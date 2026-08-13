@@ -204,6 +204,49 @@ class TestWSDMetadata(unittest.TestCase):
         self.assertIn("ActionNotSupported", resp)
         self.assertNotIn("<wsdp:ThisModel>", resp)
 
+    def test_set_event_rate_acknowledged(self):
+        # Windows sends SetEventRate while a print queue is open; a Fault
+        # (the old behaviour) crashes the spooler. It must be acked.
+        resp = self._dispatch_action(
+            "http://schemas.microsoft.com/windows/2006/08/wdp/print/"
+            "SetEventRate",
+            "<wprt:SetEventRateRequest><wprt:EventRate>2</wprt:EventRate>"
+            "</wprt:SetEventRateRequest>")
+        self.assertIn("SetEventRateResponse", resp)
+        self.assertIn("<wprt:EventRate>2</wprt:EventRate>", resp)
+        self.assertNotIn("<soap:Fault>", resp)
+
+    def test_http_keep_alive_two_requests_one_connection(self):
+        # Two WSD requests down one connection both get answered and the
+        # connection is not closed (no Connection: close, no RST storm).
+        srv = ServerHost(ip="10.1.2.100")
+        srv.hostname = "HP-OfficeJet-Den"
+        wsd.WSDHttpService().bind(srv)
+        c = ClientSim(srv, dport=wsd.WSD_HTTP_PORT)
+        self.assertTrue(c.connect())
+
+        def wsd_get():
+            body = ('<soap:Envelope xmlns:soap="http://www.w3.org/2003/05/'
+                    'soap-envelope" xmlns:wsa="http://schemas.xmlsoap.org/ws/'
+                    '2004/08/addressing"><soap:Header>'
+                    '<wsa:MessageID>urn:uuid:g</wsa:MessageID>'
+                    '<wsa:Action>http://schemas.xmlsoap.org/ws/2004/09/'
+                    'transfer/Get</wsa:Action></soap:Header>'
+                    '<soap:Body/></soap:Envelope>')
+            return ("POST /dev HTTP/1.1\r\nContent-Type: application/soap+xml"
+                    "\r\nContent-Length: %d\r\n\r\n%s"
+                    % (len(body), body)).encode()
+
+        c.send(wsd_get())
+        r1 = c.recv()
+        self.assertIn(b"HTTP/1.1 200", r1)
+        self.assertIn(b"Keep-Alive", r1)
+        self.assertNotIn(b"Connection: close", r1)
+        # Second request on the SAME connection must also be answered.
+        c.send(wsd_get())
+        r2 = c.recv()
+        self.assertIn(b"GetResponse", r2)
+
     def test_get_scanner_elements_response(self):
         h = FakeHost("HP-OfficeJet-Den", dot11.mac_bytes("00:01:e6:aa:bb:cc"),
                      ip="10.1.2.100")

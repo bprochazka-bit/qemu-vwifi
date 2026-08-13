@@ -85,6 +85,7 @@ A_GET = NS_TRANSFER + "/Get"
 A_GETRESPONSE = NS_TRANSFER + "/GetResponse"
 # WSD Print (wprt) operations, sent to the device XAddrs (5357).
 A_GETELEMENTS_RESP = NS_WPRT + "/GetPrinterElementsResponse"
+A_SETEVENTRATE_RESP = NS_WPRT + "/SetEventRateResponse"
 A_GETSCANNER_ELEMENTS_RESP = NS_WSCN + "/GetScannerElementsResponse"
 A_SUBSCRIBE_RESP = NS_EVENTING + "/SubscribeResponse"
 A_UNSUBSCRIBE_RESP = NS_EVENTING + "/UnsubscribeResponse"
@@ -337,29 +338,38 @@ class WSDHttpService(TCPService):
 
     def on_connect(self, conn):
         conn.data["buf"] = bytearray()
-        conn.data["need"] = None
 
     def on_data(self, conn, data):
+        # HTTP keep-alive: Windows sends many WSD requests down one
+        # connection and keeps it open. Handle every complete request in the
+        # buffer and leave the connection up. The old code answered one
+        # request then closed; Windows would send the next request on the
+        # connection it still considered open, and the pseudo-host, having
+        # forgotten it, answered with a TCP RST — a storm of resets that
+        # destabilised the spooler's WSD client. Keeping the connection
+        # alive removes them.
         buf = conn.data["buf"]
         buf += data
-        head_end = buf.find(b"\r\n\r\n")
-        if head_end < 0:
-            return
-        if conn.data["need"] is None:
+        while True:
+            head_end = buf.find(b"\r\n\r\n")
+            if head_end < 0:
+                return                          # headers incomplete
             m = re.search(rb"content-length:\s*(\d+)", bytes(buf[:head_end]),
                           re.I)
-            conn.data["need"] = head_end + 4 + (int(m.group(1)) if m else 0)
-        if len(buf) < conn.data["need"]:
-            return                              # wait for the whole body
-        self.dump("WSD-HTTP request", bytes(buf))
-        resp = self._dispatch(bytes(buf), head_end)
-        http = (b"HTTP/1.1 200 OK\r\n"
-                b"Content-Type: application/soap+xml; charset=utf-8\r\n"
-                b"Content-Length: " + str(len(resp)).encode() + b"\r\n"
-                b"Connection: close\r\n\r\n" + resp)
-        self.dump("WSD-HTTP response", http)
-        conn.send(http)
-        conn.close()
+            need = head_end + 4 + (int(m.group(1)) if m else 0)
+            if len(buf) < need:
+                return                          # body incomplete
+            req = bytes(buf[:need])
+            del buf[:need]                      # consume this request
+            self.dump("WSD-HTTP request", req)
+            resp = self._dispatch(req, head_end)
+            http = (b"HTTP/1.1 200 OK\r\n"
+                    b"Content-Type: application/soap+xml; charset=utf-8\r\n"
+                    b"Content-Length: " + str(len(resp)).encode() + b"\r\n"
+                    b"Connection: Keep-Alive\r\n\r\n" + resp)
+            self.dump("WSD-HTTP response", http)
+            conn.send(http)
+            # loop again for any pipelined request already in the buffer
 
     # -- request dispatch --------------------------------------------------
     def _dispatch(self, raw, head_end):
@@ -379,6 +389,13 @@ class WSDHttpService(TCPService):
         if action.endswith("/GetScannerElements"):
             self.log("GetScannerElements -> 200")
             return self._scanner_elements(msgid)
+        if action.endswith("/SetEventRate"):
+            # Windows sets how often it wants printer events while a queue is
+            # open. Acknowledge with the rate it asked for; a Fault here (or
+            # any non-response) crashes the spooler's WSD print client.
+            rate = _find(text, "EventRate") or "1"
+            self.log("SetEventRate %s -> ack" % rate)
+            return self._set_event_rate_resp(msgid, rate)
         if action.endswith("/CreatePrintJob"):
             self._job += 1
             jobname = _find(text, "JobName") or "job%d" % self._job
@@ -593,6 +610,13 @@ class WSDHttpService(TCPService):
             % (desc, config, status))
         hdr = _hdr(A_GETSCANNER_ELEMENTS_RESP, _new_msgid(),
                    relates_to=relates_to, to=NS_WSA + "/role/anonymous")
+        return _envelope(hdr, body)
+
+    def _set_event_rate_resp(self, relates_to, rate):
+        body = ('<wprt:SetEventRateResponse><wprt:EventRate>%s</wprt:EventRate>'
+                '</wprt:SetEventRateResponse>' % rate)
+        hdr = _hdr(A_SETEVENTRATE_RESP, _new_msgid(), relates_to=relates_to,
+                   to=NS_WSA + "/role/anonymous")
         return _envelope(hdr, body)
 
     # -- WS-Eventing -------------------------------------------------------
