@@ -24,12 +24,17 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from vwifi_pseudohost.profiles import get_profile, profile_names  # noqa: E402
 from vwifi_pseudohost.netstack import ip_str                       # noqa: E402
+from vwifi_pseudohost import introspect                            # noqa: E402
 
 
 def build_parser():
     p = argparse.ArgumentParser(
         prog="pseudohost",
         description="Join a vwifi network as a virtual host (no VM).")
+    p.add_argument("--dump-config", action="store_true",
+                   help="print a JSON descriptor of this device type's "
+                        "configurable parameters and exit (used by tools "
+                        "that build a UI or validate configs)")
     p.add_argument("--sock", required=True,
                    help="path to the vwifi-medium hub socket")
     p.add_argument("--essid", required=True,
@@ -63,7 +68,33 @@ def build_parser():
     return p
 
 
+def _profiles_extra():
+    """Describe each selectable profile so a UI can label the --profile
+    choices with the persona/hostname they impersonate."""
+    out = []
+    for name in profile_names():
+        cls = get_profile(name)
+        out.append({
+            "name": name,
+            "persona": getattr(cls, "persona", name),
+            "hostname": getattr(cls, "hostname", ""),
+        })
+    return out
+
+
 def main(argv=None):
+    # --dump-config short-circuits argument validation: a caller asking for
+    # the config descriptor has not supplied --sock/--essid, and shouldn't
+    # need to. parse_known_args tolerates the missing required args.
+    if argv is None:
+        argv = sys.argv[1:]
+    if "--dump-config" in argv:
+        print(introspect.dump_descriptor(
+            build_parser(), device_type="wifi-host",
+            binary="vwifi-pseudohost",
+            extras={"profiles": _profiles_extra()}))
+        return 0
+
     args = build_parser().parse_args(argv)
 
     profile = get_profile(args.profile)

@@ -29,6 +29,17 @@ from vwifi_pseudohost.mdns import Advert, MDNSResponder            # noqa: E402
 from vwifi_pseudohost.netservices import (                        # noqa: E402
     LPDService, HTTPService, NASHTTPService, SMBService)
 from vwifi_pseudohost.services import UDPEchoService              # noqa: E402
+from vwifi_pseudohost import introspect                          # noqa: E402
+
+
+# The services --services accepts, with a one-line description each, so a
+# UI can present them as labeled checkboxes rather than a raw CSV field.
+_SERVICE_CHOICES = [
+    {"name": "lpd", "description": "LPD/515 line-printer daemon"},
+    {"name": "nas", "description": "SMB + HTTP file server with mDNS advert"},
+    {"name": "http", "description": "plain HTTP web page"},
+    {"name": "echo", "description": "UDP echo responder"},
+]
 
 
 def _nas_mdns():
@@ -76,6 +87,10 @@ def build_parser():
     p = argparse.ArgumentParser(
         prog="pseudoap",
         description="Beacon a vwifi network as a simulated access point.")
+    p.add_argument("--dump-config", action="store_true",
+                   help="print a JSON descriptor of this device type's "
+                        "configurable parameters and exit (used by tools "
+                        "that build a UI or validate configs)")
     p.add_argument("--sock", required=True,
                    help="path to the vwifi-medium hub socket")
     p.add_argument("--essid", required=True, help="network name to beacon")
@@ -125,6 +140,24 @@ def build_parser():
 
 
 def main(argv=None):
+    # --dump-config short-circuits argument validation: a caller asking for
+    # the config descriptor has not supplied --sock/--essid, and shouldn't
+    # need to.
+    if argv is None:
+        argv = sys.argv[1:]
+    if "--dump-config" in argv:
+        print(introspect.dump_descriptor(
+            build_parser(), device_type="wifi-ap",
+            binary="vwifi-pseudoap",
+            extras={"services": _SERVICE_CHOICES},
+            # Mirrors the check main() enforces below: WPA2 needs a key.
+            constraints=[{
+                "requires": "passphrase",
+                "when": {"param": "encryption", "equals": "wpa2"},
+                "message": "WPA2 encryption requires a passphrase.",
+            }]))
+        return 0
+
     args = build_parser().parse_args(argv)
     if args.encryption == "wpa2" and not args.passphrase:
         print("--encryption wpa2 requires --passphrase", file=sys.stderr)
