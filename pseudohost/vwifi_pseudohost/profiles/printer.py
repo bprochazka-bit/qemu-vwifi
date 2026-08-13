@@ -68,6 +68,8 @@ class NetworkPrinter(PseudoHost):
     wsd_manufacturer = "HP"
     wsd_model = "HP LaserJet"
     wsd_model_number = "PH01"
+    wsd_vendor_id = 0x03F0                  # HP USB vendor id
+    df_device_category = "PrintFax.Printer PrintFax.Printer.LaserJet"
     # IPP (631) is the modern driverless add+print path, advertised over
     # mDNS (_ipp._tcp) so Bonjour/macOS/Windows-with-Bonjour discover it;
     # WSD makes it discoverable by stock Windows; SNMP lets the "Standard

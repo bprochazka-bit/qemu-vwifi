@@ -99,6 +99,13 @@ class HPMultifunction(PseudoHost):
     wsd_manufacturer = "HP"
     wsd_model = HP_MODEL
     wsd_model_number = "9015"
+    # HP's USB vendor id, so the PnP-X HardwareId reads like a real HP
+    # multifunction (VEN_03F0&DEV_...&SUBSYS_...).
+    wsd_vendor_id = 0x03F0
+    # Device Foundation category for a print/scan/fax multifunction, matching
+    # what a real HP OfficeJet advertises so Windows files it as an MFP.
+    df_device_category = ("PrintFax.Printer.MFP PrintFax.Printer.Inkjet "
+                          "Imaging.Scanner PrintFax.FAX")
     # WSD is what stock Windows uses for "Network" and "Add a printer";
     # mDNS covers macOS / IPP-Everywhere clients; JetDirect/9100 is the
     # raw path that always prints.

@@ -116,6 +116,21 @@ class TestWSDMetadata(unittest.TestCase):
         self.assertIn("wprt:PrintDeviceType", text)               # device
         self.assertIn(
             "<wsdp:Types>wprt:PrinterServiceType</wsdp:Types>", text)  # svc
+        # PnP-X: Windows needs a HardwareId + CompatibleId on the hosted
+        # print service (once a DeviceCategory is present) to build the
+        # printer's device node — without them it re-fetches the metadata
+        # in a loop and never shows the device. Modelled on a real HP.
+        self.assertIn("<pnpx:HardwareId>", text)
+        self.assertIn("VEN_", text)
+        self.assertIn("<pnpx:CompatibleId>http://schemas.microsoft.com/"
+                      "windows/2006/08/wdp/print/PrinterServiceType"
+                      "</pnpx:CompatibleId>", text)
+        # Device Foundation category alongside the PnP-X one, like a real
+        # printer, and its namespace must be declared.
+        self.assertIn("<df:DeviceCategory>", text)
+        self.assertIn(
+            'xmlns:df="http://schemas.microsoft.com/windows/2008/09/'
+            'devicefoundation"', text)
         self.assertIn("urn:uuid:get-1", text)                     # RelatesTo
         # The metadata wrapper MUST be WS-MetadataExchange (mex:), not
         # devprof: Windows drops the device from the Network folder if the

@@ -50,6 +50,16 @@ NS_MEX = "http://schemas.xmlsoap.org/ws/2004/09/mex"
 # publish it into the Explorer "Network" folder; a device metadata with
 # no PnP-X category is parsed but never rendered as a device tile.
 NS_PNPX = "http://schemas.microsoft.com/windows/pnpx/2005/10"
+# Device Foundation.  Windows reads <df:DeviceCategory> in ThisModel (a
+# space-separated list like "PrintFax.Printer.MFP Imaging.Scanner") in
+# addition to the PnP-X category; a real printer carries both.
+NS_DF = "http://schemas.microsoft.com/windows/2008/09/devicefoundation"
+# The standard PnP-X CompatibleId for a WSD print service. It maps the
+# hosted service to Windows' inbox WSD print class driver — the thing that
+# turns the discovered device into an installable/printable printer. Real
+# HP printers advertise exactly this string.
+WSD_PRINT_COMPATIBLE_ID = ("http://schemas.microsoft.com/windows/2006/08/"
+                           "wdp/print/PrinterServiceType")
 
 A_HELLO = NS_WSD + "/Hello"
 A_BYE = NS_WSD + "/Bye"
@@ -114,11 +124,12 @@ def _envelope(header, body):
         '<?xml version="1.0" encoding="utf-8"?>'
         '<soap:Envelope'
         ' xmlns:soap="%s" xmlns:wsa="%s" xmlns:wsd="%s"'
-        ' xmlns:wsdp="%s" xmlns:wprt="%s" xmlns:mex="%s" xmlns:pnpx="%s">'
+        ' xmlns:wsdp="%s" xmlns:wprt="%s" xmlns:mex="%s" xmlns:pnpx="%s"'
+        ' xmlns:df="%s">'
         '<soap:Header>%s</soap:Header>'
         '<soap:Body>%s</soap:Body></soap:Envelope>'
         % (NS_SOAP, NS_WSA, NS_WSD, NS_WSDP, NS_WPRT, NS_MEX, NS_PNPX,
-           header, body)
+           NS_DF, header, body)
     ).encode("utf-8")
 
 
@@ -143,6 +154,25 @@ class WSDDevice:
         # PnP-X device category (space-delimited list); this is what puts
         # the device under the right heading in Explorer's Network folder.
         self.pnpx_category = getattr(host, "pnpx_category", "Printers")
+        # Device Foundation category (space-separated). Real printers carry
+        # this alongside the PnP-X category; default to a plain printer, and
+        # a multifunction profile overrides it (MFP + scanner + fax).
+        self.df_category = getattr(host, "df_device_category", "PrintFax.Printer")
+        # PnP-X HardwareId / CompatibleId for the hosted print service.
+        # Windows REQUIRES both on a hosted element once a DeviceCategory is
+        # present, and matches a driver by HardwareId, falling back to the
+        # CompatibleId (the inbox WSD print driver) when it doesn't know the
+        # exact model — which is what makes the device install and show as a
+        # printer. Modelled on a real HP OfficeJet's:
+        #   VEN_03F0&DEV_Officejet_Pro_8600&SUBSYS_CM749A
+        # 0x03F0 is HP's USB vendor id; a profile can override the id.
+        vid = getattr(host, "wsd_vendor_id", 0x03F0)
+        model_tok = re.sub(r"[^A-Za-z0-9]+", "_", self.model).strip("_")
+        self.hardware_id = getattr(host, "wsd_hardware_id", None) or (
+            "VEN_%04X&amp;DEV_%s&amp;SUBSYS_%s"
+            % (vid, model_tok, self.model_number))
+        self.compatible_id = getattr(host, "pnpx_compatible_id",
+                                     WSD_PRINT_COMPATIBLE_ID)
         # WS-Discovery AppSequence InstanceId: MUST change each time the
         # device (re)starts so a client discards state cached under a prior
         # instance. A constant "1" means Windows treats every restart as the
@@ -354,9 +384,10 @@ class WSDHttpService(TCPService):
             '<wsdp:ModelUrl>http://%s/</wsdp:ModelUrl>'
             '<wsdp:PresentationUrl>http://%s/</wsdp:PresentationUrl>'
             '<pnpx:DeviceCategory>%s</pnpx:DeviceCategory>'
+            '<df:DeviceCategory>%s</df:DeviceCategory>'
             '</wsdp:ThisModel>'
             % (dev.manufacturer, ip, dev.model, dev.model_number, ip, ip,
-               dev.pnpx_category))
+               dev.pnpx_category, dev.df_category))
         this_device = (
             '<wsdp:ThisDevice><wsdp:FriendlyName>%s</wsdp:FriendlyName>'
             '<wsdp:FirmwareVersion>1.0</wsdp:FirmwareVersion>'
@@ -374,10 +405,16 @@ class WSDHttpService(TCPService):
             '<wsdp:Hosted><wsa:EndpointReference><wsa:Address>%s</wsa:Address>'
             '</wsa:EndpointReference>'
             '<wsdp:Types>%s</wsdp:Types>'
-            '<wsdp:ServiceId>%s</wsdp:ServiceId></wsdp:Hosted>'
+            '<wsdp:ServiceId>%s</wsdp:ServiceId>'
+            # PnP-X hardware + compatible id: Windows needs both on the
+            # hosted print service to build the printer's device node.
+            '<pnpx:HardwareId>%s</pnpx:HardwareId>'
+            '<pnpx:CompatibleId>%s</pnpx:CompatibleId>'
+            '</wsdp:Hosted>'
             '</wsdp:Relationship>'
             % (NS_WSDP, dev.uuid, DEVICE_TYPES, dev.xaddr(),
-               PRINT_SERVICE_TYPES, dev.print_svc_uuid()))
+               PRINT_SERVICE_TYPES, dev.print_svc_uuid(),
+               dev.hardware_id, dev.compatible_id))
         # The Metadata / MetadataSection wrapper elements are WS-Metadata-
         # Exchange (mex:), not devprof: Windows parses the sections by that
         # namespace and drops the device if the wrapper is mis-namespaced.
