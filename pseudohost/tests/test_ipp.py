@@ -108,6 +108,33 @@ class TestIPP(unittest.TestCase):
         with open(os.path.join(d, files[0]), "rb") as f:
             self.assertEqual(f.read(), doc)
 
+    def test_get_job_attributes_reports_completed(self):
+        # The bug that crashed the spooler: Get-Job-Attributes returned an
+        # empty body. It must carry the job's id and a terminal state so
+        # Windows sees the job done and clears the queue.
+        srv = self._server()
+        self._post(srv, ipp_request(ipp.OP_CREATE_JOB, reqid=1))
+        resp = self._post(srv, ipp_request(ipp.OP_GET_JOB_ATTRS, reqid=2))
+        status, attrs = parse_ipp_response(resp)
+        self.assertEqual(status, ipp.OK)
+        self.assertIn(b"job-id", resp)
+        self.assertEqual(attrs.get("job-state"), struct.pack(">i", 9))  # done
+        self.assertIn(b"job-completed", resp)
+
+    def test_create_job_is_pending_not_completed(self):
+        srv = self._server()
+        resp = self._post(srv, ipp_request(ipp.OP_CREATE_JOB, reqid=1))
+        _status, attrs = parse_ipp_response(resp)
+        self.assertEqual(attrs.get("job-state"), struct.pack(">i", 3))  # pend
+
+    def test_validate_job_has_no_job_group(self):
+        srv = self._server()
+        resp = self._post(srv, ipp_request(ipp.OP_VALIDATE_JOB, reqid=1))
+        status, attrs = parse_ipp_response(resp)
+        self.assertEqual(status, ipp.OK)
+        self.assertNotIn("job-state", attrs)
+        self.assertNotIn("job-id", attrs)
+
     def test_chunked_print_job(self):
         d = tempfile.mkdtemp(prefix="ph-ipp-")
         srv = self._server(print_dir=d)

@@ -160,19 +160,32 @@ class IPPService(TCPService):
             self.log("IPP Get-Printer-Attributes")
             return self._resp(OK, reqid, self._printer_attrs())
         if op == OP_VALIDATE_JOB:
-            return self._resp(OK, reqid, self._job_attrs(self._job or 1))
+            # Validate-Job only checks the job attributes are acceptable; the
+            # response carries NO job group. Returning one (with a bogus
+            # job-id/state) is malformed and upsets the client.
+            return self._resp(OK, reqid, b"")
         if op == OP_PRINT_JOB:
             self._job += 1
             self._sink(doc, "ipp-job%d" % self._job)
-            return self._resp(OK, reqid, self._job_attrs(self._job))
+            return self._resp(OK, reqid, self._job_attrs(self._job, state=9))
         if op == OP_CREATE_JOB:
             self._job += 1
-            return self._resp(OK, reqid, self._job_attrs(self._job))
+            # A freshly created job is pending, not completed — it has no
+            # document yet.
+            return self._resp(OK, reqid, self._job_attrs(
+                self._job, state=3, reasons=["none"]))
         if op == OP_SEND_DOCUMENT:
             self._sink(doc, "ipp-job%d" % (self._job or 1))
-            return self._resp(OK, reqid, self._job_attrs(self._job or 1))
-        if op in (OP_GET_JOBS, OP_GET_JOB_ATTRS):
-            return self._resp(OK, reqid, b"")
+            return self._resp(OK, reqid,
+                              self._job_attrs(self._job or 1, state=9))
+        if op == OP_GET_JOB_ATTRS:
+            # Windows polls this to learn the job finished. It MUST carry the
+            # job's attributes (id + state); an empty body here crashes the
+            # spooler's IPP client and strands the job in the queue.
+            return self._resp(OK, reqid,
+                              self._job_attrs(self._job or 1, state=9))
+        if op == OP_GET_JOBS:
+            return self._resp(OK, reqid, b"")   # no active jobs -> empty list
         return self._resp(SERVER_ERROR_OPERATION_NOT_SUPPORTED, reqid, b"")
 
     def _sink(self, doc, jobname):
@@ -277,13 +290,16 @@ class IPPService(TCPService):
         g += _keywords(TAG_KEYWORD, "identify-actions-supported", ["display"])
         return g
 
-    def _job_attrs(self, job_id):
+    def _job_attrs(self, job_id, state=9, reasons=("job-completed",)):
+        # IPP job-state enum: 3=pending, 4=pending-held, 5=processing,
+        # 7=canceled, 8=aborted, 9=completed.
         g = bytes([TAG_JOB])
         g += _attr(TAG_INTEGER, "job-id", _int(job_id))
         g += _attr(TAG_URI, "job-uri",
                    (self._printer_uri().decode() + "/%d" % job_id).encode())
-        g += _attr(TAG_ENUM, "job-state", _int(9))             # completed
-        g += _keywords(TAG_KEYWORD, "job-state-reasons", ["job-completed"])
+        g += _attr(TAG_URI, "job-printer-uri", self._printer_uri())
+        g += _attr(TAG_ENUM, "job-state", _int(state))
+        g += _keywords(TAG_KEYWORD, "job-state-reasons", list(reasons))
         return g
 
 
