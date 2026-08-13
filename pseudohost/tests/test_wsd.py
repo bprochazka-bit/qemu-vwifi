@@ -319,6 +319,41 @@ class TestWSDMetadata(unittest.TestCase):
         self.assertIn("wscn:ScannerState>Idle", resp)
         self.assertIn("urn:uuid:s-1", resp)                  # RelatesTo
 
+    def test_make_png_is_valid(self):
+        import struct
+        png = wsd.make_png(80, 60)
+        self.assertEqual(png[:8], b"\x89PNG\r\n\x1a\n")
+        self.assertEqual(struct.unpack(">II", png[16:24]), (80, 60))
+        self.assertEqual(png[-8:], b"IEND\xae\x42\x60\x82")  # IEND + its CRC
+
+    def test_create_scan_job_response(self):
+        h = FakeHost("HP-OfficeJet-Den", dot11.mac_bytes("00:01:e6:aa:bb:cc"),
+                     ip="10.1.2.100")
+        srv = wsd.WSDHttpService()
+        srv.bind(h)
+        srv._scan_job = 1
+        resp = srv._create_scan_job("urn:uuid:c", "<x/>").decode()
+        self.assertIn("<wscn:CreateScanJobResponse>", resp)
+        self.assertIn("<wscn:JobId>1</wscn:JobId>", resp)
+        self.assertIn("<wscn:JobToken>", resp)
+        self.assertIn("<wscn:ImageInformation>", resp)
+        self.assertIn("<wscn:PixelsPerLine>%d" % wsd.SCAN_W, resp)
+        self.assertIn("<wscn:DocumentFinalParameters>", resp)
+
+    def test_retrieve_image_is_mtom_with_png(self):
+        h = FakeHost("HP-OfficeJet-Den", dot11.mac_bytes("00:01:e6:aa:bb:cc"),
+                     ip="10.1.2.100")
+        srv = wsd.WSDHttpService()
+        srv.bind(h)
+        srv._scan_job = 1
+        content_type, body = srv._retrieve_image("urn:uuid:r", "")
+        self.assertIn(b"multipart/related", content_type)
+        self.assertIn(b'type="application/xop+xml"', content_type)
+        self.assertIn(b"xop:Include", body)
+        self.assertIn(b"Content-Type: image/png", body)
+        self.assertIn(b"\x89PNG\r\n\x1a\n", body)            # the image part
+        self.assertIn(b"RetrieveImageResponse", body)
+
 
 if __name__ == "__main__":
     unittest.main()

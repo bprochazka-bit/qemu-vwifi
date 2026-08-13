@@ -26,9 +26,34 @@
 # and Windows is lenient about namespace prefixes on the wire.
 #
 import re
+import struct
 import time
+import zlib
 
 from .services import Service, TCPService
+
+# A modest fixed scan raster (roughly a US-Letter page at ~100 dpi). Small
+# enough that a solid-colour PNG is a few KB over the virtual medium, while
+# still a plausible page size for Windows' scan UI.
+SCAN_W = 850
+SCAN_H = 1100
+
+
+def make_png(width, height, rgb=(224, 224, 224)):
+    """A valid 8-bit RGB PNG of a solid colour — the pseudo-host's 'scan'.
+
+    Solid colour so the zlib-compressed IDAT stays tiny regardless of the
+    page size. Stdlib only (zlib)."""
+    def chunk(typ, data):
+        body = typ + data
+        return (struct.pack(">I", len(data)) + body
+                + struct.pack(">I", zlib.crc32(body) & 0xffffffff))
+    sig = b"\x89PNG\r\n\x1a\n"
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)  # RGB/8
+    row = b"\x00" + bytes(rgb) * width          # filter byte 0 + pixels
+    idat = zlib.compress(row * height, 6)
+    return (sig + chunk(b"IHDR", ihdr) + chunk(b"IDAT", idat)
+            + chunk(b"IEND", b""))
 
 WSD_MCAST = "239.255.255.250"
 WSD_PORT = 3702
@@ -67,10 +92,12 @@ NS_DF = "http://schemas.microsoft.com/windows/2008/09/devicefoundation"
 WSD_PRINT_COMPATIBLE_ID = ("http://schemas.microsoft.com/windows/2006/08/"
                            "wdp/print/PrinterServiceType")
 # WSD Scan (WS-Scan) service — the analogue of the print service that makes
-# a multifunction show up under Scanners. The service type lives in the
-# wscn namespace, and the CompatibleId maps it to Windows' inbox WSD Scan
-# (WIA) driver, just as the print CompatibleId maps to the print driver.
-NS_WSCN = "http://schemas.microsoft.com/windows/2006/08/wdp/scan"
+# a multifunction show up under Scanners and lets Windows pull a scan. The
+# WS-Scan protocol namespace is the 2006/01 one (this is what the operation
+# elements and a real HP's metadata use); the CompatibleId that maps the
+# hosted service to Windows' inbox WSD-Scan (WIA) driver is a fixed string
+# that, by Microsoft's own quirk, carries 2006/08 instead.
+NS_WSCN = "http://schemas.microsoft.com/windows/2006/01/wdp/scan"
 SCAN_SERVICE_TYPES = "wscn:ScannerServiceType"
 WSD_SCAN_COMPATIBLE_ID = ("http://schemas.microsoft.com/windows/2006/08/"
                           "wdp/scan/ScannerServiceType")
@@ -87,6 +114,8 @@ A_GETRESPONSE = NS_TRANSFER + "/GetResponse"
 A_GETELEMENTS_RESP = NS_WPRT + "/GetPrinterElementsResponse"
 A_SETEVENTRATE_RESP = NS_WPRT + "/SetEventRateResponse"
 A_GETSCANNER_ELEMENTS_RESP = NS_WSCN + "/GetScannerElementsResponse"
+A_CREATE_SCAN_JOB_RESP = NS_WSCN + "/CreateScanJobResponse"
+A_RETRIEVE_IMAGE_RESP = NS_WSCN + "/RetrieveImageResponse"
 A_SUBSCRIBE_RESP = NS_EVENTING + "/SubscribeResponse"
 A_UNSUBSCRIBE_RESP = NS_EVENTING + "/UnsubscribeResponse"
 A_RENEW_RESP = NS_EVENTING + "/RenewResponse"
@@ -337,6 +366,7 @@ class WSDHttpService(TCPService):
         self._job = 0
         self._subs = []          # active WS-Eventing subscriptions
         self._event_q = []       # pending (dest, http_bytes) to push out
+        self._scan_job = 0       # WSD-Scan job counter
 
     def on_start(self):
         # Register as the printer's event source so the IPP printer can ask
@@ -370,10 +400,17 @@ class WSDHttpService(TCPService):
             del buf[:need]                      # consume this request
             self.dump("WSD-HTTP request", req)
             resp = self._dispatch(req, head_end)
+            # A handler may return (content_type, body) to send a non-SOAP
+            # response — RetrieveImage returns an MTOM multipart.
+            if isinstance(resp, tuple):
+                content_type, body = resp
+            else:
+                content_type = b"application/soap+xml; charset=utf-8"
+                body = resp
             http = (b"HTTP/1.1 200 OK\r\n"
-                    b"Content-Type: application/soap+xml; charset=utf-8\r\n"
-                    b"Content-Length: " + str(len(resp)).encode() + b"\r\n"
-                    b"Connection: Keep-Alive\r\n\r\n" + resp)
+                    b"Content-Type: " + content_type + b"\r\n"
+                    b"Content-Length: " + str(len(body)).encode() + b"\r\n"
+                    b"Connection: Keep-Alive\r\n\r\n" + body)
             self.dump("WSD-HTTP response", http)
             conn.send(http)
             # loop again for any pipelined request already in the buffer
@@ -396,6 +433,14 @@ class WSDHttpService(TCPService):
         if action.endswith("/GetScannerElements"):
             self.log("GetScannerElements -> 200")
             return self._scanner_elements(msgid)
+        if action.endswith("/CreateScanJob"):
+            self._scan_job += 1
+            self.log("CreateScanJob -> job %d" % self._scan_job)
+            return self._create_scan_job(msgid, text)
+        if action.endswith("/RetrieveImage"):
+            # Returns MTOM (multipart) rather than a plain SOAP body.
+            self.log("RetrieveImage -> image")
+            return self._retrieve_image(msgid, text)
         if action.endswith("/SetEventRate"):
             # Windows sets how often it wants printer events while a queue is
             # open. Acknowledge with the rate it asked for; a Fault here (or
@@ -618,6 +663,74 @@ class WSDHttpService(TCPService):
         hdr = _hdr(A_GETSCANNER_ELEMENTS_RESP, _new_msgid(),
                    relates_to=relates_to, to=NS_WSA + "/role/anonymous")
         return _envelope(hdr, body)
+
+    # -- WSD-Scan pull flow ------------------------------------------------
+    def _create_scan_job(self, relates_to, req_text):
+        """Answer CreateScanJob: hand back a job id/token and the final image
+        parameters (a fixed PNG raster the pseudo-host will return)."""
+        job = self._scan_job
+        token = "scantok-%d" % job
+        img_info = (
+            '<wscn:ImageInformation><wscn:MediaFrontImageInfo>'
+            '<wscn:PixelsPerLine>%d</wscn:PixelsPerLine>'
+            '<wscn:NumberOfLines>%d</wscn:NumberOfLines>'
+            '<wscn:BytesPerLine>%d</wscn:BytesPerLine>'
+            '</wscn:MediaFrontImageInfo></wscn:ImageInformation>'
+            % (SCAN_W, SCAN_H, SCAN_W * 3))
+        final = (
+            '<wscn:DocumentFinalParameters>'
+            '<wscn:Format>png</wscn:Format>'
+            '<wscn:CompressionQualityFactor>0</wscn:CompressionQualityFactor>'
+            '<wscn:ImagesToTransfer>1</wscn:ImagesToTransfer>'
+            '<wscn:MediaSides><wscn:MediaFront>'
+            '<wscn:ScanRegion>'
+            '<wscn:ScanRegionWidth>%d</wscn:ScanRegionWidth>'
+            '<wscn:ScanRegionHeight>%d</wscn:ScanRegionHeight>'
+            '</wscn:ScanRegion>'
+            '<wscn:ColorProcessing>RGB24</wscn:ColorProcessing>'
+            '<wscn:Resolution><wscn:Width>100</wscn:Width>'
+            '<wscn:Height>100</wscn:Height></wscn:Resolution>'
+            '</wscn:MediaFront></wscn:MediaSides>'
+            '</wscn:DocumentFinalParameters>'
+            % (SCAN_W, SCAN_H))
+        body = (
+            '<wscn:CreateScanJobResponse>'
+            '<wscn:JobId>%d</wscn:JobId>'
+            '<wscn:JobToken>%s</wscn:JobToken>'
+            '%s%s</wscn:CreateScanJobResponse>' % (job, token, img_info, final))
+        hdr = _hdr(A_CREATE_SCAN_JOB_RESP, _new_msgid(), relates_to=relates_to,
+                   to=NS_WSA + "/role/anonymous")
+        return _envelope(hdr, body)
+
+    def _retrieve_image(self, relates_to, _req_text):
+        """Answer RetrieveImage with the scan as an MTOM (multipart/related)
+        response: a SOAP part whose xop:Include points at the image part."""
+        png = make_png(SCAN_W, SCAN_H)
+        cid = "scan-%d@pseudohost" % (self._scan_job or 1)
+        soap_hdr = _hdr(A_RETRIEVE_IMAGE_RESP, _new_msgid(),
+                        relates_to=relates_to, to=NS_WSA + "/role/anonymous")
+        soap_body = (
+            '<wscn:RetrieveImageResponse><xop:Include '
+            'xmlns:xop="http://www.w3.org/2004/08/xop/include" '
+            'href="cid:%s"/></wscn:RetrieveImageResponse>' % cid)
+        soap = _envelope(soap_hdr, soap_body)
+        b = b"MIMEBoundaryPseudohostScan"
+        body = (
+            b"--" + b + b"\r\n"
+            b'Content-Type: application/xop+xml; charset=utf-8; '
+            b'type="application/soap+xml"\r\n'
+            b"Content-Transfer-Encoding: 8bit\r\n"
+            b"Content-ID: <soap@pseudohost>\r\n\r\n" + soap + b"\r\n"
+            b"--" + b + b"\r\n"
+            b"Content-Type: image/png\r\n"
+            b"Content-Transfer-Encoding: binary\r\n"
+            b"Content-ID: <" + cid.encode() + b">\r\n\r\n" + png + b"\r\n"
+            b"--" + b + b"--\r\n")
+        content_type = (
+            b'multipart/related; boundary="' + b + b'"; '
+            b'type="application/xop+xml"; start="<soap@pseudohost>"; '
+            b'start-info="application/soap+xml"')
+        return (content_type, body)
 
     def _set_event_rate_resp(self, relates_to, rate):
         body = ('<wprt:SetEventRateResponse><wprt:EventRate>%s</wprt:EventRate>'
