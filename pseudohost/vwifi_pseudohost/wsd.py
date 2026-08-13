@@ -41,6 +41,12 @@ NS_WSD = "http://schemas.xmlsoap.org/ws/2005/04/discovery"
 NS_WSDP = "http://schemas.xmlsoap.org/ws/2006/02/devprof"
 NS_WPRT = "http://schemas.microsoft.com/windows/2006/08/wdp/print"
 NS_TRANSFER = "http://schemas.xmlsoap.org/ws/2004/09/transfer"
+# WS-Eventing. Windows subscribes to the printer's PrinterElementsChangeEvent
+# while a print queue is open. The subscription MUST be answered with a
+# SubscribeResponse — returning anything else (the device metadata, say)
+# feeds the spooler's WSD event client a document it can't parse and
+# crashes it, which strands the print job in the queue.
+NS_EVENTING = "http://schemas.xmlsoap.org/ws/2004/08/eventing"
 # WS-MetadataExchange: the Metadata / MetadataSection wrapper elements a
 # WS-Transfer Get returns live in *this* namespace, not devprof.  Windows
 # silently drops a device whose metadata wrapper is mis-namespaced.
@@ -80,6 +86,10 @@ A_GETRESPONSE = NS_TRANSFER + "/GetResponse"
 # WSD Print (wprt) operations, sent to the device XAddrs (5357).
 A_GETELEMENTS_RESP = NS_WPRT + "/GetPrinterElementsResponse"
 A_GETSCANNER_ELEMENTS_RESP = NS_WSCN + "/GetScannerElementsResponse"
+A_SUBSCRIBE_RESP = NS_EVENTING + "/SubscribeResponse"
+A_UNSUBSCRIBE_RESP = NS_EVENTING + "/UnsubscribeResponse"
+A_RENEW_RESP = NS_EVENTING + "/RenewResponse"
+A_GETSTATUS_RESP = NS_EVENTING + "/GetStatusResponse"
 A_CREATEJOB_RESP = NS_WPRT + "/CreatePrintJobResponse"
 A_SENDDOC_RESP = NS_WPRT + "/SendDocumentResponse"
 A_ADDDOC_RESP = NS_WPRT + "/AddDocumentResponse"
@@ -134,11 +144,11 @@ def _envelope(header, body):
         '<soap:Envelope'
         ' xmlns:soap="%s" xmlns:wsa="%s" xmlns:wsd="%s"'
         ' xmlns:wsdp="%s" xmlns:wprt="%s" xmlns:wscn="%s" xmlns:mex="%s"'
-        ' xmlns:pnpx="%s" xmlns:df="%s">'
+        ' xmlns:pnpx="%s" xmlns:df="%s" xmlns:wse="%s">'
         '<soap:Header>%s</soap:Header>'
         '<soap:Body>%s</soap:Body></soap:Envelope>'
         % (NS_SOAP, NS_WSA, NS_WSD, NS_WSDP, NS_WPRT, NS_WSCN, NS_MEX,
-           NS_PNPX, NS_DF, header, body)
+           NS_PNPX, NS_DF, NS_EVENTING, header, body)
     ).encode("utf-8")
 
 
@@ -380,8 +390,23 @@ class WSDHttpService(TCPService):
             resp_action = (A_SENDDOC_RESP if action.endswith("/SendDocument")
                            else A_ADDDOC_RESP)
             return self._doc_resp(msgid, resp_action, self._job)
-        # Unknown op: an empty ack keeps the client from erroring hard.
-        return self._metadata(msgid)
+        # WS-Eventing: Windows subscribes to printer status events while a
+        # queue is open. These MUST get their own responses — the spooler's
+        # event client crashes on anything else.
+        if action.endswith("/eventing/Subscribe"):
+            self.log("Subscribe -> SubscribeResponse")
+            return self._subscribe_resp(msgid, text)
+        if action.endswith("/eventing/Renew"):
+            return self._renew_resp(msgid, text)
+        if action.endswith("/eventing/GetStatus"):
+            return self._getstatus_resp(msgid, text)
+        if action.endswith("/eventing/Unsubscribe"):
+            return self._unsubscribe_resp(msgid)
+        # Truly unknown op: a SOAP Fault is the correct answer. Returning
+        # device metadata here (the old behaviour) hands the client a
+        # document for the wrong operation and can crash it.
+        self.log("unhandled WSD action %r -> Fault" % action)
+        return self._fault(msgid, action)
 
     def _accept_document(self, text, binary):
         sink = getattr(self.host, "print_sink", None)
@@ -568,6 +593,67 @@ class WSDHttpService(TCPService):
             % (desc, config, status))
         hdr = _hdr(A_GETSCANNER_ELEMENTS_RESP, _new_msgid(),
                    relates_to=relates_to, to=NS_WSA + "/role/anonymous")
+        return _envelope(hdr, body)
+
+    # -- WS-Eventing -------------------------------------------------------
+    def _subscribe_resp(self, relates_to, req_text):
+        """Answer a WS-Eventing Subscribe with a SubscribeResponse.
+
+        We accept the subscription (echoing the requested Expires) and hand
+        back a SubscriptionManager the client addresses Renew/Unsubscribe to.
+        The pseudo-host does not (yet) push events to the NotifyTo sink, so
+        the subscription is effectively a no-op stream — but answering the
+        Subscribe correctly is what stops the spooler's event client from
+        crashing on a malformed reply, which is what stranded print jobs.
+        """
+        dev = WSDDevice(self.host)
+        expires = _find(req_text, "Expires") or "PT1H"
+        sub_id = _new_msgid()
+        body = (
+            '<wse:SubscribeResponse><wse:SubscriptionManager>'
+            '<wsa:Address>%s</wsa:Address>'
+            '<wsa:ReferenceParameters>'
+            '<wse:Identifier>%s</wse:Identifier>'
+            '</wsa:ReferenceParameters>'
+            '</wse:SubscriptionManager>'
+            '<wse:Expires>%s</wse:Expires>'
+            '</wse:SubscribeResponse>'
+            % (dev.xaddr(), sub_id, expires))
+        hdr = _hdr(A_SUBSCRIBE_RESP, _new_msgid(), relates_to=relates_to,
+                   to=NS_WSA + "/role/anonymous")
+        return _envelope(hdr, body)
+
+    def _renew_resp(self, relates_to, req_text):
+        expires = _find(req_text, "Expires") or "PT1H"
+        body = ('<wse:RenewResponse><wse:Expires>%s</wse:Expires>'
+                '</wse:RenewResponse>' % expires)
+        hdr = _hdr(A_RENEW_RESP, _new_msgid(), relates_to=relates_to,
+                   to=NS_WSA + "/role/anonymous")
+        return _envelope(hdr, body)
+
+    def _getstatus_resp(self, relates_to, req_text):
+        expires = _find(req_text, "Expires") or "PT1H"
+        body = ('<wse:GetStatusResponse><wse:Expires>%s</wse:Expires>'
+                '</wse:GetStatusResponse>' % expires)
+        hdr = _hdr(A_GETSTATUS_RESP, _new_msgid(), relates_to=relates_to,
+                   to=NS_WSA + "/role/anonymous")
+        return _envelope(hdr, body)
+
+    def _unsubscribe_resp(self, relates_to):
+        hdr = _hdr(A_UNSUBSCRIBE_RESP, _new_msgid(), relates_to=relates_to,
+                   to=NS_WSA + "/role/anonymous")
+        return _envelope(hdr, "")           # empty body per WS-Eventing
+
+    def _fault(self, relates_to, action):
+        """A SOAP 1.2 ActionNotSupported fault for an operation we don't do."""
+        body = (
+            '<soap:Fault><soap:Code><soap:Value>soap:Sender</soap:Value>'
+            '<soap:Subcode><soap:Value>wsa:ActionNotSupported</soap:Value>'
+            '</soap:Subcode></soap:Code><soap:Reason>'
+            '<soap:Text xml:lang="en">Action not supported: %s</soap:Text>'
+            '</soap:Reason></soap:Fault>' % action)
+        hdr = _hdr(NS_WSA + "/fault", _new_msgid(), relates_to=relates_to,
+                   to=NS_WSA + "/role/anonymous")
         return _envelope(hdr, body)
 
     def _create_job_resp(self, relates_to, job_id):

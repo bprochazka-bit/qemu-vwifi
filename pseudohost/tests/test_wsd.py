@@ -167,6 +167,43 @@ class TestWSDMetadata(unittest.TestCase):
         srv2.bind(h2)
         self.assertNotIn("ScannerServiceType", srv2._metadata("urn:uuid:y").decode())
 
+    def _dispatch_action(self, action, extra_body=""):
+        h = FakeHost("HP-OfficeJet-Den", dot11.mac_bytes("00:01:e6:aa:bb:cc"),
+                     ip="10.1.2.100")
+        srv = wsd.WSDHttpService()
+        srv.bind(h)
+        req = ('<soap:Envelope '
+               'xmlns:soap="http://www.w3.org/2003/05/soap-envelope" '
+               'xmlns:wsa="http://schemas.xmlsoap.org/ws/2004/08/addressing" '
+               'xmlns:wse="http://schemas.xmlsoap.org/ws/2004/08/eventing">'
+               '<soap:Header><wsa:MessageID>urn:uuid:req-1</wsa:MessageID>'
+               '<wsa:Action>%s</wsa:Action></soap:Header>'
+               '<soap:Body>%s</soap:Body></soap:Envelope>'
+               % (action, extra_body)).encode()
+        raw = (b"POST /x HTTP/1.1\r\nContent-Type: application/soap+xml\r\n"
+               b"Content-Length: " + str(len(req)).encode() + b"\r\n\r\n" + req)
+        return srv._dispatch(raw, raw.find(b"\r\n\r\n")).decode()
+
+    def test_eventing_subscribe_gets_subscriberesponse(self):
+        # The bug that crashed the spooler: a Subscribe used to fall through
+        # to device metadata. It must return a WS-Eventing SubscribeResponse.
+        resp = self._dispatch_action(
+            "http://schemas.xmlsoap.org/ws/2004/08/eventing/Subscribe",
+            "<wse:Subscribe><wse:Expires>PT1H</wse:Expires></wse:Subscribe>")
+        self.assertIn("<wse:SubscribeResponse>", resp)
+        self.assertIn("<wse:SubscriptionManager>", resp)
+        self.assertIn("<wse:Identifier>", resp)
+        self.assertIn("<wse:Expires>PT1H</wse:Expires>", resp)
+        self.assertIn("urn:uuid:req-1", resp)                 # RelatesTo
+        self.assertNotIn("ThisModel", resp)                   # not metadata!
+
+    def test_unknown_action_returns_fault_not_metadata(self):
+        resp = self._dispatch_action(
+            "http://example.com/some/UnknownOperation")
+        self.assertIn("<soap:Fault>", resp)
+        self.assertIn("ActionNotSupported", resp)
+        self.assertNotIn("<wsdp:ThisModel>", resp)
+
     def test_get_scanner_elements_response(self):
         h = FakeHost("HP-OfficeJet-Den", dot11.mac_bytes("00:01:e6:aa:bb:cc"),
                      ip="10.1.2.100")
