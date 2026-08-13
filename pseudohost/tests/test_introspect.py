@@ -80,6 +80,18 @@ class DumpConfigCLI(unittest.TestCase):
         self.assertEqual(enc["choices"], ["open", "wpa2"])
         svc = {s["name"] for s in d["extras"]["services"]}
         self.assertEqual(svc, {"lpd", "nas", "http", "echo"})
+        # The AP declares its wpa2-needs-a-passphrase cross-field rule so a
+        # driver can check it up front rather than on launcher exit.
+        con = d["constraints"]
+        self.assertTrue(any(
+            c["requires"] == "passphrase"
+            and c["when"] == {"param": "encryption", "equals": "wpa2"}
+            and c["message"]
+            for c in con))
+
+    def test_pseudohost_has_constraints_key(self):
+        rc, out = _run_launcher("pseudohost", ["--dump-config"])
+        self.assertEqual(json.loads(out)["constraints"], [])
 
 
 if __name__ == "__main__":

@@ -30,8 +30,22 @@
 #       },
 #       ...
 #     ],
-#     "extras": { ... }             # device-type-specific enrichment
+#     "extras": { ... },            # device-type-specific enrichment
+#     "constraints": [              # cross-field validation rules
+#       {
+#         "requires": "passphrase",         # this param must be non-empty
+#         "when": {"param": "encryption",   # ...when another param
+#                  "equals": "wpa2"},       #    equals this value
+#         "message": "WPA2 needs a passphrase."   # shown to the user
+#       },
+#       ...
+#     ]
 #   }
+#
+# Constraints let a launcher declare a rule its own argument parser
+# enforces (e.g. pseudoap rejects `--encryption wpa2` with no passphrase)
+# so a driver can check it up front and show the message, instead of only
+# discovering it when the launcher exits.
 #
 import argparse
 import json
@@ -91,7 +105,8 @@ def parser_to_params(parser):
     return params
 
 
-def build_descriptor(parser, *, device_type, binary, extras=None):
+def build_descriptor(parser, *, device_type, binary, extras=None,
+                     constraints=None):
     """Assemble the full JSON-able descriptor for a launcher."""
     return {
         "device_type": device_type,
@@ -99,12 +114,14 @@ def build_descriptor(parser, *, device_type, binary, extras=None):
         "description": (parser.description or "").strip(),
         "params": parser_to_params(parser),
         "extras": extras or {},
+        "constraints": constraints or [],
     }
 
 
-def dump_descriptor(parser, *, device_type, binary, extras=None):
+def dump_descriptor(parser, *, device_type, binary, extras=None,
+                    constraints=None):
     """Serialize the descriptor as pretty JSON (what --dump-config prints)."""
     return json.dumps(
         build_descriptor(parser, device_type=device_type, binary=binary,
-                         extras=extras),
+                         extras=extras, constraints=constraints),
         indent=2, sort_keys=False)

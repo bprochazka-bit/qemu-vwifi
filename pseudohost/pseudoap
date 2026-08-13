@@ -149,7 +149,13 @@ def main(argv=None):
         print(introspect.dump_descriptor(
             build_parser(), device_type="wifi-ap",
             binary="vwifi-pseudoap",
-            extras={"services": _SERVICE_CHOICES}))
+            extras={"services": _SERVICE_CHOICES},
+            # Mirrors the check main() enforces below: WPA2 needs a key.
+            constraints=[{
+                "requires": "passphrase",
+                "when": {"param": "encryption", "equals": "wpa2"},
+                "message": "WPA2 encryption requires a passphrase.",
+            }]))
         return 0
 
     args = build_parser().parse_args(argv)
