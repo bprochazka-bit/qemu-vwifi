@@ -102,6 +102,9 @@ class HPMultifunction(PseudoHost):
     # HP's USB vendor id, so the PnP-X HardwareId reads like a real HP
     # multifunction (VEN_03F0&DEV_...&SUBSYS_...).
     wsd_vendor_id = 0x03F0
+    # It is a multifunction: advertise a WSD scan service too, so Windows
+    # creates a scanner device node alongside the printer.
+    wsd_scan = True
     # Device Foundation category for a print/scan/fax multifunction, matching
     # what a real HP OfficeJet advertises so Windows files it as an MFP.
     df_device_category = ("PrintFax.Printer.MFP PrintFax.Printer.Inkjet "

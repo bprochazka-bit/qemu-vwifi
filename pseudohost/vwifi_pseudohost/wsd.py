@@ -60,6 +60,14 @@ NS_DF = "http://schemas.microsoft.com/windows/2008/09/devicefoundation"
 # HP printers advertise exactly this string.
 WSD_PRINT_COMPATIBLE_ID = ("http://schemas.microsoft.com/windows/2006/08/"
                            "wdp/print/PrinterServiceType")
+# WSD Scan (WS-Scan) service — the analogue of the print service that makes
+# a multifunction show up under Scanners. The service type lives in the
+# wscn namespace, and the CompatibleId maps it to Windows' inbox WSD Scan
+# (WIA) driver, just as the print CompatibleId maps to the print driver.
+NS_WSCN = "http://schemas.microsoft.com/windows/2006/08/wdp/scan"
+SCAN_SERVICE_TYPES = "wscn:ScannerServiceType"
+WSD_SCAN_COMPATIBLE_ID = ("http://schemas.microsoft.com/windows/2006/08/"
+                          "wdp/scan/ScannerServiceType")
 
 A_HELLO = NS_WSD + "/Hello"
 A_BYE = NS_WSD + "/Bye"
@@ -71,6 +79,7 @@ A_GET = NS_TRANSFER + "/Get"
 A_GETRESPONSE = NS_TRANSFER + "/GetResponse"
 # WSD Print (wprt) operations, sent to the device XAddrs (5357).
 A_GETELEMENTS_RESP = NS_WPRT + "/GetPrinterElementsResponse"
+A_GETSCANNER_ELEMENTS_RESP = NS_WSCN + "/GetScannerElementsResponse"
 A_CREATEJOB_RESP = NS_WPRT + "/CreatePrintJobResponse"
 A_SENDDOC_RESP = NS_WPRT + "/SendDocumentResponse"
 A_ADDDOC_RESP = NS_WPRT + "/AddDocumentResponse"
@@ -124,12 +133,12 @@ def _envelope(header, body):
         '<?xml version="1.0" encoding="utf-8"?>'
         '<soap:Envelope'
         ' xmlns:soap="%s" xmlns:wsa="%s" xmlns:wsd="%s"'
-        ' xmlns:wsdp="%s" xmlns:wprt="%s" xmlns:mex="%s" xmlns:pnpx="%s"'
-        ' xmlns:df="%s">'
+        ' xmlns:wsdp="%s" xmlns:wprt="%s" xmlns:wscn="%s" xmlns:mex="%s"'
+        ' xmlns:pnpx="%s" xmlns:df="%s">'
         '<soap:Header>%s</soap:Header>'
         '<soap:Body>%s</soap:Body></soap:Envelope>'
-        % (NS_SOAP, NS_WSA, NS_WSD, NS_WSDP, NS_WPRT, NS_MEX, NS_PNPX,
-           NS_DF, header, body)
+        % (NS_SOAP, NS_WSA, NS_WSD, NS_WSDP, NS_WPRT, NS_WSCN, NS_MEX,
+           NS_PNPX, NS_DF, header, body)
     ).encode("utf-8")
 
 
@@ -173,6 +182,16 @@ class WSDDevice:
             % (vid, model_tok, self.model_number))
         self.compatible_id = getattr(host, "pnpx_compatible_id",
                                      WSD_PRINT_COMPATIBLE_ID)
+        # A multifunction also hosts a WSD scan service, so it shows up
+        # under Scanners as well as Printers. The scanner gets its own
+        # PnP-X ids (a distinct HardwareId sub-id, the inbox scan driver's
+        # CompatibleId). Off unless the profile sets wsd_scan.
+        self.scan = bool(getattr(host, "wsd_scan", False))
+        self.scan_hardware_id = getattr(host, "wsd_scan_hardware_id", None) or (
+            "VEN_%04X&amp;DEV_%s&amp;SUBSYS_%s_SCAN"
+            % (vid, model_tok, self.model_number))
+        self.scan_compatible_id = getattr(host, "pnpx_scan_compatible_id",
+                                          WSD_SCAN_COMPATIBLE_ID)
         # WS-Discovery AppSequence InstanceId: MUST change each time the
         # device (re)starts so a client discards state cached under a prior
         # instance. A constant "1" means Windows treats every restart as the
@@ -347,6 +366,9 @@ class WSDHttpService(TCPService):
         if action.endswith("/GetPrinterElements"):
             self.log("GetPrinterElements -> 200")
             return self._printer_elements(msgid)
+        if action.endswith("/GetScannerElements"):
+            self.log("GetScannerElements -> 200")
+            return self._scanner_elements(msgid)
         if action.endswith("/CreatePrintJob"):
             self._job += 1
             jobname = _find(text, "JobName") or "job%d" % self._job
@@ -409,19 +431,36 @@ class WSDHttpService(TCPService):
         # device uses. The Hosted endpoint stays the reachable :5357 address
         # (where this process serves the print operations), and carries the
         # PnP-X HardwareId + CompatibleId Windows needs to build the node.
-        service_id = "http://%s/PrintService" % dev.uuid.split(":")[-1]
+        uuid_tail = dev.uuid.split(":")[-1]
+
+        def hosted(types, service_id, hwid, cid):
+            return (
+                '<wsdp:Hosted>'
+                '<wsa:EndpointReference><wsa:Address>%s</wsa:Address>'
+                '</wsa:EndpointReference>'
+                '<wsdp:Types>%s</wsdp:Types>'
+                '<wsdp:ServiceId>%s</wsdp:ServiceId>'
+                '<pnpx:HardwareId>%s</pnpx:HardwareId>'
+                '<pnpx:CompatibleId>%s</pnpx:CompatibleId>'
+                '</wsdp:Hosted>'
+                % (dev.xaddr(), types, service_id, hwid, cid))
+
+        hosted_services = [
+            hosted(PRINT_SERVICE_TYPES,
+                   "http://%s/PrintService" % uuid_tail,
+                   dev.hardware_id, dev.compatible_id),
+        ]
+        # A multifunction adds a WSD scan service so Windows also creates a
+        # scanner device node (Scanners / Windows Fax and Scan).
+        if dev.scan:
+            hosted_services.append(hosted(
+                SCAN_SERVICE_TYPES,
+                "http://%s/ScanService" % uuid_tail,
+                dev.scan_hardware_id, dev.scan_compatible_id))
+
         relationship = (
-            '<wsdp:Relationship Type="%s/host">'
-            '<wsdp:Hosted><wsa:EndpointReference><wsa:Address>%s</wsa:Address>'
-            '</wsa:EndpointReference>'
-            '<wsdp:Types>%s</wsdp:Types>'
-            '<wsdp:ServiceId>%s</wsdp:ServiceId>'
-            '<pnpx:HardwareId>%s</pnpx:HardwareId>'
-            '<pnpx:CompatibleId>%s</pnpx:CompatibleId>'
-            '</wsdp:Hosted>'
-            '</wsdp:Relationship>'
-            % (NS_WSDP, dev.xaddr(), PRINT_SERVICE_TYPES, service_id,
-               dev.hardware_id, dev.compatible_id))
+            '<wsdp:Relationship Type="%s/host">%s</wsdp:Relationship>'
+            % (NS_WSDP, "".join(hosted_services)))
         # The Metadata / MetadataSection wrapper elements are WS-Metadata-
         # Exchange (mex:), not devprof: Windows parses the sections by that
         # namespace and drops the device if the wrapper is mis-namespaced.
@@ -471,6 +510,64 @@ class WSDHttpService(TCPService):
             % (desc, status))
         hdr = _hdr(A_GETELEMENTS_RESP, _new_msgid(), relates_to=relates_to,
                    to=NS_WSA + "/role/anonymous")
+        return _envelope(hdr, body)
+
+    def _scanner_elements(self, relates_to):
+        """Minimal WSD-Scan GetScannerElements response.
+
+        Enough for Windows to finish installing the scanner devnode: a
+        ScannerDescription (name/info), a ScannerConfiguration advertising a
+        flatbed (Platen) with common resolutions, and an Idle status. This
+        is the scan analogue of _printer_elements; it does not implement an
+        actual scan (CreateScanJob/RetrieveImage) yet — it makes the device
+        install and show under Scanners.
+        """
+        dev = WSDDevice(self.host)
+        desc = (
+            '<wscn:ScannerDescription>'
+            '<wscn:ScannerName xml:lang="en-US">%s</wscn:ScannerName>'
+            '<wscn:ScannerInfo xml:lang="en-US">Simulated by '
+            'vwifi-pseudohost</wscn:ScannerInfo>'
+            '</wscn:ScannerDescription>' % dev.friendly)
+        status = (
+            '<wscn:ScannerStatus>'
+            '<wscn:ScannerCurrentTime>1970-01-01T00:00:00.000Z'
+            '</wscn:ScannerCurrentTime>'
+            '<wscn:ScannerState>Idle</wscn:ScannerState>'
+            '</wscn:ScannerStatus>')
+        config = (
+            '<wscn:ScannerConfiguration>'
+            '<wscn:DeviceSettings>'
+            '<wscn:FormatsSupported>'
+            '<wscn:FormatValue>jfif</wscn:FormatValue>'
+            '<wscn:FormatValue>png</wscn:FormatValue>'
+            '</wscn:FormatsSupported>'
+            '<wscn:ContentTypesSupported>'
+            '<wscn:ContentTypeValue>Auto</wscn:ContentTypeValue>'
+            '</wscn:ContentTypesSupported>'
+            '</wscn:DeviceSettings>'
+            '<wscn:Platen>'
+            '<wscn:PlatenOpticalResolution>'
+            '<wscn:Width>300</wscn:Width><wscn:Height>300</wscn:Height>'
+            '</wscn:PlatenOpticalResolution>'
+            '<wscn:PlatenColorSpaces>'
+            '<wscn:ColorEntry>RGB24</wscn:ColorEntry>'
+            '<wscn:ColorEntry>Grayscale8</wscn:ColorEntry>'
+            '</wscn:PlatenColorSpaces>'
+            '</wscn:Platen>'
+            '</wscn:ScannerConfiguration>')
+        body = (
+            '<wscn:GetScannerElementsResponse><wscn:ScannerElements>'
+            '<wscn:ElementData Name="wscn:ScannerDescription">%s'
+            '</wscn:ElementData>'
+            '<wscn:ElementData Name="wscn:ScannerConfiguration">%s'
+            '</wscn:ElementData>'
+            '<wscn:ElementData Name="wscn:ScannerStatus">%s'
+            '</wscn:ElementData>'
+            '</wscn:ScannerElements></wscn:GetScannerElementsResponse>'
+            % (desc, config, status))
+        hdr = _hdr(A_GETSCANNER_ELEMENTS_RESP, _new_msgid(),
+                   relates_to=relates_to, to=NS_WSA + "/role/anonymous")
         return _envelope(hdr, body)
 
     def _create_job_resp(self, relates_to, job_id):

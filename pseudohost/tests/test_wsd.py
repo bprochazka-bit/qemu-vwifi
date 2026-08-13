@@ -140,13 +140,43 @@ class TestWSDMetadata(unittest.TestCase):
                       text)
         self.assertIn("<mex:Metadata>", text)
         self.assertIn("mex:MetadataSection", text)
-        self.assertNotIn("<wsdp:Metadata>", text)
         # PnP-X DeviceCategory: without it Windows parses the metadata but
         # never publishes the device into the Explorer "Network" folder.
         self.assertIn('xmlns:pnpx="http://schemas.microsoft.com/windows/'
                       'pnpx/2005/10"', text)
         self.assertIn("<pnpx:DeviceCategory>Printers</pnpx:DeviceCategory>",
                       text)
+
+    def test_multifunction_advertises_scan_service(self):
+        # A device with wsd_scan carries a second hosted service so Windows
+        # also creates a scanner node.
+        h = FakeHost("HP-OfficeJet-Den", dot11.mac_bytes("00:01:e6:aa:bb:cc"),
+                     ip="10.1.2.100")
+        h.wsd_scan = True
+        h.wsd_model = "HP OfficeJet Pro 9015"
+        srv = wsd.WSDHttpService()
+        srv.bind(h)
+        meta = srv._metadata("urn:uuid:x").decode()
+        self.assertIn("<wsdp:Types>wscn:ScannerServiceType</wsdp:Types>", meta)
+        self.assertIn("wdp/scan/ScannerServiceType", meta)   # scan compat id
+        self.assertIn("<wsdp:Types>wprt:PrinterServiceType</wsdp:Types>", meta)
+        # A print-only device has no scan service.
+        h2 = FakeHost("Plain", dot11.mac_bytes("02:60:b0:aa:bb:cc"),
+                      ip="10.1.2.101")
+        srv2 = wsd.WSDHttpService()
+        srv2.bind(h2)
+        self.assertNotIn("ScannerServiceType", srv2._metadata("urn:uuid:y").decode())
+
+    def test_get_scanner_elements_response(self):
+        h = FakeHost("HP-OfficeJet-Den", dot11.mac_bytes("00:01:e6:aa:bb:cc"),
+                     ip="10.1.2.100")
+        h.wsd_scan = True
+        srv = wsd.WSDHttpService()
+        srv.bind(h)
+        resp = srv._scanner_elements("urn:uuid:s-1").decode()
+        self.assertIn("GetScannerElementsResponse", resp)
+        self.assertIn("wscn:ScannerState>Idle", resp)
+        self.assertIn("urn:uuid:s-1", resp)                  # RelatesTo
 
 
 if __name__ == "__main__":
