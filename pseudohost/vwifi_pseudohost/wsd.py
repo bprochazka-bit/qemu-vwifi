@@ -49,6 +49,15 @@ NS_MEX = "http://schemas.xmlsoap.org/ws/2004/09/mex"
 # publish it into the Explorer "Network" folder; a device metadata with
 # no PnP-X category is parsed but never rendered as a device tile.
 NS_PNPX = "http://schemas.microsoft.com/windows/pnpx/2005/10"
+# Device Foundation (Windows 7+).  Modern Windows categorises a device
+# for the Network folder from <df:DeviceCategory> here, not the legacy
+# 2005 PnP-X category -- a real HP OfficeJet carries *both*.  Without it
+# the device is parsed but never published as a device node.
+NS_DF = "http://schemas.microsoft.com/windows/2008/09/devicefoundation"
+# The inbox-driver match a standard WSD print service advertises so
+# Windows can drive it with its built-in class driver.
+WSD_PRINT_COMPATIBLE_ID = (
+    "http://schemas.microsoft.com/windows/2006/08/wdp/print/PrinterServiceType")
 
 A_HELLO = NS_WSD + "/Hello"
 A_BYE = NS_WSD + "/Bye"
@@ -106,11 +115,12 @@ def _envelope(header, body):
         '<?xml version="1.0" encoding="utf-8"?>'
         '<soap:Envelope'
         ' xmlns:soap="%s" xmlns:wsa="%s" xmlns:wsd="%s"'
-        ' xmlns:wsdp="%s" xmlns:wprt="%s" xmlns:mex="%s" xmlns:pnpx="%s">'
+        ' xmlns:wsdp="%s" xmlns:wprt="%s" xmlns:mex="%s" xmlns:pnpx="%s"'
+        ' xmlns:df="%s">'
         '<soap:Header>%s</soap:Header>'
         '<soap:Body>%s</soap:Body></soap:Envelope>'
         % (NS_SOAP, NS_WSA, NS_WSD, NS_WSDP, NS_WPRT, NS_MEX, NS_PNPX,
-           header, body)
+           NS_DF, header, body)
     ).encode("utf-8")
 
 
@@ -135,7 +145,19 @@ class WSDDevice:
         # PnP-X device category (space-delimited list); this is what puts
         # the device under the right heading in Explorer's Network folder.
         self.pnpx_category = getattr(host, "pnpx_category", "Printers")
+        # Device Foundation category taxonomy that Windows 7+ actually
+        # reads (e.g. "PrintFax.Printer", or the MFP set an OfficeJet ships).
+        self.df_category = getattr(host, "df_category", "PrintFax.Printer")
+        # PnP-X hardware id for driver matching; a plausible VEN/DEV string
+        # built from the model, overridable per-profile.
+        self.hardware_id = getattr(host, "wsd_hardware_id", None) \
+            or self._default_hwid()
         self.instance = 1
+
+    def _default_hwid(self):
+        model = re.sub(r"[^A-Za-z0-9]+", "_", self.model).strip("_")
+        return "VEN_%s&DEV_%s" % (self.manufacturer[:4].upper() or "PSEU",
+                                  model or "Device")
 
     def xaddr(self):
         ip = ".".join(str(x) for x in (self.host.stack.ip or bytes(4)))
@@ -340,9 +362,10 @@ class WSDHttpService(TCPService):
             '<wsdp:ModelUrl>http://%s/</wsdp:ModelUrl>'
             '<wsdp:PresentationUrl>http://%s/</wsdp:PresentationUrl>'
             '<pnpx:DeviceCategory>%s</pnpx:DeviceCategory>'
+            '<df:DeviceCategory>%s</df:DeviceCategory>'
             '</wsdp:ThisModel>'
             % (dev.manufacturer, ip, dev.model, dev.model_number, ip, ip,
-               dev.pnpx_category))
+               dev.pnpx_category, dev.df_category))
         this_device = (
             '<wsdp:ThisDevice><wsdp:FriendlyName>%s</wsdp:FriendlyName>'
             '<wsdp:FirmwareVersion>1.0</wsdp:FirmwareVersion>'
@@ -359,11 +382,15 @@ class WSDHttpService(TCPService):
             '<wsdp:Types>%s</wsdp:Types></wsdp:Host>'
             '<wsdp:Hosted><wsa:EndpointReference><wsa:Address>%s</wsa:Address>'
             '</wsa:EndpointReference>'
-            '<wsdp:Types>wprt:PrintDeviceType</wsdp:Types>'
-            '<wsdp:ServiceId>%s</wsdp:ServiceId></wsdp:Hosted>'
+            '<wsdp:Types>wprt:PrinterServiceType</wsdp:Types>'
+            '<wsdp:ServiceId>%s</wsdp:ServiceId>'
+            '<pnpx:HardwareId>%s</pnpx:HardwareId>'
+            '<pnpx:CompatibleId>%s</pnpx:CompatibleId>'
+            '</wsdp:Hosted>'
             '</wsdp:Relationship>'
             % (NS_WSDP, dev.uuid, DEVICE_TYPES, dev.xaddr(),
-               dev.print_svc_uuid()))
+               dev.print_svc_uuid(), _xml_escape(dev.hardware_id),
+               WSD_PRINT_COMPATIBLE_ID))
         # The Metadata / MetadataSection wrapper elements are WS-Metadata-
         # Exchange (mex:), not devprof: Windows parses the sections by that
         # namespace and drops the device if the wrapper is mis-namespaced.
@@ -462,6 +489,10 @@ def _split_mtom(headers, body):
         elif pbody:
             binary = pbody
     return soap, binary
+
+
+def _xml_escape(s):
+    return (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
 
 
 def _find(text, tag):

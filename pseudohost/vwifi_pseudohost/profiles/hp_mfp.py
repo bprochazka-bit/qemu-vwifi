@@ -99,6 +99,11 @@ class HPMultifunction(PseudoHost):
     wsd_manufacturer = "HP"
     wsd_model = HP_MODEL
     wsd_model_number = "9015"
+    # Device Foundation category taxonomy Windows 7+ reads to publish the
+    # device into the Network folder; the MFP set mirrors a real OfficeJet
+    # (print + inkjet + scan + fax), not just a plain printer.
+    df_category = ("PrintFax.Printer.MFP PrintFax.Printer.Inkjet "
+                   "Imaging.Scanner PrintFax.FAX")
     # WSD is what stock Windows uses for "Network" and "Add a printer";
     # mDNS covers macOS / IPP-Everywhere clients; JetDirect/9100 is the
     # raw path that always prints.

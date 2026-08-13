@@ -111,6 +111,12 @@ class TestWSDMetadata(unittest.TestCase):
                       'pnpx/2005/10"', text)
         self.assertIn("<pnpx:DeviceCategory>Printers</pnpx:DeviceCategory>",
                       text)
+        # Device Foundation category (what Windows 7+ actually publishes on)
+        # and the PnP-X hardware/compatible ids that let it build a devnode.
+        self.assertIn("<df:DeviceCategory>", text)
+        self.assertIn("<wsdp:Types>wprt:PrinterServiceType</wsdp:Types>", text)
+        self.assertIn("<pnpx:HardwareId>", text)
+        self.assertIn("wdp/print/PrinterServiceType</pnpx:CompatibleId>", text)
 
 
 if __name__ == "__main__":
