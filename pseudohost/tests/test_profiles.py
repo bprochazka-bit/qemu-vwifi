@@ -151,6 +151,109 @@ class TestMDNS(unittest.TestCase):
         self.assertIsNotNone(resp, "MFP did not answer a scanner browse")
 
 
+def _all_mdns_ip_packets(station):
+    """Every mDNS egress IP packet (full IP datagram bytes)."""
+    out = []
+    for _dst, et, sdu in station.sent:
+        if et != dot11.ETH_P_IP or sdu[9] != netstack.IPPROTO_UDP:
+            continue
+        out.append(sdu)
+    return out
+
+
+class FakeClock:
+    def __init__(self, t=1000.0):
+        self.t = t
+
+    def __call__(self):
+        return self.t
+
+
+class TestMDNSDelivery(unittest.TestCase):
+    """The bug this guards: a full record set crammed into one >MTU datagram
+    is dropped on the wire, so mDNS discovery silently fails."""
+
+    def _mfp(self):
+        h = FakeHost("HP-OfficeJet-PH01", dot11.mac_bytes("00:01:e6:c1:23:45"),
+                     ip="192.168.1.127")
+        from vwifi_pseudohost.profiles.hp_mfp import _mfp_mdns
+        svc = _mfp_mdns()
+        svc.bind(h)
+        return h, svc
+
+    def test_announcement_split_under_mtu(self):
+        h, svc = self._mfp()
+        svc._armed = False
+        svc.tick()                                   # one announcement pass
+        pkts = _all_mdns_ip_packets(h.station)
+        self.assertGreater(len(pkts), 1,
+                           "announcement should split across packets")
+        for sdu in pkts:
+            self.assertLessEqual(len(sdu), 1500,
+                                 "an mDNS datagram exceeded the link MTU")
+            ihl = (sdu[0] & 0x0F) * 4
+            self.assertLessEqual(len(sdu) - ihl - 8, mdns.MDNS_MAX_PAYLOAD)
+
+    def test_browse_response_under_mtu(self):
+        # An ANY browse of every advertised type returns a large record set.
+        h, svc = self._mfp()
+        h.station.sent.clear()
+        for a in svc.adverts:
+            svc.on_udp(netstack.ip_bytes("192.168.1.99"), 5353,
+                       netstack.ip_bytes("224.0.0.251"), 5353,
+                       _mdns_query(a.stype, mdns.T_ANY))
+        for sdu in _all_mdns_ip_packets(h.station):
+            self.assertLessEqual(len(sdu), 1500)
+
+    def test_pack_groups_splits_and_preserves(self):
+        # 40 groups of a ~200B record each must span multiple <=max packets.
+        rr = mdns._rr("x._ipp._tcp.local", mdns.T_TXT, b"k=" + b"v" * 180)
+        groups = [([rr], []) for _ in range(40)]
+        pkts = mdns.pack_groups(groups, max_payload=1400)
+        self.assertGreater(len(pkts), 1)
+        for p in pkts:
+            self.assertLessEqual(len(p), 1400)
+        # Every record still shipped (answer counts sum to 40).
+        total = sum(struct.unpack_from(">H", p, 6)[0] for p in pkts)
+        self.assertEqual(total, 40)
+
+    def test_startup_burst_then_periodic(self):
+        h, svc = self._mfp()
+        clock = FakeClock()
+        orig = mdns.time.monotonic
+        mdns.time.monotonic = clock
+        try:
+            rounds = 0
+            for _ in range(4):                       # first ~4 seconds
+                before = len(h.station.sent)
+                svc.tick()
+                if len(h.station.sent) > before:
+                    rounds += 1
+                clock.t += 1.0
+            self.assertGreaterEqual(rounds, 2,
+                                    "expected a startup announcement burst")
+            # After the burst, it should not announce again every second.
+            quiet_before = len(h.station.sent)
+            svc.tick()
+            self.assertEqual(len(h.station.sent), quiet_before)
+        finally:
+            mdns.time.monotonic = orig
+
+    def test_plain_printer_profile_advertises_mdns(self):
+        h = FakeHost("HPLJ-PH01", dot11.mac_bytes("02:60:b0:12:34:56"))
+        from vwifi_pseudohost.profiles.printer import _printer_mdns
+        svc = _printer_mdns()
+        svc.bind(h)
+        svc.on_udp(netstack.ip_bytes("192.168.5.9"), 5353,
+                   netstack.ip_bytes("224.0.0.251"), 5353,
+                   _mdns_query("_ipp._tcp.local"))
+        resp = _last_udp_payload(h.station)
+        self.assertIsNotNone(resp, "plain printer profile answered no IPP browse")
+        types = {t for _n, t in _parse_rrs(resp)}
+        self.assertIn(mdns.T_SRV, types)
+        self.assertIn(mdns.T_TXT, types)
+
+
 class TestSIP(unittest.TestCase):
     def test_options_200(self):
         h = FakeHost("sip-phone-den", dot11.mac_bytes("02:1b:77:11:22:33"))

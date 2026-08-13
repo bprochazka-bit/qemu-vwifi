@@ -24,6 +24,16 @@ from .services import Service
 MDNS_ADDR = "224.0.0.251"
 MDNS_PORT = 5353
 
+# Keep every response/announcement datagram within the link MTU. The
+# netstack emits a single unfragmented IP packet per send_udp, so a
+# datagram larger than the path MTU (1500B Ethernet) is silently dropped
+# on the wire — which is exactly what happened when a multifunction's full
+# record set (PTR+SRV+TXT+A for six service types) was crammed into one
+# 2KB packet: WSD worked, mDNS never arrived. RFC 6762 §17 says a responder
+# with more records than fit MUST split them across multiple messages;
+# 1400 leaves headroom under 1500 minus the IP(20)+UDP(8) headers.
+MDNS_MAX_PAYLOAD = 1400
+
 # record types
 T_A = 1
 T_PTR = 12
@@ -120,6 +130,33 @@ def build_response(answers, additionals=()):
     return hdr + b"".join(answers) + b"".join(additionals)
 
 
+def pack_groups(groups, max_payload=MDNS_MAX_PAYLOAD):
+    """Pack answer/additional record groups into >=1 datagrams under the MTU.
+
+    `groups` is a list of (answer_rrs, additional_rrs): one group per
+    service, kept together in the same datagram so a client sees a PTR with
+    its SRV/TXT/A. Groups are accumulated into a response until the next one
+    would push the datagram over `max_payload`, then a new datagram starts.
+    Returns a list of packet bytes (empty if there is nothing to send).
+    """
+    packets = []
+    ans, add = [], []
+
+    def cur_size():
+        return 12 + sum(len(x) for x in ans) + sum(len(x) for x in add)
+
+    for g_ans, g_add in groups:
+        g_len = sum(len(x) for x in g_ans) + sum(len(x) for x in g_add)
+        if (ans or add) and cur_size() + g_len > max_payload:
+            packets.append(build_response(ans, add))
+            ans, add = [], []
+        ans.extend(g_ans)
+        add.extend(g_add)
+    if ans or add:
+        packets.append(build_response(ans, add))
+    return packets
+
+
 class Advert:
     """One advertised DNS-SD service.
 
@@ -150,19 +187,33 @@ class MDNSResponder(Service):
     name = "mdns"
     udp_ports = (MDNS_PORT,)
 
-    def __init__(self, adverts=(), announce_period=0.0, advert_factory=None):
+    def __init__(self, adverts=(), announce_period=0.0, advert_factory=None,
+                 startup_bursts=3, burst_interval=1.0):
         """
         adverts         : fixed list of Advert, or
         advert_factory  : callable(host) -> [Advert], resolved at bind time
                           (use this when an advert depends on the host's
                           identity — its MAC-derived id, its hostname).
+        announce_period : seconds between periodic re-announcements after the
+                          startup burst (0 = only the burst, then respond to
+                          queries — the RFC-minimum behaviour).
+        startup_bursts  : how many unsolicited announcements to send when the
+                          host first comes online. RFC 6762 §8.3 wants at
+                          least two, spaced >=1s, so a browser already
+                          listening catches the device without waiting for
+                          the next periodic announce (or a query).
+        burst_interval  : spacing of the startup burst, in seconds.
         """
         super().__init__()
         self.adverts = list(adverts)
         self.announce_period = announce_period
         self._advert_factory = advert_factory
         self.host_name = "pseudohost.local"
-        self._next_announce = 0.0
+        self.startup_bursts = startup_bursts
+        self.burst_interval = burst_interval
+        self._bursts_left = startup_bursts
+        self._armed = False            # set once the host has an IP
+        self._next_announce = 0.0      # None => no further announcements
 
     def on_start(self):
         # host label from the profile's hostname (DNS labels: no spaces).
@@ -193,58 +244,75 @@ class MDNSResponder(Service):
             extra.append(arec)
         return ptr, extra
 
+    # -- packet egress -----------------------------------------------------
+    def _send_groups(self, groups):
+        """Send record groups as one or more datagrams, each under the MTU."""
+        for pkt in pack_groups(groups):
+            self.stack.send_udp(MDNS_ADDR, MDNS_PORT, pkt, src_port=MDNS_PORT)
+
+    def _announcement_groups(self):
+        """The full PTR+SRV+TXT+A bundle for every advertised service."""
+        groups = []
+        for a in self.adverts:
+            ptr, extra = self._answer_for_type(a)
+            groups.append(([ptr], list(extra)))
+        return groups
+
     # -- query handling ----------------------------------------------------
     def on_udp(self, src_ip, src_port, dst_ip, dst_port, payload):
         questions = parse_questions(payload)
         if not questions:
             return
-        answers = []
-        additionals = []
+        groups = []
         for qname, qtype in questions:
-            self._match(qname, qtype, answers, additionals)
-        if answers:
-            resp = build_response(answers, additionals)
-            self.stack.send_udp(MDNS_ADDR, MDNS_PORT, resp,
-                                src_port=MDNS_PORT)
+            self._match(qname, qtype, groups)
+        # A response may not fit one datagram; split it so nothing is lost to
+        # the MTU (a large answer set is why mDNS silently failed before).
+        self._send_groups(groups)
 
-    def _match(self, qname, qtype, answers, additionals):
+    def _match(self, qname, qtype, groups):
         # Service enumeration: list the types we offer.
         if qname == SERVICE_ENUM and qtype in (T_PTR, T_ANY):
-            for a in self.adverts:
-                answers.append(_rr(SERVICE_ENUM, T_PTR, encode_name(a.stype),
-                                   cache_flush=False))
+            ptrs = [_rr(SERVICE_ENUM, T_PTR, encode_name(a.stype),
+                        cache_flush=False) for a in self.adverts]
+            if ptrs:
+                groups.append((ptrs, []))
             return
         for a in self.adverts:
             if qname == a.stype.lower() and qtype in (T_PTR, T_ANY):
                 ptr, extra = self._answer_for_type(a)
-                answers.append(ptr)
-                additionals.extend(extra)
+                groups.append(([ptr], list(extra)))
             elif qname == a.fqdn.lower() and qtype in (T_SRV, T_TXT, T_ANY):
                 srv, txt = self._srv_and_txt(a)
-                answers.extend([srv, txt])
                 arec = self._a_record()
-                if arec:
-                    additionals.append(arec)
+                groups.append(([srv, txt], [arec] if arec else []))
         if qname == self.host_name.lower() and qtype in (T_A, T_ANY):
             arec = self._a_record()
             if arec:
-                answers.append(arec)
+                groups.append(([arec], []))
 
     # -- unsolicited announcement -----------------------------------------
     def tick(self):
-        if self.announce_period <= 0 or self.stack.ip is None:
+        # Nothing to announce until the host has an address for its A record.
+        if self.stack.ip is None:
             return
         now = time.monotonic()
-        if now < self._next_announce:
+        if not self._armed:
+            # The host just came online: start the startup announcement
+            # burst now (RFC 6762 §8.3) rather than waiting a whole period.
+            self._armed = True
+            self._bursts_left = self.startup_bursts
+            self._next_announce = now
+        if self._next_announce is None or now < self._next_announce:
             return
-        self._next_announce = now + self.announce_period
-        answers = []
-        additionals = []
-        for a in self.adverts:
-            ptr, extra = self._answer_for_type(a)
-            answers.append(ptr)
-            additionals.extend(extra)
-        if answers:
-            self.stack.send_udp(MDNS_ADDR, MDNS_PORT,
-                                build_response(answers, additionals),
-                                src_port=MDNS_PORT)
+        self._send_groups(self._announcement_groups())
+        if self._bursts_left > 0:
+            # Still in the startup burst — re-announce again shortly.
+            self._bursts_left -= 1
+            self._next_announce = now + self.burst_interval
+        elif self.announce_period > 0:
+            self._next_announce = now + self.announce_period
+        else:
+            # Burst done and no periodic re-announce requested: fall silent
+            # and just answer queries from here on.
+            self._next_announce = None

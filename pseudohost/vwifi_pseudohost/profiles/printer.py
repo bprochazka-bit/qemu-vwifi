@@ -11,11 +11,12 @@
 # in as UDPService/TCP handlers without touching this profile.
 #
 from ..host import PseudoHost
+from ..mdns import Advert, MDNSResponder
 from ..services import Service
 from ..printing import JetDirectService
 from ..ipp import IPPService
 from ..snmp import SNMPAgent
-from ..wsd import WSDiscoveryService, WSDHttpService
+from ..wsd import WSDiscoveryService, WSDHttpService, uuid_from_mac
 
 
 class PrinterService(Service):
@@ -23,6 +24,39 @@ class PrinterService(Service):
 
     name = "printer"
     tcp_ports = (515,)                     # LPD (advertisement)
+
+
+def _printer_adverts(host):
+    """mDNS/Bonjour adverts for a plain network printer: IPP (the modern
+    driverless path), LPD, raw JetDirect, and the embedded web page. This is
+    what makes the printer show up in a Bonjour browse / macOS 'Add Printer'
+    / Windows-with-Bonjour, the same way the multifunction profile does."""
+    inst = host.hostname
+    model = getattr(host, "wsd_model", "Network Printer")
+    ty = ("ty=" + model).encode()
+    uuid = uuid_from_mac(host.mac).split(":")[-1].encode()
+    ipp_txt = [
+        b"txtvers=1", b"qtotal=1",
+        b"rp=ipp/print",
+        ty,
+        ("product=(%s)" % model).encode(),
+        b"pdl=application/pdf,image/urf,image/pwg-raster,image/jpeg",
+        b"URF=CP1,PQ4-5,RS300-600,SRGB24,W8,V1.4,DM1",
+        b"UUID=" + uuid,
+        b"adminurl=http://" + host.hostname.encode() + b".local./",
+        b"priority=50",
+        b"Color=F", b"Duplex=T",
+    ]
+    return [
+        Advert("_ipp._tcp.local", inst, 631, ipp_txt),
+        Advert("_printer._tcp.local", inst, 515, [ty]),
+        Advert("_pdl-datastream._tcp.local", inst, 9100, [ty]),
+        Advert("_http._tcp.local", inst, 80, [b"path=/"]),
+    ]
+
+
+def _printer_mdns():
+    return MDNSResponder(advert_factory=_printer_adverts, announce_period=30.0)
 
 
 class NetworkPrinter(PseudoHost):
@@ -34,8 +68,9 @@ class NetworkPrinter(PseudoHost):
     wsd_manufacturer = "HP"
     wsd_model = "HP LaserJet"
     wsd_model_number = "PH01"
-    # IPP (631) is the modern driverless add+print path (mDNS _ipp._tcp);
-    # WSD makes it discoverable by older Windows; SNMP lets the "Standard
+    # IPP (631) is the modern driverless add+print path, advertised over
+    # mDNS (_ipp._tcp) so Bonjour/macOS/Windows-with-Bonjour discover it;
+    # WSD makes it discoverable by stock Windows; SNMP lets the "Standard
     # TCP/IP Port" wizard identify it; JetDirect/9100 always prints raw.
-    services = [PrinterService, IPPService, JetDirectService, SNMPAgent,
-                WSDiscoveryService, WSDHttpService]
+    services = [PrinterService, _printer_mdns, IPPService, JetDirectService,
+                SNMPAgent, WSDiscoveryService, WSDHttpService]
