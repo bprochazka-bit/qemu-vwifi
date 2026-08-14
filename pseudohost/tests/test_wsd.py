@@ -159,6 +159,14 @@ class TestWSDMetadata(unittest.TestCase):
         meta = srv._metadata("urn:uuid:x").decode()
         self.assertIn("<wsdp:Types>wscn:ScannerServiceType</wsdp:Types>", meta)
         self.assertIn("wdp/scan/ScannerServiceType", meta)   # scan compat id
+        # The wscn prefix MUST bind to the 2006/08 namespace: the
+        # ScannerServiceType QName is resolved through it, and Windows only
+        # treats the hosted service as a scanner when it is
+        # {2006/08}ScannerServiceType. Binding wscn to 2006/01 (an earlier
+        # regression) left the device showing only as a printer.
+        self.assertIn(
+            'xmlns:wscn="http://schemas.microsoft.com/windows/2006/08/'
+            'wdp/scan"', meta)
         self.assertIn("<wsdp:Types>wprt:PrinterServiceType</wsdp:Types>", meta)
         # A print-only device has no scan service.
         h2 = FakeHost("Plain", dot11.mac_bytes("02:60:b0:aa:bb:cc"),

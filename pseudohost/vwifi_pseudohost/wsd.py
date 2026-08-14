@@ -92,12 +92,19 @@ NS_DF = "http://schemas.microsoft.com/windows/2008/09/devicefoundation"
 WSD_PRINT_COMPATIBLE_ID = ("http://schemas.microsoft.com/windows/2006/08/"
                            "wdp/print/PrinterServiceType")
 # WSD Scan (WS-Scan) service — the analogue of the print service that makes
-# a multifunction show up under Scanners and lets Windows pull a scan. The
-# WS-Scan protocol namespace is the 2006/01 one (this is what the operation
-# elements and a real HP's metadata use); the CompatibleId that maps the
-# hosted service to Windows' inbox WSD-Scan (WIA) driver is a fixed string
-# that, by Microsoft's own quirk, carries 2006/08 instead.
-NS_WSCN = "http://schemas.microsoft.com/windows/2006/01/wdp/scan"
+# a multifunction show up under Scanners and lets Windows pull a scan.
+#
+# This namespace is the one the `wscn` prefix binds to throughout the
+# envelope, and it MUST be the 2006/08 one: the scanner service type
+# (wscn:ScannerServiceType, below) is a QName resolved through this prefix,
+# and Windows only categorises the hosted service as a scanner when that
+# QName is {2006/08}ScannerServiceType — exactly what the real HP OfficeJet
+# binds wscn to in its own metadata and event envelopes. Binding wscn to
+# the 2006/01 variant leaves the device fetched but shown only as a printer,
+# never a scanner. The scan operation elements ride the same namespace; if a
+# real scan capture later shows the operations need a different one, give
+# them their own prefix rather than rebinding wscn.
+NS_WSCN = "http://schemas.microsoft.com/windows/2006/08/wdp/scan"
 SCAN_SERVICE_TYPES = "wscn:ScannerServiceType"
 WSD_SCAN_COMPATIBLE_ID = ("http://schemas.microsoft.com/windows/2006/08/"
                           "wdp/scan/ScannerServiceType")
