@@ -255,6 +255,16 @@ class WSDDevice:
         # from its cache forever — fatal when iterating on the metadata. A
         # start-time epoch is monotonic across restarts and fits the field.
         self.instance = int(time.time())
+        # WSD MetadataVersion: Windows re-fetches a device's metadata (the
+        # WS-Transfer Get) ONLY when a Hello/ProbeMatch/ResolveMatch carries
+        # a MetadataVersion higher than the one it cached. Our device UUID is
+        # stable across restarts, so a constant version (the old hard-coded
+        # "1") means Windows keeps serving whatever metadata it first cached
+        # — e.g. a printer-only document from before the scanner was added —
+        # and never sees the scanner/fax services no matter how often the
+        # device restarts. Tying it to the boot epoch makes every restart
+        # present a higher version, so Windows always re-reads fresh metadata.
+        self.metadata_version = self.instance
 
     def xaddr(self):
         ip = ".".join(str(x) for x in (self.host.stack.ip or bytes(4)))
@@ -293,8 +303,9 @@ class WSDiscoveryService(Service):
         body = ('<wsd:Hello><wsa:EndpointReference><wsa:Address>%s'
                 '</wsa:Address></wsa:EndpointReference>'
                 '<wsd:Types>%s</wsd:Types><wsd:XAddrs>%s</wsd:XAddrs>'
-                '<wsd:MetadataVersion>1</wsd:MetadataVersion></wsd:Hello>'
-                % (self.dev.uuid, DEVICE_TYPES, self.dev.xaddr()))
+                '<wsd:MetadataVersion>%d</wsd:MetadataVersion></wsd:Hello>'
+                % (self.dev.uuid, DEVICE_TYPES, self.dev.xaddr(),
+                   self.dev.metadata_version))
         hdr = _hdr(A_HELLO, _new_msgid(), to=TO_DISCOVERY,
                    seq=self.seq.next(), instance=self.dev.instance)
         self.stack.send_udp(WSD_MCAST, WSD_PORT, _envelope(hdr, body),
@@ -335,9 +346,10 @@ class WSDiscoveryService(Service):
                 '<wsa:EndpointReference><wsa:Address>%s</wsa:Address>'
                 '</wsa:EndpointReference>'
                 '<wsd:Types>%s</wsd:Types><wsd:XAddrs>%s</wsd:XAddrs>'
-                '<wsd:MetadataVersion>1</wsd:MetadataVersion>'
+                '<wsd:MetadataVersion>%d</wsd:MetadataVersion>'
                 '</wsd:ProbeMatch></wsd:ProbeMatches>'
-                % (self.dev.uuid, DEVICE_TYPES, self.dev.xaddr()))
+                % (self.dev.uuid, DEVICE_TYPES, self.dev.xaddr(),
+                   self.dev.metadata_version))
         hdr = _hdr(A_PROBEMATCH, _new_msgid(), relates_to=msg_id,
                    to=NS_WSA + "/role/anonymous", seq=self.seq.next(),
                    instance=self.dev.instance)
@@ -353,9 +365,10 @@ class WSDiscoveryService(Service):
                 '<wsa:EndpointReference><wsa:Address>%s</wsa:Address>'
                 '</wsa:EndpointReference>'
                 '<wsd:Types>%s</wsd:Types><wsd:XAddrs>%s</wsd:XAddrs>'
-                '<wsd:MetadataVersion>1</wsd:MetadataVersion>'
+                '<wsd:MetadataVersion>%d</wsd:MetadataVersion>'
                 '</wsd:ResolveMatch></wsd:ResolveMatches>'
-                % (self.dev.uuid, DEVICE_TYPES, self.dev.xaddr()))
+                % (self.dev.uuid, DEVICE_TYPES, self.dev.xaddr(),
+                   self.dev.metadata_version))
         hdr = _hdr(A_RESOLVEMATCH, _new_msgid(), relates_to=msg_id,
                    to=NS_WSA + "/role/anonymous", seq=self.seq.next(),
                    instance=self.dev.instance)

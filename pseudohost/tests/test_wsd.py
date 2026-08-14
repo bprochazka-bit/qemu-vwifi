@@ -49,6 +49,22 @@ class TestWSDiscovery(unittest.TestCase):
         self.assertIn("10.1.2.100:5357", text)                    # XAddrs
         self.assertIn("urn:uuid:probe-0001", text)                # RelatesTo
 
+    def test_metadata_version_is_per_boot_not_constant(self):
+        # Windows re-fetches WSD metadata only when MetadataVersion rises.
+        # A constant value (the old hard-coded 1) makes it keep stale
+        # printer-only metadata cached across restarts and never see the
+        # scanner. It must reflect the boot so every restart forces a
+        # re-read of the current (scanner-inclusive) metadata.
+        import re as _re
+        h, _svc = self._svc()
+        deliver_udp(h, "10.1.2.5", 50000, wsd.WSD_PORT, PROBE,
+                    src_mac="02:00:00:00:00:05")
+        text = _last_udp_payload(h.station).decode()
+        m = _re.search(r"<wsd:MetadataVersion>(\d+)</wsd:MetadataVersion>",
+                       text)
+        self.assertIsNotNone(m)
+        self.assertGreater(int(m.group(1)), 1)
+
     def test_appsequence_instance_id_is_per_boot(self):
         # A constant InstanceId lets Windows keep stale metadata cached
         # across restarts; it must reflect the boot (a time epoch here).
