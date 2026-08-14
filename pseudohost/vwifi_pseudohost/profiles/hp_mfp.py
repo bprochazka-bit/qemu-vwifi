@@ -26,6 +26,7 @@ from ..printing import JetDirectService
 from ..ipp import IPPService
 from ..snmp import SNMPAgent
 from ..wsd import WSDiscoveryService, WSDHttpService
+from ..escl import ESCLService
 
 # A plausible model string; TXT records below mirror what an HP MFP
 # publishes so a scan of the mDNS records reads like the real thing.
@@ -39,7 +40,7 @@ class MFPPortsService(Service):
     services and SNMP (UDP 161) by the SNMP agent, so nothing clashes.
     """
     name = "hp-mfp"
-    tcp_ports = (80, 443, 515, 8080, 8290)     # web, LPD, scan (IPP/9100 own theirs)
+    tcp_ports = (80, 443, 8290)                # web, mgmt (IPP/9100/eSCL own theirs)
 
 
 def _mfp_adverts(host):
@@ -105,6 +106,12 @@ class HPMultifunction(PseudoHost):
     # It is a multifunction: advertise a WSD scan service too, so Windows
     # creates a scanner device node alongside the printer.
     wsd_scan = True
+    # PnP-X device category drives which headings Windows files the device
+    # under. It MUST list Scanners (and FaxMachines) as well as Printers, or
+    # Windows categorises the multifunction as a printer only and never
+    # surfaces its scanner function — the default "Printers" is why the
+    # scanner did not appear. Space-delimited, mirroring a real MFP.
+    pnpx_category = "Printers Scanners FaxMachines"
     # Device Foundation category for a print/scan/fax multifunction, matching
     # what a real HP OfficeJet advertises so Windows files it as an MFP.
     df_device_category = ("PrintFax.Printer.MFP PrintFax.Printer.Inkjet "
@@ -113,4 +120,4 @@ class HPMultifunction(PseudoHost):
     # mDNS covers macOS / IPP-Everywhere clients; JetDirect/9100 is the
     # raw path that always prints.
     services = [MFPPortsService, _mfp_mdns, IPPService, JetDirectService,
-                SNMPAgent, WSDiscoveryService, WSDHttpService]
+                SNMPAgent, WSDiscoveryService, WSDHttpService, ESCLService]
