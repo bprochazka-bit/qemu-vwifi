@@ -35,6 +35,35 @@ class TestPrintSink(unittest.TestCase):
         p = PrintSink(d).write_job(b"%!PS-Adobe-3.0\n...", jobname="ps")
         self.assertTrue(p.endswith(".ps"))
 
+    def test_restart_does_not_overwrite_prior_jobs(self):
+        # A fresh PrintSink (a restarted pseudo-host) must resume numbering
+        # past the jobs already on disk, not start over at 0001 and clobber
+        # them.
+        d = tempfile.mkdtemp(prefix="ph-print-")
+        first = PrintSink(d)
+        p1 = first.write_job(b"%PDF-1.4 one", jobname="a")
+        p2 = first.write_job(b"%PDF-1.4 two", jobname="b")
+        self.assertTrue(os.path.basename(p1).startswith("0001-"))
+        self.assertTrue(os.path.basename(p2).startswith("0002-"))
+
+        second = PrintSink(d)                   # simulate a restart
+        p3 = second.write_job(b"%PDF-1.4 three", jobname="c")
+        self.assertTrue(os.path.basename(p3).startswith("0003-"))
+        # all three still on disk, none overwritten
+        self.assertEqual(len(os.listdir(d)), 3)
+        with open(p1, "rb") as f:
+            self.assertEqual(f.read(), b"%PDF-1.4 one")
+
+    def test_never_reuses_an_index_even_with_odd_names(self):
+        # An index already present under a different job name / extension is
+        # stepped over rather than reused.
+        d = tempfile.mkdtemp(prefix="ph-print-")
+        with open(os.path.join(d, "0005-leftover.prn"), "wb") as f:
+            f.write(b"old")
+        sink = PrintSink(d)
+        p = sink.write_job(b"%PDF-1.4 new", jobname="new")
+        self.assertTrue(os.path.basename(p).startswith("0006-"))
+
 
 class TestJetDirect(unittest.TestCase):
     def test_raw_job_to_sink(self):

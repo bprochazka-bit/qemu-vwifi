@@ -27,10 +27,34 @@ class PrintSink:
         self.directory = directory
         self.log = log or (lambda *a: None)
         self.count = 0
+        self._seeded = False
+
+    def _seed_count(self):
+        """Resume numbering past the highest job already on disk.
+
+        The counter lives only in memory, so without this a restarted
+        pseudo-host would begin again at 0001 and overwrite the jobs a
+        previous run had written.  Scan the output directory once and pick
+        up after its largest ``NNNN-`` prefix so indices are never reused.
+        """
+        self._seeded = True
+        if not self.directory:
+            return
+        hi = 0
+        try:
+            for n in os.listdir(self.directory):
+                m = re.match(r"(\d+)-", n)
+                if m:
+                    hi = max(hi, int(m.group(1)))
+        except OSError:
+            return
+        self.count = hi
 
     def write_job(self, data, jobname="job", source="print"):
         if not data:
             return None
+        if not self._seeded:
+            self._seed_count()
         self.count += 1
         ext = _sniff_ext(data)
         if not self.directory:
@@ -41,6 +65,11 @@ class PrintSink:
             os.makedirs(self.directory, exist_ok=True)
             safe = re.sub(r"[^A-Za-z0-9._-]+", "_", jobname).strip("_")[:60] \
                 or "job"
+            # Belt and suspenders: if this index is somehow already on disk
+            # (e.g. files created between seeding and now), step past it so a
+            # job is never silently overwritten.
+            while _index_taken(self.directory, self.count):
+                self.count += 1
             path = os.path.join(self.directory,
                                 "%04d-%s.%s" % (self.count, safe, ext))
             with open(path, "wb") as f:
@@ -50,6 +79,14 @@ class PrintSink:
         except OSError as e:
             self.log("%s: could not write job: %s" % (source, e))
             return None
+
+
+def _index_taken(directory, idx):
+    prefix = "%04d-" % idx
+    try:
+        return any(n.startswith(prefix) for n in os.listdir(directory))
+    except OSError:
+        return False
 
 
 def _sniff_ext(data):
