@@ -163,6 +163,35 @@ class TestWSDMetadata(unittest.TestCase):
         self.assertIn("<pnpx:DeviceCategory>Printers</pnpx:DeviceCategory>",
                       text)
 
+    def test_multifunction_advertises_scan_device_type_in_discovery(self):
+        # Windows' scanner Function Discovery probes filtering on
+        # wscn:ScanDeviceType. A multifunction must claim that DEVICE type
+        # (not only the hosted ScannerServiceType) or the scanner subsystem
+        # never matches it and it installs as a printer only.
+        h = FakeHost("HP-OfficeJet-Den", dot11.mac_bytes("00:01:e6:aa:bb:cc"),
+                     ip="10.1.2.100")
+        h.wsd_scan = True
+        dev = wsd.WSDDevice(h)
+        self.assertIn("wscn:ScanDeviceType", dev.device_types)
+        self.assertIn("wprt:PrintDeviceType", dev.device_types)
+        # a print-only device must NOT claim the scan device type
+        h2 = FakeHost("Plain", dot11.mac_bytes("02:60:b0:aa:bb:cc"),
+                      ip="10.1.2.101")
+        self.assertNotIn("ScanDeviceType", wsd.WSDDevice(h2).device_types)
+
+    def test_scanner_hosted_service_has_its_own_endpoint(self):
+        h = FakeHost("HP-OfficeJet-Den", dot11.mac_bytes("00:01:e6:aa:bb:cc"),
+                     ip="10.1.2.100")
+        h.wsd_scan = True
+        srv = wsd.WSDHttpService()
+        srv.bind(h)
+        meta = srv._metadata("urn:uuid:x").decode()
+        dev = wsd.WSDDevice(h)
+        # print at the base endpoint, scan at a distinct one
+        self.assertIn("<wsa:Address>%s</wsa:Address>" % dev.xaddr(), meta)
+        self.assertIn("<wsa:Address>%s</wsa:Address>" % dev.scan_xaddr(), meta)
+        self.assertNotEqual(dev.xaddr(), dev.scan_xaddr())
+
     def test_multifunction_advertises_scan_service(self):
         # A device with wsd_scan carries a second hosted service so Windows
         # also creates a scanner node.

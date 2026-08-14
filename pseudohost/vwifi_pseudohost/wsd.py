@@ -143,6 +143,14 @@ A_ELEMENTS_CHANGE_EVENT = NS_WPRT + "/PrinterElementsChangeEvent"
 TO_DISCOVERY = "urn:schemas-xmlsoap-org:ws:2005:04:discovery"
 # The device advertises itself as a WSD Device that is a print device.
 DEVICE_TYPES = "wsdp:Device wprt:PrintDeviceType"
+# A multifunction must ALSO claim the scan DEVICE type here, not only the
+# hosted scanner service. Windows runs a separate Function Discovery for
+# scanners whose Probe filters on wscn:ScanDeviceType; a device that only
+# claims wprt:PrintDeviceType never matches that probe, so Windows treats it
+# as a printer and never instantiates the scanner — even though the metadata
+# carries a wscn:ScannerServiceType hosted service. Appending the scan
+# device type is what makes the scanner subsystem pick the device up.
+SCAN_DEVICE_TYPE = "wscn:ScanDeviceType"
 # The hosted print SERVICE inside the device is a different WSD type from
 # the device itself: the device is wprt:PrintDeviceType, the service that
 # hosts the print operations is wprt:PrinterServiceType. Windows keys the
@@ -248,6 +256,11 @@ class WSDDevice:
             % (vid, model_tok, self.model_number))
         self.scan_compatible_id = getattr(host, "pnpx_scan_compatible_id",
                                           WSD_SCAN_COMPATIBLE_ID)
+        # The device-level Types advertised in Hello/ProbeMatch/ResolveMatch.
+        # A scanner-capable device MUST add the scan device type so Windows'
+        # scanner discovery (which probes for wscn:ScanDeviceType) matches it.
+        self.device_types = DEVICE_TYPES + (
+            " " + SCAN_DEVICE_TYPE if self.scan else "")
         # WS-Discovery AppSequence InstanceId: MUST change each time the
         # device (re)starts so a client discards state cached under a prior
         # instance. A constant "1" means Windows treats every restart as the
@@ -270,6 +283,13 @@ class WSDDevice:
         ip = ".".join(str(x) for x in (self.host.stack.ip or bytes(4)))
         return "http://%s:%d/%s" % (ip, WSD_HTTP_PORT,
                                     self.uuid.split(":")[-1])
+
+    def scan_xaddr(self):
+        # The hosted scanner service gets its own endpoint, as a real
+        # multifunction does, so Windows builds a distinct scanner function
+        # rather than folding it into the printer. The HTTP service dispatches
+        # by SOAP action regardless of path, so the extra path segment is free.
+        return self.xaddr() + "/scan"
 
     def print_svc_uuid(self):
         # A distinct-but-stable UUID for the hosted print service (the
@@ -304,7 +324,7 @@ class WSDiscoveryService(Service):
                 '</wsa:Address></wsa:EndpointReference>'
                 '<wsd:Types>%s</wsd:Types><wsd:XAddrs>%s</wsd:XAddrs>'
                 '<wsd:MetadataVersion>%d</wsd:MetadataVersion></wsd:Hello>'
-                % (self.dev.uuid, DEVICE_TYPES, self.dev.xaddr(),
+                % (self.dev.uuid, self.dev.device_types, self.dev.xaddr(),
                    self.dev.metadata_version))
         hdr = _hdr(A_HELLO, _new_msgid(), to=TO_DISCOVERY,
                    seq=self.seq.next(), instance=self.dev.instance)
@@ -348,7 +368,7 @@ class WSDiscoveryService(Service):
                 '<wsd:Types>%s</wsd:Types><wsd:XAddrs>%s</wsd:XAddrs>'
                 '<wsd:MetadataVersion>%d</wsd:MetadataVersion>'
                 '</wsd:ProbeMatch></wsd:ProbeMatches>'
-                % (self.dev.uuid, DEVICE_TYPES, self.dev.xaddr(),
+                % (self.dev.uuid, self.dev.device_types, self.dev.xaddr(),
                    self.dev.metadata_version))
         hdr = _hdr(A_PROBEMATCH, _new_msgid(), relates_to=msg_id,
                    to=NS_WSA + "/role/anonymous", seq=self.seq.next(),
@@ -367,7 +387,7 @@ class WSDiscoveryService(Service):
                 '<wsd:Types>%s</wsd:Types><wsd:XAddrs>%s</wsd:XAddrs>'
                 '<wsd:MetadataVersion>%d</wsd:MetadataVersion>'
                 '</wsd:ResolveMatch></wsd:ResolveMatches>'
-                % (self.dev.uuid, DEVICE_TYPES, self.dev.xaddr(),
+                % (self.dev.uuid, self.dev.device_types, self.dev.xaddr(),
                    self.dev.metadata_version))
         hdr = _hdr(A_RESOLVEMATCH, _new_msgid(), relates_to=msg_id,
                    to=NS_WSA + "/role/anonymous", seq=self.seq.next(),
@@ -563,7 +583,7 @@ class WSDHttpService(TCPService):
         # PnP-X HardwareId + CompatibleId Windows needs to build the node.
         uuid_tail = dev.uuid.split(":")[-1]
 
-        def hosted(types, service_id, hwid, cid):
+        def hosted(address, types, service_id, hwid, cid):
             return (
                 '<wsdp:Hosted>'
                 '<wsa:EndpointReference><wsa:Address>%s</wsa:Address>'
@@ -573,18 +593,19 @@ class WSDHttpService(TCPService):
                 '<pnpx:HardwareId>%s</pnpx:HardwareId>'
                 '<pnpx:CompatibleId>%s</pnpx:CompatibleId>'
                 '</wsdp:Hosted>'
-                % (dev.xaddr(), types, service_id, hwid, cid))
+                % (address, types, service_id, hwid, cid))
 
         hosted_services = [
-            hosted(PRINT_SERVICE_TYPES,
+            hosted(dev.xaddr(), PRINT_SERVICE_TYPES,
                    "http://%s/PrintService" % uuid_tail,
                    dev.hardware_id, dev.compatible_id),
         ]
-        # A multifunction adds a WSD scan service so Windows also creates a
-        # scanner device node (Scanners / Windows Fax and Scan).
+        # A multifunction adds a WSD scan service, on its OWN endpoint, so
+        # Windows builds a separate scanner device node (Scanners / Windows
+        # Fax and Scan) rather than folding it into the printer.
         if dev.scan:
             hosted_services.append(hosted(
-                SCAN_SERVICE_TYPES,
+                dev.scan_xaddr(), SCAN_SERVICE_TYPES,
                 "http://%s/ScanService" % uuid_tail,
                 dev.scan_hardware_id, dev.scan_compatible_id))
 
