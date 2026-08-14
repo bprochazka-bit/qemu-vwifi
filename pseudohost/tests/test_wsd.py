@@ -250,8 +250,9 @@ class TestWSDMetadata(unittest.TestCase):
                '</wse:NotifyTo></wse:Subscribe>')
         # Minimal record; _notify_dest tolerates the namespaces above.
         dest = wsd._notify_dest(req)
-        svc._subs.append({"id": "urn:uuid:i", "dest": dest, "filter": ""})
-        svc._queue_event(dest, svc._printer_change_event("urn:uuid:i", dest))
+        svc._subs.append({"dest": dest, "filter": ""})
+        svc._queue_event(dest, svc._event(
+            dest, wsd.A_ELEMENTS_CHANGE_EVENT, svc._elements_change_body()))
         h.station.sent.clear()
         svc.tick()
         syn = None
@@ -264,6 +265,105 @@ class TestWSDMetadata(unittest.TestCase):
             if flags & 0x02:                       # SYN
                 syn = dip
         self.assertEqual(syn, "192.168.1.99")      # active open to the sink
+
+    def test_job_end_event_routed_only_to_jobend_subscriber(self):
+        # Windows subscribes once per event type. A JobEndStateEvent must be
+        # delivered to the subscription that filtered for it (and echo that
+        # subscription's NotifyTo Identifier), not to a status subscriber.
+        h = self._host_with_tcp()
+        svc = wsd.WSDHttpService()
+        svc.bind(h)
+        jobend = {"dest": {"url": "http://192.168.1.99:5357/je",
+                           "ip": "192.168.1.99", "port": 5357, "path": "/je",
+                           "identifier": "urn:uuid:je-id"},
+                  "filter": wsd.A_JOBEND_EVENT}
+        status = {"dest": {"url": "http://192.168.1.99:5357/ps",
+                           "ip": "192.168.1.99", "port": 5357, "path": "/ps",
+                           "identifier": "urn:uuid:ps-id"},
+                  "filter": wsd.A_STATUS_SUMMARY_EVENT}
+        svc._subs = [jobend, status]
+        svc._cur_jobname = "Test Page"
+        svc._cur_jobuser = "user"
+        svc._queue_job_completion(job_id=2, nbytes=318 * 1024)
+
+        posts = [req.decode("latin1") for _dest, req in svc._event_q]
+        jobend_posts = [p for p in posts if "JobEndStateEvent" in p]
+        self.assertEqual(len(jobend_posts), 1)
+        je = jobend_posts[0]
+        self.assertIn("POST /je ", je)                  # to the jobend sink
+        self.assertIn("<wprt:JobId>2</wprt:JobId>", je)
+        self.assertIn("Completed", je)
+        self.assertIn("JobCompletedSuccessfully", je)
+        self.assertIn("<wprt:JobName>Test Page</wprt:JobName>", je)
+        self.assertIn("urn:uuid:je-id", je)             # echoes its Identifier
+        # the status sink got the Processing/Idle summaries, not the job end
+        status_posts = [p for p in posts if "POST /ps " in p]
+        self.assertTrue(status_posts)
+        self.assertTrue(all("JobEndStateEvent" not in p for p in status_posts))
+        self.assertTrue(any("PrinterStatusSummaryEvent" in p
+                            for p in status_posts))
+
+    def test_send_document_queues_job_end_event(self):
+        # End to end through _dispatch: CreatePrintJob then an MTOM
+        # SendDocument, with a JobEndStateEvent subscription active, must
+        # queue a terminal job-end notification so Windows clears the queue.
+        from vwifi_pseudohost.printing import PrintSink
+        h = FakeHost("HP-OfficeJet-Den", dot11.mac_bytes("00:01:e6:aa:bb:cc"),
+                     ip="10.1.2.100")
+        h.print_sink = PrintSink(None)
+        svc = wsd.WSDHttpService()
+        svc.bind(h)
+        svc._subs = [{"dest": {"url": "http://192.168.1.99:5357/je",
+                               "ip": "192.168.1.99", "port": 5357,
+                               "path": "/je", "identifier": "urn:uuid:je"},
+                      "filter": wsd.A_JOBEND_EVENT}]
+
+        def post(raw):
+            return svc._dispatch(raw, raw.find(b"\r\n\r\n"))
+
+        cj = ('<soap:Envelope '
+              'xmlns:soap="http://www.w3.org/2003/05/soap-envelope" '
+              'xmlns:wsa="http://schemas.xmlsoap.org/ws/2004/08/addressing" '
+              'xmlns:wprt="%s"><soap:Header>'
+              '<wsa:MessageID>urn:uuid:c</wsa:MessageID>'
+              '<wsa:Action>%s/CreatePrintJob</wsa:Action></soap:Header>'
+              '<soap:Body><wprt:CreatePrintJobRequest><wprt:JobDescription>'
+              '<wprt:JobName>Report</wprt:JobName>'
+              '<wprt:JobOriginatingUserName>alice'
+              '</wprt:JobOriginatingUserName></wprt:JobDescription>'
+              '</wprt:CreatePrintJobRequest></soap:Body></soap:Envelope>'
+              % (wsd.NS_WPRT, wsd.NS_WPRT)).encode()
+        post(b"POST /x HTTP/1.1\r\nContent-Type: application/soap+xml\r\n"
+             b"Content-Length: " + str(len(cj)).encode() + b"\r\n\r\n" + cj)
+
+        doc = b"%PDF-1.7\nhello\n%%EOF"
+        soap = ('<soap:Envelope '
+                'xmlns:soap="http://www.w3.org/2003/05/soap-envelope" '
+                'xmlns:wsa="http://schemas.xmlsoap.org/ws/2004/08/addressing" '
+                'xmlns:wprt="%s"><soap:Header>'
+                '<wsa:MessageID>urn:uuid:d</wsa:MessageID>'
+                '<wsa:Action>%s/SendDocument</wsa:Action></soap:Header>'
+                '<soap:Body/></soap:Envelope>' % (wsd.NS_WPRT, wsd.NS_WPRT))
+        boundary = "B"
+        body = (("--%s\r\n" % boundary).encode() +
+                b'Content-Type: application/xop+xml\r\nContent-ID: <s>\r\n\r\n'
+                + soap.encode() + ("\r\n--%s\r\n" % boundary).encode() +
+                b"Content-Type: application/octet-stream\r\n"
+                b"Content-ID: <d>\r\n\r\n" + doc +
+                ("\r\n--%s--\r\n" % boundary).encode())
+        raw = (b"POST /x HTTP/1.1\r\nContent-Type: multipart/related; "
+               b'boundary="' + boundary.encode() + b'"; '
+               b'type="application/xop+xml"\r\nContent-Length: ' +
+               str(len(body)).encode() + b"\r\n\r\n" + body)
+        resp = post(raw)
+        self.assertIn(b"SendDocumentResponse", resp)
+
+        posts = [req.decode("latin1") for _d, req in svc._event_q]
+        je = [p for p in posts if "JobEndStateEvent" in p]
+        self.assertEqual(len(je), 1)
+        self.assertIn("<wprt:JobName>Report</wprt:JobName>", je[0])
+        self.assertIn("<wprt:JobOriginatingUserName>alice", je[0])
+        self.assertIn("<wprt:JobId>1</wprt:JobId>", je[0])
 
     def test_set_event_rate_acknowledged(self):
         # Windows sends SetEventRate while a print queue is open; a Fault

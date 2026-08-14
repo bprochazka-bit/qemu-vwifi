@@ -123,6 +123,15 @@ A_GETSTATUS_RESP = NS_EVENTING + "/GetStatusResponse"
 A_CREATEJOB_RESP = NS_WPRT + "/CreatePrintJobResponse"
 A_SENDDOC_RESP = NS_WPRT + "/SendDocumentResponse"
 A_ADDDOC_RESP = NS_WPRT + "/AddDocumentResponse"
+# Outbound WSD-Print notifications the device pushes to Windows' event sink.
+# JobEndStateEvent is the one that matters: it tells the spooler the job
+# reached a terminal state, so Windows removes it from the queue. Without
+# it a WSD-Print job never completes in Windows' view and is re-flushed on
+# every wake — the "phantom job" symptom. The action strings and bodies are
+# modelled on a real HP OfficeJet's on-the-wire events.
+A_JOBEND_EVENT = NS_WPRT + "/JobEndStateEvent"
+A_STATUS_SUMMARY_EVENT = NS_WPRT + "/PrinterStatusSummaryEvent"
+A_ELEMENTS_CHANGE_EVENT = NS_WPRT + "/PrinterElementsChangeEvent"
 
 TO_DISCOVERY = "urn:schemas-xmlsoap-org:ws:2005:04:discovery"
 # The device advertises itself as a WSD Device that is a print device.
@@ -452,12 +461,19 @@ class WSDHttpService(TCPService):
             self._job += 1
             jobname = _find(text, "JobName") or "job%d" % self._job
             self._cur_jobname = jobname
+            self._cur_jobuser = _find(text, "JobOriginatingUserName") or "user"
             self.log("CreatePrintJob '%s' -> job %d" % (jobname, self._job))
             return self._create_job_resp(msgid, self._job)
         if action.endswith("/SendDocument") or action.endswith("/AddDocument"):
             self._accept_document(text, binary)
             resp_action = (A_SENDDOC_RESP if action.endswith("/SendDocument")
                            else A_ADDDOC_RESP)
+            # A WSD-Print job is a single SendDocument here; once we have the
+            # document the job is done, so push the completion events (chiefly
+            # JobEndStateEvent) to any subscriber, exactly as a real printer
+            # does. This is what clears the job from Windows' queue.
+            if action.endswith("/SendDocument"):
+                self._queue_job_completion(self._job, len(binary or b""))
             return self._doc_resp(msgid, resp_action, self._job)
         # WS-Eventing: Windows subscribes to printer status events while a
         # queue is open. These MUST get their own responses — the spooler's
@@ -755,14 +771,24 @@ class WSDHttpService(TCPService):
         sub_id = _new_msgid()
 
         # Record the subscription so we can push events to it. The NotifyTo
-        # address is the sink Windows opened to receive notifications.
+        # address is the sink Windows opened; the Filter names the single
+        # event action this subscription wants (Windows subscribes once per
+        # event type), so we keep it to route events to the right sink.
         dest = _notify_dest(req_text)
         filt = _find(req_text, "Filter") or ""
         if dest is not None:
-            self._subs.append({"id": sub_id, "dest": dest, "filter": filt})
-            # Prime the subscriber with the current printer status, which
-            # also proves the outbound event path works.
-            self._queue_event(dest, self._printer_change_event(sub_id, dest))
+            self._subs.append({"dest": dest, "filter": filt})
+            # Prime a status subscriber with the current state (this also
+            # proves the outbound path). A JobEndStateEvent subscription is
+            # not primed — there is no completed job to report yet.
+            if not filt or A_ELEMENTS_CHANGE_EVENT in filt:
+                self._queue_event(dest, self._event(
+                    dest, A_ELEMENTS_CHANGE_EVENT,
+                    self._elements_change_body()))
+            elif A_STATUS_SUMMARY_EVENT in filt:
+                self._queue_event(dest, self._event(
+                    dest, A_STATUS_SUMMARY_EVENT,
+                    self._status_summary_body(self._printer_state())))
 
         body = (
             '<wse:SubscribeResponse><wse:SubscriptionManager>'
@@ -780,37 +806,89 @@ class WSDHttpService(TCPService):
 
     # -- outbound event delivery ------------------------------------------
     def notify_printer_change(self):
-        """Queue a PrinterElementsChangeEvent for every subscriber. Called by
-        the IPP printer when a job arrives/completes so Windows gets a live
-        status push instead of only seeing changes when it next polls."""
+        """Push a live status event to any subscriber that asked for one.
+        Called by the IPP printer when a job arrives/completes so Windows
+        gets a status push instead of only seeing changes when it polls."""
+        self._emit(A_ELEMENTS_CHANGE_EVENT, self._elements_change_body())
+        self._emit(A_STATUS_SUMMARY_EVENT,
+                   self._status_summary_body(self._printer_state()))
+
+    def _queue_job_completion(self, job_id, nbytes):
+        """Push the end-of-job event sequence a real printer sends when a
+        WSD-Print job finishes: a transient Processing status, the terminal
+        JobEndStateEvent that clears the job from Windows' queue, then back
+        to Idle. Modelled on a real HP OfficeJet's wire trace."""
+        koct = max(1, (nbytes + 1023) // 1024)
+        self._emit(A_STATUS_SUMMARY_EVENT,
+                   self._status_summary_body("Processing"))
+        self._emit(A_JOBEND_EVENT, self._job_end_body(job_id, koct))
+        self._emit(A_STATUS_SUMMARY_EVENT, self._status_summary_body("Idle"))
+
+    def _emit(self, action, body):
+        """Queue `body` as `action` to every subscription whose filter selects
+        it. A WSD client subscribes once per event type, so an event must go
+        only to the subscription that asked for that action — delivering it
+        to a subscription with a different filter gets it dropped."""
         for sub in self._subs:
-            self._queue_event(sub["dest"],
-                              self._printer_change_event(sub["id"], sub["dest"]))
+            if _sub_wants(sub, action):
+                self._queue_event(sub["dest"],
+                                  self._event(sub["dest"], action, body))
 
     def _queue_event(self, dest, soap):
         self._event_q.append((dest, _http_post(dest, soap)))
 
-    def _printer_change_event(self, sub_id, dest):
-        queued = self._queued_job_count()
-        state = "Processing" if queued else "Idle"
+    def _event(self, dest, action, body):
+        """Wrap an event body in a notification envelope addressed to the
+        subscriber's sink, echoing its NotifyTo Identifier (as a reference
+        parameter) so Windows can match the event to the subscription."""
+        hdr = ('<wsa:To>%s</wsa:To><wsa:Action>%s</wsa:Action>'
+               '<wsa:MessageID>%s</wsa:MessageID>'
+               % (dest["url"], action, _new_msgid()))
+        if dest.get("identifier"):
+            hdr += '<wse:Identifier>%s</wse:Identifier>' % dest["identifier"]
+        return _envelope(hdr, body)
+
+    # -- event bodies (modelled on a real HP OfficeJet's wire format) ------
+    def _printer_state(self):
+        return "Processing" if self._queued_job_count() else "Idle"
+
+    def _status_summary_body(self, state):
+        return ('<wprt:PrinterStatusSummaryEvent><wprt:StatusSummary>'
+                '<wprt:PrinterState>%s</wprt:PrinterState>'
+                '</wprt:StatusSummary></wprt:PrinterStatusSummaryEvent>'
+                % state)
+
+    def _elements_change_body(self):
+        state = self._printer_state()
         status = (
             '<wprt:PrinterStatus><wprt:PrinterState>%s</wprt:PrinterState>'
             '<wprt:PrinterPrimaryStateReason>None'
             '</wprt:PrinterPrimaryStateReason>'
             '<wprt:QueuedJobCount>%d</wprt:QueuedJobCount>'
-            '</wprt:PrinterStatus>' % (state, queued))
-        body = (
+            '</wprt:PrinterStatus>' % (state, self._queued_job_count()))
+        return (
             '<wprt:PrinterElementsChangeEvent><wprt:PrinterElements>'
             '<wprt:ElementData Name="wprt:PrinterStatus" Valid="true">%s'
             '</wprt:ElementData></wprt:PrinterElements>'
             '</wprt:PrinterElementsChangeEvent>' % status)
-        # The subscription's Identifier is echoed as a reference parameter
-        # in the notification header so the client can match it.
-        hdr = ('<wsa:To>%s</wsa:To><wse:Identifier>%s</wse:Identifier>'
-               % (dest["url"], sub_id))
-        hdr += ('<wsa:Action>%s/PrinterElementsChangeEvent</wsa:Action>'
-                '<wsa:MessageID>%s</wsa:MessageID>' % (NS_WPRT, _new_msgid()))
-        return _envelope(hdr, body)
+
+    def _job_end_body(self, job_id, koctets):
+        jobname = getattr(self, "_cur_jobname", None) or "Document"
+        user = getattr(self, "_cur_jobuser", None) or "user"
+        return (
+            '<wprt:JobEndStateEvent><wprt:JobEndState>'
+            '<wprt:JobId>%d</wprt:JobId>'
+            '<wprt:JobCompletedState>Completed</wprt:JobCompletedState>'
+            '<wprt:JobCompletedStateReasons><wprt:JobStateReason>'
+            'JobCompletedSuccessfully</wprt:JobStateReason>'
+            '</wprt:JobCompletedStateReasons>'
+            '<wprt:JobName>%s</wprt:JobName>'
+            '<wprt:JobOriginatingUserName>%s</wprt:JobOriginatingUserName>'
+            '<wprt:KOctetsProcessed>%d</wprt:KOctetsProcessed>'
+            '<wprt:MediaSheetsCompleted>1</wprt:MediaSheetsCompleted>'
+            '<wprt:NumberOfDocuments>1</wprt:NumberOfDocuments>'
+            '</wprt:JobEndState></wprt:JobEndStateEvent>'
+            % (job_id, _xml_escape(jobname), _xml_escape(user), koctets))
 
     def _queued_job_count(self):
         # 0 unless a job is mid-flight; the IPP printer marks jobs complete
@@ -920,6 +998,21 @@ def _find(text, tag):
     return m.group(1).strip() if m else None
 
 
+def _xml_escape(s):
+    return (str(s).replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;"))
+
+
+def _sub_wants(sub, action):
+    """Whether a recorded subscription should receive `action`. A WSD
+    subscription's Filter names one event action; an empty/absent filter
+    means the subscriber takes everything."""
+    filt = sub.get("filter") or ""
+    if not filt:
+        return True
+    return action in filt or filt.rstrip().endswith(action.rsplit("/", 1)[-1])
+
+
 def _ip(b):
     return ".".join(str(x) for x in b)
 
@@ -927,10 +1020,17 @@ def _ip(b):
 def _notify_dest(sub_text):
     """Parse the WS-Eventing NotifyTo sink out of a Subscribe request.
 
-    Returns {"url", "ip", "port", "path"} or None. The address looks like
-    http://192.168.1.99:5357/<uuid>; only IPv4 literals are handled (the
-    virtual network has no DNS)."""
-    m = re.search(r"NotifyTo>.*?<[\w:]*Address>\s*([^<\s]+)", sub_text, re.S)
+    Returns {"url", "ip", "port", "path", "identifier"} or None. The address
+    looks like http://192.168.1.99:5357/<uuid>; only IPv4 literals are
+    handled (the virtual network has no DNS). The identifier is the NotifyTo
+    reference-parameter wse:Identifier, which the device must echo back in
+    the header of every notification so Windows can match it to the
+    subscription — without it the event is ignored and the job never clears.
+    """
+    block = re.search(r"<[\w:]*NotifyTo>(.*?)</[\w:]*NotifyTo>", sub_text,
+                      re.S)
+    scope = block.group(1) if block else sub_text
+    m = re.search(r"<[\w:]*Address>\s*([^<\s]+)", scope)
     if not m:
         return None
     url = m.group(1).strip()
@@ -938,7 +1038,8 @@ def _notify_dest(sub_text):
     if not u:
         return None
     return {"url": url, "ip": u.group(1),
-            "port": int(u.group(2) or 80), "path": u.group(3) or "/"}
+            "port": int(u.group(2) or 80), "path": u.group(3) or "/",
+            "identifier": _find(scope, "Identifier")}
 
 
 def _http_post(dest, soap_bytes):
