@@ -66,6 +66,12 @@ class Service:
     def on_start(self):
         pass
 
+    def on_stop(self):
+        """Called once during an orderly shutdown, while the link is still
+        up, so a service can send a farewell (e.g. a WSD Bye) before the
+        host leaves the medium."""
+        pass
+
     def on_udp(self, src_ip, src_port, dst_ip, dst_port, payload):
         pass
 
@@ -175,6 +181,15 @@ class ServiceRegistry:
     def tick(self):
         for s in self.services:
             s.tick()
+
+    def stop(self):
+        """Fan an orderly-shutdown notice out to every service (best effort;
+        one service's failure must not block the others' farewells)."""
+        for s in self.services:
+            try:
+                s.on_stop()
+            except Exception as e:                       # noqa: BLE001
+                self.host.log("svc[%s]: on_stop raised: %s" % (s.name, e))
 
     def open_ports(self):
         """(proto, port) the host advertises — useful for a scan summary."""

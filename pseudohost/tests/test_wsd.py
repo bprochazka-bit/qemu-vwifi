@@ -97,6 +97,27 @@ class TestWSDiscovery(unittest.TestCase):
         svc.tick()
         self.assertIsNone(_last_udp_payload(h.station))
 
+    def test_bye_on_stop_after_hello(self):
+        # An orderly shutdown must multicast a Bye so Windows drops the
+        # device instead of leaving a phantom instance that can wedge a
+        # later install.
+        h, svc = self._svc()
+        svc.tick()                                  # announce (Hello)
+        h.station.sent.clear()
+        svc.on_stop()
+        resp = _last_udp_payload(h.station)
+        self.assertIsNotNone(resp)
+        text = resp.decode()
+        self.assertIn("Bye", text)
+        self.assertIn(wsd.uuid_from_mac(h.mac), text)
+
+    def test_no_bye_if_never_announced(self):
+        # If the device never said Hello (e.g. no address yet), there is
+        # nothing to retract, so on_stop stays silent.
+        h, svc = self._svc()
+        svc.on_stop()
+        self.assertIsNone(_last_udp_payload(h.station))
+
 
 class TestWSDMetadata(unittest.TestCase):
     def test_get_returns_device_metadata(self):

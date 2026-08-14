@@ -136,6 +136,14 @@ class PseudoHost:
         self._running = False
 
     def close(self):
+        # Let services say goodbye while the link is still up — the WSD
+        # service multicasts a Bye so Windows drops the device cleanly
+        # instead of leaving a phantom instance that can wedge a later
+        # install (especially across a restart).
+        try:
+            self.registry.stop()
+        except Exception:
+            pass
         try:
             self.station.deauth()
         except Exception:

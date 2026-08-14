@@ -326,6 +326,27 @@ class WSDiscoveryService(Service):
         self.stack.send_udp(WSD_MCAST, WSD_PORT, _envelope(hdr, body),
                             src_port=WSD_PORT)
 
+    def on_stop(self):
+        # Multicast a Bye on orderly shutdown so Windows removes the device
+        # from Function Discovery immediately. Without it, a restarted
+        # simulator leaves the previous instance lingering in Windows' cache;
+        # the stale endpoint can wedge an in-progress "Add device" (the
+        # install queries an instance that is gone) and pile up phantom
+        # devnodes under the same UUID. Only Bye if we actually announced.
+        if not self._said_hello or self.dev is None or self.stack.ip is None:
+            return
+        body = ('<wsd:Bye><wsa:EndpointReference><wsa:Address>%s'
+                '</wsa:Address></wsa:EndpointReference>'
+                '<wsd:Types>%s</wsd:Types><wsd:XAddrs>%s</wsd:XAddrs>'
+                '<wsd:MetadataVersion>%d</wsd:MetadataVersion></wsd:Bye>'
+                % (self.dev.uuid, self.dev.device_types, self.dev.xaddr(),
+                   self.dev.metadata_version))
+        hdr = _hdr(A_BYE, _new_msgid(), to=TO_DISCOVERY,
+                   seq=self.seq.next(), instance=self.dev.instance)
+        self.log("shutdown -> WSD Bye")
+        self.stack.send_udp(WSD_MCAST, WSD_PORT, _envelope(hdr, body),
+                            src_port=WSD_PORT)
+
     # -- probe / resolve ---------------------------------------------------
     def on_udp(self, src_ip, src_port, dst_ip, dst_port, payload):
         try:
