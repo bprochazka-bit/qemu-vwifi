@@ -17,6 +17,7 @@
 # connection the stack calls the service's on_connect/on_data/on_close,
 # and the service writes back through conn.send().
 #
+import collections
 import os
 import struct
 
@@ -128,6 +129,13 @@ class TCPStack:
         self.listeners = {}                    # port -> service
         self.conns = {}                        # (rip, rport, lport) -> conn
         self._ephemeral = 49152                # next outbound local port
+        # 4-tuples of connections we just closed. A real stack keeps these in
+        # TIME_WAIT to absorb the peer's straggling FIN/ACK retransmits; we
+        # keep a small bounded history so those stragglers are ignored instead
+        # of drawing a RST. That RST is not cosmetic: sent right after a clean
+        # close of a WSD metadata connection, Windows reads it as the transfer
+        # having been aborted and refuses to install the device.
+        self._closed = collections.deque(maxlen=128)
         stack.attach_tcp(self)
 
     def listen(self, port, service):
@@ -179,8 +187,17 @@ class TCPStack:
         if conn is None:
             if (flags & SYN) and not (flags & ACK) and dport in self.listeners:
                 self._accept(src_ip, sport, dport, seq)
-            elif not (flags & RST):
-                # unknown connection -> reset the peer
+            elif flags & RST:
+                pass                            # stray RST: nothing to reset
+            elif not (flags & SYN) and key in self._closed:
+                # A straggling FIN/ACK for a connection we just closed
+                # cleanly. A real stack would swallow it in TIME_WAIT;
+                # answering with a RST makes the peer believe the close was
+                # an abort (fatal for a just-delivered WSD metadata fetch).
+                pass
+            else:
+                # genuinely unknown connection (or data to a dead one) ->
+                # reset the peer so it fails fast
                 self._send_rst(dst_ip, src_ip, dport, sport, ack, seq,
                                flags, len(payload))
             return
@@ -263,6 +280,9 @@ class TCPStack:
     def _drop(self, conn):
         conn.state = CLOSED
         self.conns.pop(conn.key, None)
+        # Remember it briefly so late FIN/ACK retransmits are ignored rather
+        # than answered with a RST (see on_segment / _closed).
+        self._closed.append(conn.key)
 
     def _send_rst(self, local_ip, remote_ip, lport, rport, ack, seq, flags,
                   plen):

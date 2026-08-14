@@ -114,6 +114,43 @@ class TestTCP(unittest.TestCase):
         # connect() returns False because it gets RST, not SYN|ACK
         self.assertFalse(c.connect())
 
+    def test_no_rst_on_straggler_after_clean_close(self):
+        # A retransmitted FIN/ACK arriving after a clean close must be
+        # ignored, not answered with a RST. Windows sends such stragglers,
+        # and a RST right after a WSD metadata fetch makes it treat the
+        # transfer as aborted and refuse to install the device.
+        srv = self._server(EchoTCP, 7)
+        c = ClientSim(srv, dport=7, sport=55001)
+        self.assertTrue(c.connect())
+        # client initiates the close
+        c._to_server(tcp.FIN | tcp.ACK)
+        c.snd_nxt = tcp._u32(c.snd_nxt + 1)
+        # take the server's ACK + FIN, then ACK its FIN to finish the close
+        for flags, seq, _ack, _p in c._from_server():
+            if flags & tcp.FIN:
+                c.rcv_nxt = tcp._u32(seq + 1)
+        c._to_server(tcp.ACK)                  # completes close -> conn dropped
+        # a straggling retransmit of the client's FIN/ACK
+        c._to_server(tcp.FIN | tcp.ACK)
+        rst = [f for f, _s, _a, _p in c._from_server() if f & tcp.RST]
+        self.assertEqual(rst, [], "spurious RST after a clean close")
+
+    def test_syn_to_closed_port_still_resets_after_a_prior_close(self):
+        # The TIME_WAIT-style suppression must not swallow a genuine SYN to a
+        # port with no listener — that must still fail fast with a RST.
+        srv = self._server(EchoTCP, 7)
+        c = ClientSim(srv, dport=7, sport=55002)
+        self.assertTrue(c.connect())
+        c._to_server(tcp.FIN | tcp.ACK)
+        c.snd_nxt = tcp._u32(c.snd_nxt + 1)
+        for flags, seq, _a, _p in c._from_server():
+            if flags & tcp.FIN:
+                c.rcv_nxt = tcp._u32(seq + 1)
+        c._to_server(tcp.ACK)
+        # brand-new connection to a dead port still gets reset
+        c2 = ClientSim(srv, dport=8, sport=55003)
+        self.assertFalse(c2.connect())
+
 
 class TestNetServices(unittest.TestCase):
     def test_http_serves_page(self):
