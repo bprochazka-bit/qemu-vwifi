@@ -106,12 +106,12 @@ class HPMultifunction(PseudoHost):
     # It is a multifunction: advertise a WSD scan service too, so Windows
     # creates a scanner device node alongside the printer.
     wsd_scan = True
-    # PnP-X device category drives which headings Windows files the device
-    # under. It MUST list Scanners (and FaxMachines) as well as Printers, or
-    # Windows categorises the multifunction as a printer only and never
-    # surfaces its scanner function — the default "Printers" is why the
-    # scanner did not appear. Space-delimited, mirroring a real MFP.
-    pnpx_category = "Printers Scanners FaxMachines"
+    # NOTE: pnpx_category is intentionally left at the default "Printers".
+    # The scanner devnode comes from the hosted wscn:ScannerServiceType plus
+    # the Imaging.Scanner entry in df_device_category below — a known-good
+    # configuration that installed as printer+scanner. Expanding the PnP-X
+    # category to include non-standard tokens (e.g. "FaxMachines") regressed
+    # the scanner install, so it is deliberately not set here.
     # Device Foundation category for a print/scan/fax multifunction, matching
     # what a real HP OfficeJet advertises so Windows files it as an MFP.
     df_device_category = ("PrintFax.Printer.MFP PrintFax.Printer.Inkjet "

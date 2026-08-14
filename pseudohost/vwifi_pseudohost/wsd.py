@@ -143,14 +143,6 @@ A_ELEMENTS_CHANGE_EVENT = NS_WPRT + "/PrinterElementsChangeEvent"
 TO_DISCOVERY = "urn:schemas-xmlsoap-org:ws:2005:04:discovery"
 # The device advertises itself as a WSD Device that is a print device.
 DEVICE_TYPES = "wsdp:Device wprt:PrintDeviceType"
-# A multifunction must ALSO claim the scan DEVICE type here, not only the
-# hosted scanner service. Windows runs a separate Function Discovery for
-# scanners whose Probe filters on wscn:ScanDeviceType; a device that only
-# claims wprt:PrintDeviceType never matches that probe, so Windows treats it
-# as a printer and never instantiates the scanner — even though the metadata
-# carries a wscn:ScannerServiceType hosted service. Appending the scan
-# device type is what makes the scanner subsystem pick the device up.
-SCAN_DEVICE_TYPE = "wscn:ScanDeviceType"
 # The hosted print SERVICE inside the device is a different WSD type from
 # the device itself: the device is wprt:PrintDeviceType, the service that
 # hosts the print operations is wprt:PrinterServiceType. Windows keys the
@@ -257,10 +249,13 @@ class WSDDevice:
         self.scan_compatible_id = getattr(host, "pnpx_scan_compatible_id",
                                           WSD_SCAN_COMPATIBLE_ID)
         # The device-level Types advertised in Hello/ProbeMatch/ResolveMatch.
-        # A scanner-capable device MUST add the scan device type so Windows'
-        # scanner discovery (which probes for wscn:ScanDeviceType) matches it.
-        self.device_types = DEVICE_TYPES + (
-            " " + SCAN_DEVICE_TYPE if self.scan else "")
+        # NOTE: kept to the print device type even for a multifunction. The
+        # known-good configuration that installed as printer+scanner did NOT
+        # add wscn:ScanDeviceType here — the scanner devnode is driven by the
+        # hosted wscn:ScannerServiceType in the metadata, not a device-level
+        # scan type. Adding ScanDeviceType did not fix (and may have hindered)
+        # the scanner install, so it is intentionally omitted.
+        self.device_types = DEVICE_TYPES
         # WS-Discovery AppSequence InstanceId: MUST change each time the
         # device (re)starts so a client discards state cached under a prior
         # instance. A constant "1" means Windows treats every restart as the
@@ -285,11 +280,11 @@ class WSDDevice:
                                     self.uuid.split(":")[-1])
 
     def scan_xaddr(self):
-        # The hosted scanner service gets its own endpoint, as a real
-        # multifunction does, so Windows builds a distinct scanner function
-        # rather than folding it into the printer. The HTTP service dispatches
-        # by SOAP action regardless of path, so the extra path segment is free.
-        return self.xaddr() + "/scan"
+        # The hosted scanner service shares the device's single HTTP endpoint,
+        # as the known-good (installing) configuration did. Giving it a
+        # separate .../scan endpoint regressed the scanner install, so it is
+        # deliberately the same address as the print service.
+        return self.xaddr()
 
     def print_svc_uuid(self):
         # A distinct-but-stable UUID for the hosted print service (the
